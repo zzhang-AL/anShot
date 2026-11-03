@@ -1,0 +1,59 @@
+# ─── XcodeGen 生成产物（工程定义的产物，不入库）───
+*.xcodeproj/
+*.xcworkspace/
+!*.xcworkspace/contents.xcworkspacedata
+
+# ─── 构建产物 ───
+build/
+DerivedData/
+*.o
+*.dSYM/
+*.app
+
+# ─── Swift Package Manager ───
+.build/
+.swiftpm/
+# 注意：Package.resolved **必须入库**，故意不忽略。
+#
+# 本仓库是**应用**而非被复用的库，构建应当可重现。
+# AnShotAutomation/Package.swift 用 `exact: "0.12.1"` 钉住 MCP SDK，
+# 但 `exact` 只管住它自己——它的传递依赖（swift-nio / swift-collections /
+# swift-atomics / swift-system / swift-log / eventsource）不会被钉住。
+# 忽略本文件，同一个提交在不同时间 clone 就会解析出不同的依赖版本，
+# 与那条注释的意图直接矛盾。
+#
+# 副作用：升级依赖时需要显式提交本文件的变更——这正是想要的可见性。
+
+# ─── 签名材料（含私钥，绝不入库）───
+*.p12
+*.key
+*.crt
+*.cer
+*.mobileprovision
+
+# ─── macOS ───
+.DS_Store
+._*
+
+# ─── 编辑器 ───
+.vscode/
+.idea/
+*.swp
+
+# ─── 本地工具状态（Open Context Engine 客户端索引，可重建）───
+.oce-client/
+
+# ─── 发布产物（含 DMG/zip，不入库；由 tools/make-release.sh 生成）───
+dist/
+build-release/
+
+# ─── 文档不推送到远程 ───
+#
+# 设计契约、竞品调研与实现笔记只保留在本机；推送的仓库只包含代码与
+# 运行所需的资源。`git rm --cached docs` 之后这些文件仍在工作区，
+# 但不进入提交。
+/docs/
+
+# ─── 本地临时数据库 ───
+*.sqlite
+*.sqlite3

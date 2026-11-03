@@ -1,0 +1,166 @@
+# anShot 工程定义（XcodeGen）
+#
+# 本文件是工程的唯一事实来源。anShot.xcodeproj 是生成产物，不得手改，已在 .gitignore 中忽略。
+# 修改工程结构请改本文件，然后执行：xcodegen generate
+#
+# 相关文档：docs/m1-capture/plan.md（设计）、docs/m1-capture/model.md（契约）
+
+name: anShot
+
+options:
+  bundleIdPrefix: com.anshot
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: false
+  defaultConfig: Debug
+
+# ─────────────────────────────────────────────────────────────
+# 本地 SPM 包（模块划分，详见 plan.md §4）
+# ─────────────────────────────────────────────────────────────
+packages:
+  AnShotCore:
+    path: Packages/AnShotCore
+  AnShotCapture:
+    path: Packages/AnShotCapture
+  AnShotUI:
+    path: Packages/AnShotUI
+  # 自动化接口层：MCP stdio 服务端 + 命令行截图。
+  # 依赖 MCP 官方 Swift SDK（0.12.1），由本包自己的 Package.swift 声明。
+  # 它被 App target 引用，因此**与 GUI 共用同一个签名身份与可执行文件**。
+  AnShotAutomation:
+    path: Packages/AnShotAutomation
+
+# ─────────────────────────────────────────────────────────────
+# 全局构建设置
+# ─────────────────────────────────────────────────────────────
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    # 版本号：1.0.0 为正式发布版。
+    # MARKETING_VERSION 进 CFBundleShortVersionString（用户看到的版本），
+    # CURRENT_PROJECT_VERSION 进 CFBundleVersion（构建号，同一版本内递增）。
+    MARKETING_VERSION: "1.0.0"
+    # 构建号：build 1 的成包有「开始录制被面板下缘裁掉」的缺陷（验收时发现），
+    # 故修复后递增为 2——版本号不变，构建号用于区分同一版本的不同构件。
+    # build 3：新增自动化接口（MCP stdio 服务端 + 命令行截图，见 docs/automation/）。
+    # build 6：第二轮评审的缺陷修复与优化（见 docs/refactor/changelog.md 2026-10-14）。
+    # build 7：长截图保留可信基准，阻止断层与无关画面续接（2026-10-26）。
+    # build 8：正文视口识别、纹理签名位移投票与稀疏文字变化检测（2026-10-27）。
+    # build 9：保留整块选区，局部纹理匹配及重叠正文接缝（2026-10-27）。
+    # build 15：多显示器、跨桌面窗口与显式桌面切换截图（2026-10-28）。
+    # 之所以必须递增而不是沿用 2：产物文件名只含版本号
+    # （`anShot-1.0.0.dmg`），不含构建号，沿用同一个数字会让新构件与
+    # 它替换掉的那个在元数据上完全一致，事后无从区分。
+    CURRENT_PROJECT_VERSION: "15"
+
+    # 签名：本地自签名证书（详见 plan.md §3.5）
+    # 不使用 Apple ID；证书位于 login 钥匙串，名为 "anShot Dev"。
+    # 关键：Designated Requirement = bundleID + 证书根哈希，重编译不失效，故 TCC 授权稳定。
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "anShot Dev"
+    DEVELOPMENT_TEAM: ""
+    PROVISIONING_PROFILE_SPECIFIER: ""
+
+    # Hardened Runtime 例外项（麦克风）。
+    # 启用 Hardened Runtime 后，访问麦克风必须声明该 entitlement，否则 TCC 直接拒绝
+    # 且**不显示授权弹窗**，系统设置里也不会出现本应用条目。详见 App/anShot.entitlements。
+    CODE_SIGN_ENTITLEMENTS: App/anShot.entitlements
+
+    # 构建行为
+    ALWAYS_SEARCH_USER_PATHS: NO
+    ENABLE_HARDENED_RUNTIME: YES
+    DEAD_CODE_STRIPPING: YES
+    CLANG_ENABLE_MODULES: YES
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: NO
+
+    # ⚠️ 必须关闭：Xcode 16+ 的 Debug Dylib 特性会把主二进制拆为
+    # 「薄壳 + anShot.debug.dylib」，而 dyld 的库验证要求两者 Team ID 一致。
+    # 自签名证书没有 Team ID（TeamIdentifier=not set），导致启动即崩溃：
+    #   dyld: Library not loaded: @rpath/anShot.debug.dylib
+    #   Reason: mapping process and mapped file (non-platform) have different Team IDs
+    # SwiftUI Preview 注入的 __preview.dylib 同理。详见 plan.md §3.5。
+    ENABLE_DEBUG_DYLIB: NO
+    ENABLE_PREVIEWS: NO
+
+  configs:
+    # `#if DEBUG` 依赖此条件编译符号。XcodeGen 不会像 Xcode 新建工程那样自动添加，
+    # 必须显式声明，否则 Debug 专属代码（如诊断入口）永远不会被编译进去。
+    Debug:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+      GCC_PREPROCESSOR_DEFINITIONS: $(inherited) DEBUG=1
+    Release:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: ""
+
+# ─────────────────────────────────────────────────────────────
+# 目标
+# ─────────────────────────────────────────────────────────────
+targets:
+  anShot:
+    type: application
+    platform: macOS
+
+    sources:
+      - path: App/Sources
+      # 图标资源。XcodeGen 识别 .xcassets 为 asset catalog，
+      # 编译进 Assets.car 后由系统按尺寸取用。
+      #
+      # 注意这**只影响 App 图标**（Dock / Finder / ⌘Tab）；
+      # 状态栏菜单图标是代码绘制的单色符号，与本目录无关。
+      - path: App/Assets.xcassets
+
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleName: anShot
+        CFBundleDisplayName: anShot
+        CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundlePackageType: APPL
+        LSMinimumSystemVersion: "13.0"
+        # ⚠️ 缺失此项会让进程在首次访问麦克风时**直接崩溃**（而不是被拒绝）。
+        # 与屏幕录制权限不同：后者缺失只会导致 preflight 返回 false。
+        NSMicrophoneUsageDescription: "anShot 需要访问麦克风以录制旁白"
+        # 菜单栏 agent：无 Dock 图标、无主菜单
+        LSUIElement: true
+        NSPrincipalClass: NSApplication
+
+        # 自动化能力标记。外部包装脚本（tools/anshot）借此判断某个 app
+        # 是否支持 --capture / --list-displays / --mcp。
+        #
+        # 为何需要它：不支持这些参数的旧版本会把它们当成未知参数、
+        # 以 GUI 模式启动并常驻，调用方只能看到「命令挂住」——
+        # 既看不出原因，也无法用退出码发现。（本项目已实际踩到：
+        # 包装脚本曾选中 build 2 的旧安装包，命令直接挂死。）
+        #
+        # 为何不用「跑一次 --help 探活」：那会把旧版 GUI 真的拉起来，
+        # 而 GUI 启动会抢占全局热键（本项目已记录该进程级独占问题）。
+        # 读 Info.plist 不产生任何副作用。
+        #
+        # 递增语义：接口发生**不兼容**变更时递增。
+        AnShotAutomationVersion: "1"
+
+        # Finder 的「显示简介」与「关于」里可见。占位为项目名——
+        # 若要发布给他人，请改成真实的著作权人（与 LICENSE 里的保持一致）。
+        NSHumanReadableCopyright: "© 2026 anShot"
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anshot.app
+        PRODUCT_NAME: anShot
+        COMBINE_HIDPI_IMAGES: YES
+        # App 图标名。不声明这一项，asset catalog 里的 AppIcon 不会被采用，
+        # 构建出的 app 仍旧是系统默认图标。
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+
+    dependencies:
+      - package: AnShotCore
+      - package: AnShotCapture
+      - package: AnShotUI
+      - package: AnShotAutomation
+
+    scheme:
+      testTargets: []
+      gatherCoverageData: false

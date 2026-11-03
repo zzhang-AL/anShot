@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+#
+# tools/anshot —— anShot 自动化入口的包装脚本
+#
+# ── 它解决什么 ────────────────────────────────────────────────
+#
+# anShot 的截图能力内建在 app 可执行文件里（`anShot.app/Contents/MacOS/anShot`
+# 的 `--capture` / `--list-displays` / `--mcp`），本脚本只做两件铺路的事：
+#
+#   1. 定位 app —— 调用方不必知道是构建产物还是 /Applications
+#   2. 转发子命令到该 app 的可执行文件
+#
+# ── 权限（已实测）────────────────────────────────────────────
+#
+#   **默认就复用 anShot.app 已有的授权**，不需要给终端或 AI 客户端任何授权：
+#   app 内部会经 `open -n -g` 让 anShot.app 自己截图（见 docs/automation/）。
+#
+#   `--direct` 是唯一的出口：显式要求就地截图时，授权才落到当前进程。
+#
+#   注意：具体「被授权对象叫什么」由系统决定，脚本不做猜测。
+#   若报权限不足，最终以「系统设置 → 隐私与安全性 → 屏幕录制」里实际
+#   显示的条目为准。
+#
+# ── 为什么不在这里实现「复用授权」────────────────────────────
+#
+# 首版确实把这个逻辑写在本脚本里（`open -n` + 轮询临时报告 + 同步等待）。
+# 但 MCP 服务器必须由宿主 spawn、stdio 就是协议通道，脚本那套插不进去，
+# 于是命令行能复用授权、MCP 却要求宿主额外授权——两条路径行为分叉。
+# 现在这段逻辑内建在 app 里，MCP 与命令行共用同一实现，脚本也就不再需要
+# 维护一份会与 app 漂移的等待/超时/取回代码。
+#
+# ── 用法 ──────────────────────────────────────────────────────
+#
+#   tools/anshot list-displays
+#   tools/anshot capture --out /tmp/a.png
+#   tools/anshot capture --via-app --region 0,0,400,300 --out /tmp/a.png
+#   tools/anshot mcp
+#   tools/anshot path
+#
+#   `capture --via-app` 会把结果 JSON 打到 stdout（那是唯一能取回信息的通道）。
+
+set -euo pipefail
+
+# 解析脚本自身的**真实**路径，而不是调用时的那条路径。
+#
+# 本脚本会被软链到 ~/.local/bin/anshot 以便全局调用；只取 dirname
+# 会得到软链所在目录（~/.local/bin），于是所有仓库内候选全部落空、
+# 静默退化成「只用 /Applications」——行为看起来正常，但开发者
+# 期望的「优先用我刚构建的产物」就失效了，而且没有任何提示。
+#
+# 逐级解析软链是这类自举脚本的标准做法；`cd -P` 保证物理路径。
+SELF="${BASH_SOURCE[0]}"
+while [ -L "${SELF}" ]; do
+    _target="$(readlink "${SELF}")"
+    case "${_target}" in
+        /*) SELF="${_target}" ;;
+        *)  SELF="$(dirname "${SELF}")/${_target}" ;;
+    esac
+done
+REPO_ROOT="$(cd -P "$(dirname "${SELF}")/.." && pwd)"
+unset _target
+
+# ── 定位 app ──────────────────────────────────────────────────
+
+# 自动化能力标记的 Info.plist 键名（见 project.yml 中的同名条目）。
+AUTOMATION_MARKER="AnShotAutomationVersion"
+
+# 判断一个 app 是否支持自动化接口。
+#
+# 刻意**不执行**候选二进制来探活：旧版本会把 `--capture` 当成未知参数，
+# 以 GUI 模式启动并常驻（同时抢占全局热键，而热键是进程级独占资源）。
+# 读 Info.plist 没有任何副作用。
+#
+# 本项目已实际踩过这个坑：包装脚本曾选中旧安装包，命令直接挂死且看不出原因。
+supports_automation() {
+    local app="$1"
+    local plist="${app}/Contents/Info.plist"
+    [ -f "${plist}" ] || return 1
+
+    local value
+    value="$(/usr/libexec/PlistBuddy -c "Print :${AUTOMATION_MARKER}" "${plist}" 2>/dev/null || true)"
+    [ -n "${value}" ]
+}
+
+# 查找顺序：本地构建产物 > 已安装的正式版。
+#
+# 为什么本地构建优先于 /Applications：本脚本随仓库分发，主要消费者是
+# **正在开发/测试 anShot 的人**，他会期望自己刚构建的产物被用上。
+# 正式使用可用 ANSHOT_APP 显式指定安装版。
+find_app() {
+    local candidates=(
+        "${REPO_ROOT}/build-release/Build/Products/Release/anShot.app"
+        "${REPO_ROOT}/build/Build/Products/Debug/anShot.app"
+        "${REPO_ROOT}/build/Build/Products/Release/anShot.app"
+        "/Applications/anShot.app"
+    )
+
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        [ -x "${candidate}/Contents/MacOS/anShot" ] || continue
+        # 跳过不支持自动化接口的版本，而不是报错退出：
+        # 机器上同时存在旧安装包与新构建产物是常态。
+        supports_automation "${candidate}" || continue
+        printf '%s\n' "${candidate}"
+        return 0
+    done
+    return 1
+}
+
+# 显式指定时必须真的可用——静默回退会让调用方以为用的是自己指定的那个 app。
+if [ -n "${ANSHOT_APP:-}" ]; then
+    if [ ! -x "${ANSHOT_APP}/Contents/MacOS/anShot" ]; then
+        echo "ANSHOT_APP 指向的不是一个可用的 anShot.app：${ANSHOT_APP}" >&2
+        exit 1
+    fi
+    if ! supports_automation "${ANSHOT_APP}"; then
+        echo "ANSHOT_APP 指向的 app 不支持自动化接口（缺少 Info.plist 键 ${AUTOMATION_MARKER}）：" >&2
+        echo "  ${ANSHOT_APP}" >&2
+        exit 1
+    fi
+    APP_PATH="${ANSHOT_APP}"
+elif ! APP_PATH="$(find_app)"; then
+    cat >&2 <<EOF
+找不到支持自动化接口的 anShot.app。
+
+本脚本需要 Info.plist 中存在 ${AUTOMATION_MARKER} 标记的构建，
+该标记从具备 --capture / --list-displays / --mcp 的版本开始才有。
+
+请先构建：
+
+    xcodegen generate &&
+    xcodebuild -project anShot.xcodeproj -scheme anShot -configuration Debug \\
+      -destination 'generic/platform=macOS' -derivedDataPath build build
+
+也可以用 ANSHOT_APP=/path/to/anShot.app 显式指定。
+EOF
+    exit 1
+fi
+
+BINARY="${APP_PATH}/Contents/MacOS/anShot"
+
+# ── 子命令 ────────────────────────────────────────────────────
+
+usage() {
+    cat <<'EOF'
+用法：
+  tools/anshot list-displays
+  tools/anshot list-desktops
+  tools/anshot list-windows
+  tools/anshot capture [选项]
+  tools/anshot mcp
+  tools/anshot path
+
+capture 选项（均透传给 app 的 --capture）：
+  默认行为              让 anShot.app 自己截图，复用它已有的屏幕录制授权。
+                        **不需要**给终端或 AI 客户端授权。
+  --via-app             显式写法，与默认等价。
+  --direct              就地截图，用当前终端/宿主的授权（一般不需要）。
+  --window <id>         截取指定窗口（id 来自 list-windows）。
+                        **窗口被遮挡、不在最顶层时同样能截到完整内容**。
+                        可尝试其他桌面的窗口；隐藏或最小化时可能不可用。
+  --app <name>          按应用名截取窗口（当前在屏优先，其次面积最大）。
+                        与 --window 二选一；两者都不能与 --display/--space/--region 混用。
+  --display <id>        目标显示器 ID。默认主显示器。
+  --space <id>          指定 list-desktops 返回的桌面 ID；默认不会切换桌面。
+  --switch-desktop      明确允许切换目标桌面并在截图后恢复。
+  --region x,y,w,h      截取区域，单位是显示器内逻辑点，原点在该显示器左上角。
+  --max-size <n>        输出长边像素上限，默认 2560，0 表示不缩放。
+  --out <path>          保存路径。省略则存到 ~/Pictures/anShot/。不覆盖已有文件。
+
+其它：
+  mcp                   以 MCP stdio 服务端运行（前台，供 MCP 客户端配置用）。
+  path                  打印实际使用的可执行文件路径。
+
+示例：
+  tools/anshot list-windows
+  tools/anshot list-desktops
+  tools/anshot capture --app Safari --out /tmp/safari.png
+  tools/anshot capture --window 1234 --out /tmp/win.png
+  tools/anshot capture --region 0,0,800,600 --out /tmp/ui.png
+
+环境变量：
+  ANSHOT_APP            显式指定要使用的 anShot.app（必须支持自动化接口）。
+  说明：capture 的结果 JSON 打到 stdout；失败时 stderr 上有简短诊断。
+EOF
+}
+
+# 直接调用：权限归因给当前终端。
+run_direct() {
+    exec "${BINARY}" "$@"
+}
+
+# 经 LaunchServices 启动：权限归因给 anShot.app，复用其已有授权。
+#
+# 用 `open -n` 而非 `open`：已运行的实例**不会**收到新的 `--args`
+# （参数只在进程启动时读一次），故必须强制新实例。
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift || true
+
+case "${cmd}" in
+    list-displays)
+        run_direct --list-displays "$@"
+        ;;
+
+    list-desktops)
+        run_direct --list-desktops "$@"
+        ;;
+
+    list-windows)
+        # 与 list-displays 不同：窗口**标题**受屏幕录制权限管控，而本脚本的
+        # 调用进程（终端 / AI 宿主）通常没有这个权限。app 内部会自己决定是否
+        # 另起一个有权限的实例来枚举，这里只管把命令透传过去。
+        run_direct --list-windows "$@"
+        ;;
+
+    capture)
+        # 不再在本脚本里做 `open -n` + 轮询：那已经内建在 app 里了。
+        #
+        # 首版把「复用 anShot 授权」实现在这个脚本里（见 git 历史），
+        # 结果是命令行能用、MCP 不能用——MCP 服务器必须由宿主 spawn，
+        # 脚本那套 open+轮询根本插不进去，于是 MCP 用户被迫额外授权。
+        # 现在 app 自己负责这件事，两条路径共用同一套逻辑，脚本也不再需要
+        # 维护一份会与 app 行为漂移的等待/超时/取回实现。
+        run_direct --capture "$@"
+        ;;
+
+    mcp)
+        # 拒绝额外参数：否则 `tools/anshot mcp --capture` 会绕过 app 入口
+        # 那条「--mcp 不能与其它选项混用」的检查，得到一个意图不明的结果。
+        if [ $# -gt 0 ]; then
+            echo "mcp 子命令不接受额外参数（收到：$*）。" >&2
+            echo "它只用于让 MCP 客户端以 stdio 方式启动服务端。" >&2
+            exit 2
+        fi
+        # exec 是必需的：stdio 传输直接使用本进程的 stdin/stdout，
+        # 中间多一层 shell 只会多一个可能缓冲输出的环节。
+        exec "${BINARY}" --mcp
+        ;;
+
+    path)
+        # 供 MCP 客户端配置使用：直接打印可执行文件路径
+        printf '%s\n' "${BINARY}"
+        ;;
+
+    ""|-h|--help|help)
+        usage
+        ;;
+
+    *)
+        echo "未知子命令：${cmd}" >&2
+        echo >&2
+        usage >&2
+        exit 1
+        ;;
+esac

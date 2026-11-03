@@ -1,0 +1,104 @@
+name: CI
+
+# ── 为什么需要这个 workflow ────────────────────────────────────
+#
+# 在此之前，全部自动化检查只存在于 `tools/make-release.sh` 里——
+# 也就是「发布时才跑」。日常开发的每一次推送都不受任何检查，
+# 而 1.0.0 的 DMG 正是在从未运行过任何自动化测试的情况下构建出来的。
+#
+# 本 workflow 把同一套检查前移到每次 push / PR。
+#
+# ── 为什么不用 xcodebuild 构建 App target ──────────────────────
+#
+# App target 使用本机自签证书 `anShot Dev`（见 project.yml 的
+# CODE_SIGN_IDENTITY），该证书不存在于 CI，`xcodebuild` 必然失败。
+#
+# 因此 CI **只覆盖四个 SPM 包**：它们的构建与测试不需要签名。
+# App 层面的验证仍依赖人工冒烟（见 docs/refactor/task.md §八）。
+#
+# ── 为什么显式选择 Xcode ──────────────────────────────────────
+#
+# 四个包声明 `swift-tools-version: 6.0` / `6.1`，需要 Xcode 16+ 的工具链。
+# runner 的默认 Xcode 会随 GitHub 的镜像调整而变化，显式选择可避免
+# 「某天 CI 突然因工具链降到 15.x 而全线失败」这类与环境无关的故障。
+#
+# ── 测试是否需要特殊权限 ──────────────────────────────────────
+#
+# 不需要。`AnShotCapture` 的权限相关测试使用 `ScreenCaptureAccessProviding`
+# 的协议替身（`FakeAccess`），不触碰真实 TCC；其余测试均为纯逻辑。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  PACKAGES: AnShotCore AnShotCapture AnShotAutomation AnShotUI
+
+jobs:
+  test:
+    name: 构建与单元测试
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 选择 Xcode 并打印工具链
+        run: |
+          set -euo pipefail
+          ls /Applications | grep -i '^Xcode' || true
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          swift --version
+
+      # 构建、告警门禁、单元测试合并在一步，而不是拆成三步。
+      #
+      # 理由：`swift build` 是增量的。若把告警检查放在独立的第二步，
+      # 那时已无源文件需要重编译，构建输出为空，grep 必然什么都找不到——
+      # 门禁会**静默失效**（看起来一直通过，实际从未检查）。
+      # 必须与首次构建共用同一份输出。
+      - name: 构建 + 零告警门禁 + 单元测试
+        run: |
+          set -euo pipefail
+          failed=0
+          for pkg in ${PACKAGES}; do
+            echo "════════════════ ${pkg} ════════════════"
+            log="$(mktemp)"
+            swift build --package-path "Packages/${pkg}" 2>&1 | tee "$log"
+
+            # 只统计**本项目源**的告警：依赖包（swift-nio、swift-system 等）
+            # 的告警不在本仓库的控制范围内。
+            if grep -qE "Packages/${pkg}/.*: warning:" "$log"; then
+              echo "::error::${pkg} 存在编译告警"
+              grep -E "Packages/${pkg}/.*: warning:" "$log" | head -20
+              failed=1
+            fi
+
+            # UI 包的测试大量使用 MainActor 与定时抓帧；Swift Testing 默认
+            # 并行跑 suite 时，某个同步耗时的主线程用例会把另一个等待
+            # 主线程的用例饿到 10 秒超时（本地与 CI 都能复现）。串行只影响
+            # UI 包，运行时间仍在 30 秒量级。
+            if [ "$pkg" = "AnShotUI" ]; then
+              swift test --package-path "Packages/${pkg}" --no-parallel
+            else
+              swift test --package-path "Packages/${pkg}"
+            fi
+          done
+
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::编译告警门禁未通过"
+            exit 1
+          fi
+
+      - name: 格式检查（仅输出报告，不作门禁）
+        continue-on-error: true
+        run: |
+          # 仓库既有代码仍有约 2,578 条风格类违规，其中 99.9% 是
+          # 换行/缩进偏好而非错误（见 docs/refactor/plan.md 的 NG-1）。
+          # 全量格式化被主动否决——它会重写 git blame，使 docs/*/changelog.md
+          # 中按行号引用的验证证据失效。
+          #
+          # 故这里只统计并打印数量供参考，不使构建失败。
+          count="$(xcrun swift-format lint --recursive Packages/*/Sources 2>&1 | grep -c 'warning:' || true)"
+          echo "swift-format 违规数：${count}（既有代码的风格分歧，非门禁项）"

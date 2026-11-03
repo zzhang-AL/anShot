@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      麦克风访问权限（Hardened Runtime 例外）。
+
+      ⚠️ 本项**不可省略**：项目启用了 ENABLE_HARDENED_RUNTIME，而在 Hardened Runtime 下
+      访问麦克风必须声明此 entitlement。缺失时 TCC 会**直接拒绝且不显示授权弹窗**，
+      日志中的原文为：
+
+          Prompting policy for hardened runtime; service: kTCCServiceMicrophone
+          requires entitlement com.apple.security.device.audio-input but it is missing
+
+      后果具有误导性：`AVCaptureDevice.authorizationStatus` 返回 `.notDetermined`
+      看起来像「尚未询问」，但 requestAccess 立即返回拒绝，且系统设置里
+      **不会出现本应用的条目**（因为它从未成功注册过），用户也无法手动授权。
+
+      对比：屏幕录制（kTCCServiceScreenCapture）**没有**这项要求，
+      因此 M1 阶段从未遇到此问题。
+    -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>
