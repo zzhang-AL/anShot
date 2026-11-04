@@ -25,7 +25,10 @@ import Testing
 @testable import AnShotCore
 @testable import AnShotUI
 
-@Suite("长截图 · 整块选区与轴向")
+// 这些用例依赖主 actor 的时序（阻塞 80ms、按序 drain）。Swift Testing 默认
+// 并行跑套件时，其它用例会抢主 actor，10s 等待会假超时；串行化本套件，
+// 让「等待」只等被测逻辑，而不是等调度器。
+@Suite("长截图 · 整块选区与轴向", .serialized)
 @MainActor
 struct ScrollshotHorizontalTests {
 
@@ -319,18 +322,12 @@ struct ScrollshotHorizontalTests {
         controller.start()
         try await waitUntil(timeout: .seconds(15)) { capturer.captureCount >= 1 }
         for _ in 1..<frames.count { await controller.tick() }
-        await controller.finish()
-        let image = try #require(outcome?.image)
-        let output = try #require(ScrollshotImage(image))
         let start = offsets.min()!
-        let expected = sliceRows(page, offset: start, height: offsets.max()! - start + 390)
-        #expect(output.width == 800)
-        #expect(output.height == expected.height + 90)
-        let body = try #require(ScrollshotViewport(x: 160, y: 40, width: 640, height: expected.height).crop(output))
-        let matches = body.data.elementsEqual(expected.data)
-        #expect(matches, "正文在任意接缝处均不能缺失或重复")
-        #expect(preview?.worldWidth == 800)
         let worldStart = start - offsets[0]
+
+        // 明细切片是**会话进行中**的能力（进度浮层的放大栏）。
+        // `finish()` 会释放会话段缓冲以降低收尾峰值，之后 detailImage 不再可用；
+        // 因此这里在 finish 前取切片，和真实 UI 的时序一致。
         let detailCG = try #require(controller.detailImage(
             worldRows: (worldStart + 90)..<(worldStart + 290), targetWidth: 800
         ))
@@ -338,6 +335,17 @@ struct ScrollshotHorizontalTests {
         let detailBody = try #require(ScrollshotViewport(x: 160, y: 0, width: 640, height: 200).crop(detail))
         let detailMatches = detailBody.data.elementsEqual(sliceRows(page, offset: start + 50, height: 200).data)
         #expect(detailMatches)
+
+        await controller.finish()
+        let image = try #require(outcome?.image)
+        let output = try #require(ScrollshotImage(image))
+        let expected = sliceRows(page, offset: start, height: offsets.max()! - start + 390)
+        #expect(output.width == 800)
+        #expect(output.height == expected.height + 90)
+        let body = try #require(ScrollshotViewport(x: 160, y: 40, width: 640, height: expected.height).crop(output))
+        let matches = body.data.elementsEqual(expected.data)
+        #expect(matches, "正文在任意接缝处均不能缺失或重复")
+        #expect(preview?.worldWidth == 800)
         let header = sliceRows(output, offset: 0, height: 40)
         let footer = sliceRows(output, offset: output.height - 50, height: 50)
         let headerMatches = header.data.elementsEqual(sliceRows(frames[0], offset: 0, height: 40).data)
@@ -578,7 +586,7 @@ struct ScrollshotHorizontalTests {
     }
 
     private func waitUntil(
-        timeout: Duration = .seconds(10),
+        timeout: Duration = .seconds(30),
         _ condition: () -> Bool
     ) async throws {
         let deadline = ContinuousClock.now + timeout

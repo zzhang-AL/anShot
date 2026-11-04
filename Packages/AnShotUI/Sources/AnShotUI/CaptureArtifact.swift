@@ -38,17 +38,27 @@ struct CaptureArtifact {
     let fileURL: URL?
     let delivery: CaptureDelivery
 
+    /// 交付路径**已经编码好**的 PNG。
+    ///
+    /// 复制与长截图都要把同一张图写进剪贴板，同时又要在历史里缓存一份；
+    /// 两处各自编码就是同一幅大图编两次。这里让编码只发生一次，
+    /// 历史层（`AppDelegate.cacheArtifact`）直接复用这份数据。
+    /// 保存路径不需要它——保存引用的是用户文件，不复制第二份。
+    let pngData: Data?
+
     init(
         kind: HistoryEntryKind,
         source: HistorySource?,
         image: CGImage?,
         fileURL: URL?,
-        delivery: CaptureDelivery
+        delivery: CaptureDelivery,
+        pngData: Data? = nil
     ) {
         self.kind = kind
         self.source = source
         self.image = image
         self.fileURL = fileURL
         self.delivery = delivery
+        self.pngData = pngData
     }
 }

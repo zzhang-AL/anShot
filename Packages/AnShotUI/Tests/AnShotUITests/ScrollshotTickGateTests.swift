@@ -30,7 +30,9 @@ import Testing
 @testable import AnShotCore
 @testable import AnShotUI
 
-@Suite("长截图抓帧 · 单飞闸门")
+// 单飞闸门用例依赖主 actor 的调度时序；并行跑套件时其它用例会占住
+// 主 actor，等待 `onFinish`/抓帧计数的 10s 会假超时。串行化本套件。
+@Suite("长截图抓帧 · 单飞闸门", .serialized)
 @MainActor
 struct ScrollshotTickGateTests {
 
@@ -125,7 +127,7 @@ struct ScrollshotTickGateTests {
 
     /// 轮询等待条件成立（避免依赖固定 sleep 的脆弱性）。
     private func waitUntil(
-        timeout: Duration = .seconds(10),
+        timeout: Duration = .seconds(30),
         _ condition: () -> Bool
     ) async throws {
         let deadline = ContinuousClock.now + timeout

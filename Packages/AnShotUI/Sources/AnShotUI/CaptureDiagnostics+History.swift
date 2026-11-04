@@ -56,16 +56,16 @@ extension CaptureDiagnostics {
             exit(1)
         }
 
-        // ① 缩略图生成：能解码回来，且尺寸按 maxWidth 缩到位。
-        let thumbnail = HistoryThumbnail.makePNG(from: image, maxWidth: 180, scale: 2)
+        // ① 缩略图生成：能解码回来，且尺寸收敛到行内的 96×64（2x = 192×128）。
+        let thumbnail = HistoryThumbnail.makePNG(from: image, maxWidth: 96, maxHeight: 64, scale: 2)
         let decoded = thumbnail.flatMap { NSImage(data: $0) }
         report("缩略图生成成功", "\(thumbnail?.count ?? 0) 字节", "> 0", (thumbnail?.count ?? 0) > 0)
         report("缩略图可解码", "\(decoded != nil)", "true", decoded != nil)
         if let rep = decoded?.representations.first {
-            // 1600 宽缩到 180 逻辑点、2x = 360 像素。
-            report("缩略图尺寸按 maxWidth 收敛",
-                   "\(rep.pixelsWide)x\(rep.pixelsHigh)", "约 360x225",
-                   abs(rep.pixelsWide - 360) <= 2 && abs(rep.pixelsHigh - 225) <= 2)
+            // 固定为 192×128（等比填满 + 居中裁切），不再随原图比例变高。
+            report("缩略图尺寸固定为 192x128",
+                   "\(rep.pixelsWide)x\(rep.pixelsHigh)", "192x128",
+                   rep.pixelsWide == 192 && rep.pixelsHigh == 128)
         }
 
         // ② 写入历史并渲染面板。

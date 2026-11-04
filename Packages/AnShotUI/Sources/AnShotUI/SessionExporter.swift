@@ -55,15 +55,30 @@ enum SessionExporter {
 
     // MARK: - 剪贴板
 
-    /// 拷贝到系统剪贴板。
+    /// 一次拷贝的结果。
     ///
-    /// PNG 立即写入；TIFF **按需生成**（见 `LazyTIFFProvider`）。
+    /// PNG 编码与写剪贴板是两件成功与否不同的事：
+    /// - 编码失败：没有图可给，调用方只能当作「什么都没做」（返回 nil）；
+    /// - 写剪贴板失败：图已经编好了，历史缓存仍然应该用得上它。
+    /// 所以这里把两者拆开，而不是压缩成一个 Bool。
+    struct PasteboardCopyResult {
+        let pngData: Data
+        let didCopy: Bool
+    }
+
+    /// 拷贝到系统剪贴板，并把**编码好的 PNG**一起交还给调用方。
     ///
+    /// PNG 只编码一次：同一份数据既写进剪贴板，又随产物进入历史缓存，
+    /// 避免复制路径上出现第二次全尺寸编码。
+    ///
+    /// - Returns: 编码失败时为 nil；写剪贴板失败时 `didCopy == false`，但 `pngData` 仍有效。
     /// - Parameter pasteboard: 目标剪贴板。只有测试会传入私有剪贴板，避免碰用户的系统剪贴板。
-    @discardableResult
-    static func copyToPasteboard(_ image: CGImage, to pasteboard: NSPasteboard = .general) -> Bool {
+    static func copyToPasteboardWithPNG(
+        _ image: CGImage,
+        to pasteboard: NSPasteboard = .general
+    ) -> PasteboardCopyResult? {
         guard let png = Exporter.pngData(from: image) else {
-            return false
+            return nil
         }
 
         // 再放一份 TIFF。
@@ -80,11 +95,20 @@ enum SessionExporter {
 
         pasteboard.clearContents()
         guard pasteboard.writeObjects([item]) else {
-            return false
+            return PasteboardCopyResult(pngData: png, didCopy: false)
         }
         // 剪贴板不保证持有数据提供者，由这里保活到它被告知「用完了」为止。
         LazyTIFFProvider.current = provider
-        return true
+        return PasteboardCopyResult(pngData: png, didCopy: true)
+    }
+
+    /// 拷贝到系统剪贴板。
+    ///
+    /// 保留 Bool 形态供只关心成功与否的调用方（保存/钉住/结果窗口、测试）使用。
+    /// - Parameter pasteboard: 目标剪贴板。只有测试会传入私有剪贴板，避免碰用户的系统剪贴板。
+    @discardableResult
+    static func copyToPasteboard(_ image: CGImage, to pasteboard: NSPasteboard = .general) -> Bool {
+        copyToPasteboardWithPNG(image, to: pasteboard)?.didCopy ?? false
     }
 
     // MARK: - 保存

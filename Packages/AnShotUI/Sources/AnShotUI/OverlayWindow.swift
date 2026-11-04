@@ -863,6 +863,9 @@ final class OverlayView: NSView {
             // 光标本类装饰性重绘不会改变输入，直接复用上次合成结果。
             image = cache.image
         } else {
+            // 先断开旧缓存再分配新画布：两者都是整张选区大小的位图，
+            // 同时在场只会白白抬高峰值内存（释放发生在 render 分配之前）。
+            composedCache = nil
             guard let pixelSelection = pixelSelection(from: selection),
                   let composed = AnnotationRenderer.render(
                       backdrop: backdrop,
@@ -1361,8 +1364,9 @@ final class OverlayView: NSView {
     ///
     /// 合成失败（选区非法等）时只响一声，**不结束会话**——
     /// 用户的标注还在，静默关掉窗口等于把工作丢掉。
+    /// 合成结果优先复用显示侧缓存（见 `composedImageForExport()`）。
     private func performExport(_ action: ExportAction) {
-        guard let editorState, let backdrop else {
+        guard editorState != nil, backdrop != nil else {
             NSSound.beep()
             return
         }
@@ -1382,16 +1386,49 @@ final class OverlayView: NSView {
             return
         }
 
-        guard let image = SessionExporter.compose(
-            editor: editorState,
-            backdrop: backdrop,
-            scaleFactor: backdropScale
-        ) else {
+        guard let image = composedImageForExport() else {
             NSSound.beep()
             return
         }
 
         onExport?(image, action)
+    }
+
+    /// 导出用的合成图，优先复用显示侧那份缓存。
+    ///
+    /// 显示侧（`drawAnnotations`）已经把当前输入合成过一次；导出再合一遍
+    /// 等于在用户按下 ⌘C 的那一帧上多分配一张整选区大小的位图。缓存里那幅
+    /// 图**本来就是选区原像素尺寸的成品**，输入（选区 + 标注）没变就能直接用，
+    /// 也因此仍然满足「显示与导出走同一个 `AnnotationRenderer.render`」。
+    ///
+    /// 不直接裁 `backdrop` 走捷径：渲染器会归一化到 BGRA/sRGB，
+    /// 裸裁剪会改变色彩语义，看到的与存下来的就不一致了。
+    ///
+    /// - Returns: 合成结果；选区非法或渲染失败时为 `nil`（调用方响一声并留在会话里）。
+    private func composedImageForExport() -> CGImage? {
+        guard let editorState, let backdrop, let selection = effectiveSelection else {
+            return nil
+        }
+
+        // 文字草稿必须在取标注之前提交：导出图不能少掉用户刚敲的字。
+        SessionExporter.finishEditing(editorState, scaleFactor: backdropScale)
+
+        let annotations = displayedAnnotations
+        if let cache = composedCache,
+           cache.selection == selection,
+           cache.annotations == annotations {
+            return cache.image
+        }
+
+        // 先释放旧的整幅缓存，再让渲染器分配新画布 + 新 CGImage。
+        composedCache = nil
+        return pixelSelection(from: selection).flatMap {
+            AnnotationRenderer.render(
+                backdrop: backdrop,
+                selection: $0,
+                annotations: annotations
+            )
+        }
     }
 
     /// 导出前把进行中的选区手势落定到模型；返回是否可以继续导出。

@@ -54,4 +54,19 @@ struct PasteboardExportTests {
         let tiffRep = try #require(NSBitmapImageRep(data: tiff))
         #expect(tiffRep.pixelsWide == 37 && tiffRep.pixelsHigh == 21)
     }
+
+    @Test("一次编码同时供剪贴板与历史缓存：返回的数据就是剪贴板里的 PNG")
+    func encodedPNGIsSharedWithCaller() throws {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("anshot-test-\(UUID().uuidString)"))
+        defer { pasteboard.releaseGlobally() }
+        let image = try makeImage(width: 37, height: 21)
+
+        let result = try #require(
+            SessionExporter.copyToPasteboardWithPNG(image, to: pasteboard)
+        )
+        #expect(result.didCopy)
+        #expect(!result.pngData.isEmpty)
+        // 历史缓存直接复用这份 Data，不能再编码一次；这里钉住「同一份字节」。
+        #expect(pasteboard.data(forType: .png) == result.pngData)
+    }
 }

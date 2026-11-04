@@ -140,7 +140,8 @@ final class ScrollshotController {
     private let frameInterval: TimeInterval
 
     /// 抓帧数上限：即使内容一直在变，也不无限抓下去。
-    /// 输出本身的硬边界在 `ScrollStitcher.Options.maxOutputHeight`。
+    /// 输出本身的硬边界是 `ScrollshotSession.outputHeightLimit`
+    /// （`maxOutputHeight` 与宽度感知的内存预算取小）。
     private static let maxFrames = 1200
     /// 回看已采内容不占图像内存，允许更多观察帧，但日志元数据仍有上限。
     private static let maxObservedFrames = 1200
@@ -245,23 +246,28 @@ final class ScrollshotController {
         emitPreviewIfDue()
 
         let result = session.result()
-        // 会话收尾摘要：排查时先看这一行，就知道那次会话拼了多少帧、有没有跟丢。
+        // 收尾摘要与 `Outcome` 都要用**重建前**的计数：下面重建会话后它们归零。
         let frameCount = session.acceptedFrameCount
         let observed = session.decisions.count
         let stalled = session.isStalled
+        let plan = result.plan
         ScrollshotLogStore.shared.appendEvent(
             "session-finish 采纳=\(frameCount) 观察=\(observed) 输出高=\(result.image?.height ?? 0) 跟丢=\(stalled)"
         )
+        // 会话持有每一段的像素缓冲；在转 `CGImage` 之前就释放它，峰值内存才
+        // 不会叠加「段缓冲 + 长图缓冲」。`result.image` 自带独立缓冲，重建
+        // 会话不影响它，所以转换必须留在重建之后。
+        session = ScrollshotSession(options: options)
         // 会话产出的是**会话空间**的长图（横向时躺倒），归还原方向再交给界面。
         let image = result.image
             .flatMap { convertAxis($0) }
-            .flatMap { Self.makeCGImage(from: $0) }
+            .flatMap { $0.makeCGImage() }
         onFinish?(Outcome(
             image: image,
-            plan: result.plan,
+            plan: plan,
             failure: captureFailure ?? result.failure.map(String.init(describing:)),
-            capturedFrames: session.acceptedFrameCount,
-            observedFrames: session.decisions.count,
+            capturedFrames: frameCount,
+            observedFrames: observed,
             stalled: stalled
         ))
     }
@@ -433,9 +439,11 @@ final class ScrollshotController {
             onRecovery?()
         }
         // 高度到顶单独判：帧被拒收但配准成功，所以它不会表现为 `stalled`。
-        if session.coveredWorldHeight >= options.maxOutputHeight, !hasReportedHeightLimit {
+        // 比较与上报都用宽度感知的有效上限（`session.outputHeightLimit`），
+        // 否则窄窗口下内存已经吃紧、回调却还说没到顶。
+        if session.coveredWorldHeight >= session.outputHeightLimit, !hasReportedHeightLimit {
             hasReportedHeightLimit = true
-            onLimitReached?(.outputHeight(options.maxOutputHeight))
+            onLimitReached?(.outputHeight(session.outputHeightLimit))
         }
         guard decision.isAccepted else { return }
         onProgress?(session.acceptedFrameCount, session.coveredWorldHeight)
@@ -506,7 +514,7 @@ final class ScrollshotController {
         guard let preview = session.preview(
             fittingWidth: Self.navigatorWidth,
             fittingHeight: Self.navigatorHeight
-        ), let cgImage = Self.makeCGImage(from: preview.image) else {
+        ), let cgImage = preview.image.makeCGImage() else {
             onPreview?(nil)
             return
         }
@@ -544,6 +552,9 @@ final class ScrollshotController {
     /// 会话进行中由用户**拖动定位框**连续触发，所以这里只做一次 `slice` +
     /// 一次 `CGImage` 构造，不做任何缓存——切片本身就是最近邻采样，重复缓存的
     /// 收益抵不上它带来的失效判断复杂度。
+    ///
+    /// `finish()` 会释放会话的段缓冲（收尾峰值），因此**结束后返回 nil**；
+    /// 调用方只应在进度浮层仍存活时取切片。
     func detailImage(worldRows: Range<Int>, targetWidth: Int) -> CGImage? {
         // ── 横向时切片宽度取「视口高」而不是详情区宽 ──────────
         //
@@ -561,7 +572,7 @@ final class ScrollshotController {
         }
         // 切片是会话空间，横向时转回正向再显示（与预览相反：内容要看得懂）。
         guard let oriented = convertAxis(slice) else { return nil }
-        return Self.makeCGImage(from: oriented)
+        return oriented.makeCGImage()
     }
 
     /// 廉价变化检测：抽样比较（不进入配准）。
@@ -599,22 +610,5 @@ final class ScrollshotController {
         // 等下一帧再提交时已经跨过重叠范围。保留绝对数量下限以过滤小光标闪烁。
         return Double(sum) / Double(count) / 3 > changeThreshold
             || changed >= max(8, count / 500)
-    }
-
-    private static func makeCGImage(from image: ScrollshotImage) -> CGImage? {
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
-        var buffer = image.data
-        return buffer.withUnsafeMutableBytes { raw -> CGImage? in
-            guard let context = CGContext(
-                data: raw.baseAddress,
-                width: image.width,
-                height: image.height,
-                bitsPerComponent: 8,
-                bytesPerRow: image.width * 4,
-                space: colorSpace,
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-            ) else { return nil }
-            return context.makeImage()
-        }
     }
 }

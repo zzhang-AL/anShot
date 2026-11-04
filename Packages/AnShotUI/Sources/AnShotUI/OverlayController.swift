@@ -1308,17 +1308,22 @@ public final class OverlayController {
             return
         }
 
-        // 先登记产物再复制：复制失败时结果仍在结果窗口里，
+        // PNG 只编码一次：这份数据既进剪贴板，也随产物交给历史缓存。
+        let copyResult = SessionExporter.copyToPasteboardWithPNG(image)
+        let copied = copyResult?.didCopy ?? false
+
+        // 先登记产物：复制失败时结果仍在结果窗口里，
         // 不会出现「会话关了、剪贴板里没有、历史里也没有」的三重丢失。
+        // 即便写剪贴板失败，已编码的 PNG 仍然可用，历史缓存照样成立。
         onArtifact?(CaptureArtifact(
             kind: .longScreenshot,
             source: CurrentSource.longScreenshot,
             image: image,
             fileURL: nil,
-            delivery: .longShot
+            delivery: .longShot,
+            pngData: copyResult?.pngData
         ))
 
-        let copied = SessionExporter.copyToPasteboard(image)
         logger.notice("""
             滚动截图完成：\(image.width, privacy: .public)x\(image.height, privacy: .public) \
             采纳帧=\(outcome.capturedFrames, privacy: .public) \
@@ -1550,18 +1555,21 @@ public final class OverlayController {
             }
 
         case .copy:
-            let copied = SessionExporter.copyToPasteboard(image)
+            // 编码一次：成功时那份 PNG 直接进历史缓存，不再二次编码。
+            let copyResult = SessionExporter.copyToPasteboardWithPNG(image)
+            let copied = copyResult?.didCopy ?? false
             logger.notice("""
                 export copy: success=\(copied, privacy: .public) \
                 size=\(image.width, privacy: .public)x\(image.height, privacy: .public)
                 """)
-            if copied {
+            if copied, let copyResult {
                 onArtifact?(CaptureArtifact(
                     kind: .screenshot,
                     source: currentSource(mode: "region"),
                     image: image,
                     fileURL: nil,
-                    delivery: .copied
+                    delivery: .copied,
+                    pngData: copyResult.pngData
                 ))
                 dismiss()
             } else {

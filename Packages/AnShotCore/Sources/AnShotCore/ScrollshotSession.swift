@@ -270,6 +270,22 @@ public struct ScrollshotSession {
     /// 因此回滚期间（在已覆盖区内往返）不会跳动。
     public private(set) var coveredWorldHeight = 0
 
+    /// **本次会话实际生效的输出行数上限**——所有行数限制的唯一来源。
+    ///
+    /// `options.maxOutputHeight` 只是行数上限；输出字节数是 `宽 × 高 × 4`，
+    /// 同一行数在宽屏上占更多内存。所以再按像素预算压一道：
+    ///
+    ///     min(maxOutputHeight, maxOutputPixels / 宽)
+    ///
+    /// 首帧宽度是会话内唯一可信的宽度（尺寸不符的帧会被拒绝），因此以它为除数；
+    /// 取 `max(1, …)` 保证宽到极端时上限也不会退化成 0 或负数。
+    /// 首帧尚未到达时还无从计算，先返回 `maxOutputHeight`。
+    public var outputHeightLimit: Int {
+        guard let first = firstImage else { return options.maxOutputHeight }
+        let pixelBound = max(1, options.maxOutputPixels / max(1, first.width))
+        return min(options.maxOutputHeight, pixelBound)
+    }
+
     /// 粘合片段：已经算好「从帧内第几行、取多少行、覆盖世界的哪一段」。
     ///
     /// 决策一旦做出就固定下来，收尾时只做坐标重映射与内存复制，不再重新推导——
@@ -489,7 +505,7 @@ public struct ScrollshotSession {
         var planning: (sourceY: Int, rows: Int, worldStart: Int)?
 
         var stalled = false
-        if !trusted || (!connectsToCoverage && coveredWorldHeight < options.maxOutputHeight) {
+        if !trusted || (!connectsToCoverage && coveredWorldHeight < outputHeightLimit) {
             // 配准失败或完全没依据：既不知道位移也不知道方向。判 `unresolved` 而不是
             // 「没滚动」，后者会让一帧无法对齐的内容被静默当成空转丢掉。
             verdict = .unresolved
@@ -546,9 +562,13 @@ public struct ScrollshotSession {
             // 按 `rows` 量：慢滚会在两三帧后自然越过阈值，而悬浮层动画
             //（画面在变但没滚动）的 `rows` 永远不增，会被一直拦住。
             verdict = .transient
-        } else if coveredWorldHeight >= options.maxOutputHeight {
+        } else if coveredWorldHeight >= outputHeightLimit {
             // 高度上限：长截图的内存是 宽×高×4，必须有硬边界。
-            warnings.append("达到输出高度上限 \(options.maxOutputHeight)px，后续帧未采纳")
+            // 报出**生效的**行数上限（可能已被像素预算压低）以及像素预算本身，
+            // 否则宽屏下用户会看到「明明没到 32768 行就停了」而无法解释。
+            warnings.append(
+                "达到输出高度上限 \(outputHeightLimit)px（像素预算 \(options.maxOutputPixels)px），后续帧未采纳"
+            )
             verdict = .outputLimit
             frameWarnings.append("超过高度上限")
         } else {
@@ -566,11 +586,13 @@ public struct ScrollshotSession {
         // 否则会出现「结论是采纳、却什么都没贴」的不一致——实测就是这么漏掉
         // 用户停手时那最后几十像素的。
         if verdict == .accepted {
-            let allowedRows = options.maxOutputHeight - coveredWorldHeight
+            let allowedRows = max(0, outputHeightLimit - coveredWorldHeight)
             let acceptedRows = min(rows, allowedRows)
             if acceptedRows < rows {
                 frameWarnings.append("被高度上限截断，少接 \(rows - acceptedRows)px")
-                warnings.append("达到输出高度上限 \(options.maxOutputHeight)px，最后一帧被截断")
+                warnings.append(
+                    "达到输出高度上限 \(outputHeightLimit)px（像素预算 \(options.maxOutputPixels)px），最后一帧被截断"
+                )
             }
             // 被截断时**保留紧邻已覆盖区的那一段**：向下扩展丢远端（更靠下的），
             // 向上扩展丢远端（更靠上的）。两端一致，用户看到的是「从当前进度往外接」

@@ -287,6 +287,20 @@ private let recordingFrame = RecordingRegionFrame()
     /// - **`.utility` 优先级**：用户真在用的时候（手动截图、标注）不能被它抢走算力。
     /// - **失败不上抛**：预热纯属预热，它坏了不能影响任何真实功能。
     private func scheduleOCRPreheat() {
+        // 预热只对 Apple Vision 有意义。
+        //
+        // 云端 provider（本机实际配置的是 baiduPPOCR）根本不加载本地识别模型，
+        // 跑一遍 Vision 预热等于白白付出约 48MB 的神经网络峰值内存与十几秒算力。
+        // 诊断进程同样跳过：它不验证预热带来的延迟改善，却会跟真实会话抢资源。
+        guard !isDiagnosticRun else {
+            logger.notice("OCR 预热跳过：诊断运行")
+            return
+        }
+        guard OCRProviderSettings().selectedKind == .appleVision else {
+            logger.notice("OCR 预热跳过：当前 provider 不是 Apple Vision")
+            return
+        }
+
         // 不持有这个 Task：预热没有需要取消的下游资源，进程退出时它自然消失。
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(3))
@@ -375,11 +389,14 @@ private let recordingFrame = RecordingRegionFrame()
         guard let image = artifact.image else { return }
         let kind = artifact.kind
         let source = artifact.source
+        // 复制/长截图的交付路径已经编码过 PNG：直接复用，避免同一张图
+        // 在这里再全量编码一次。只取需要的字段，不把整个产物带进后台任务。
+        let preEncodedPNG = artifact.pngData
 
         Task { @MainActor [weak self] in
             let payload = await Task.detached(priority: .utility) {
                 (
-                    Exporter.pngData(from: image),
+                    preEncodedPNG ?? Exporter.pngData(from: image),
                     HistoryThumbnail.makePNG(from: image)
                 )
             }.value

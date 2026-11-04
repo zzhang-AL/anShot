@@ -158,6 +158,36 @@ struct ScrollStitcherTests {
         #expect(result.plan.warnings.contains { $0.contains("高度上限") })
     }
 
+    @Test("像素预算：宽屏下等效行数上限被压到 maxOutputPixels / 宽")
+    func respectsPixelBudget() throws {
+        // 宽度 100、预算 48000 像素 → 生效行数上限 480 行。
+        // 固定行数上限（32768）对这张宽图毫无约束力，正是像素预算要兜住的情形。
+        let page = makePage(width: 100, pageHeight: 1200)
+        // 帧高 240、步进 100：保留足够重叠让配准能接上；首帧 240 小于
+        // 生效上限 480，后续帧还能继续被采纳，只是到 480 行截止。
+        let frameHeight = 240
+        let frames = (0..<5).map { slice(page, offset: $0 * 100, height: frameHeight) }
+        let options = ScrollStitcher.Options(maxOutputPixels: 48_000) // 480 行
+        let result = ScrollStitcher.stitch(frames: frames, options: options)
+        let image = try #require(result.image)
+
+        #expect(image.height == 480, "输出高度 \(image.height)")
+        #expect(result.plan.warnings.contains { $0.contains("像素预算") }, "没有报出像素预算")
+
+        // 会话里该上限是**唯一**来源：首帧到达后即可读出生效值。
+        var session = ScrollshotSession(options: options)
+        session.submit(frames[0])
+        #expect(session.outputHeightLimit == 480, "生效上限 \(session.outputHeightLimit)")
+
+        // 同一批帧在默认预算（48M）下不受像素上限约束，语义保持不变。
+        var relaxed = ScrollshotSession()
+        relaxed.submit(frames[0])
+        #expect(relaxed.outputHeightLimit == ScrollStitcher.Options().maxOutputHeight)
+        let relaxedResult = ScrollStitcher.stitch(frames: frames)
+        #expect(relaxedResult.image?.height == frameHeight + 4 * 100)
+        #expect(relaxedResult.image?.height == 640)
+    }
+
     @Test("配准不可信：结论必须可解释，不能被当成「没滚动」静默丢掉（FAIL-OPEN）")
     func failOpenOnUnreliableFrame() throws {
         // 制造一个「与上一帧毫无重叠关系」的帧：整幅随机噪声，模拟内容整体变化

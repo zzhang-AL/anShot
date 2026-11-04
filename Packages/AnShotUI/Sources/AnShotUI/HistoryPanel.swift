@@ -41,18 +41,28 @@ import AppKit
 /// 缩略图生成。
 enum HistoryThumbnail {
 
-    /// 把全尺寸图缩成小尺寸 PNG。
+    /// 把全尺寸图缩成小尺寸 PNG（等比填满后居中裁切）。
     ///
     /// - Parameters:
     ///   - image: 全尺寸图。
-    ///   - maxWidth: 缩略图的最大宽度（逻辑点）。
+    ///   - maxWidth: 缩略图的逻辑宽度，默认与行内 96×64 的框一致。
+    ///   - maxHeight: 缩略图的逻辑高度。
     ///   - scale: 屏幕缩放，用于在该尺寸下仍然清晰。
     /// - Returns: PNG 数据；失败返回 nil（调用方退化为占位图标）。
-    static func makePNG(from image: CGImage, maxWidth: CGFloat = 180, scale: CGFloat = 2) -> Data? {
-        guard image.width > 0, image.height > 0 else { return nil }
-        let ratio = min(1, maxWidth / CGFloat(image.width))
-        let width = max(1, Int((CGFloat(image.width) * ratio * scale).rounded()))
-        let height = max(1, Int((CGFloat(image.height) * ratio * scale).rounded()))
+    ///
+    /// 输出恒为 `maxWidth*scale × maxHeight*scale` 像素。行内本来就按
+    /// 「填满再裁切」绘制，若保留原始比例，2940×32768 的长截图会得到
+    /// 约 360×4013 的缩略图（每张数 MB），而屏幕上只看得到 96×64 的那一块。
+    static func makePNG(
+        from image: CGImage,
+        maxWidth: CGFloat = 96,
+        maxHeight: CGFloat = 64,
+        scale: CGFloat = 2
+    ) -> Data? {
+        guard image.width > 0, image.height > 0,
+              maxWidth > 0, maxHeight > 0, scale > 0 else { return nil }
+        let width = max(1, Int((maxWidth * scale).rounded()))
+        let height = max(1, Int((maxHeight * scale).rounded()))
         guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
               let context = CGContext(
                   data: nil, width: width, height: height,
@@ -61,7 +71,21 @@ enum HistoryThumbnail {
                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
               ) else { return nil }
         context.interpolationQuality = .high
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        // 按「长边贴满、短边溢出」求比例，再居中绘制；画布就是目标尺寸，
+        // 溢出部分自然被裁掉 —— 与行内 `HistoryThumbnailView` 的
+        // aspect-fill 一致，缩略图里看到的正是行里会画出来的那一块。
+        let fill = max(
+            CGFloat(width) / CGFloat(image.width),
+            CGFloat(height) / CGFloat(image.height)
+        )
+        let drawWidth = CGFloat(image.width) * fill
+        let drawHeight = CGFloat(image.height) * fill
+        context.draw(image, in: CGRect(
+            x: (CGFloat(width) - drawWidth) / 2,
+            y: (CGFloat(height) - drawHeight) / 2,
+            width: drawWidth,
+            height: drawHeight
+        ))
         guard let scaled = context.makeImage() else { return nil }
         return Exporter.pngData(from: scaled)
     }
@@ -944,6 +968,17 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
     /// 缩略图只用于屏上几十点，系统内存吃紧时允许回收。
     private let thumbnailCache = NSCache<NSString, NSImage>()
 
+    /// 缩略图缓存上限：24 MiB，按行内 192×128 的像素体积约可容纳 256 张。
+    ///
+    /// 只设 `countLimit` 不够：长截图时代的缩略图每张可达数 MB，
+    /// 200 张的上限意味着上百 MB 常驻。成本按单张 192×128×4 像素字节计，
+    /// 与实际缓存条目一一对应（`HistoryThumbnail` 默认输出即该尺寸）。
+    private static let thumbnailPixelWidth = 192
+    private static let thumbnailPixelHeight = 128
+    private static let thumbnailCacheCostLimit = 24 * 1024 * 1024
+    private static let thumbnailCacheItemCost =
+        thumbnailPixelWidth * thumbnailPixelHeight * 4
+
     /// 缩略图由 store 定位：面板不该自己拼目录（那会把存储布局复制成两处真相）。
     private let store: HistoryStore
 
@@ -976,6 +1011,7 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
         window.delegate = self
 
         thumbnailCache.countLimit = 200
+        thumbnailCache.totalCostLimit = Self.thumbnailCacheCostLimit
 
         configureSearchField()
         configureKindFilter()
@@ -1379,7 +1415,38 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
         if let cached = thumbnailCache.object(forKey: key) { return cached }
         guard let url = store.thumbnailURL(for: entry),
               let image = NSImage(contentsOf: url) else { return nil }
-        thumbnailCache.setObject(image, forKey: key)
+        // 成本必须按**实际像素**算：旧版本生成的长截图缩略图可能是 360×4013，
+        // 用固定的 192×128 成本会低估几十倍，24 MiB 的总上限就形同虚设。
+        let representation = image.representations.first
+        let pixelWidth = representation?.pixelsWide ?? 0
+        let pixelHeight = representation?.pixelsHigh ?? 0
+
+        // 旧版本按原始比例生成缩略图，长截图可能是 360×4013。这里在**读取时**
+        // 一次性迁移到新的 192×128 裁切尺寸：只保留迁移后的小图，并把新文件
+        // 异步写回；否则 200 条旧记录仍会让历史页常驻数百 MB。
+        if pixelWidth > Self.thumbnailPixelWidth || pixelHeight > Self.thumbnailPixelHeight {
+            var proposed = CGRect(origin: .zero, size: image.size)
+            if let cgImage = image.cgImage(forProposedRect: &proposed, context: nil, hints: nil),
+               let data = HistoryThumbnail.makePNG(from: cgImage),
+               let migrated = NSImage(data: data) {
+                DispatchQueue.global(qos: .utility).async {
+                    try? data.write(to: url, options: .atomic)
+                }
+                thumbnailCache.setObject(
+                    migrated,
+                    forKey: key,
+                    cost: Self.thumbnailCacheItemCost
+                )
+                return migrated
+            }
+        }
+
+        let pixelCost = pixelWidth * pixelHeight * 4
+        thumbnailCache.setObject(
+            image,
+            forKey: key,
+            cost: max(pixelCost, Self.thumbnailCacheItemCost)
+        )
         return image
     }
 
@@ -1569,5 +1636,18 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
         // 预览的 `onClose` 会尝试归还焦点；`isClosing` 让那次回交成为空操作。
         preview.close()
         isClosing = false
+
+        // 关窗即释放行视图与缩略图：它们只服务屏上显示。窗口不销毁
+        // （`isReleasedWhenClosed = false`），若不主动清空，最多 200 行
+        // 视图和 24 MiB 缩略图会被一个隐藏窗口长期持有。
+        // `entries` 只是元数据，留着让下次 `show(_:)` 的刷新更平滑；
+        // `rebuildRows()` 见 `rows` 为空会整批重建，重开照常显示缩略图。
+        for view in listStack.arrangedSubviews {
+            listStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        rows.removeAll()
+        visibleEntryIndices.removeAll()
+        thumbnailCache.removeAllObjects()
     }
 }

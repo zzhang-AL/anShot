@@ -17,8 +17,9 @@
 //  ── 内存边界 ─────────────────────────────────────────────
 //
 //  长截图的输出内存是 `宽 × 高 × 4` 字节，很容易到几百 MB。
-//  `Options.maxOutputHeight` 是硬上限，到达后 `ScrollshotSession` 停止采纳新帧，
-//  而不是让进程被 OOM 杀掉。
+//  `Options.maxOutputHeight` 是行数硬上限，`Options.maxOutputPixels` 是像素数
+//  硬上限（宽屏下同一行数占更多内存），到达任一上限后 `ScrollshotSession`
+//  停止采纳新帧，而不是让进程被 OOM 杀掉。
 //
 //  ── 决策记录是产物，不是调试信息 ──────────────────────────
 //
@@ -72,6 +73,17 @@ public enum ScrollStitcher {
         /// 长截图的内存是 `宽 × 高 × 4` 字节，很快就是几百 MB。
         /// 必须有硬上限，到达后停止接受新帧并告警，而不是让进程被 OOM 杀掉。
         public var maxOutputHeight: Int
+        /// 输出**像素数**上限（宽 × 高），默认 4800 万（约 192MB RGBA8）。
+        ///
+        /// 输出字节数是 `宽 × 高 × 4`，所以**固定的行数上限对宽屏不够**：
+        /// 同一行数在 2 倍宽度下占 2 倍内存（例如 4K 宽 3840px、
+        /// `maxOutputHeight` 32768 行 = 约 503MB）。因此行数上限之外再加一道
+        /// 像素预算硬上限：会话据此把有效行数上限压到
+        /// `maxOutputPixels / 宽`，两者取小。
+        ///
+        /// 默认值 4800 万像素 ≈ 192MB，常见窗口宽度（≤ 1920px）下
+        /// 折算行数 ≥ 25000，不会改变原有的行数上限语义。
+        public var maxOutputPixels: Int
         /// 传给配准的参数（`ignoreTopRows` 会自动取 `stickyHeaderRows`）。
         public var overlap: VerticalOverlap.Options
         /// 在已对齐的重叠正文中接缝，并替换接缝外的旧帧区域。
@@ -86,6 +98,7 @@ public enum ScrollStitcher {
             minConfidence: Double = 0.5,
             transientDeltaThreshold: Int = 40,
             maxOutputHeight: Int = 32_768,
+            maxOutputPixels: Int = 48_000_000,
             overlap: VerticalOverlap.Options = VerticalOverlap.Options(),
             unusableTopRows: Int = 0,
             unusableBottomRows: Int = 0,
@@ -97,6 +110,7 @@ public enum ScrollStitcher {
             self.minConfidence = minConfidence
             self.transientDeltaThreshold = transientDeltaThreshold
             self.maxOutputHeight = maxOutputHeight
+            self.maxOutputPixels = maxOutputPixels
             self.overlap = overlap
             self.unusableTopRows = unusableTopRows
             self.unusableBottomRows = unusableBottomRows
@@ -228,8 +242,13 @@ public enum ScrollStitcher {
     ) -> ScrollshotImage? {
         guard width > 0, height > 0 else { return nil }
         var buffer = [UInt8](repeating: 0, count: width * height * 4)
-        return buffer.withUnsafeMutableBufferPointer { output -> ScrollshotImage? in
-            guard let out = output.baseAddress else { return nil }
+        // 直接在预分配缓冲上写完，再把这块内存**移交**给结果。
+        //
+        // 早期版本在闭包里把指针缓冲再复制成数组后返回：那会额外复制一整张
+        // 宽×高×4 的输出图（长图常达数百 MB），峰值内存瞬间翻倍——正是本模块
+        // 要防的 OOM。闭包只负责填像素，结果在闭包外用同一块 `buffer` 构造。
+        let filled = buffer.withUnsafeMutableBufferPointer { output -> Bool in
+            guard let out = output.baseAddress else { return false }
             let bytesPerRow = width * 4
             let totalBytes = width * height * 4
             for segment in segments {
@@ -246,7 +265,9 @@ public enum ScrollStitcher {
                     }
                 }
             }
-            return ScrollshotImage(width: width, height: height, data: Array(output))
+            return true
         }
+        guard filled else { return nil }
+        return ScrollshotImage(width: width, height: height, data: buffer)
     }
 }
