@@ -241,7 +241,10 @@ final class MovieWriter: RecordingSampleSink {
             return false
         }
         guard videoInput.append(adjusted) else {
-            writerLogger.error("视频帧写入失败：\(String(describing: self.writer.error), privacy: .public)")
+            writerLogger.error("""
+                视频帧写入失败：\(Self.diagnose(sampleBuffer), privacy: .public) \
+                \(String(describing: self.writer.error), privacy: .public)
+                """)
             return false
         }
 
@@ -280,7 +283,10 @@ final class MovieWriter: RecordingSampleSink {
             return false
         }
         guard audioInput.append(adjusted) else {
-            writerLogger.error("音频样本写入失败：\(String(describing: self.writer.error), privacy: .public)")
+            writerLogger.error("""
+                音频样本写入失败：\(Self.diagnose(sampleBuffer), privacy: .public) \
+                \(String(describing: self.writer.error), privacy: .public)
+                """)
             return false
         }
 
@@ -328,7 +334,10 @@ final class MovieWriter: RecordingSampleSink {
             return false
         }
         guard microphoneInput.append(adjusted) else {
-            writerLogger.error("麦克风样本写入失败：\(String(describing: self.writer.error), privacy: .public)")
+            writerLogger.error("""
+                麦克风样本写入失败：\(Self.diagnose(sampleBuffer), privacy: .public) \
+                \(String(describing: self.writer.error), privacy: .public)
+                """)
             return false
         }
 
@@ -491,7 +500,18 @@ final class MovieWriter: RecordingSampleSink {
                 asbd: asbd,
                 at: cursor,
                 frameCount: frames
-            ), input.append(silent) else {
+            ) else {
+                writerLogger.error("""
+                    静音填充构造失败：start=\(cursor.seconds, privacy: .public) \
+                    frames=\(frames, privacy: .public)
+                    """)
+                return false
+            }
+            guard input.append(silent) else {
+                writerLogger.error("""
+                    静音填充写入失败：\(Self.diagnose(silent), privacy: .public) \
+                    \(String(describing: self.writer.error), privacy: .public)
+                    """)
                 return false
             }
 
@@ -502,14 +522,24 @@ final class MovieWriter: RecordingSampleSink {
     }
 
     /// 构造一段零值 PCM 样本。
-    private static func makeSilence(
+    ///
+    /// **非交错音频的数据长度与样本尺寸约定**（本函数曾是 -12704 的根因）：
+    /// 非交错格式的 `mBytesPerFrame` 只描述**一个声道**的一帧，
+    /// 缓冲里却是 `声道数` 个连续平面；同时 CoreMedia 要求这类样本的
+    /// per-sample 尺寸数组必须为 NULL（样本在缓冲内不连续）。
+    /// 若按单声道长度构造并声明 `sampleSize = bytesPerFrame`，
+    /// AVAssetWriter 在追加静音填充时会以
+    /// `kCMBlockBufferBadLengthParameterErr(-12704)` 失败并终止整条录制。
+    static func makeSilence(
         formatDescription: CMAudioFormatDescription,
         asbd: AudioStreamBasicDescription,
         at pts: CMTime,
         frameCount: Int
     ) -> CMSampleBuffer? {
         let bytesPerFrame = Int(asbd.mBytesPerFrame)
-        let length = bytesPerFrame * frameCount
+        let isNonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+        let channelCount = max(1, Int(asbd.mChannelsPerFrame))
+        let length = bytesPerFrame * frameCount * (isNonInterleaved ? channelCount : 1)
         guard bytesPerFrame > 0, length > 0 else { return nil }
 
         var blockBuffer: CMBlockBuffer?
@@ -539,17 +569,30 @@ final class MovieWriter: RecordingSampleSink {
         )
         var sampleSize = bytesPerFrame
         var sampleBuffer: CMSampleBuffer?
-        guard CMSampleBufferCreateReady(
-            allocator: kCFAllocatorDefault,
-            dataBuffer: blockBuffer,
-            formatDescription: formatDescription,
-            sampleCount: frameCount,
-            sampleTimingEntryCount: 1,
-            sampleTimingArray: &timing,
-            sampleSizeEntryCount: 1,
-            sampleSizeArray: &sampleSize,
-            sampleBufferOut: &sampleBuffer
-        ) == noErr else { return nil }
+        let status: OSStatus = isNonInterleaved
+            ? CMSampleBufferCreateReady(
+                allocator: kCFAllocatorDefault,
+                dataBuffer: blockBuffer,
+                formatDescription: formatDescription,
+                sampleCount: frameCount,
+                sampleTimingEntryCount: 1,
+                sampleTimingArray: &timing,
+                sampleSizeEntryCount: 0,
+                sampleSizeArray: nil,
+                sampleBufferOut: &sampleBuffer
+            )
+            : CMSampleBufferCreateReady(
+                allocator: kCFAllocatorDefault,
+                dataBuffer: blockBuffer,
+                formatDescription: formatDescription,
+                sampleCount: frameCount,
+                sampleTimingEntryCount: 1,
+                sampleTimingArray: &timing,
+                sampleSizeEntryCount: 1,
+                sampleSizeArray: &sampleSize,
+                sampleBufferOut: &sampleBuffer
+            )
+        guard status == noErr else { return nil }
         return sampleBuffer
     }
 
@@ -571,6 +614,25 @@ final class MovieWriter: RecordingSampleSink {
             loggedMicrophoneFormat = true
             writerLogger.notice("麦克风格式：\(Self.formatDescription(of: microphoneBuffer), privacy: .public)")
         }
+    }
+
+    /// 诊断取样失败时的样本事实：长度、采样数、格式与时间戳。
+    private static func diagnose(_ sampleBuffer: CMSampleBuffer) -> String {
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let duration = CMSampleBufferGetDuration(sampleBuffer)
+        let dataLength = CMSampleBufferGetDataBuffer(sampleBuffer)
+            .map { CMBlockBufferGetDataLength($0) } ?? -1
+        var format = "非音频"
+        if let description = CMSampleBufferGetFormatDescription(sampleBuffer),
+           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee {
+            let nonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+            format = "rate=\(asbd.mSampleRate) ch=\(asbd.mChannelsPerFrame) "
+                + "bpf=\(asbd.mBytesPerFrame) nonInterleaved=\(nonInterleaved)"
+        }
+        return "pts=\(String(format: "%.4f", pts.seconds)) "
+            + "dur=\(String(format: "%.6f", duration.seconds)) "
+            + "n=\(CMSampleBufferGetNumSamples(sampleBuffer)) "
+            + "blockLen=\(dataLength) \(format)"
     }
 
     private static func formatDescription(of sampleBuffer: CMSampleBuffer) -> String {
