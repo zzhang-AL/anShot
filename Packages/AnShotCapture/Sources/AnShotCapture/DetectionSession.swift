@@ -14,6 +14,7 @@ import AnShotCore
 import AppKit
 import CoreGraphics
 import Foundation
+import os
 
 /// 修饰键决定的识别层级偏好。
 public enum DetectionLayerPreference: Equatable, Sendable {
@@ -37,9 +38,14 @@ public final class DetectionSession {
     private let displayID: CGDirectDisplayID
     private let displayBounds: CGRect
 
-    /// 当前窗口快照，**已按可能的 z 序（前到后）排列**。
+    /// 当前窗口快照，**已按权威 z 序（前到后）排列**。
     private var windows: [DetectedWindow] = []
     private var isLoaded = false
+    /// 在 `load()` 时缓存的辅助功能权限状态，避免鼠标移动高频触发跨进程检查。
+    private var cachedAccessibilityPermission: Bool
+    /// 后台控件去抖查询代际号与当前任务。
+    private var controlLookupGeneration: UInt64 = 0
+    private var controlLookupTask: Task<Void, Never>?
 
     public init(
         detector: ScreenElementDetecting,
@@ -49,11 +55,17 @@ public final class DetectionSession {
         self.detector = detector
         self.displayID = displayID
         self.displayBounds = displayBounds
+        self.cachedAccessibilityPermission = detector.hasAccessibilityPermission
     }
 
     /// 是否具备组件级识别能力。
     public var canDetectControls: Bool {
-        detector.hasAccessibilityPermission
+        cachedAccessibilityPermission
+    }
+
+    /// 刷新已缓存的辅助功能权限状态。
+    public func refreshAccessibilityPermission() {
+        cachedAccessibilityPermission = detector.hasAccessibilityPermission
     }
 
     /// 已载入的窗口数（诊断用）。
@@ -61,11 +73,12 @@ public final class DetectionSession {
         windows.count
     }
 
-    /// 重新枚举窗口。会话开始时调用一次；枚举失败时保持空列表。
+    /// 重新枚举窗口并缓存辅助功能权限。会话开始时调用一次；枚举失败时保持空列表。
     ///
     /// 失败不抛给调用方：识别是便利功能，取不到就不识别，
     /// 不该让「按热键截图」这条主路径因为窗口枚举失败而中断。
     public func load() async {
+        cachedAccessibilityPermission = detector.hasAccessibilityPermission
         do {
             windows = try await detector.windows(onDisplay: displayID)
         } catch {
@@ -74,7 +87,7 @@ public final class DetectionSession {
         isLoaded = true
     }
 
-    /// 指定全局点应当选中的区域。
+    /// 同步识别指定全局点应当选中的区域（保留旧有调用契约）。
     ///
     /// - Parameters:
     ///   - point: **全局左上原点**点坐标（来自鼠标位置）
@@ -110,6 +123,102 @@ public final class DetectionSession {
                 ?? windowTarget(atGlobalPoint: point)
                 ?? displayTarget()
         }
+    }
+
+    /// 阶段一零阻塞即时命中：仅使用内存中的窗口快照，不发起跨进程 AX 查询。
+    public func immediateTarget(
+        atGlobalPoint point: CGPoint,
+        preference: DetectionLayerPreference
+    ) -> DetectionTarget? {
+        guard preference != .disabled, isLoaded else {
+            return nil
+        }
+        switch preference {
+        case .disabled:
+            return nil
+        case .automatic, .window:
+            return windowTarget(atGlobalPoint: point) ?? displayTarget()
+        case .application:
+            return applicationTarget(atGlobalPoint: point)
+                ?? windowTarget(atGlobalPoint: point)
+                ?? displayTarget()
+        }
+    }
+
+    /// 异步识别指定全局点应当选中的区域：控件级 AX IPC 在后台执行，不阻塞主线程。
+    public func resolveTargetAsync(
+        atGlobalPoint point: CGPoint,
+        preference: DetectionLayerPreference
+    ) async -> DetectionTarget? {
+        guard preference != .disabled, isLoaded else {
+            return nil
+        }
+        guard preference == .automatic else {
+            return immediateTarget(atGlobalPoint: point, preference: preference)
+        }
+        guard cachedAccessibilityPermission,
+              let window = windows.first(where: { $0.frame.contains(point) }) else {
+            return windowTarget(atGlobalPoint: point) ?? displayTarget()
+        }
+
+        let detector = self.detector
+        let pid = window.processID
+        let hit = await Task.detached(priority: .userInitiated) {
+            detector.control(atGlobalPoint: point, inApplication: pid)
+        }.value
+
+        if let hit, let control = makeControlTarget(from: hit, in: window) {
+            return control
+        }
+        return windowTarget(atGlobalPoint: point) ?? displayTarget()
+    }
+
+    /// 阶段二后台去抖查询控件：主线程可先用 `immediateTarget` 瞬时响应，再由本方法异步收窄到控件框。
+    ///
+    /// 每次调用会自动取消前一次尚未完成或仍在去抖窗口内的查询，确保只有最新坐标的控件结果回填。
+    public func scheduleControlTarget(
+        atGlobalPoint point: CGPoint,
+        preference: DetectionLayerPreference,
+        debounce: Duration = .milliseconds(20),
+        onUpdate: @escaping @MainActor (DetectionTarget?) -> Void
+    ) {
+        cancelPendingControlLookup()
+        guard preference == .automatic, isLoaded, cachedAccessibilityPermission,
+              let window = windows.first(where: { $0.frame.contains(point) }) else {
+            return
+        }
+
+        controlLookupGeneration &+= 1
+        let generation = controlLookupGeneration
+        let detector = self.detector
+        let pid = window.processID
+
+        controlLookupTask = Task { [weak self] in
+            do {
+                if debounce > .zero {
+                    try await Task.sleep(for: debounce)
+                }
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+
+            let hit = await Task.detached(priority: .userInitiated) {
+                detector.control(atGlobalPoint: point, inApplication: pid)
+            }.value
+
+            guard !Task.isCancelled, let self else { return }
+            guard self.controlLookupGeneration == generation, self.isLoaded else { return }
+            let controlTarget = hit.flatMap { self.makeControlTarget(from: $0, in: window) }
+            onUpdate(controlTarget)
+        }
+    }
+
+    /// 取消挂起的后台控件查询。
+    public func cancelPendingControlLookup() {
+        controlLookupGeneration &+= 1
+        controlLookupTask?.cancel()
+        controlLookupTask = nil
     }
 
     /// 诊断：在某点直接尝试控件命中，绕过「窗口尺寸判断」。
@@ -216,16 +325,19 @@ public final class DetectionSession {
     /// 永远是覆盖层自己，控件层会恒等于整屏。详见
     /// `ScreenElementDetecting.control(atGlobalPoint:inApplication:)`。
     private func controlTarget(atGlobalPoint point: CGPoint) -> DetectionTarget? {
-        guard let window = windows.first(where: { $0.frame.contains(point) }) else {
+        guard cachedAccessibilityPermission,
+              let window = windows.first(where: { $0.frame.contains(point) }),
+              let hit = detector.control(
+                  atGlobalPoint: point,
+                  inApplication: window.processID
+              ) else {
             return nil
         }
-        guard let hit = detector.control(
-            atGlobalPoint: point,
-            inApplication: window.processID
-        ) else {
-            return nil
-        }
+        return makeControlTarget(from: hit, in: window)
+    }
 
+    /// 将 AX 控件命中结果收敛为有效的控件级 `DetectionTarget`。
+    private func makeControlTarget(from hit: ControlHit, in window: DetectedWindow) -> DetectionTarget? {
         // 命中的元素就是窗口本身时，「控件层」与「窗口层」会给出同一个矩形，
         // 这一层就等于没有价值，还多花一次跨进程调用。
         // 用面积占比判断：覆盖窗口九成以上即视为非控件。
@@ -277,5 +389,49 @@ public extension SystemElementDetector {
             return
         }
         NSWorkspace.shared.open(url)
+    }
+
+    /// 监听辅助功能授权状态变更（支持分布式通知与前台激活刷新）。
+    static func accessibilityPermissionUpdates() -> AsyncStream<Bool> {
+        AsyncStream { continuation in
+            let initial = AXIsProcessTrusted()
+            let lastLock = OSAllocatedUnfairLock<Bool>(initialState: initial)
+            continuation.yield(initial)
+
+            @Sendable func publishIfChanged() {
+                let current = AXIsProcessTrusted()
+                let changed = lastLock.withLock { prev -> Bool in
+                    guard current != prev else { return false }
+                    prev = current
+                    return true
+                }
+                if changed {
+                    continuation.yield(current)
+                }
+            }
+
+            let distCenter = DistributedNotificationCenter.default()
+            let distBox = NotificationTokenBox(token: distCenter.addObserver(
+                forName: NSNotification.Name("com.apple.accessibility.api"),
+                object: nil,
+                queue: nil
+            ) { _ in
+                publishIfChanged()
+            })
+
+            let appCenter = NotificationCenter.default
+            let activeBox = NotificationTokenBox(token: appCenter.addObserver(
+                forName: NSApplication.didBecomeActiveNotification,
+                object: nil,
+                queue: nil
+            ) { _ in
+                publishIfChanged()
+            })
+
+            continuation.onTermination = { _ in
+                DistributedNotificationCenter.default().removeObserver(distBox.token)
+                NotificationCenter.default.removeObserver(activeBox.token)
+            }
+        }
     }
 }

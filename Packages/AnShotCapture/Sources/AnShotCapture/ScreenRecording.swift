@@ -25,6 +25,7 @@ import AnShotCore
 import CoreMedia
 import CoreVideo
 import Foundation
+import os
 
 // MARK: - 配置
 
@@ -58,18 +59,28 @@ public struct RecordingConfiguration: Sendable, Equatable {
     /// 但那种情况下录制的是用户指定的别的窗口，本应用 UI 只在重叠时才可能入镜。
     public var excludedWindowIDs: [CGWindowID]
 
+    /// 指定麦克风输入设备唯一 ID；为 nil 时使用系统默认输入设备。
+    public var microphoneDeviceID: String?
+
+    /// 是否在录屏期间采集并高亮叠加鼠标点击动效。
+    public var highlightsMouseClicks: Bool
+
     public init(
         scope: CaptureScope,
         video: VideoSettings = VideoSettings(),
         audio: AudioSettings = AudioSettings(),
         output: RecordingOutput,
-        excludedWindowIDs: [CGWindowID] = []
+        excludedWindowIDs: [CGWindowID] = [],
+        microphoneDeviceID: String? = nil,
+        highlightsMouseClicks: Bool = false
     ) {
         self.scope = scope
         self.video = video
         self.audio = audio
         self.output = output
         self.excludedWindowIDs = excludedWindowIDs
+        self.microphoneDeviceID = microphoneDeviceID
+        self.highlightsMouseClicks = highlightsMouseClicks
     }
 
     /// 按输出格式归一化：GIF 无音轨，音频一律归零。
@@ -127,12 +138,21 @@ public struct RecordingConfiguration: Sendable, Equatable {
 /// 不能拿状态机的转换结果充当收尾权：`(.finishing, .fail) → .failed` 是合法转换，
 /// 于是「用户正在停止」与「流恰好报错」会各自认为自己该收尾——
 /// 结果是重复停流，甚至在其中一条路径尚未停流时就提前给出终结结果。
-public final class FinalizeGate: @unchecked Sendable {
+/// 收尾权的唯一裁决。
+///
+/// 一次会话的收尾（停流 → 排空输出队列 → 给出最终结果）必须恰好发生一次。
+/// 不能拿状态机的转换结果充当收尾权：`(.finishing, .fail) → .failed` 是合法转换，
+/// 于是「用户正在停止」与「流恰好报错」会各自认为自己该收尾——
+/// 结果是重复停流，甚至在其中一条路径尚未停流时就提前给出终结结果。
+public final class FinalizeGate: Sendable {
 
-    private let lock = NSLock()
-    private var claimed = false
-    /// 正在执行的收尾任务。第一个调用者创建它，后来者等待它。
-    private var ongoingTask: Task<Void, Never>?
+    private struct GateState {
+        var claimed = false
+        /// 正在执行的收尾任务。第一个调用者创建它，后来者等待它。
+        var ongoingTask: Task<Void, Never>?
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: GateState())
 
     public init() {}
 
@@ -143,9 +163,9 @@ public final class FinalizeGate: @unchecked Sendable {
     /// - Important: 只拿到收尾权**不等于**收尾已经完成。需要「返回时收尾已结束」
     ///   这一保证的调用方应当使用 ``runOrWait(_:)``。
     public func claim() -> Bool {
-        lock.withLock {
-            guard !claimed else { return false }
-            claimed = true
+        state.withLock { current in
+            guard !current.claimed else { return false }
+            current.claimed = true
             return true
         }
     }
@@ -157,14 +177,14 @@ public final class FinalizeGate: @unchecked Sendable {
     /// 调用方据此关闭界面就会提前，甚至在上一个会话仍在清理时就放行新会话。
     /// 两者是不同的契约，必须由类型本身提供，否则调用方无从判断该不该等。
     public func runOrWait(_ body: @escaping @Sendable () async -> Void) async {
-        let task = lock.withLock { () -> Task<Void, Never> in
-            if let existing = ongoingTask {
+        let task = state.withLock { current -> Task<Void, Never> in
+            if let existing = current.ongoingTask {
                 return existing
             }
             // 与 claim() 共享同一份状态：无论走哪个入口，收尾都只发生一次。
-            self.claimed = true
+            current.claimed = true
             let created = Task { await body() }
-            self.ongoingTask = created
+            current.ongoingTask = created
             return created
         }
         await task.value
@@ -187,6 +207,9 @@ public final class FinalizeGate: @unchecked Sendable {
 /// 返回值表示是否接受：返回 `false` 时录制器计入丢弃统计，而不是静默丢弃。
 /// 这使「写入器跟不上」成为**可观测**的事实，而不是靠猜。
 protocol RecordingSampleSink: AnyObject {
+
+    /// 若写入器已进入不可恢复的失败状态（如磁盘满），返回底层错误；正常时为 `nil`。
+    var failureError: Error? { get }
 
     /// 消费一个视频帧。
     ///

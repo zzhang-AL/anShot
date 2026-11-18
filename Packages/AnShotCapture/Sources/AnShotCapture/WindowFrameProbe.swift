@@ -35,6 +35,8 @@ public enum WindowFrameProbe {
             windowID
         ) as? [[String: Any]],
         let info = list.first,
+        // 明确校验是否在屏上，避免最小化或切到其它桌面后仍返回旧位置。
+        (info[kCGWindowIsOnscreen as String] as? Bool) == true,
         // 逐键取值而不是 `CGRect(dictionaryRepresentation:)`：后者要 CFDictionary，
         // 而从 `Any` 条件转换到 CF 类型会被编译器判为「总是成功」而报警。
         let bounds = info[kCGWindowBounds as String] as? [String: NSNumber],
@@ -47,5 +49,16 @@ public enum WindowFrameProbe {
             return nil
         }
         return CGRect(x: x, y: y, width: width, height: height)
+    }
+
+    /// 检查窗口是否仍存在于窗口服务中（包含最小化及跨桌面窗口；仅当窗口被关闭销毁时返回 `false`）。
+    public static func exists(windowID: CGWindowID) -> Bool {
+        guard let list = CGWindowListCopyWindowInfo(
+            [.optionIncludingWindow, .excludeDesktopElements],
+            windowID
+        ) as? [[String: Any]] else {
+            return false
+        }
+        return !list.isEmpty
     }
 }

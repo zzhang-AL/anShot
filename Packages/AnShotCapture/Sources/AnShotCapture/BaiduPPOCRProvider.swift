@@ -32,15 +32,15 @@ import UniformTypeIdentifiers
 /// 散落在明文偏好里就等于把凭据降级了。
 struct BaiduAccessTokenStore: Sendable {
 
-    private static let tokenAccount = "ocr.baiduPPOCR.accessToken"
-    private static let expiryAccount = "ocr.baiduPPOCR.accessTokenExpiry"
+    static let tokenAccount = "ocr.baiduPPOCR.accessToken"
+    static let expiryAccount = "ocr.baiduPPOCR.accessTokenExpiry"
 
     /// 换取该 token 所用凭据的指纹。
     ///
     /// 缓存必须与凭据绑定：用户在设置里换了 Key/Secret 之后，旧 token 仍在有效期内
     /// （最长 30 天），只看有效期就会继续拿旧账号的 token 发请求——计费落在旧账号上，
     /// 新填的凭据形同没生效，而且没有任何报错能让用户察觉。
-    private static let ownerAccount = "ocr.baiduPPOCR.accessTokenOwner"
+    static let ownerAccount = "ocr.baiduPPOCR.accessTokenOwner"
 
     /// token 失效时百度返回的错误码：110 = 无效，111 = 已过期。
     static let invalidTokenCodes: Set<Int> = [110, 111]
@@ -104,7 +104,7 @@ struct BaiduAccessTokenStore: Sendable {
         request.httpMethod = "POST"
         request.timeoutInterval = 30
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await EndpointSecurity.ephemeralSession.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw OCRProviderFailure.badResponse
         }
@@ -162,13 +162,18 @@ public struct BaiduPPOCRProvider: OCRProvider {
 
         let store = BaiduAccessTokenStore(settings: settings)
         let endpoint = config.resolvedEndpoint(for: .baiduPPOCR)
-        let payload = try Self.encode(image: image)
+        let encoded = try Self.encodeWithScale(image: image)
         let imageSize = PixelSize(width: Double(image.width), height: Double(image.height))
 
         var token = try await store.token(apiKey: apiKey, secretKey: secretKey)
         do {
-            let json = try await Self.send(endpoint: endpoint, token: token, payload: payload)
-            return try Self.makeResult(json: json, imageSize: imageSize)
+            let json = try await Self.send(endpoint: endpoint, token: token, payload: encoded.base64)
+            return try Self.makeResult(
+                json: json,
+                imageSize: imageSize,
+                coordinateScaleX: encoded.scaleX,
+                coordinateScaleY: encoded.scaleY
+            )
         } catch let failure as OCRProviderFailure {
             // token 失效是这类服务的常态（30 天有效期，或服务端提前作废）。
             // 换一个新 token 重试一次，而不是把 110 直接抛给用户去猜。
@@ -178,8 +183,13 @@ public struct BaiduPPOCRProvider: OCRProvider {
             }
             store.invalidate()
             token = try await store.token(apiKey: apiKey, secretKey: secretKey, forceRefresh: true)
-            let json = try await Self.send(endpoint: endpoint, token: token, payload: payload)
-            return try Self.makeResult(json: json, imageSize: imageSize)
+            let json = try await Self.send(endpoint: endpoint, token: token, payload: encoded.base64)
+            return try Self.makeResult(
+                json: json,
+                imageSize: imageSize,
+                coordinateScaleX: encoded.scaleX,
+                coordinateScaleY: encoded.scaleY
+            )
         }
     }
 
@@ -194,7 +204,12 @@ public struct BaiduPPOCRProvider: OCRProvider {
     /// 标 `public` 是为诊断验证格式（与 `HTTPOCRProvider.makeRequest` 同一理由）：
     /// 请求/响应的形状是对外契约，不能只靠真实网络请求才能验。
     public static func encode(image: CGImage) throws -> String {
-        let prepared = resizeIfNeeded(image, maxSide: maxSide)
+        try encodeWithScale(image: image).base64
+    }
+
+    /// 编码图片并返回相对于原图的实际缩放比（用于把服务端返回的 `rec_boxes` 还原回原图坐标）。
+    static func encodeWithScale(image: CGImage) throws -> (base64: String, scaleX: Double, scaleY: Double) {
+        let resized = resizeWithScaleIfNeeded(image, maxSide: maxSide)
         let buffer = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
             buffer as CFMutableData,
@@ -204,43 +219,59 @@ public struct BaiduPPOCRProvider: OCRProvider {
         ) else {
             throw OCRProviderFailure.unsupportedImage
         }
-        CGImageDestinationAddImage(destination, prepared, nil)
+        CGImageDestinationAddImage(destination, resized.image, nil)
         guard CGImageDestinationFinalize(destination) else {
             throw OCRProviderFailure.unsupportedImage
         }
-        return (buffer as Data).base64EncodedString()
+        return ((buffer as Data).base64EncodedString(), resized.scaleX, resized.scaleY)
     }
 
     /// 抽出来单独放，是因为诊断要验证「超限才缩、不超限原样传」。
     public static func resizeIfNeeded(_ image: CGImage, maxSide: Double) -> CGImage {
+        resizeWithScaleIfNeeded(image, maxSide: maxSide).image
+    }
+
+    /// 超出最长边时使用 sRGB 画布降采样，并返回实际缩放比。
+    static func resizeWithScaleIfNeeded(
+        _ image: CGImage,
+        maxSide: Double
+    ) -> (image: CGImage, scaleX: Double, scaleY: Double) {
         let longest = Double(max(image.width, image.height))
-        guard longest > maxSide else { return image }
+        guard longest > maxSide, image.width > 0, image.height > 0 else {
+            return (image, 1.0, 1.0)
+        }
 
         let ratio = maxSide / longest
         let width = max(Int((Double(image.width) * ratio).rounded()), 1)
         let height = max(Int((Double(image.height) * ratio).rounded()), 1)
+        let srgb = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         guard let context = CGContext(
             data: nil,
             width: width,
             height: height,
             bitsPerComponent: 8,
             bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(),
+            space: srgb,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
-            return image
+            return (image, 1.0, 1.0)
         }
         context.interpolationQuality = .high
         context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-        return context.makeImage() ?? image
+        guard let scaled = context.makeImage() else {
+            return (image, 1.0, 1.0)
+        }
+        return (
+            scaled,
+            Double(scaled.width) / Double(image.width),
+            Double(scaled.height) / Double(image.height)
+        )
     }
 
     /// 组装识别请求（不含 token 换取）。公开理由同 `encode`。
     public static func makeRequest(endpoint: String, token: String, payload: String) throws -> URLRequest {
-        var components = URLComponents(string: endpoint)
-        guard components?.scheme != nil else {
-            throw OCRProviderFailure.badEndpoint
-        }
+        let validated = try EndpointSecurity.validatedURL(from: endpoint)
+        var components = URLComponents(url: validated, resolvingAgainstBaseURL: false)
         components?.queryItems = [URLQueryItem(name: "access_token", value: token)]
         guard let url = components?.url else {
             throw OCRProviderFailure.badEndpoint
@@ -250,13 +281,13 @@ public struct BaiduPPOCRProvider: OCRProvider {
         request.httpMethod = "POST"
         request.timeoutInterval = 60
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.httpBody = Data("image=\(formEncode(payload))".utf8)
+        request.httpBody = formEncodedBody(forBase64: payload)
         return request
     }
 
     static func send(endpoint: String, token: String, payload: String) async throws -> [String: Any] {
         let request = try makeRequest(endpoint: endpoint, token: token, payload: payload)
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await EndpointSecurity.ephemeralSession.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw OCRProviderFailure.badResponse
         }
@@ -297,14 +328,44 @@ public struct BaiduPPOCRProvider: OCRProvider {
         return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
     }
 
+    /// 单遍扫描 UTF-8 字节直接拼装表单体，避免大 Base64 字符串二次整段拷贝。
+    static func formEncodedBody(forBase64 payload: String) -> Data {
+        let prefix = "image=".utf8
+        let utf8 = payload.utf8
+        var output = Data()
+        output.reserveCapacity(prefix.count + utf8.count + 16)
+        output.append(contentsOf: prefix)
+        for byte in utf8 {
+            switch byte {
+            case 0x2B: // '+'
+                output.append(contentsOf: "%2B".utf8)
+            case 0x2F: // '/'
+                output.append(contentsOf: "%2F".utf8)
+            case 0x3D: // '='
+                output.append(contentsOf: "%3D".utf8)
+            case 0x41...0x5A, 0x61...0x7A, 0x30...0x39, 0x2D, 0x2E, 0x5F, 0x7E:
+                output.append(byte)
+            default:
+                let hex = String(format: "%%%02X", byte)
+                output.append(contentsOf: hex.utf8)
+            }
+        }
+        return output
+    }
+
     // MARK: 响应解析
 
-    /// 解析 `page_result[0]` 的三个平行数组。
+    /// 解析 `page_result[0]` 的三个平行数组；若送检前做过降采样，按缩放比还原回原图像素空间。
     ///
     /// `lines` / `probability` / `rec_boxes` **按下标对齐**，这里取最短长度：
     /// 长度不齐时按短的算，总比下标越界崩掉好。置信度缺失时填 1.0——
     /// 但要注意那意味着「没有信息」，不是「百分之百确定」。
-    public static func makeResult(json: [String: Any], imageSize: PixelSize) throws -> OCRResult {
+    public static func makeResult(
+        json: [String: Any],
+        imageSize: PixelSize,
+        coordinateScaleX: Double = 1.0,
+        coordinateScaleY: Double = 1.0
+    ) throws -> OCRResult {
         guard let pages = json["page_result"] as? [[String: Any]],
               let first = pages.first else {
             throw OCRProviderFailure.badResponse
@@ -319,6 +380,9 @@ public struct BaiduPPOCRProvider: OCRProvider {
             throw OCRProviderFailure.badResponse
         }
 
+        let safeScaleX = coordinateScaleX > 0 ? coordinateScaleX : 1.0
+        let safeScaleY = coordinateScaleY > 0 ? coordinateScaleY : 1.0
+
         var lines: [OCRTextLine] = []
         for index in 0 ..< count {
             let text = texts[index].trimmingCharacters(in: .whitespacesAndNewlines)
@@ -329,7 +393,11 @@ public struct BaiduPPOCRProvider: OCRProvider {
                     // 百度不返回备选文本。
                     candidates: [],
                     confidence: index < probabilities.count ? probabilities[index] : 1.0,
-                    boundingBox: makeBox(boxes[index])
+                    boundingBox: makeBox(
+                        boxes[index],
+                        scaleX: safeScaleX,
+                        scaleY: safeScaleY
+                    )
                 )
             )
         }
@@ -343,15 +411,21 @@ public struct BaiduPPOCRProvider: OCRProvider {
         )
     }
 
-    /// `[x_min, y_min, x_max, y_max]` → `PixelRect`。
+    /// `[x_min, y_min, x_max, y_max]` → `PixelRect`（按降采样比例反缩放回原图坐标）。
     ///
     /// 百度的坐标系是像素、左上角原点，与核心契约一致，不需要任何翻转。
-    public static func makeBox(_ box: [Int]) -> PixelRect {
+    public static func makeBox(
+        _ box: [Int],
+        scaleX: Double = 1.0,
+        scaleY: Double = 1.0
+    ) -> PixelRect {
         guard box.count == 4 else { return .zero }
-        let xMin = Double(box[0])
-        let yMin = Double(box[1])
-        let xMax = Double(box[2])
-        let yMax = Double(box[3])
+        let invX = scaleX > 0 ? 1.0 / scaleX : 1.0
+        let invY = scaleY > 0 ? 1.0 / scaleY : 1.0
+        let xMin = Double(box[0]) * invX
+        let yMin = Double(box[1]) * invY
+        let xMax = Double(box[2]) * invX
+        let yMax = Double(box[3]) * invY
         return PixelRect(
             origin: PixelPoint(x: xMin, y: yMin),
             size: PixelSize(width: max(xMax - xMin, 0), height: max(yMax - yMin, 0))

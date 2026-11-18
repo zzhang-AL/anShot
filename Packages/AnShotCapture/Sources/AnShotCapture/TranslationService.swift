@@ -19,11 +19,12 @@
 
 import AnShotCore
 import Foundation
+import os
 
 let translationServiceLogger = AnShotLog.translation
 /// 翻译入口。
 ///
-/// `Sendable`：只持有一份线程安全的配置读取器与一个不可变工厂，没有可变状态。
+/// `Sendable`：只持有一份线程安全的配置读取器、不可变工厂及受锁保护的最近一次错误消息。
 public final class TranslationService: Sendable {
 
     /// 构造 provider 的工厂。
@@ -46,6 +47,12 @@ public final class TranslationService: Sendable {
 
     private let settings: TranslationProviderSettings
     private let makeProvider: ProviderFactory
+    private let lastErrorLock = OSAllocatedUnfairLock<String?>(initialState: nil)
+
+    /// 最近一次翻译失败的诊断原因（无失败或翻译成功时为 `nil`）。
+    public var lastErrorMessage: String? {
+        lastErrorLock.withLock { $0 }
+    }
 
     public init(
         settings: TranslationProviderSettings = TranslationProviderSettings(),
@@ -118,20 +125,33 @@ public final class TranslationService: Sendable {
         source: String?,
         target: String
     ) async -> TranslationResult {
+        await translateWithDiagnostics(lines: lines, source: source, target: target).result
+    }
+
+    /// 翻译并附带云端错误诊断原因，方便上层展示具体失败细节（401/429/网络超时/截断等）。
+    public func translateWithDiagnostics(
+        lines: [OCRTextLine],
+        source: String?,
+        target: String
+    ) async -> TranslationExecutionResult {
+        lastErrorLock.withLock { $0 = nil }
         guard !Task.isCancelled, !lines.isEmpty else {
-            return untranslatedResult(lines: lines, source: source, target: target)
+            return TranslationExecutionResult(result: untranslatedResult(lines: lines, source: source, target: target))
         }
 
+        let outcome: TranslationExecutionResult
         switch settings.selectedStrategy {
         case .automatic:
-            return await translateAutomatically(lines: lines, source: source, target: target)
+            outcome = await translateAutomatically(lines: lines, source: source, target: target)
         case .appleTranslation, .openAICompatible, .claude:
             guard let kind = settings.selectedStrategy.explicitKind else {
-                return untranslatedResult(lines: lines, source: source, target: target)
+                return TranslationExecutionResult(result: untranslatedResult(lines: lines, source: source, target: target))
             }
             // 显式选择即严格：失败就失败，不换 provider。
-            return await run(kind: kind, lines: lines, source: source, target: target)
+            outcome = await run(kind: kind, lines: lines, source: source, target: target)
         }
+        lastErrorLock.withLock { $0 = outcome.errorMessage }
+        return outcome
     }
 
     /// 自动模式：云端优先，拿不到译文再回到本机。
@@ -144,17 +164,22 @@ public final class TranslationService: Sendable {
         lines: [OCRTextLine],
         source: String?,
         target: String
-    ) async -> TranslationResult {
+    ) async -> TranslationExecutionResult {
         let cloud = settings.preferredCloudKind
+        var cloudError: String?
 
         if settings.isConfigured(cloud) {
-            let result = await run(kind: cloud, lines: lines, source: source, target: target)
+            let outcome = await run(kind: cloud, lines: lines, source: source, target: target)
             guard !Task.isCancelled else {
-                return untranslatedResult(lines: lines, source: source, target: target)
+                return TranslationExecutionResult(
+                    result: untranslatedResult(lines: lines, source: source, target: target),
+                    errorMessage: outcome.errorMessage
+                )
             }
-            if !result.isEntirelyUntranslated {
-                return result
+            if !outcome.result.isEntirelyUntranslated {
+                return outcome
             }
+            cloudError = outcome.errorMessage
             // 部分成功也算成功：逐行降级已经在结果里表达了，整段重翻一遍
             // 只会把已经翻好的行也换成另一套译文。
             translationServiceLogger.notice("""
@@ -166,7 +191,14 @@ public final class TranslationService: Sendable {
                 """)
         }
 
-        return await run(kind: .appleTranslation, lines: lines, source: source, target: target)
+        let localOutcome = await run(kind: .appleTranslation, lines: lines, source: source, target: target)
+        if !localOutcome.result.isEntirelyUntranslated {
+            return TranslationExecutionResult(result: localOutcome.result, errorMessage: nil)
+        }
+        return TranslationExecutionResult(
+            result: localOutcome.result,
+            errorMessage: localOutcome.errorMessage ?? cloudError
+        )
     }
 
     /// 用指定的 provider 完整跑一次，并留下可归因的计时日志。
@@ -178,20 +210,26 @@ public final class TranslationService: Sendable {
         lines: [OCRTextLine],
         source: String?,
         target: String
-    ) async -> TranslationResult {
+    ) async -> TranslationExecutionResult {
         guard !Task.isCancelled else {
-            return untranslatedResult(lines: lines, source: source, target: target)
+            return TranslationExecutionResult(result: untranslatedResult(lines: lines, source: source, target: target))
         }
         let provider = makeProvider(kind, settings.config(for: kind))
         let started = Date()
-        let result = await provider.translate(lines, from: source, to: target)
+        let outcome: TranslationExecutionResult
+        if let diagnosticProvider = provider as? DiagnosticTranslationProvider {
+            outcome = await diagnosticProvider.translateWithDiagnostics(lines, from: source, to: target)
+        } else {
+            let result = await provider.translate(lines, from: source, to: target)
+            outcome = TranslationExecutionResult(result: result, errorMessage: nil)
+        }
         translationServiceLogger.notice("""
             translation: provider=\(kind.rawValue, privacy: .public) \
             \(source ?? "auto", privacy: .public)→\(target, privacy: .public) \
-            成功 \(result.translatedCount, privacy: .public)/\(result.segments.count, privacy: .public) 行 \
+            成功 \(outcome.result.translatedCount, privacy: .public)/\(outcome.result.segments.count, privacy: .public) 行 \
             耗时=\(Int(Date().timeIntervalSince(started) * 1000), privacy: .public)ms
             """)
-        return result
+        return outcome
     }
 
     /// 本机翻译的可用性（系统版本 + 语言对与语言包）。

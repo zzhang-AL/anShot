@@ -45,10 +45,7 @@ public struct TranslationProviderConfig: Equatable, Sendable {
 }
 
 /// 翻译 provider 设置的读写。
-///
-/// `@unchecked Sendable` 的理由与 `OCRProviderSettings` 相同：UserDefaults
-/// 跨线程可访问，两种 `SecretStoring` 实现都有同步保护，类内没有可变存储属性。
-public final class TranslationProviderSettings: @unchecked Sendable {
+public final class TranslationProviderSettings: Sendable {
 
     /// 当前生效的选用策略。
     ///
@@ -71,14 +68,15 @@ public final class TranslationProviderSettings: @unchecked Sendable {
         "translation.\(kind.rawValue).apiKey"
     }
 
-    private let defaults: UserDefaults
+    private let defaultsStore: SendableUserDefaults
+    private var defaults: UserDefaults { defaultsStore.raw }
     private let secrets: SecretStoring
 
     public init(
         defaults: UserDefaults = .standard,
         secrets: SecretStoring = LocalFileSecretStore()
     ) {
-        self.defaults = defaults
+        self.defaultsStore = SendableUserDefaults(raw: defaults)
         self.secrets = secrets
     }
 

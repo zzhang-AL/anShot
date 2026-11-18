@@ -43,6 +43,7 @@
 //
 
 import AnShotCore
+import AppKit
 import CoreGraphics
 import CoreMedia
 import Foundation
@@ -86,6 +87,16 @@ public final class SCStreamRecorder: NSObject, ScreenRecording, @unchecked Senda
     private var stopRequested = false
     private var writer: MovieWriter?
     private var microphone: MicrophoneCapturer?
+    private var sleepObserver: NSObjectProtocol?
+    private var mouseClickMonitor: MouseClickMonitor?
+    private var captureOriginForClicks: CGPoint = .zero
+    private var captureScaleFactor: CGFloat = 1.0
+    private var consecutiveBlankOrSuspendedCount = 0
+
+    /// 跨并发读取的可变属性统一经 `lock` 保护，消除数据竞争。
+    private var _onExportProgress: (@Sendable (Double) -> Void)?
+    private var _keptOutput: KeptRecording?
+    private var _didReachDurationLimit = false
 
     /// 收尾权的唯一裁决。
     ///
@@ -111,27 +122,29 @@ public final class SCStreamRecorder: NSObject, ScreenRecording, @unchecked Senda
 
     // MARK: - 回调与附属事实
 
-    /// GIF 导出进度回调（0…1），在任意线程调用。
-    ///
-    /// **不进状态机**：进度是同一状态内的连续值，而状态机描述的是生命周期，
-    /// 它的转移表正被穷尽性单测验证着（见 `model.md` §3）。
-    /// 界面层负责把它折到主 actor；`GIFExporter` 已把进度量化成整百分比，
-    /// 所以这里的调用频率就是「可见的变化」的频率。
-    public var onExportProgress: (@Sendable (Double) -> Void)?
+    /// GIF 导出进度回调（0…1），在任意线程调用（由 `lock` 保护线程安全读写）。
+    public var onExportProgress: (@Sendable (Double) -> Void)? {
+        get { lock.withLock { _onExportProgress } }
+        set { lock.withLock { _onExportProgress = newValue } }
+    }
 
     /// 会话失败时被保留下来的产物（若有）。
     ///
     /// 只在会话失败时有意义：成功时产物就是 `RecordingResult.url`。
     /// 只有写入器已正常收尾才会被设置——`finish()` 自身失败时文件可能是半截的，
     /// 把它称作可用产物比不给路径更糟。
-    public private(set) var keptOutput: KeptRecording?
+    public var keptOutput: KeptRecording? {
+        lock.withLock { _keptOutput }
+    }
 
     /// 会话是否因到达 GIF 时长上限而自动停止。
     ///
     /// 由 `scheduleAutoStop` 置位。界面据此说明停止原因，
     /// 而不是用「时长≈上限」去反推——后者在「用户恰好在上限前一刻手停」
     /// 这类情形下会给出错误结论。
-    public private(set) var didReachDurationLimit = false
+    public var didReachDurationLimit: Bool {
+        lock.withLock { _didReachDurationLimit }
+    }
 
     // MARK: - ScreenRecording
 
@@ -180,35 +193,49 @@ public final class SCStreamRecorder: NSObject, ScreenRecording, @unchecked Senda
             try await ensureMicrophonePermission()
         }
 
-        return try await withCheckedThrowingContinuation { continuation in
-            let rejection = lock.withLock { () -> RecordingError? in
-                // 停止可能发生在等待麦克风授权期间，不能在授权返回后重新启动。
-                guard !stopRequested, !Task.isCancelled else { return .cancelled }
-                guard machine.apply(.start).didApply else { return .alreadyRunning }
-                sessionStartedAt = Date()
-                activeConfiguration = configuration
-                // ⚠️ continuation 必须在任何异步步骤之前安装。
-                // 若推迟到起流之后，期间的失败（枚举异常、startCapture 抛错、
-                // 用户停止）将找不到等待方，record() 永久挂起。
-                pendingContinuation = continuation
-                return nil
-            }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let rejection = lock.withLock { () -> RecordingError? in
+                    // 停止可能发生在等待麦克风授权期间，不能在授权返回后重新启动。
+                    guard !stopRequested, !Task.isCancelled else { return .cancelled }
+                    guard machine.apply(.start).didApply else { return .alreadyRunning }
+                    sessionStartedAt = Date()
+                    activeConfiguration = configuration
+                    // ⚠️ continuation 必须在任何异步步骤之前安装。
+                    // 若推迟到起流之后，期间的失败（枚举异常、startCapture 抛错、
+                    // 用户停止）将找不到等待方，record() 永久挂起。
+                    pendingContinuation = continuation
+                    return nil
+                }
 
-            if let rejection {
-                continuation.resume(throwing: rejection)
-                return
-            }
+                if let rejection {
+                    continuation.resume(throwing: rejection)
+                    return
+                }
 
-            // 强引用 self：整个会话期间录制器必须存活，否则 continuation 永远不会被
-            // resume。任务在会话终结后自行结束，不构成循环引用（self 不持有该任务）。
-            Task {
-                do {
-                    try await self.prepareAndStart(configuration: configuration)
-                } catch {
-                    self.noteFailure(Self.recordingError(from: error))
+                // 强引用 self：整个会话期间录制器必须存活，否则 continuation 永远不会被
+                // resume。任务在会话终结后自行结束，不构成循环引用（self 不持有该任务）。
+                Task {
+                    do {
+                        try await self.prepareAndStart(configuration: configuration)
+                    } catch {
+                        self.noteFailure(Self.recordingError(from: error))
+                    }
                 }
             }
+        } onCancel: {
+            self.cancelFromParentTask()
         }
+    }
+
+    /// 外部取消调用 `record()` 的父任务时安全收尾，避免 Continuation 永久挂起。
+    private func cancelFromParentTask() {
+        let shouldConclude = lock.withLock { () -> Bool in
+            stopRequested = true
+            return pendingContinuation != nil
+        }
+        guard shouldConclude else { return }
+        noteFailure(.cancelled)
     }
 
     /// 请求暂停。
@@ -271,7 +298,13 @@ public final class SCStreamRecorder: NSObject, ScreenRecording, @unchecked Senda
 
     /// 构造过滤器与配置、建立流并启动，随后安排首帧超时。
     private func prepareAndStart(configuration: RecordingConfiguration) async throws {
-        let content = try await CaptureSetup.fetchShareableContent()
+        let content: SCShareableContent
+        if case .window(let windowID) = configuration.scope {
+            // 窗口录屏支持跨桌面查找目标窗口。
+            content = try await CaptureSetup.fetchShareableContent(matchingWindowID: windowID)
+        } else {
+            content = try await CaptureSetup.fetchShareableContent()
+        }
 
         // 枚举期间用户可能已经停止。此处提前返回，不建立任何资源。
         guard isActive else { return }
@@ -285,17 +318,40 @@ public final class SCStreamRecorder: NSObject, ScreenRecording, @unchecked Senda
         )
         recorderLogger.notice("录制目标：\(target.description, privacy: .public) 输出=\(Int(target.pixelSize.width), privacy: .public)x\(Int(target.pixelSize.height), privacy: .public)px")
 
+        let effectiveVideo = Self.resolvedVideoSettings(configuration.video, pixelSize: target.pixelSize)
+
         let streamConfiguration = CaptureSetup.makeRecordingConfiguration(
             sourceRect: target.sourceRect,
             outputPixelSize: target.pixelSize,
-            video: configuration.video,
+            video: effectiveVideo,
             audio: configuration.audio
         )
 
         // 写入器必须在起流**之前**建好：它要先建立编码轨道，
         // 失败也应当早于任何捕获活动发生，而不是录了几秒才发现写不了。
-        let movieWriter = try makeWriter(configuration: configuration, pixelSize: target.pixelSize)
+        let movieWriter = try makeWriter(
+            configuration: configuration,
+            video: effectiveVideo,
+            pixelSize: target.pixelSize
+        )
         guard install(writer: movieWriter) else { return }
+
+        if configuration.highlightsMouseClicks {
+            let monitor = MouseClickMonitor()
+            let origin = Self.resolveCaptureGlobalOrigin(
+                scope: configuration.scope,
+                content: content,
+                displayID: target.displayID
+            )
+            lock.withLock {
+                captureOriginForClicks = origin
+                captureScaleFactor = target.scaleFactor
+                mouseClickMonitor = monitor
+            }
+            monitor.start()
+        }
+
+        installSleepObserver()
 
         let newStream = SCStream(
             filter: target.filter,
@@ -361,7 +417,7 @@ public final class SCStreamRecorder: NSObject, ScreenRecording, @unchecked Senda
                     guard self.machine.state.isActive, !self.stopRequested else { return nil }
                     let remaining = max(0, limit - self.currentDuration(now: Date()))
                     if self.machine.state == .recording, remaining <= 0 {
-                        self.didReachDurationLimit = true
+                        self._didReachDurationLimit = true
                         return 0
                     }
                     // 上限只累计已录时长；准备与暂停阶段保持等待。
@@ -427,8 +483,9 @@ public final class SCStreamRecorder: NSObject, ScreenRecording, @unchecked Senda
             return
         }
 
+        let selectedDeviceID = lock.withLock { activeConfiguration?.microphoneDeviceID }
         do {
-            try await capturer.start(on: outputQueue) { [weak self] sampleBuffer in
+            try await capturer.start(on: outputQueue, deviceID: selectedDeviceID) { [weak self] sampleBuffer in
                 self?.handleMicrophoneSample(sampleBuffer)
             }
         } catch {
@@ -474,6 +531,7 @@ public final class SCStreamRecorder: NSObject, ScreenRecording, @unchecked Senda
     /// 按输出配置创建写入器。
     private func makeWriter(
         configuration: RecordingConfiguration,
+        video: VideoSettings,
         pixelSize: CGSize
     ) throws -> MovieWriter {
         switch configuration.output {
@@ -481,7 +539,7 @@ public final class SCStreamRecorder: NSObject, ScreenRecording, @unchecked Senda
             return try MovieWriter(
                 url: url,
                 container: container,
-                video: configuration.video,
+                video: video,
                 audio: configuration.audio,
                 pixelSize: pixelSize
             )
@@ -494,10 +552,68 @@ public final class SCStreamRecorder: NSObject, ScreenRecording, @unchecked Senda
             return try MovieWriter(
                 url: temporaryURL,
                 container: .mp4,
-                video: configuration.video,
+                video: video,
                 audio: AudioSettings(systemAudio: false, microphone: false),
                 pixelSize: pixelSize
             )
+        }
+    }
+
+    /// 针对 H.264 硬编码器 4096px 边长上限做自动兼容：超限时自动升级到 HEVC。
+    static func resolvedVideoSettings(_ video: VideoSettings, pixelSize: CGSize) -> VideoSettings {
+        guard video.codec == .h264,
+              max(pixelSize.width, pixelSize.height) > 4096 else {
+            return video
+        }
+        var adjusted = video
+        adjusted.codec = .hevc
+        recorderLogger.notice(
+            "输出分辨率 \(Int(pixelSize.width), privacy: .public)x\(Int(pixelSize.height), privacy: .public) 超出 H.264 4096px 上限，已自动切换为 HEVC"
+        )
+        return adjusted
+    }
+
+    /// 计算捕获目标在全局屏幕坐标系下的左上角原点，用于鼠标点击高亮叠加。
+    private static func resolveCaptureGlobalOrigin(
+        scope: CaptureScope,
+        content: SCShareableContent,
+        displayID: CGDirectDisplayID
+    ) -> CGPoint {
+        switch scope {
+        case .display(let id):
+            return DisplayGeometry.bounds(for: id).origin
+        case .region(let id, let rect):
+            return DisplayGeometry.globalRect(for: rect, in: id).origin
+        case .window(let windowID):
+            return content.windows.first(where: { $0.windowID == windowID })?.frame.origin
+                ?? DisplayGeometry.bounds(for: displayID).origin
+        case .application(_, let id):
+            return DisplayGeometry.bounds(for: id).origin
+        }
+    }
+
+    /// 监听系统即将休眠通知，自动停止并保留已录成片。
+    private func installSleepObserver() {
+        let token = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            guard let self else { return }
+            recorderLogger.notice("检测到系统即将休眠，自动结束当前录制并保留已录内容")
+            Task { [weak self] in
+                await self?.stop()
+            }
+        }
+        let installed = lock.withLock { () -> Bool in
+            guard machine.state.isActive, sleepObserver == nil else {
+                return false
+            }
+            sleepObserver = token
+            return true
+        }
+        if !installed {
+            NSWorkspace.shared.notificationCenter.removeObserver(token)
         }
     }
 
@@ -636,19 +752,25 @@ public final class SCStreamRecorder: NSObject, ScreenRecording, @unchecked Senda
     /// 排空不可省略：`stopCapture()` 返回后，队列里可能仍有已入队的帧回调，
     /// 不清空就会出现「会话已结束后统计还在增长」这类难以复现的偏差。
     private func cleanupStream() async {
-        // 先停麦克风：它是独立的采集会话，不属于 SCStream
-        let microphoneToStop = lock.withLock { () -> MicrophoneCapturer? in
-            let capturer = microphone
+        let (observerToRemove, clickMonitorToStop, microphoneToStop, streamToStop) = lock.withLock {
+            let obs = sleepObserver
+            sleepObserver = nil
+            let monitor = mouseClickMonitor
+            mouseClickMonitor = nil
+            let mic = microphone
             microphone = nil
-            return capturer
-        }
-        await microphoneToStop?.stop()
-
-        let streamToStop = lock.withLock { () -> SCStream? in
-            let registered = stream
+            let registeredStream = stream
             stream = nil
-            return registered
+            return (obs, monitor, mic, registeredStream)
         }
+
+        if let observerToRemove {
+            NSWorkspace.shared.notificationCenter.removeObserver(observerToRemove)
+        }
+        clickMonitorToStop?.stop()
+
+        // 先停麦克风：它是独立的采集会话，不属于 SCStream
+        await microphoneToStop?.stop()
 
         if let streamToStop {
             do {
@@ -661,7 +783,12 @@ public final class SCStreamRecorder: NSObject, ScreenRecording, @unchecked Senda
             }
         }
 
-        outputQueue.sync { }
+        // 用异步 continuation 排空输出队列，绝不阻塞 Swift 协作式线程池。
+        await withCheckedContinuation { continuation in
+            outputQueue.async {
+                continuation.resume()
+            }
+        }
     }
 
     /// 影片写完之后，把「输出目标」这一步做完。
@@ -683,19 +810,23 @@ public final class SCStreamRecorder: NSObject, ScreenRecording, @unchecked Senda
         failure: inout RecordingError?,
         result: inout RecordingResult?
     ) async {
-        guard case .gif(let finalURL, let gifSettings) = activeConfiguration?.output else {
+        let outputConfig = lock.withLock { activeConfiguration?.output }
+        guard case .gif(let finalURL, let gifSettings) = outputConfig else {
             if failure == nil {
                 result = movie
             } else {
                 // 影片本就写在最终路径上。如实登记它，是否告知用户
                 // 由 `shouldKeepPartialOutput` 在界面层裁决。
-                keptOutput = KeptRecording(url: movie.url, isAtRequestedLocation: true)
+                lock.withLock {
+                    _keptOutput = KeptRecording(url: movie.url, isAtRequestedLocation: true)
+                }
             }
             return
         }
 
         guard failure == nil else {
-            keptOutput = rescueMovie(at: movie.url, gifURL: finalURL)
+            let rescued = rescueMovie(at: movie.url, gifURL: finalURL)
+            lock.withLock { _keptOutput = rescued }
             return
         }
 
@@ -703,10 +834,12 @@ public final class SCStreamRecorder: NSObject, ScreenRecording, @unchecked Senda
             result = try await convertToGIF(movie: movie, finalURL: finalURL, settings: gifSettings)
         } catch let error as RecordingError {
             failure = error
-            keptOutput = rescueMovie(at: movie.url, gifURL: finalURL)
+            let rescued = rescueMovie(at: movie.url, gifURL: finalURL)
+            lock.withLock { _keptOutput = rescued }
         } catch {
             failure = .gifExportFailed(error.localizedDescription)
-            keptOutput = rescueMovie(at: movie.url, gifURL: finalURL)
+            let rescued = rescueMovie(at: movie.url, gifURL: finalURL)
+            lock.withLock { _keptOutput = rescued }
         }
     }
 
@@ -886,18 +1019,27 @@ extension SCStreamRecorder: SCStreamOutput {
     private func handleVideoSample(_ sampleBuffer: CMSampleBuffer) {
         lock.withLock { stats.totalVideoSampleCount += 1 }
 
+        let status = CaptureSetup.frameStatus(sampleBuffer)
         // 只接受完整帧：首批回调可能给出内容不完整的帧
-        guard CaptureSetup.isCompleteFrame(sampleBuffer) else {
+        guard status == .complete else {
             recordDiscardedVideoFrame()
+            checkWindowDestructionIfNeeded(frameStatus: status)
             return
         }
+        consecutiveBlankOrSuspendedCount = 0
 
         markFirstFrameIfNeeded()
 
         // 状态判定与交付都在 outputQueue 上（串行），且 `pause()`/`resume()`
         // 也派发到本队列，因此这里不会与它们交错。
-        let activeWriter: MovieWriter? = lock.withLock {
-            machine.state == .recording ? writer : nil
+        let (activeWriter, clickMonitor, clickOrigin, scaleFactor, scope) = lock.withLock {
+            (
+                machine.state == .recording ? writer : nil,
+                mouseClickMonitor,
+                captureOriginForClicks,
+                captureScaleFactor,
+                activeConfiguration?.scope
+            )
         }
 
         // 暂停或已停止：数据不入输出，计入丢弃而非静默吞掉
@@ -906,8 +1048,26 @@ extension SCStreamRecorder: SCStreamOutput {
             return
         }
 
+        var bufferToWrite = sampleBuffer
+        if let clickMonitor {
+            let highlights = clickMonitor.activeHighlights()
+            if !highlights.isEmpty {
+                var effectiveOrigin = clickOrigin
+                if case .window(let windowID) = scope,
+                   let currentOrigin = WindowFrameProbe.frame(of: windowID)?.origin {
+                    effectiveOrigin = currentOrigin
+                }
+                bufferToWrite = MouseClickHighlightRenderer.overlayHighlights(
+                    highlights,
+                    onto: sampleBuffer,
+                    captureOrigin: effectiveOrigin,
+                    scaleFactor: scaleFactor
+                )
+            }
+        }
+
         // 计数放在交付之后：`videoFrameCount` 表示**真正被消费**的帧数。
-        let accepted = activeWriter.consumeVideo(sampleBuffer)
+        let accepted = activeWriter.consumeVideo(bufferToWrite)
 
         lock.withLock {
             if accepted {
@@ -915,6 +1075,10 @@ extension SCStreamRecorder: SCStreamOutput {
             } else {
                 stats.discardedFrameCount += 1
             }
+        }
+
+        if !accepted, let writerFailure = activeWriter.failureError {
+            notifyWriterFailure(writerFailure)
         }
     }
 
@@ -926,6 +1090,8 @@ extension SCStreamRecorder: SCStreamOutput {
 
         if activeWriter.consumeMicrophone(sampleBuffer) {
             lock.withLock { stats.microphoneBufferCount += 1 }
+        } else if let writerFailure = activeWriter.failureError {
+            notifyWriterFailure(writerFailure)
         }
     }
 
@@ -937,6 +1103,44 @@ extension SCStreamRecorder: SCStreamOutput {
 
         if activeWriter.consumeSystemAudio(sampleBuffer) {
             lock.withLock { stats.systemAudioBufferCount += 1 }
+        } else if let writerFailure = activeWriter.failureError {
+            notifyWriterFailure(writerFailure)
+        }
+    }
+
+    /// 当写入器进入失败状态（如磁盘满）时立即停止空跑并通报失败。
+    private func notifyWriterFailure(_ error: Error) {
+        let detail = Self.describeWriterError(error)
+        recorderLogger.error("写入器不可恢复失败，终止录制：\(detail, privacy: .public)")
+        noteFailure(.writerFailed(detail))
+    }
+
+    private static func describeWriterError(_ error: Error) -> String {
+        if let recordingError = error as? RecordingError,
+           case .writerFailed(let detail) = recordingError {
+            return detail
+        }
+        let nsError = error as NSError
+        let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
+        return "\(nsError.domain)#\(nsError.code) \(nsError.localizedDescription)"
+            + (underlying.map { " ← \($0.domain)#\($0.code) \($0.localizedDescription)" } ?? "")
+    }
+
+    /// 窗口录制期间若连续收到 `.blank`/`.suspended` 帧，探测目标窗口是否已销毁；若已关闭则自动收尾。
+    private func checkWindowDestructionIfNeeded(frameStatus: SCFrameStatus?) {
+        guard frameStatus == .blank || frameStatus == .suspended else {
+            return
+        }
+        let scope = lock.withLock { activeConfiguration?.scope }
+        guard case .window(let windowID) = scope else { return }
+
+        consecutiveBlankOrSuspendedCount += 1
+        guard consecutiveBlankOrSuspendedCount >= 15 else { return }
+        consecutiveBlankOrSuspendedCount = 0
+
+        if !WindowFrameProbe.exists(windowID: windowID) {
+            recorderLogger.notice("目标窗口 #\(windowID, privacy: .public) 已关闭销毁，自动收尾保留已录内容")
+            noteFailure(.scopeUnavailable)
         }
     }
 

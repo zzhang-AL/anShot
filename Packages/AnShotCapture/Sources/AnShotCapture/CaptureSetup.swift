@@ -10,6 +10,7 @@
 //
 
 import AnShotCore
+import ApplicationServices
 import CoreGraphics
 import CoreMedia
 import Foundation
@@ -148,16 +149,12 @@ enum CaptureSetup {
 
         case .window(let windowID):
             let window = try self.window(in: content, matching: windowID)
+            try validateWindowCapturable(window)
             let frame = window.frame
-            guard frame.width >= 1, frame.height >= 1 else {
-                throw CaptureError.emptyResult
-            }
 
-            // `SCWindow` 不携带显示器信息（窗口可跨屏），按 frame 中心点定位，
-            // 用它取缩放系数——输出像素尺寸必须与窗口所在屏一致。
-            guard let owningDisplay = DisplayGeometry.displayContaining(frame) else {
-                throw CaptureError.displayUnavailable
-            }
+            // `SCWindow` 不携带显示器信息（窗口可跨屏），按 frame 中心点定位；
+            // 离屏窗口找不到归属显示器时回退主屏缩放系数，避免误报「目标显示器不可用」。
+            let owningDisplay = DisplayGeometry.displayContaining(frame) ?? DisplayGeometry.mainDisplay()
             let context = try displayContext(for: owningDisplay)
 
             return SingleFrameSetup(
@@ -220,6 +217,8 @@ enum CaptureSetup {
 
         // 截图默认不含光标：光标会遮挡内容，且窗口截图里它通常根本不在窗口内。
         configuration.showsCursor = showsCursor
+        // 显式指定 32BGRA 像素格式，避免默认 YCbCr 4:2:0 导致彩色细字色度抽样发虚。
+        configuration.pixelFormat = kCVPixelFormatType_32BGRA
 
         // captureResolution 为 macOS 14.0+，13.0 上不存在此属性。
         if #available(macOS 14.0, *) {
@@ -305,6 +304,8 @@ enum CaptureSetup {
 
         // 截图默认不含光标：光标会遮挡内容
         configuration.showsCursor = showsCursor
+        // 显式指定 32BGRA 像素格式，避免默认 YCbCr 4:2:0 导致彩色细字色度抽样发虚。
+        configuration.pixelFormat = kCVPixelFormatType_32BGRA
 
         // captureResolution 为 macOS 14.0+，13.0 上不存在此属性
         if #available(macOS 14.0, *) {
@@ -383,7 +384,7 @@ enum CaptureSetup {
             return RecordingTarget(
                 filter: SCContentFilter(display: display, excludingWindows: excludedWindows),
                 sourceRect: nil,
-                pixelSize: context.pixelSize,
+                pixelSize: alignedEvenPixelSize(context.pixelSize),
                 scaleFactor: context.scaleFactor,
                 displayID: displayID,
                 description: "显示器 #\(displayID)"
@@ -395,13 +396,14 @@ enum CaptureSetup {
             guard let clamped = DisplayGeometry.clamp(rect: rect, to: displayID) else {
                 throw CaptureError.emptyResult
             }
+            let rawPixelSize = CGSize(
+                width: clamped.width * context.scaleFactor,
+                height: clamped.height * context.scaleFactor
+            )
             return RecordingTarget(
                 filter: SCContentFilter(display: display, excludingWindows: excludedWindows),
                 sourceRect: clamped,
-                pixelSize: CGSize(
-                    width: max(1, (clamped.width * context.scaleFactor).rounded()),
-                    height: max(1, (clamped.height * context.scaleFactor).rounded())
-                ),
+                pixelSize: alignedEvenPixelSize(rawPixelSize),
                 scaleFactor: context.scaleFactor,
                 displayID: displayID,
                 description: "显示器 #\(displayID) 的区域 \(Int(clamped.width))×\(Int(clamped.height))"
@@ -411,25 +413,21 @@ enum CaptureSetup {
             guard let window = content.windows.first(where: { $0.windowID == windowID }) else {
                 throw CaptureError.scopeUnavailable
             }
+            try validateWindowCapturable(window)
             let frame = window.frame
-            guard frame.width >= 1, frame.height >= 1 else {
-                throw CaptureError.emptyResult
-            }
             // `SCWindow` 不携带显示器信息：用 frame 中心点定位所在显示器以取得缩放系数。
-            // 契约（model.md §2.2）：跨屏时以**首帧确定的尺寸**为准，中途不改尺寸——
-            // AVAssetWriter 不支持中途改分辨率，强行改会得到损坏文件。
-            guard let displayID = DisplayGeometry.displayContaining(frame) else {
-                throw CaptureError.displayUnavailable
-            }
+            // 离屏窗口找不到归属显示器时回退主屏，避免误报「目标显示器不可用」。
+            let displayID = DisplayGeometry.displayContaining(frame) ?? DisplayGeometry.mainDisplay()
             let scaleFactor = DisplayGeometry.scaleFactor(for: displayID)
             let title = window.title ?? window.owningApplication?.applicationName ?? "未命名"
+            let rawPixelSize = CGSize(
+                width: frame.width * scaleFactor,
+                height: frame.height * scaleFactor
+            )
             return RecordingTarget(
                 filter: SCContentFilter(desktopIndependentWindow: window),
                 sourceRect: nil,
-                pixelSize: CGSize(
-                    width: max(1, (frame.width * scaleFactor).rounded()),
-                    height: max(1, (frame.height * scaleFactor).rounded())
-                ),
+                pixelSize: alignedEvenPixelSize(rawPixelSize),
                 scaleFactor: scaleFactor,
                 displayID: displayID,
                 description: "窗口 #\(windowID)「\(title)」"
@@ -452,7 +450,7 @@ enum CaptureSetup {
                     exceptingWindows: excludedWindows
                 ),
                 sourceRect: nil,
-                pixelSize: context.pixelSize,
+                pixelSize: alignedEvenPixelSize(context.pixelSize),
                 scaleFactor: context.scaleFactor,
                 displayID: displayID,
                 description: "应用「\(application.applicationName)」在显示器 #\(displayID) 上的窗口"
@@ -492,6 +490,8 @@ enum CaptureSetup {
 
         configuration.showsCursor = video.showsCursor
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
+        // 显式对齐 sRGB 色域，与 MovieWriter 输出标记的 BT.709 色彩配置保持一致。
+        configuration.colorSpaceName = CGColorSpace.sRGB
         // 队列深度用系统的保守值：过小（如 1）会让管道在启动阶段就无法维持，
         // 实测该值下每一轮流都收不到帧。
         configuration.queueDepth = 3
@@ -504,10 +504,10 @@ enum CaptureSetup {
             // 区域：只采样该矩形，输出尺寸由调用方按「逻辑尺寸 × 缩放系数」给出
             configuration.sourceRect = rect
         }
-        // 输出尺寸统一由 RecordingTarget 计算，此处只做整数化与下限保护。
-        // 误用 CGDisplayPixelsWide 会得到 1x 降采样结果（见 DisplayGeometry.scaleFactor）。
-        configuration.width = max(1, Int(outputPixelSize.width.rounded()))
-        configuration.height = max(1, Int(outputPixelSize.height.rounded()))
+        // 输出尺寸统一由 RecordingTarget 计算并偶数对齐，防止 H.264 编码器因奇数分辨率报错。
+        let alignedSize = alignedEvenPixelSize(outputPixelSize)
+        configuration.width = Int(alignedSize.width)
+        configuration.height = Int(alignedSize.height)
 
         // 系统声音：capturesAudio / sampleRate / channelCount /
         // excludesCurrentProcessAudio 均为 macOS 13.0+，基线上可用。
@@ -531,18 +531,22 @@ enum CaptureSetup {
     /// 单帧截图与录制共用本判定：单帧时期望的是「第一张可用的图」，
     /// 录制时期里它决定该帧是否计入统计——两处若各写一份，
     /// 迟早出现「截图接受的帧录制不接受」这类无解释的不一致。
-    static func isCompleteFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
+    /// 读取 `CMSampleBuffer` 携带的 `SCStreamFrameInfo.status`。
+    static func frameStatus(_ sampleBuffer: CMSampleBuffer) -> SCFrameStatus? {
         guard let attachments = CMSampleBufferGetSampleAttachmentsArray(
             sampleBuffer,
             createIfNecessary: false
         ) as? [[SCStreamFrameInfo: Any]] else {
-            return false
+            return nil
         }
-        guard let rawStatus = attachments.first?[.status] as? Int,
-              let status = SCFrameStatus(rawValue: rawStatus) else {
-            return false
+        guard let rawStatus = attachments.first?[.status] as? Int else {
+            return nil
         }
-        return status == .complete
+        return SCFrameStatus(rawValue: rawStatus)
+    }
+
+    static func isCompleteFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
+        frameStatus(sampleBuffer) == .complete
     }
 
     // MARK: - 诊断
@@ -586,10 +590,88 @@ enum CaptureSetup {
         String(format: "%.1f", seconds * 1000)
     }
 
+    /// 录屏输出像素偶数对齐（YUV 4:2:0 硬编码器要求宽高为偶数，且最小 2px）。
+    static func alignedEvenPixelSize(_ size: CGSize) -> CGSize {
+        let evenWidth = max(2, Int(size.width.rounded()) & ~1)
+        let evenHeight = max(2, Int(size.height.rounded()) & ~1)
+        return CGSize(width: evenWidth, height: evenHeight)
+    }
+
+    /// 校验目标窗口当前是否可捕获/录制；若已最小化则给出明确错误。
+    static func validateWindowCapturable(_ window: SCWindow) throws {
+        guard window.frame.width >= 1, window.frame.height >= 1 else {
+            throw CaptureError.emptyResult
+        }
+        if !window.isOnScreen, isWindowMinimized(window) {
+            throw CaptureError.unsupportedScope("目标窗口已最小化，无法捕获或录制，请先恢复窗口")
+        }
+    }
+
+    /// 通过辅助功能属性检查离屏窗口是否处于 Dock 最小化状态（有权限时有效，跨桌面普通窗口不受影响）。
+    private static func isWindowMinimized(_ window: SCWindow) -> Bool {
+        guard AXIsProcessTrusted(), let pid = window.owningApplication?.processID else {
+            return false
+        }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.04)
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let axWindows = windowsRef as? [AXUIElement] else {
+            return false
+        }
+        let targetTitle = window.title
+        for axWindow in axWindows {
+            AXUIElementSetMessagingTimeout(axWindow, 0.04)
+            var minRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(axWindow, kAXMinimizedAttribute as CFString, &minRef) == .success,
+                  let isMin = minRef as? Bool, isMin else {
+                continue
+            }
+            if let targetTitle, !targetTitle.isEmpty {
+                var titleRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef) == .success,
+                   let axTitle = titleRef as? String,
+                   axTitle == targetTitle {
+                    return true
+                }
+            } else {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// 为异步捕获操作提供超时熔断保护。
+    static func withTimeout<T: Sendable>(
+        _ timeout: TimeInterval,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        guard timeout > 0 else {
+            return try await operation()
+        }
+        return try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask {
+                try await operation()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                throw CaptureError.timedOut
+            }
+            defer { group.cancelAll() }
+            guard let first = try await group.next() else {
+                throw CaptureError.timedOut
+            }
+            return first
+        }
+    }
+
     // MARK: - 错误映射
 
     /// 把 ScreenCaptureKit 的错误映射到本模块的错误类型。
     static func mapError(_ error: Error) -> CaptureError {
+        if let captureError = error as? CaptureError {
+            return captureError
+        }
         if let streamError = error as? SCStreamError {
             switch streamError.code {
             case .userDeclined:

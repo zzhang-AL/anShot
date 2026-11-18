@@ -19,7 +19,12 @@ private let screenshotLogger = AnShotLog.capture
 @available(macOS 14.0, *)
 public struct ScreenshotCapturer: ScreenCapturing {
 
-    public init() {}
+    /// 单帧捕获默认超时（秒），避免 `replayd` 异常时无限挂起。
+    private let timeout: TimeInterval
+
+    public init(timeout: TimeInterval = 5.0) {
+        self.timeout = timeout
+    }
 
     public func captureFrame(scope: CaptureScope) async throws -> CapturedFrame {
         let t0 = Date()
@@ -27,46 +32,49 @@ public struct ScreenshotCapturer: ScreenCapturing {
         try CaptureSetup.requirePermission()
 
         let target = try CaptureSetup.resolveSingleFrameTarget(scope)
+        let capturedTimeout = timeout
 
-        let t1 = Date()
-        let content = try await CaptureSetup.fetchShareableContent(for: target)
-        let t2 = Date()
+        return try await CaptureSetup.withTimeout(capturedTimeout) {
+            let t1 = Date()
+            let content = try await CaptureSetup.fetchShareableContent(for: target)
+            let t2 = Date()
 
-        // 构造（过滤器 / 配置 / 归属元数据）与另一实现共用同一份代码：
-        // 两个实现各自成型会让「同一个请求在 13 与 14 上产出不同尺寸的图」
-        // 这类缺陷只在旧系统暴露，而开发机看不到。
-        let setup = try CaptureSetup.makeSingleFrameSetup(
-            target: target,
-            scope: scope,
-            content: content,
-            showsCursor: false
-        )
-
-        let t3 = Date()
-
-        do {
-            let image = try await SCScreenshotManager.captureImage(
-                contentFilter: setup.filter,
-                configuration: setup.configuration
+            // 构造（过滤器 / 配置 / 归属元数据）与另一实现共用同一份代码：
+            // 两个实现各自成型会让「同一个请求在 13 与 14 上产出不同尺寸的图」
+            // 这类缺陷只在旧系统暴露，而开发机看不到。
+            let setup = try CaptureSetup.makeSingleFrameSetup(
+                target: target,
+                scope: scope,
+                content: content,
+                showsCursor: false
             )
-            let t4 = Date()
 
-            screenshotLogger.notice("""
-                screenshot timing: setup=\(Self.ms(t1.timeIntervalSince(t0)), privacy: .public)ms \
-                shareableContent=\(Self.ms(t2.timeIntervalSince(t1)), privacy: .public)ms \
-                filter+config=\(Self.ms(t3.timeIntervalSince(t2)), privacy: .public)ms \
-                capture=\(Self.ms(t4.timeIntervalSince(t3)), privacy: .public)ms \
-                total=\(Self.ms(t4.timeIntervalSince(t0)), privacy: .public)ms
-                """)
+            let t3 = Date()
 
-            return CapturedFrame(
-                image: image,
-                displayID: setup.displayID,
-                scaleFactor: setup.scaleFactor,
-                window: setup.windowInfo
-            )
-        } catch {
-            throw CaptureSetup.mapError(error)
+            do {
+                let image = try await SCScreenshotManager.captureImage(
+                    contentFilter: setup.filter,
+                    configuration: setup.configuration
+                )
+                let t4 = Date()
+
+                screenshotLogger.notice("""
+                    screenshot timing: setup=\(Self.ms(t1.timeIntervalSince(t0)), privacy: .public)ms \
+                    shareableContent=\(Self.ms(t2.timeIntervalSince(t1)), privacy: .public)ms \
+                    filter+config=\(Self.ms(t3.timeIntervalSince(t2)), privacy: .public)ms \
+                    capture=\(Self.ms(t4.timeIntervalSince(t3)), privacy: .public)ms \
+                    total=\(Self.ms(t4.timeIntervalSince(t0)), privacy: .public)ms
+                    """)
+
+                return CapturedFrame(
+                    image: image,
+                    displayID: setup.displayID,
+                    scaleFactor: setup.scaleFactor,
+                    window: setup.windowInfo
+                )
+            } catch {
+                throw CaptureSetup.mapError(error)
+            }
         }
     }
 

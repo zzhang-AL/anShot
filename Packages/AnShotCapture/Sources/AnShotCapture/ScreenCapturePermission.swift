@@ -30,8 +30,10 @@
 //  导致已授权仍恒返回 false。
 //
 
+import AppKit
 import CoreGraphics
 import Foundation
+import os
 
 // MARK: - 权限状态
 
@@ -92,17 +94,14 @@ public struct SystemScreenCaptureAccess: ScreenCaptureAccessProviding {
 // MARK: - 权限服务
 
 /// 权限状态服务。
-///
-/// `@unchecked Sendable` 的理由：`UserDefaults` 未标注 `Sendable`，
-/// 但 Apple 文档明确其为线程安全；本类型无可变状态，
-/// 且 `access` 已是 `Sendable`，故可安全跨并发域传递。
-public struct ScreenCapturePermissionService: @unchecked Sendable {
+public struct ScreenCapturePermissionService: Sendable {
 
     /// UserDefaults 中记录「是否曾经请求过权限」的键。
     private static let hasRequestedKey = "com.anshot.hasRequestedScreenCapturePermission"
 
     private let access: ScreenCaptureAccessProviding
-    private let store: UserDefaults
+    private let storeWrapper: SendableUserDefaults
+    private var store: UserDefaults { storeWrapper.raw }
 
     /// - Parameters:
     ///   - access: 系统权限 API，默认使用真实实现。
@@ -112,7 +111,7 @@ public struct ScreenCapturePermissionService: @unchecked Sendable {
         store: UserDefaults = .standard
     ) {
         self.access = access
-        self.store = store
+        self.storeWrapper = SendableUserDefaults(raw: store)
     }
 
     /// 查询当前权限状态。**不触发任何弹窗，可随时调用。**
@@ -151,4 +150,40 @@ public struct ScreenCapturePermissionService: @unchecked Sendable {
     public func resetRequestRecord() {
         store.removeObject(forKey: Self.hasRequestedKey)
     }
+
+    /// 监听屏幕录制权限状态变更（应用回到前台时重新探测并在变化时发出事件）。
+    public func statusUpdates() -> AsyncStream<ScreenCapturePermission> {
+        AsyncStream { continuation in
+            let initial = current()
+            let lastLock = OSAllocatedUnfairLock(initialState: initial)
+            continuation.yield(initial)
+
+            let rawToken = NotificationCenter.default.addObserver(
+                forName: NSApplication.didBecomeActiveNotification,
+                object: nil,
+                queue: nil
+            ) { _ in
+                let latest = self.current()
+                let changed = lastLock.withLock { prev -> Bool in
+                    guard prev != latest else { return false }
+                    prev = latest
+                    return true
+                }
+                if changed {
+                    continuation.yield(latest)
+                }
+            }
+            let observerBox = NotificationTokenBox(token: rawToken)
+
+            continuation.onTermination = { _ in
+                NotificationCenter.default.removeObserver(observerBox.token)
+            }
+        }
+    }
+}
+
+/// 将非 `Sendable` 的通知注册令牌包装进可控容器，仅用于跨队列注销监听。
+final class NotificationTokenBox: @unchecked Sendable {
+    let token: NSObjectProtocol
+    init(token: NSObjectProtocol) { self.token = token }
 }
