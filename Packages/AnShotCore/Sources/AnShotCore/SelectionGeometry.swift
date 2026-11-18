@@ -49,6 +49,55 @@ public enum CoordinateConversion {
             height: rect.size.height / Double(scaleFactor)
         )
     }
+
+    /// 将像素矩形向外吸附到整数像素网格（含浮点容差）。
+    ///
+    /// 在 `floor` / `ceil` 前引入 `tolerance`（默认 `1e-6`），
+    /// 消除逻辑点乘以缩放系数时 IEEE 754 尾数毛刺导致的 1px 杂边。
+    public static func snappedPixelRect(
+        _ rect: PixelRect,
+        tolerance: Double = 1e-6
+    ) -> PixelRect {
+        let eps = max(0, tolerance)
+        let x0 = (rect.origin.x + eps).rounded(.down)
+        let y0 = (rect.origin.y + eps).rounded(.down)
+        guard rect.isNonEmpty else {
+            return PixelRect(origin: PixelPoint(x: x0, y: y0), size: .zero)
+        }
+        let x1 = max(x0, (rect.origin.x + rect.size.width - eps).rounded(.up))
+        let y1 = max(y0, (rect.origin.y + rect.size.height - eps).rounded(.up))
+        return PixelRect(
+            origin: PixelPoint(x: x0, y: y0),
+            size: PixelSize(width: x1 - x0, height: y1 - y0)
+        )
+    }
+
+    /// 显示器逻辑点矩形 → 吸附到整数像素网格后的底图像素矩形。
+    public static func snappedPixelRect(
+        fromLogical rect: CGRect,
+        scaleFactor: CGFloat,
+        tolerance: Double = 1e-6
+    ) -> PixelRect {
+        let raw = pixelRect(fromLogical: rect, scaleFactor: scaleFactor)
+        return snappedPixelRect(raw, tolerance: tolerance)
+    }
+
+    /// 将显示器逻辑点矩形按给定缩放系数吸附到物理像素网格后再转回逻辑点。
+    public static func snappedLogicalRect(
+        _ rect: CGRect,
+        scaleFactor: CGFloat,
+        tolerance: Double = 1e-6
+    ) -> CGRect {
+        guard scaleFactor > 0 else {
+            return rect
+        }
+        let snapped = snappedPixelRect(
+            fromLogical: rect,
+            scaleFactor: scaleFactor,
+            tolerance: tolerance
+        )
+        return logicalRect(fromPixel: snapped, scaleFactor: scaleFactor)
+    }
 }
 
 // MARK: - 调整手柄
@@ -183,13 +232,18 @@ public enum SelectionGeometry {
         )
     }
 
-    /// 把矩形钳制在给定边界内，并在尺寸不足时返回 nil。
+    /// 把矩形钳制在给定边界内：同步钳制宽高不超过边界尺寸，并限制原点使整体不越界。
     ///
-    /// 用于「拖动选区内部移动」：移动中选区尺寸不变，但需要被限制在屏幕内。
+    /// 用于「拖动选区内部移动」及选区边界约束：正常情况下保持尺寸不变，
+    /// 当待钳制矩形大于边界时，将尺寸收窄至边界宽高，防止出现 `maxX > bounds.maxX` 越界。
     public static func clamp(_ rect: CGRect, to bounds: CGRect) -> CGRect {
+        let clampedSize = CGSize(
+            width: min(max(0, rect.width), max(0, bounds.width)),
+            height: min(max(0, rect.height), max(0, bounds.height))
+        )
         var origin = rect.origin
-        origin.x = min(max(origin.x, bounds.minX), max(bounds.minX, bounds.maxX - rect.width))
-        origin.y = min(max(origin.y, bounds.minY), max(bounds.minY, bounds.maxY - rect.height))
-        return CGRect(origin: origin, size: rect.size)
+        origin.x = min(max(origin.x, bounds.minX), bounds.maxX - clampedSize.width)
+        origin.y = min(max(origin.y, bounds.minY), bounds.maxY - clampedSize.height)
+        return CGRect(origin: origin, size: clampedSize)
     }
 }

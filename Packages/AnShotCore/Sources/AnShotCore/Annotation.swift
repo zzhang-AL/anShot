@@ -99,21 +99,20 @@ public struct FontDescriptor: Codable, Equatable, Sendable {
 
 /// 马赛克的处理模式（model.md §4.6）。
 ///
-/// M1 仅实现 `pixelate`；`blur` 与 `solid` 为契约预留，
-/// 解码时保留原值以便未来实现，渲染时按「不支持的 mode」处理。
+/// 当前已完整支持 `pixelate`（像素化）、`blur`（高斯模糊）与 `solid`（纯色遮盖）三种打码模式。
 public enum MosaicMode: String, Codable, Equatable, Sendable, CaseIterable {
     /// 像素化，`intensity` 为马赛克块边长（像素）。
     case pixelate
 
-    /// 高斯模糊，`intensity` 为模糊半径（像素）。M1 未实现。
+    /// 高斯模糊，`intensity` 为模糊半径（像素）。
     case blur
 
-    /// 纯色填充，`intensity` 被忽略，颜色取自 `stroke.color`。M1 未实现。
+    /// 纯色遮盖，`intensity` 被忽略。
     case solid
 
     /// 当前版本是否具备渲染能力。
     public var isRenderable: Bool {
-        self == .pixelate
+        true
     }
 }
 
@@ -293,10 +292,8 @@ public struct Annotation: Equatable, Sendable, Identifiable {
             return Self.boundingRect(of: points, padding: stroke.width / 2)
 
         case let .curvedArrow(start, control, end, _, _, _):
-            // 用三个控制点的包围盒，**不是**曲线的紧致包围盒：二次贝塞尔的极值
-            // 可能落在控制点之外，这里取的是保守上界。用途是范围校验与命中，
-            // 上界偏大只会让判界更宽松，不会漏掉内容。
-            return Self.boundingRect(of: [start, control, end], padding: 0)
+            // 采用二次贝塞尔解析极值求紧致包围盒，避免控制点偏出时误报贴边越界。
+            return Self.quadraticBezierBoundingRect(start: start, control: control, end: end)
         }
     }
 }
@@ -322,6 +319,79 @@ extension Annotation {
                 height: (maxY - minY) + padding * 2
             )
         )
+    }
+
+    /// 计算二次贝塞尔曲线在 `[0, 1]` 区间上的解析紧致包围盒。
+    ///
+    /// 对各轴分量 $p(t) = (1-t)^2 p_0 + 2(1-t)t p_1 + t^2 p_2$ 求导并令导数为 0，
+    /// 若驻点 $t^* = (p_0 - p_1) / (p_0 - 2p_1 + p_2)$ 落在开区间 `(0, 1)` 内，
+    /// 则将其函数值纳入极值范围。
+    static func quadraticBezierBoundingRect(
+        start: PixelPoint,
+        control: PixelPoint,
+        end: PixelPoint
+    ) -> PixelRect {
+        func axisBounds(_ p0: Double, _ p1: Double, _ p2: Double) -> (min: Double, max: Double) {
+            var lo = min(p0, p2)
+            var hi = max(p0, p2)
+            let denominator = p0 - 2 * p1 + p2
+            if abs(denominator) > 1e-12 {
+                let t = (p0 - p1) / denominator
+                if t > 0 && t < 1 {
+                    let oneMinusT = 1 - t
+                    let extremum = oneMinusT * oneMinusT * p0 + 2 * oneMinusT * t * p1 + t * t * p2
+                    lo = min(lo, extremum)
+                    hi = max(hi, extremum)
+                }
+            }
+            return (lo, hi)
+        }
+
+        let x = axisBounds(start.x, control.x, end.x)
+        let y = axisBounds(start.y, control.y, end.y)
+        return PixelRect(
+            origin: PixelPoint(x: x.min, y: y.min),
+            size: PixelSize(width: x.max - x.min, height: y.max - y.min)
+        )
+    }
+}
+
+// MARK: - 编号重排辅助
+
+extension Collection where Element == Annotation {
+    /// 推导下一个新建编号标注应使用的序号（现有最大序号 + 1，无编号时返回 `1`）。
+    public var nextNumberingIndex: Int {
+        var maxIndex = 0
+        for annotation in self {
+            if case let .numbering(_, _, index, _, _, _) = annotation.kind {
+                maxIndex = Swift.max(maxIndex, index)
+            }
+        }
+        return maxIndex + 1
+    }
+}
+
+extension Array where Element == Annotation {
+    /// 按当前数组顺序将所有编号标注连续重排为 `1...N`，保留其 `id`、几何位置与样式。
+    public func renumbered() -> [Annotation] {
+        var nextIndex = 1
+        return map { annotation in
+            guard case let .numbering(center, radius, _, stroke, fill, textColor) = annotation.kind else {
+                return annotation
+            }
+            defer { nextIndex += 1 }
+            return Annotation(
+                id: annotation.id,
+                kind: .numbering(
+                    center: center,
+                    radius: radius,
+                    index: nextIndex,
+                    stroke: stroke,
+                    fill: fill,
+                    textColor: textColor
+                )
+            )
+        }
     }
 }
 
@@ -591,12 +661,22 @@ extension AnnotationList: Codable {
         }
 
         // 第二步：在普通数组上做容错转换，此处不可能死循环。
+        // 复用同一对编解码器，并区分「未知类型（静默跳过）」与「已知类型字段损坏（记告警）」。
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
         var decoded: [Annotation] = []
         var skipped = 0
-        for raw in rawItems {
-            if let annotation = try? raw.decode(as: Annotation.self) {
+        for (index, raw) in rawItems.enumerated() {
+            do {
+                let annotation = try raw.decode(as: Annotation.self, using: encoder, decoder: decoder)
                 decoded.append(annotation)
-            } else {
+            } catch AnnotationDecodingError.unknownType {
+                skipped += 1
+            } catch {
+                let typeLabel = raw["type"]?.stringValue ?? "<missing>"
+                AnShotLog.overlay.warning(
+                    "跳过损坏的标注条目（索引 \(index)，type=\(typeLabel, privacy: .public)）：\(error.localizedDescription, privacy: .public)"
+                )
                 skipped += 1
             }
         }

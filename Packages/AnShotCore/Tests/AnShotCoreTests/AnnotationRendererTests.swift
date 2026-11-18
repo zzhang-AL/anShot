@@ -320,23 +320,48 @@ struct RenderMosaicTests {
         expectColor(pixels.rgb(x: 50, y: 50), (255, 0, 0), "后画的矩形不应被马赛克处理")
     }
 
-    @Test("未实现的马赛克模式被跳过而不是中断整幅渲染")
-    func unsupportedModeIsSkipped() throws {
-        let backdrop = solidImage(width: 100, height: 100, color: white)
-        let annotation = Annotation(kind: .mosaic(
-            rect: rect(0, 0, 100, 100),
+    @Test("高斯模糊模式平顺过渡且纯色遮盖完全阻断底图")
+    func blurAndSolidModesRender() throws {
+        let backdrop = regionedImage(
+            width: 120,
+            height: 120,
+            background: white,
+            regions: [
+                (0, 0, 60, 120, black),
+                (60, 0, 60, 120, white),
+            ]
+        )
+
+        let blur = Annotation(kind: .mosaic(
+            rect: rect(20, 20, 80, 40),
             mode: .blur,
             intensity: 10
         ))
-
-        let result = try #require(AnnotationRenderer.render(
+        let blurResult = try #require(AnnotationRenderer.render(
             backdrop: backdrop,
-            selection: rect(0, 0, 100, 100),
-            annotations: [annotation]
+            selection: rect(0, 0, 120, 120),
+            annotations: [blur]
         ))
-        let pixels = PixelBuffer(result)
+        let blurPixels = PixelBuffer(blurResult)
+        // 黑白交界 x=60 附近在模糊后应呈现中间灰阶，且外部区域保持黑白原色。
+        let boundary = blurPixels.rgb(x: 60, y: 40)
+        #expect(boundary.r > 20 && boundary.r < 235, "模糊交界处应呈平滑中间灰度，实际 \(boundary)")
+        expectColor(blurPixels.rgb(x: 5, y: 5), (0, 0, 0), "模糊框外左侧应保持黑底")
+        expectColor(blurPixels.rgb(x: 115, y: 5), (255, 255, 255), "模糊框外右侧应保持白底")
 
-        expectColor(pixels.rgb(x: 50, y: 50), (255, 255, 255), "未实现的模式应只跳过自身")
+        let solid = Annotation(kind: .mosaic(
+            rect: rect(70, 70, 40, 40),
+            mode: .solid,
+            intensity: 0
+        ))
+        let solidResult = try #require(AnnotationRenderer.render(
+            backdrop: backdrop,
+            selection: rect(0, 0, 120, 120),
+            annotations: [solid]
+        ))
+        let solidPixels = PixelBuffer(solidResult)
+        expectColor(solidPixels.rgb(x: 90, y: 90), (0, 0, 0), "纯色遮盖区域应完全变黑")
+        expectColor(solidPixels.rgb(x: 65, y: 90), (255, 255, 255), "纯色遮盖框外应保持白色")
     }
 
     @Test("非零选区原点下马赛克仍作用于标注指定的底图区域")

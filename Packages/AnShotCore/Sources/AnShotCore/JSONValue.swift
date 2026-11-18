@@ -131,8 +131,17 @@ public enum JSONValue: Codable, Equatable, Sendable {
     /// 用于「原始 JSON → 强类型模型」的二次解析：走到这一步时
     /// 容器游标已经安全前进，因此解析失败可以放心跳过。
     public func decode<T: Decodable>(as type: T.Type) throws -> T {
-        let data = try JSONEncoder().encode(self)
-        return try JSONDecoder().decode(T.self, from: data)
+        try decode(as: type, using: JSONEncoder(), decoder: JSONDecoder())
+    }
+
+    /// 复用外部传入的编解码器执行二次解析，避免批量解码时反复创建编解码器实例。
+    public func decode<T: Decodable>(
+        as type: T.Type,
+        using encoder: JSONEncoder,
+        decoder: JSONDecoder
+    ) throws -> T {
+        let data = try encoder.encode(self)
+        return try decoder.decode(T.self, from: data)
     }
 }
 

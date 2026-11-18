@@ -12,7 +12,41 @@
 //  - RGB 分量与 `RGBAColor` 一致：非预乘 sRGB，0...1
 //
 
+import CoreGraphics
 import Foundation
+
+/// 图像与渲染管线的色彩空间辅助工具。
+///
+/// 统一管理 sRGB / Display P3 常量与画布色彩空间判定，
+/// 确保渲染器在保留 Mac 原生 Display P3 广色域的同时，
+/// 对不支持位图输出的特殊输入色域安全回退到 sRGB。
+public enum ImageColorSpace {
+    /// 标准 sRGB 色彩空间。
+    public static let sRGB: CGColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+        ?? CGColorSpaceCreateDeviceRGB()
+
+    /// Apple Display P3 广色域色彩空间。
+    public static let displayP3: CGColorSpace = CGColorSpace(name: CGColorSpace.displayP3)
+        ?? sRGB
+
+    /// 判断给定色彩空间是否支持作为 8-bit 预乘 RGB 位图上下文的输出空间。
+    public static func isSupportedRGBBitmapOutput(_ colorSpace: CGColorSpace) -> Bool {
+        colorSpace.model == .rgb
+            && colorSpace.numberOfComponents == 3
+            && colorSpace.supportsOutput
+    }
+
+    /// 为输入底图解析渲染画布应采用的色彩空间。
+    ///
+    /// 优先复用底图自带的 RGB 输出色彩空间（如 Display P3、sRGB），
+    /// 避免强制降级到 sRGB 导致广色域截断与 ColorSync 转换损耗。
+    public static func canvasColorSpace(for image: CGImage) -> CGColorSpace {
+        if let space = image.colorSpace, isSupportedRGBBitmapOutput(space) {
+            return space
+        }
+        return sRGB
+    }
+}
 
 /// HSV 颜色分量。
 public struct HSVColor: Equatable, Sendable {

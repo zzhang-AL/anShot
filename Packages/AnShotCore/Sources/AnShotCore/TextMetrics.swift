@@ -25,9 +25,50 @@ public enum TextMetrics {
     ///
     /// 渲染与度量共用这一个构造路径：只要构造一致，
     /// 输入时看到的行高与提交后画出来的行高就一致。
+    /// 对于系统字体占位名 `.AppleSystemUIFont`，使用公开 API
+    /// `CTFontCreateUIFontForLanguage(.system, ...)` 再叠加字重与斜体 trait，
+    /// 消除 CoreText 私有字体名告警并避免回退至衬线体。
     public static func font(for descriptor: FontDescriptor) -> CTFont {
+        let size = CGFloat(descriptor.size)
+        let weightTrait = normalizedWeight(descriptor.weight)
+
+        if descriptor.family == ".AppleSystemUIFont" || descriptor.family.isEmpty {
+            let baseFont = CTFontCreateUIFontForLanguage(.system, size, nil)
+                ?? CTFontCreateWithName("HelveticaNeue" as CFString, size, nil)
+
+            let traits: [CFString: Any] = [
+                kCTFontWeightTrait: weightTrait,
+                kCTFontSlantTrait: descriptor.italic ? 1.0 : 0.0,
+            ]
+            let attributes: [CFString: Any] = [
+                kCTFontTraitsAttribute: traits as CFDictionary,
+            ]
+            let fontDescriptor = CTFontDescriptorCreateWithAttributes(attributes as CFDictionary)
+            var resolved = CTFontCreateCopyWithAttributes(baseFont, size, nil, fontDescriptor)
+
+            if descriptor.italic {
+                let symbolic = CTFontGetSymbolicTraits(resolved)
+                if !symbolic.contains(.traitItalic) {
+                    if let italicCopy = CTFontCreateCopyWithSymbolicTraits(
+                        resolved,
+                        size,
+                        nil,
+                        .traitItalic,
+                        .traitItalic
+                    ) {
+                        resolved = italicCopy
+                    } else {
+                        // 部分系统字重缺少独立斜体字形，采用约 14° 剪切矩阵实现一致斜体外观。
+                        var slant = CGAffineTransform(a: 1, b: 0, c: 0.25, d: 1, tx: 0, ty: 0)
+                        resolved = CTFontCreateCopyWithAttributes(resolved, size, &slant, nil)
+                    }
+                }
+            }
+            return resolved
+        }
+
         let traits: [CFString: Any] = [
-            kCTFontWeightTrait: normalizedWeight(descriptor.weight),
+            kCTFontWeightTrait: weightTrait,
             kCTFontSlantTrait: descriptor.italic ? 1.0 : 0.0,
         ]
         let attributes: [CFString: Any] = [
@@ -36,7 +77,100 @@ public enum TextMetrics {
             kCTFontTraitsAttribute: traits as CFDictionary,
         ]
         let fontDescriptor = CTFontDescriptorCreateWithAttributes(attributes as CFDictionary)
-        return CTFontCreateWithFontDescriptor(fontDescriptor, descriptor.size, nil)
+        return CTFontCreateWithFontDescriptor(fontDescriptor, size, nil)
+    }
+
+    /// 统一排版行结果，供渲染侧与命中测试共用，确保末尾换行与断行高度严格一致。
+    internal struct LaidOutLine {
+        let line: CTLine?
+        let width: Double
+        let ascent: Double
+        let descent: Double
+        let leading: Double
+
+        var height: Double {
+            ascent + descent + leading
+        }
+    }
+
+    /// 统一执行多行文字排版（支持限定宽度断行与显式换行，且统一末尾换行高度）。
+    internal static func layoutLines(
+        text: String,
+        font: FontDescriptor,
+        maxWidth: Double?,
+        foregroundColor: CGColor? = nil
+    ) -> (ctFont: CTFont, ascent: Double, lines: [LaidOutLine]) {
+        let ctFont = self.font(for: font)
+        let fontAscent = Double(CTFontGetAscent(ctFont))
+        let fontDescent = Double(CTFontGetDescent(ctFont))
+        let fontLeading = Double(CTFontGetLeading(ctFont))
+        let emptyLine = LaidOutLine(
+            line: nil,
+            width: 0,
+            ascent: fontAscent,
+            descent: fontDescent,
+            leading: fontLeading
+        )
+
+        guard !text.isEmpty else {
+            return (ctFont, fontAscent, [])
+        }
+
+        var attributes: [NSAttributedString.Key: Any] = [
+            kCTFontAttributeName as NSAttributedString.Key: ctFont,
+        ]
+        if let foregroundColor {
+            attributes[kCTForegroundColorAttributeName as NSAttributedString.Key] = foregroundColor
+        }
+
+        var result: [LaidOutLine] = []
+
+        if let maxWidth, maxWidth > 0 {
+            let attributed = NSAttributedString(string: text, attributes: attributes)
+            let typesetter = CTTypesetterCreateWithAttributedString(attributed)
+            var index = 0
+            while index < attributed.length {
+                let count = CTTypesetterSuggestLineBreak(typesetter, index, maxWidth)
+                guard count > 0 else { break }
+                let line = CTTypesetterCreateLine(
+                    typesetter,
+                    CFRange(location: index, length: count)
+                )
+                result.append(measureLine(line))
+                index += count
+            }
+            // CTTypesetter 对末尾换行符不会生成额外的空行，显式补足空行高度，
+            // 使带 maxWidth 与不带 maxWidth 路径在末尾换行时的包围盒高度保持一致。
+            if text.hasSuffix("\n") || text.hasSuffix("\r") {
+                result.append(emptyLine)
+            }
+        } else {
+            for fragment in text.split(separator: "\n", omittingEmptySubsequences: false) {
+                if fragment.isEmpty {
+                    result.append(emptyLine)
+                    continue
+                }
+                let attributed = NSAttributedString(string: String(fragment), attributes: attributes)
+                let line = CTLineCreateWithAttributedString(attributed)
+                result.append(measureLine(line))
+            }
+        }
+
+        return (ctFont, fontAscent, result)
+    }
+
+    private static func measureLine(_ line: CTLine) -> LaidOutLine {
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        var leading: CGFloat = 0
+        let width = CTLineGetTypographicBounds(line, &ascent, &descent, &leading)
+        return LaidOutLine(
+            line: line,
+            width: Double(width),
+            ascent: Double(ascent),
+            descent: Double(descent),
+            leading: Double(leading)
+        )
     }
 
     /// 单行行高：ascent + descent + leading（像素）。

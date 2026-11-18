@@ -382,17 +382,20 @@ struct CaptureSessionTests {
         }
     }
 
-    @Test("预留的马赛克模式在校验时被拒绝")
-    func validateRejectsUnsupportedMosaicMode() {
-        let annotation = Annotation(kind: .mosaic(
+    @Test("高斯模糊与纯色马赛克模式均可通过校验")
+    func validateSupportsBlurAndSolidMosaicModes() throws {
+        let blurAnnotation = Annotation(kind: .mosaic(
             rect: rect(500, 400, 100, 100),
             mode: .blur,
             intensity: 8
         ))
+        let solidAnnotation = Annotation(kind: .mosaic(
+            rect: rect(650, 400, 100, 100),
+            mode: .solid,
+            intensity: 0
+        ))
 
-        #expect(throws: SessionInvariantError.unsupportedMosaicMode(.blur)) {
-            try session(annotations: [annotation]).validate()
-        }
+        try session(annotations: [blurAnnotation, solidAnnotation]).validate()
     }
 
     @Test("缩放系数非法时校验失败")
@@ -419,11 +422,11 @@ struct ModelPrimitiveTests {
         #expect(decoded == color)
     }
 
-    @Test("马赛克模式只在 pixelate 时可渲染")
+    @Test("所有马赛克模式（像素化、模糊、纯色）均支持渲染")
     func mosaicRenderability() {
         #expect(MosaicMode.pixelate.isRenderable)
-        #expect(MosaicMode.blur.isRenderable == false)
-        #expect(MosaicMode.solid.isRenderable == false)
+        #expect(MosaicMode.blur.isRenderable)
+        #expect(MosaicMode.solid.isRenderable)
     }
 
     @Test("包围盒对线类标注取两点极值")

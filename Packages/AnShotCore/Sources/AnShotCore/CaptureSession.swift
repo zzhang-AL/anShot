@@ -92,11 +92,12 @@ public struct CaptureSession: Codable, Equatable, Sendable {
         skippedAnnotationCount = 0
     }
 
+    /// 线程安全的静态 ISO-8601 日期格式化器（值类型，`Sendable`），避免重复创建格式化器实例。
+    private static let timestampFormat = Date.ISO8601FormatStyle.iso8601
+
     /// 当前 UTC 时间的 ISO-8601 表示。
     public static func timestamp(for date: Date = Date()) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.string(from: date)
+        timestampFormat.format(date)
     }
 
     private enum CodingKeys: String, CodingKey {

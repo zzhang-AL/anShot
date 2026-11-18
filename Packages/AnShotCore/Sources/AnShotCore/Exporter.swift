@@ -141,13 +141,22 @@ public enum Exporter {
 
     // MARK: - 文件名
 
+    /// 保护静态 `DateFormatter` 的互斥锁，保证多线程安全复用。
+    private static let fileNameFormatterLock = NSLock()
+    private static let fileNameFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH-mm-ss"
+        return formatter
+    }()
+
     /// 生成默认文件名，例如 `截图 2026-09-12 18-30-05.png`。
     ///
     /// 用 `-` 而不是 `:`：macOS 上文件名里的 `:` 在 Finder 中会显示成 `/`。
     public static func defaultFileName(at date: Date = Date()) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd HH-mm-ss"
-        return "截图 \(formatter.string(from: date)).png"
+        let formatted = fileNameFormatterLock.withLock {
+            fileNameFormatter.string(from: date)
+        }
+        return "截图 \(formatted).png"
     }
 }

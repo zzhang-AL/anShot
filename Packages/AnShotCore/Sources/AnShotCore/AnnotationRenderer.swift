@@ -15,15 +15,15 @@
 //  差异仅在于目标 CGContext，否则必然出现「屏幕上与导出图不一致」的缺陷。
 //
 
+import Accelerate
 import CoreGraphics
 import CoreText
 import Foundation
 
 /// 标注合成渲染器。
 public enum AnnotationRenderer {
-    /// 渲染管线可用的色彩空间（sRGB）。
-    private static let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
-        ?? CGColorSpaceCreateDeviceRGB()
+    /// 渲染管线回退色彩空间（sRGB）。
+    private static let fallbackColorSpace = ImageColorSpace.sRGB
 
     // MARK: - 对外接口
 
@@ -155,10 +155,12 @@ public enum AnnotationRenderer {
         }
 
         // 选区越界属于不变量违规（调用方应先 validate）；这里夹住而不是崩。
-        let x0 = min(max(0, Int(selection.origin.x.rounded(.down))), backdropWidth)
-        let y0 = min(max(0, Int(selection.origin.y.rounded(.down))), backdropHeight)
-        let x1 = min(max(0, Int((selection.origin.x + selection.size.width).rounded(.up))), backdropWidth)
-        let y1 = min(max(0, Int((selection.origin.y + selection.size.height).rounded(.up))), backdropHeight)
+        // 引入 1e-6 浮点容差，避免逻辑点乘以缩放系数后的 IEEE 754 尾数毛刺多吃进 1px 桌面杂边。
+        let epsilon = 1e-6
+        let x0 = min(max(0, Int((selection.origin.x + epsilon).rounded(.down))), backdropWidth)
+        let y0 = min(max(0, Int((selection.origin.y + epsilon).rounded(.down))), backdropHeight)
+        let x1 = min(max(0, Int((selection.origin.x + selection.size.width - epsilon).rounded(.up))), backdropWidth)
+        let y1 = min(max(0, Int((selection.origin.y + selection.size.height - epsilon).rounded(.up))), backdropHeight)
 
         let width = x1 - x0
         let height = y1 - y0
@@ -184,15 +186,28 @@ public enum AnnotationRenderer {
         let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue
             | CGBitmapInfo.byteOrder32Little.rawValue
 
-        guard let context = CGContext(
+        // 优先保留输入底图原生 RGB 输出广色域（如 Display P3 / sRGB）；
+        // 若底图色域不支持 8-bit 预乘位图创建，再安全回退至 sRGB。
+        let preferredSpace = ImageColorSpace.canvasColorSpace(for: backdrop)
+        let context = CGContext(
             data: nil,
             width: rect.width,
             height: rect.height,
             bitsPerComponent: 8,
             bytesPerRow: 0,
-            space: colorSpace,
+            space: preferredSpace,
             bitmapInfo: bitmapInfo
-        ) else {
+        ) ?? (preferredSpace !== fallbackColorSpace ? CGContext(
+            data: nil,
+            width: rect.width,
+            height: rect.height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: fallbackColorSpace,
+            bitmapInfo: bitmapInfo
+        ) : nil)
+
+        guard let context else {
             return nil
         }
 
@@ -263,10 +278,17 @@ public enum AnnotationRenderer {
     ) {
         switch annotation.kind {
         case let .rectangle(rect, stroke, fill, cornerRadius):
-            drawRectangle(rect, stroke: stroke, fill: fill, cornerRadius: cornerRadius, in: context)
+            drawRectangle(
+                rect,
+                stroke: stroke,
+                fill: fill,
+                cornerRadius: cornerRadius,
+                id: annotation.id,
+                in: context
+            )
 
         case let .line(start, end, stroke):
-            drawLine(start, end, stroke: stroke, in: context)
+            drawLine(start, end, stroke: stroke, id: annotation.id, in: context)
 
         case let .arrow(start, end, stroke, headLength, headWidth):
             drawArrow(
@@ -275,6 +297,7 @@ public enum AnnotationRenderer {
                 stroke: stroke,
                 headLength: headLength,
                 headWidth: headWidth,
+                id: annotation.id,
                 in: context
             )
 
@@ -315,7 +338,15 @@ public enum AnnotationRenderer {
             drawHighlight(rect, color: color, in: context)
 
         case let .measure(start, end, stroke):
-            drawMeasure(start: start, end: end, stroke: stroke, in: context)
+            drawMeasure(
+                start: start,
+                end: end,
+                stroke: stroke,
+                canvasOrigin: canvasOrigin,
+                canvasWidth: canvasWidth,
+                canvasHeight: canvasHeight,
+                in: context
+            )
 
         case let .magnifier(center, radius, zoom, border):
             drawMagnifier(
@@ -328,7 +359,7 @@ public enum AnnotationRenderer {
             )
 
         case let .freehand(points, stroke):
-            drawFreehand(points, stroke: stroke, in: context)
+            drawFreehand(points, stroke: stroke, id: annotation.id, in: context)
 
         case let .curvedArrow(start, control, end, stroke, headLength, headWidth):
             drawCurvedArrow(
@@ -338,6 +369,7 @@ public enum AnnotationRenderer {
                 stroke: stroke,
                 headLength: headLength,
                 headWidth: headWidth,
+                id: annotation.id,
                 in: context
             )
 
@@ -356,11 +388,19 @@ public enum AnnotationRenderer {
 
     // MARK: - 矢量标注
 
-    private static func drawRectangle(
+    /// 绘制椭圆标注辅助方法（预留供集成阶段接入 `Kind.ellipse` 复用）。
+    ///
+    /// - Parameters:
+    ///   - rect: 椭圆外接矩形（底图像素坐标）
+    ///   - stroke: 描边样式，支持 `isSketchy` 手绘双描边
+    ///   - fill: 可选填充颜色
+    ///   - id: 用于手绘微扰的确定性种子；缺省时采用固定常量种子
+    ///   - context: 目标渲染上下文
+    public static func drawEllipse(
         _ rect: PixelRect,
         stroke: StrokeStyle,
         fill: RGBAColor?,
-        cornerRadius: Double,
+        id: UUID? = nil,
         in context: CGContext
     ) {
         let cgRect = rect.cgRect
@@ -368,7 +408,65 @@ public enum AnnotationRenderer {
             return
         }
 
-        let radius = max(0, cornerRadius)
+        let path = CGPath(ellipseIn: cgRect, transform: nil)
+        context.saveGState()
+        defer { context.restoreGState() }
+
+        if let fill {
+            context.addPath(path)
+            context.setFillColor(fill.cgColor)
+            context.fillPath()
+        }
+
+        if stroke.isSketchy {
+            var rng = SketchyRandom(seedID: id)
+            let cx = Double(cgRect.midX)
+            let cy = Double(cgRect.midY)
+            let rx = Double(cgRect.width / 2)
+            let ry = Double(cgRect.height / 2)
+            let amplitude = sketchyAmplitude(for: stroke, span: min(rx, ry) * 2)
+            let segments = 28
+
+            for pass in 0 ..< 2 {
+                let passPath = CGMutablePath()
+                let angleOffset = rng.nextUnit() * 0.12
+                for step in 0 ... segments {
+                    let angle = angleOffset + (Double(step) / Double(segments)) * (.pi * 2)
+                    let radialJitter = 1.0 + (rng.nextUnit() * amplitude) / max(8.0, min(rx, ry))
+                    let pt = CGPoint(
+                        x: cx + rx * radialJitter * Foundation.cos(angle),
+                        y: cy + ry * radialJitter * Foundation.sin(angle)
+                    )
+                    if step == 0 {
+                        passPath.move(to: pt)
+                    } else {
+                        passPath.addLine(to: pt)
+                    }
+                }
+                strokeSketchyPass(passPath, stroke: stroke, pass: pass, in: context)
+            }
+            return
+        }
+
+        context.addPath(path)
+        configureStroke(stroke, in: context)
+        context.strokePath()
+    }
+
+    private static func drawRectangle(
+        _ rect: PixelRect,
+        stroke: StrokeStyle,
+        fill: RGBAColor?,
+        cornerRadius: Double,
+        id: UUID,
+        in context: CGContext
+    ) {
+        let cgRect = rect.cgRect
+        guard cgRect.width > 0, cgRect.height > 0 else {
+            return
+        }
+
+        let radius = min(max(0, cornerRadius), min(cgRect.width, cgRect.height) / 2)
         let path = radius > 0
             ? CGPath(roundedRect: cgRect, cornerWidth: radius, cornerHeight: radius, transform: nil)
             : CGPath(rect: cgRect, transform: nil)
@@ -382,6 +480,48 @@ public enum AnnotationRenderer {
             context.fillPath()
         }
 
+        if stroke.isSketchy {
+            var rng = SketchyRandom(seedID: id)
+            let span = min(Double(cgRect.width), Double(cgRect.height))
+            let amplitude = sketchyAmplitude(for: stroke, span: span)
+            let corners = [
+                CGPoint(x: cgRect.minX, y: cgRect.minY),
+                CGPoint(x: cgRect.maxX, y: cgRect.minY),
+                CGPoint(x: cgRect.maxX, y: cgRect.maxY),
+                CGPoint(x: cgRect.minX, y: cgRect.maxY),
+            ]
+            for pass in 0 ..< 2 {
+                let passPath = CGMutablePath()
+                if radius > 0 {
+                    // 圆角矩形先取四条直边端点并带轻微圆角插值点，施以手绘双描边扰动。
+                    let r = radius
+                    let loopPoints: [CGPoint] = [
+                        CGPoint(x: cgRect.minX + r, y: cgRect.minY),
+                        CGPoint(x: cgRect.maxX - r, y: cgRect.minY),
+                        CGPoint(x: cgRect.maxX, y: cgRect.minY + r),
+                        CGPoint(x: cgRect.maxX, y: cgRect.maxY - r),
+                        CGPoint(x: cgRect.maxX - r, y: cgRect.maxY),
+                        CGPoint(x: cgRect.minX + r, y: cgRect.maxY),
+                        CGPoint(x: cgRect.minX, y: cgRect.maxY - r),
+                        CGPoint(x: cgRect.minX, y: cgRect.minY + r),
+                    ]
+                    for idx in 0 ..< loopPoints.count {
+                        let a = loopPoints[idx]
+                        let b = loopPoints[(idx + 1) % loopPoints.count]
+                        appendSketchySegment(from: a, to: b, amplitude: amplitude, rng: &rng, to: passPath, moveToStart: idx == 0)
+                    }
+                } else {
+                    for edge in 0 ..< 4 {
+                        let a = corners[edge]
+                        let b = corners[(edge + 1) % 4]
+                        appendSketchySegment(from: a, to: b, amplitude: amplitude, rng: &rng, to: passPath, moveToStart: true)
+                    }
+                }
+                strokeSketchyPass(passPath, stroke: stroke, pass: pass, in: context)
+            }
+            return
+        }
+
         // 描边居中于路径：与 CoreGraphics 默认语义一致，不额外内缩。
         context.addPath(path)
         configureStroke(stroke, in: context)
@@ -392,10 +532,30 @@ public enum AnnotationRenderer {
         _ start: PixelPoint,
         _ end: PixelPoint,
         stroke: StrokeStyle,
+        id: UUID,
         in context: CGContext
     ) {
         context.saveGState()
         defer { context.restoreGState() }
+
+        if stroke.isSketchy {
+            var rng = SketchyRandom(seedID: id)
+            let span = hypot(end.x - start.x, end.y - start.y)
+            let amplitude = sketchyAmplitude(for: stroke, span: span)
+            for pass in 0 ..< 2 {
+                let passPath = CGMutablePath()
+                appendSketchySegment(
+                    from: start.cgPoint,
+                    to: end.cgPoint,
+                    amplitude: amplitude,
+                    rng: &rng,
+                    to: passPath,
+                    moveToStart: true
+                )
+                strokeSketchyPass(passPath, stroke: stroke, pass: pass, in: context)
+            }
+            return
+        }
 
         context.beginPath()
         context.move(to: start.cgPoint)
@@ -410,6 +570,7 @@ public enum AnnotationRenderer {
         stroke: StrokeStyle,
         headLength: Double,
         headWidth: Double,
+        id: UUID,
         in context: CGContext
     ) {
         let from = start.cgPoint
@@ -438,6 +599,43 @@ public enum AnnotationRenderer {
 
         context.saveGState()
         defer { context.restoreGState() }
+
+        if stroke.isSketchy {
+            var rng = SketchyRandom(seedID: id)
+            let shaftAmplitude = sketchyAmplitude(for: stroke, span: Double(length))
+            let headAmplitude = sketchyAmplitude(for: stroke, span: max(head, halfWidth * 2))
+
+            for pass in 0 ..< 2 {
+                let shaftPath = CGMutablePath()
+                appendSketchySegment(
+                    from: from,
+                    to: shaftEnd,
+                    amplitude: shaftAmplitude,
+                    rng: &rng,
+                    to: shaftPath,
+                    moveToStart: true
+                )
+                strokeSketchyPass(shaftPath, stroke: stroke, pass: pass, in: context)
+            }
+
+            // 头部先实心填充以保证尖端不镂空，再叠加手绘双描边轮廓。
+            context.beginPath()
+            context.move(to: to)
+            context.addLine(to: left)
+            context.addLine(to: right)
+            context.closePath()
+            context.setFillColor(stroke.color.cgColor)
+            context.fillPath()
+
+            for pass in 0 ..< 2 {
+                let headPath = CGMutablePath()
+                appendSketchySegment(from: to, to: left, amplitude: headAmplitude, rng: &rng, to: headPath, moveToStart: true)
+                appendSketchySegment(from: left, to: right, amplitude: headAmplitude, rng: &rng, to: headPath, moveToStart: false)
+                appendSketchySegment(from: right, to: to, amplitude: headAmplitude, rng: &rng, to: headPath, moveToStart: false)
+                strokeSketchyPass(headPath, stroke: stroke, pass: pass, in: context)
+            }
+            return
+        }
 
         context.beginPath()
         context.move(to: from)
@@ -493,9 +691,25 @@ public enum AnnotationRenderer {
         configureStroke(stroke, in: context)
         context.strokePath()
 
-        // 字号随半径走：固定字号在半径小的时候会撑满整个圆，半径大时又显得空。
-        let font = FontDescriptor.system(size: max(9, radius * 1.1))
-        drawCenteredText("\(index)", center: center.cgPoint, font: font, color: textColor, in: context)
+        // 字号随半径走；对于 >= 100 的多位数按实际排版宽度自适应缩放，防止序号穿出圆框。
+        let label = "\(index)"
+        var fontSize = max(9, radius * 1.1)
+        if index >= 100 || label.count >= 3 {
+            let probeFont = TextMetrics.font(for: .system(size: fontSize))
+            let probeLine = CTLineCreateWithAttributedString(
+                NSAttributedString(
+                    string: label,
+                    attributes: [kCTFontAttributeName as NSAttributedString.Key: probeFont]
+                )
+            )
+            let measuredWidth = Double(CTLineGetTypographicBounds(probeLine, nil, nil, nil))
+            let safeChordWidth = max(6.0, radius * 1.52)
+            if measuredWidth > safeChordWidth {
+                fontSize = max(6.0, fontSize * (safeChordWidth / measuredWidth))
+            }
+        }
+        let font = FontDescriptor.system(size: fontSize)
+        drawCenteredText(label, center: center.cgPoint, font: font, color: textColor, in: context)
     }
 
     /// 高亮：半透明填充的矩形。
@@ -513,7 +727,7 @@ public enum AnnotationRenderer {
         context.fill(cgRect)
     }
 
-    /// 测量：两点连线 + 中点处的距离读数（像素）。
+    /// 测量：两点连线 + 沿法向量偏移的圆角半透明读数底板。
     ///
     /// 只画读数不画单位：单位换算属 UI 层（契约 §2.2），
     /// 模型存的是底图像素，导出图上的数字必须与像素一致。
@@ -521,9 +735,12 @@ public enum AnnotationRenderer {
         start: PixelPoint,
         end: PixelPoint,
         stroke: StrokeStyle,
+        canvasOrigin: PixelPoint,
+        canvasWidth: Int,
+        canvasHeight: Int,
         in context: CGContext
     ) {
-        drawLine(start, end, stroke: stroke, in: context)
+        drawLine(start, end, stroke: stroke, id: UUID(), in: context)
 
         let dx = end.x - start.x
         let dy = end.y - start.y
@@ -532,19 +749,107 @@ public enum AnnotationRenderer {
             return
         }
 
-        // 读数贴着中点上方：字号跟线宽走，细线不至于读出大字。
-        let font = FontDescriptor.system(size: max(10, stroke.width * 6))
-        let center = CGPoint(
-            x: (start.x + end.x) / 2,
-            y: (start.y + end.y) / 2 - max(10, stroke.width * 6)
+        let label = "\(Int(length.rounded()))"
+        let fontSize = max(10, stroke.width * 6)
+        let font = FontDescriptor.system(size: fontSize)
+        let ctFont = TextMetrics.font(for: font)
+        let probeLine = CTLineCreateWithAttributedString(
+            NSAttributedString(
+                string: label,
+                attributes: [kCTFontAttributeName as NSAttributedString.Key: ctFont]
+            )
         )
-        drawCenteredText("\(Int(length.rounded()))", center: center, font: font, color: stroke.color, in: context)
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        var leading: CGFloat = 0
+        let textWidth = Double(CTLineGetTypographicBounds(probeLine, &ascent, &descent, &leading))
+        let textHeight = Double(ascent + descent + leading)
+
+        let padX = max(5.0, fontSize * 0.35)
+        let padY = max(3.0, fontSize * 0.2)
+        let pillWidth = textWidth + padX * 2
+        let pillHeight = textHeight + padY * 2
+
+        // 单位方向与规范化法向量（水平/斜线优先向画布上方偏移，纯竖线优先向右侧偏移）。
+        let ux = dx / length
+        let uy = dy / length
+        var nx = -uy
+        var ny = ux
+        if ny > 0.001 || (abs(ny) <= 0.001 && nx < 0) {
+            nx = -nx
+            ny = -ny
+        }
+
+        let gap = max(4.0, stroke.width / 2 + 4.0)
+        let normalOffset = gap + (abs(nx) * pillWidth + abs(ny) * pillHeight) / 2
+        let midX = (start.x + end.x) / 2
+        let midY = (start.y + end.y) / 2
+
+        let preferredCenter = CGPoint(x: midX + nx * normalOffset, y: midY + ny * normalOffset)
+        let flippedCenter = CGPoint(x: midX - nx * normalOffset, y: midY - ny * normalOffset)
+
+        let margin = 2.0
+        let minX = canvasOrigin.x + margin + pillWidth / 2
+        let maxX = canvasOrigin.x + Double(canvasWidth) - margin - pillWidth / 2
+        let minY = canvasOrigin.y + margin + pillHeight / 2
+        let maxY = canvasOrigin.y + Double(canvasHeight) - margin - pillHeight / 2
+
+        func fitsInCanvas(_ center: CGPoint) -> Bool {
+            (minX > maxX || (center.x >= minX && center.x <= maxX))
+                && (minY > maxY || (center.y >= minY && center.y <= maxY))
+        }
+
+        var labelCenter = preferredCenter
+        if !fitsInCanvas(preferredCenter) && fitsInCanvas(flippedCenter) {
+            labelCenter = flippedCenter
+        }
+
+        // 将读数底板中心钳制到画布可见边界内，彻底避免顶边或侧边裁切。
+        if minX <= maxX {
+            labelCenter.x = min(max(labelCenter.x, minX), maxX)
+        } else {
+            labelCenter.x = canvasOrigin.x + Double(canvasWidth) / 2
+        }
+        if minY <= maxY {
+            labelCenter.y = min(max(labelCenter.y, minY), maxY)
+        } else {
+            labelCenter.y = canvasOrigin.y + Double(canvasHeight) / 2
+        }
+
+        let pillRect = CGRect(
+            x: labelCenter.x - pillWidth / 2,
+            y: labelCenter.y - pillHeight / 2,
+            width: pillWidth,
+            height: pillHeight
+        )
+        let cornerRadius = min(pillWidth, pillHeight) / 2
+        let pillPath = CGPath(
+            roundedRect: pillRect,
+            cornerWidth: cornerRadius,
+            cornerHeight: cornerRadius,
+            transform: nil
+        )
+
+        // 根据文字感知亮度自适应高对比度半透明底板，确保浅色/深色标注读数均清晰可读。
+        let luminance = 0.2126 * stroke.color.r + 0.7152 * stroke.color.g + 0.0722 * stroke.color.b
+        let backdropColor = luminance < 0.45
+            ? RGBAColor(r: 0.96, g: 0.96, b: 0.98, a: 0.86)
+            : RGBAColor(r: 0.08, g: 0.09, b: 0.12, a: 0.78)
+
+        context.saveGState()
+        context.addPath(pillPath)
+        context.setFillColor(backdropColor.cgColor)
+        context.fillPath()
+        context.restoreGState()
+
+        drawCenteredText(label, center: labelCenter, font: font, color: stroke.color, in: context)
     }
 
     /// 放大镜：把圆心处一小块底图放大后画回圆形区域。
     ///
-    /// 与马赛克同类——都需要读**当前画布**的像素。这里取整幅画布的快照后裁出源矩形，
-    /// 而不是逐像素搬：放大是按倍率重采样，交给 CoreGraphics 的插值质量更好。
+    /// 与马赛克同类——都需要读**当前画布**的像素。直接在圆形 `clip()` 内以 `center` 为锚点
+    /// 局部翻转 Y 轴并按 `zoom` 绘制整幅画布快照，既抵消画布坐标系 Y 轴翻转引起的倒置，
+    /// 又彻底消除贴边 `cropping` 引起的拉伸畸变。
     private static func drawMagnifier(
         center: PixelPoint,
         radius: Double,
@@ -564,25 +869,28 @@ public enum AnnotationRenderer {
         )
         let path = CGPath(ellipseIn: destRect, transform: nil)
 
-        // 源矩形比目标小 `zoom` 倍，且要在**画布图像坐标**下给出：
-        // 画布含留白，内容的原点在 `canvasOrigin`（makeCanvas 建立的坐标系）。
-        let sourceRect = CGRect(
-            x: canvasOrigin.x + center.x - radius / zoom,
-            y: canvasOrigin.y + center.y - radius / zoom,
-            width: radius * 2 / zoom,
-            height: radius * 2 / zoom
-        )
+        context.saveGState()
+        if let snapshot = context.makeImage() {
+            context.addPath(path)
+            context.clip()
+
+            // 画布 CTM 已翻转 Y 轴（向下），在圆心处再次局部翻转使图像正立，
+            // 同时以 `center - canvasOrigin` 为放大锚点等比绘制快照。
+            context.translateBy(x: center.x, y: center.y)
+            context.scaleBy(x: 1, y: -1)
+            let drawRect = CGRect(
+                x: (canvasOrigin.x - center.x) * zoom,
+                y: (center.y - canvasOrigin.y - Double(snapshot.height)) * zoom,
+                width: Double(snapshot.width) * zoom,
+                height: Double(snapshot.height) * zoom
+            )
+            context.interpolationQuality = .high
+            context.draw(snapshot, in: drawRect)
+        }
+        context.restoreGState()
 
         context.saveGState()
         defer { context.restoreGState() }
-
-        if let snapshot = context.makeImage(), let source = snapshot.cropping(to: sourceRect) {
-            context.addPath(path)
-            context.clip()
-            context.interpolationQuality = .high
-            context.draw(source, in: destRect)
-        }
-
         context.addPath(path)
         configureStroke(border, in: context)
         context.strokePath()
@@ -595,31 +903,56 @@ public enum AnnotationRenderer {
     private static func drawFreehand(
         _ points: [PixelPoint],
         stroke: StrokeStyle,
+        id: UUID,
         in context: CGContext
     ) {
         guard points.count >= 2 else {
             return
         }
-        let path = CGMutablePath()
-        path.move(to: points[0].cgPoint)
 
-        if points.count == 2 {
-            path.addLine(to: points[1].cgPoint)
-        } else {
-            // 以每个采样点为控制点、相邻两点的中点为端点：
-            // 曲线恰好穿过中点，不会像直接连折线那样出现尖角。
-            for index in 1..<(points.count - 1) {
-                let current = points[index].cgPoint
-                let next = points[index + 1].cgPoint
-                let mid = CGPoint(x: (current.x + next.x) / 2, y: (current.y + next.y) / 2)
-                path.addQuadCurve(to: mid, control: current)
+        func buildSmoothPath(from source: [PixelPoint]) -> CGMutablePath {
+            let path = CGMutablePath()
+            path.move(to: source[0].cgPoint)
+            if source.count == 2 {
+                path.addLine(to: source[1].cgPoint)
+            } else {
+                // 以每个采样点为控制点、相邻两点的中点为端点：
+                // 曲线恰好穿过中点，不会像直接连折线那样出现尖角。
+                for index in 1 ..< (source.count - 1) {
+                    let current = source[index].cgPoint
+                    let next = source[index + 1].cgPoint
+                    let mid = CGPoint(x: (current.x + next.x) / 2, y: (current.y + next.y) / 2)
+                    path.addQuadCurve(to: mid, control: current)
+                }
+                path.addLine(to: source[source.count - 1].cgPoint)
             }
-            path.addLine(to: points[points.count - 1].cgPoint)
+            return path
         }
 
         context.saveGState()
         defer { context.restoreGState() }
-        context.addPath(path)
+
+        if stroke.isSketchy {
+            var rng = SketchyRandom(seedID: id)
+            let amplitude = sketchyAmplitude(for: stroke, span: 60) * 0.75
+            let primaryPoints = points.map {
+                PixelPoint(
+                    x: $0.x + rng.nextUnit() * amplitude * 0.35,
+                    y: $0.y + rng.nextUnit() * amplitude * 0.35
+                )
+            }
+            let secondaryPoints = points.map {
+                PixelPoint(
+                    x: $0.x + rng.nextUnit() * amplitude,
+                    y: $0.y + rng.nextUnit() * amplitude
+                )
+            }
+            strokeSketchyPass(buildSmoothPath(from: primaryPoints), stroke: stroke, pass: 0, in: context)
+            strokeSketchyPass(buildSmoothPath(from: secondaryPoints), stroke: stroke, pass: 1, in: context)
+            return
+        }
+
+        context.addPath(buildSmoothPath(from: points))
         configureStroke(stroke, in: context)
         context.strokePath()
     }
@@ -632,6 +965,7 @@ public enum AnnotationRenderer {
         stroke: StrokeStyle,
         headLength: Double,
         headWidth: Double,
+        id: UUID,
         in context: CGContext
     ) {
         // 头部方向取**终点切线**（end − control），不是 start→end 的弦方向：
@@ -640,7 +974,7 @@ public enum AnnotationRenderer {
         let tangentY = end.y - control.y
         let tangentLength = (tangentX * tangentX + tangentY * tangentY).squareRoot()
         guard tangentLength > 0 else {
-            drawLine(start, end, stroke: stroke, in: context)
+            drawLine(start, end, stroke: stroke, id: id, in: context)
             return
         }
         let ux = tangentX / tangentLength
@@ -657,6 +991,49 @@ public enum AnnotationRenderer {
 
         context.saveGState()
         defer { context.restoreGState() }
+
+        if stroke.isSketchy {
+            var rng = SketchyRandom(seedID: id)
+            let span = hypot(end.x - start.x, end.y - start.y)
+            let shaftAmplitude = sketchyAmplitude(for: stroke, span: span)
+            let headAmplitude = sketchyAmplitude(for: stroke, span: max(head, halfWidth * 2))
+
+            for pass in 0 ..< 2 {
+                let shaftPath = CGMutablePath()
+                let jitterStart = CGPoint(
+                    x: start.x + rng.nextUnit() * shaftAmplitude * 0.35,
+                    y: start.y + rng.nextUnit() * shaftAmplitude * 0.35
+                )
+                let jitterControl = CGPoint(
+                    x: control.x + rng.nextUnit() * shaftAmplitude,
+                    y: control.y + rng.nextUnit() * shaftAmplitude
+                )
+                let jitterBase = CGPoint(
+                    x: headBase.x + rng.nextUnit() * shaftAmplitude * 0.35,
+                    y: headBase.y + rng.nextUnit() * shaftAmplitude * 0.35
+                )
+                shaftPath.move(to: jitterStart)
+                shaftPath.addQuadCurve(to: jitterBase, control: jitterControl)
+                strokeSketchyPass(shaftPath, stroke: stroke, pass: pass, in: context)
+            }
+
+            context.beginPath()
+            context.move(to: tip)
+            context.addLine(to: left)
+            context.addLine(to: right)
+            context.closePath()
+            context.setFillColor(stroke.color.cgColor)
+            context.fillPath()
+
+            for pass in 0 ..< 2 {
+                let headPath = CGMutablePath()
+                appendSketchySegment(from: tip, to: left, amplitude: headAmplitude, rng: &rng, to: headPath, moveToStart: true)
+                appendSketchySegment(from: left, to: right, amplitude: headAmplitude, rng: &rng, to: headPath, moveToStart: false)
+                appendSketchySegment(from: right, to: tip, amplitude: headAmplitude, rng: &rng, to: headPath, moveToStart: false)
+                strokeSketchyPass(headPath, stroke: stroke, pass: pass, in: context)
+            }
+            return
+        }
 
         // 杆画到头部底边：画到尖端的话线宽会在三角形外露出一截。
         context.beginPath()
@@ -736,101 +1113,36 @@ public enum AnnotationRenderer {
         defer { context.restoreGState() }
         context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
 
-        let ctFont = TextMetrics.font(for: font)
-        let attributes: [NSAttributedString.Key: Any] = [
-            kCTFontAttributeName as NSAttributedString.Key: ctFont,
-            kCTForegroundColorAttributeName as NSAttributedString.Key: color.cgColor,
-        ]
+        // 与 `AnnotationHitTest.measuredTextRect` 共用 `TextMetrics.layoutLines`，
+        // 确保断行宽度、行高及末尾换行空行推进完全一致。
+        let layout = TextMetrics.layoutLines(
+            text: text,
+            font: font,
+            maxWidth: maxWidth,
+            foregroundColor: color.cgColor
+        )
 
         var baselineY = origin.y
-
-        if let maxWidth, maxWidth > 0 {
-            // 有宽度约束时才交给 typesetter 做断行分析。
-            // 无约束时不传「极大宽度」而改为按显式换行符分行，是为了让语义准确
-            // （「不约束宽度」不应靠一个假宽度来表达），也省掉一次无谓的断行分析。
-            let attributed = NSAttributedString(string: text, attributes: attributes)
-            let typesetter = CTTypesetterCreateWithAttributedString(attributed)
-            var index = 0
-
-            while index < attributed.length {
-                let count = CTTypesetterSuggestLineBreak(typesetter, index, maxWidth)
-                guard count > 0 else {
-                    break
-                }
-
-                let line = CTTypesetterCreateLine(
-                    typesetter,
-                    CFRange(location: index, length: count)
-                )
-                baselineY = drawTextLine(
-                    line,
-                    x: origin.x,
-                    baselineY: baselineY,
-                    background: background,
-                    in: context
-                )
-                index += count
+        for item in layout.lines {
+            guard let line = item.line else {
+                baselineY += item.height
+                continue
             }
-        } else {
-            // 无宽度约束：只在显式换行符处分行，不做宽度分析。
-            let fragments = text.split(separator: "\n", omittingEmptySubsequences: false)
-            let emptyLineHeight = fontLineHeight(ctFont)
-
-            for fragment in fragments {
-                if fragment.isEmpty {
-                    // 空行没有字形，用字体行高推进基线，保持行间距一致。
-                    baselineY += emptyLineHeight
-                    continue
-                }
-
-                let attributed = NSAttributedString(string: String(fragment), attributes: attributes)
-                let line = CTLineCreateWithAttributedString(attributed)
-                baselineY = drawTextLine(
-                    line,
+            if let background {
+                // 底色紧贴该行的排版盒：上边为基线减去 ascent。
+                let box = CGRect(
                     x: origin.x,
-                    baselineY: baselineY,
-                    background: background,
-                    in: context
+                    y: baselineY - item.ascent,
+                    width: item.width,
+                    height: item.height
                 )
+                context.setFillColor(background.cgColor)
+                context.fill(box)
             }
+            context.textPosition = CGPoint(x: origin.x, y: baselineY)
+            CTLineDraw(line, context)
+            baselineY += item.height
         }
-    }
-
-    /// 绘制一行文字，返回下一行的基线 y。
-    private static func drawTextLine(
-        _ line: CTLine,
-        x: Double,
-        baselineY: Double,
-        background: RGBAColor?,
-        in context: CGContext
-    ) -> Double {
-        var ascent: CGFloat = 0
-        var descent: CGFloat = 0
-        var leading: CGFloat = 0
-        let width = CTLineGetTypographicBounds(line, &ascent, &descent, &leading)
-        let lineHeight = Double(ascent + descent + leading)
-
-        if let background {
-            // 底色紧贴该行的排版盒：上边为基线再加 ascent。
-            let box = CGRect(
-                x: x,
-                y: baselineY - Double(ascent),
-                width: Double(width),
-                height: lineHeight
-            )
-            context.setFillColor(background.cgColor)
-            context.fill(box)
-        }
-
-        context.textPosition = CGPoint(x: x, y: baselineY)
-        CTLineDraw(line, context)
-
-        return baselineY + lineHeight
-    }
-
-    /// 字体自身的行高（ascent + descent + leading）。
-    private static func fontLineHeight(_ font: CTFont) -> Double {
-        Double(CTFontGetAscent(font) + CTFontGetDescent(font) + CTFontGetLeading(font))
     }
 
     // MARK: - 马赛克
@@ -944,7 +1256,7 @@ public enum AnnotationRenderer {
         }
     }
 
-    /// 像素化马赛克。
+    /// 统一打码入口：支持像素化（`pixelate`）、高斯模糊（`blur`）与纯色遮盖（`solid`）。
     ///
     /// 直接读写位图数据而不经过 CoreGraphics 绘制：
     /// 这是唯一需要「读回像素」的标注，走绘制路径无法实现。
@@ -952,9 +1264,7 @@ public enum AnnotationRenderer {
     /// 正因为它是直接寻址位图，调用者必须提供 `canvasOrigin`：
     /// CGContext 的变换只影响矢量绘制，**不会**改变 `context.data` 的索引基准。
     ///
-    /// 块网格**锚定在底图原点**。块号由底图坐标决定，与拖动框或笔画的起点无关；
-    /// 若按「框的左上角」起算，同一区域先后刷两次会得到两套网格，
-    /// 拼缝处会出现半块错位。
+    /// 对于像素化模式，块网格**锚定在底图原点**，确保同一区域多次涂抹拼缝处不出现半块错位。
     private static func applyMosaic(
         coverage: MosaicCoverage,
         mode: MosaicMode,
@@ -964,12 +1274,6 @@ public enum AnnotationRenderer {
         canvasWidth: Int,
         canvasHeight: Int
     ) {
-        // M1 只实现 pixelate；其余模式在契约中预留，此处静默跳过而非中断整幅渲染。
-        guard mode == .pixelate else {
-            return
-        }
-
-        let blockSize = max(2, Int(intensity.rounded()))
         guard let data = context.data else {
             return
         }
@@ -998,95 +1302,332 @@ public enum AnnotationRenderer {
             return
         }
 
-        // 向下取整地求块号：块网格锚定在底图原点，
-        // 因此块号 = floor(底图坐标 / 块边长)。
-        let firstBlockX = Int(floor(Double(canvasX0 + originX) / Double(blockSize)))
-        let lastBlockX = Int(floor(Double(canvasX1 - 1 + originX) / Double(blockSize)))
-        let firstBlockY = Int(floor(Double(canvasY0 + originY) / Double(blockSize)))
-        let lastBlockY = Int(floor(Double(canvasY1 - 1 + originY) / Double(blockSize)))
-
-        let halfDiagonal = Double(blockSize) * 0.7072
-
-        // 涂抹：先把笔迹描成一条粗线作为**覆盖掩码**，再逐像素查表。
-        //
-        // 不能逐像素问 `coverage.covers`：对 `.stroke` 它要算到整条路径的
-        // 距离（O(点数)），于是总成本变成 O(覆盖像素 × 点数)。实测
-        // 2000×1500 选区（300 万像素）配 300 个点是 **6.5 秒/帧**——
-        // 用户感受到的「涂抹很卡」就是它。把描线交给 CoreGraphics 后，
-        // 每像素只剩一次查表（O(1)）。
+        // 涂抹模式统一构建「局部包围盒尺寸」的 8-bit 灰度掩码，
+        // 相比分配整幅画布可将大图涂抹内存降低百倍。
         var maskContext: CGContext?
         var maskBuffer: UnsafeMutablePointer<UInt8>?
-        var digestContext: CGContext?
-        var digestBuffer: UnsafeMutablePointer<UInt8>?
+        let maskWidth = canvasX1 - canvasX0
+        let maskHeight = canvasY1 - canvasY0
         if case let .stroke(points, radius) = coverage {
             maskContext = makeStrokeMask(
                 points: points,
                 radius: radius,
                 originX: originX,
                 originY: originY,
-                canvasWidth: canvasWidth,
-                canvasHeight: canvasHeight
+                maskOriginX: canvasX0,
+                maskOriginY: canvasY0,
+                maskWidth: maskWidth,
+                maskHeight: maskHeight
             )
             maskBuffer = maskContext?.data?.assumingMemoryBound(to: UInt8.self)
+        }
+        let maskBytesPerRow = maskContext?.bytesPerRow ?? 0
 
-            digestContext = makeStrokeBlockDigest(
-                points: points,
-                radius: radius,
-                blockSize: blockSize,
-                firstBlockX: firstBlockX,
-                firstBlockY: firstBlockY,
-                lastBlockX: lastBlockX,
-                lastBlockY: lastBlockY
+        switch mode {
+        case .pixelate:
+            let blockSize = max(2, Int(intensity.rounded()))
+            let firstBlockX = Int(floor(Double(canvasX0 + originX) / Double(blockSize)))
+            let lastBlockX = Int(floor(Double(canvasX1 - 1 + originX) / Double(blockSize)))
+            let firstBlockY = Int(floor(Double(canvasY0 + originY) / Double(blockSize)))
+            let lastBlockY = Int(floor(Double(canvasY1 - 1 + originY) / Double(blockSize)))
+            let halfDiagonal = Double(blockSize) * 0.7072
+
+            var digestContext: CGContext?
+            var digestBuffer: UnsafeMutablePointer<UInt8>?
+            if case let .stroke(points, radius) = coverage {
+                digestContext = makeStrokeBlockDigest(
+                    points: points,
+                    radius: radius,
+                    blockSize: blockSize,
+                    firstBlockX: firstBlockX,
+                    firstBlockY: firstBlockY,
+                    lastBlockX: lastBlockX,
+                    lastBlockY: lastBlockY
+                )
+                digestBuffer = digestContext?.data?.assumingMemoryBound(to: UInt8.self)
+            }
+
+            for blockY in firstBlockY ... lastBlockY {
+                let blockY0 = max(canvasY0, blockY * blockSize - originY)
+                let blockY1 = min(canvasY1, blockY * blockSize - originY + blockSize)
+                guard blockY0 < blockY1 else { continue }
+
+                for blockX in firstBlockX ... lastBlockX {
+                    let blockX0 = max(canvasX0, blockX * blockSize - originX)
+                    let blockX1 = min(canvasX1, blockX * blockSize - originX + blockSize)
+                    guard blockX0 < blockX1 else { continue }
+
+                    if let digestBuffer, let digestContext {
+                        let dx = blockX - firstBlockX
+                        let dy = blockY - firstBlockY
+                        if digestBuffer[dy * digestContext.bytesPerRow + dx] == 0 {
+                            continue
+                        }
+                    }
+
+                    if maskBuffer == nil, digestBuffer == nil, case let .stroke(_, radius) = coverage {
+                        let centerX = Double((blockX0 + blockX1) / 2 + originX)
+                        let centerY = Double((blockY0 + blockY1) / 2 + originY)
+                        if coverage.distanceToPath(x: centerX, y: centerY) - halfDiagonal > radius {
+                            continue
+                        }
+                    }
+
+                    pixelateBlock(
+                        x0: blockX0,
+                        x1: blockX1,
+                        y0: blockY0,
+                        y1: blockY1,
+                        coverage: coverage,
+                        mask: maskBuffer,
+                        maskOriginX: canvasX0,
+                        maskOriginY: canvasY0,
+                        maskBytesPerRow: maskBytesPerRow,
+                        originX: originX,
+                        originY: originY,
+                        buffer: buffer,
+                        bytesPerRow: bytesPerRow
+                    )
+                }
+            }
+
+        case .blur:
+            applyBlur(
+                x0: canvasX0,
+                x1: canvasX1,
+                y0: canvasY0,
+                y1: canvasY1,
+                intensity: intensity,
+                coverage: coverage,
+                mask: maskBuffer,
+                maskBytesPerRow: maskBytesPerRow,
+                originX: originX,
+                originY: originY,
+                canvasWidth: canvasWidth,
+                canvasHeight: canvasHeight,
+                buffer: buffer,
+                bytesPerRow: bytesPerRow
             )
-            digestBuffer = digestContext?.data?.assumingMemoryBound(to: UInt8.self)
+
+        case .solid:
+            applySolid(
+                x0: canvasX0,
+                x1: canvasX1,
+                y0: canvasY0,
+                y1: canvasY1,
+                coverage: coverage,
+                mask: maskBuffer,
+                maskBytesPerRow: maskBytesPerRow,
+                originX: originX,
+                originY: originY,
+                buffer: buffer,
+                bytesPerRow: bytesPerRow
+            )
+        }
+    }
+
+    /// 使用 Accelerate 高斯近似卷积（Tent + Box + `kvImageEdgeExtend`）实现局部模糊打码。
+    private static func applyBlur(
+        x0: Int,
+        x1: Int,
+        y0: Int,
+        y1: Int,
+        intensity: Double,
+        coverage: MosaicCoverage,
+        mask: UnsafeMutablePointer<UInt8>?,
+        maskBytesPerRow: Int,
+        originX: Int,
+        originY: Int,
+        canvasWidth: Int,
+        canvasHeight: Int,
+        buffer: UnsafeMutablePointer<UInt8>,
+        bytesPerRow: Int
+    ) {
+        let blurRadius = max(1, min(Int(intensity.rounded()), 120))
+        let subRadius = max(1, Int((Double(blurRadius) * 0.65).rounded()))
+        let kernelSize = UInt32(subRadius * 2 + 1)
+
+        // 向四周借取 `blurRadius` 的真实画布像素，避免打码框内部切边失真；
+        // 遇画布真边界则交由 `kvImageEdgeExtend` 延伸像素，消除边缘黑晕。
+        let srcX0 = max(0, x0 - blurRadius)
+        let srcY0 = max(0, y0 - blurRadius)
+        let srcX1 = min(canvasWidth, x1 + blurRadius)
+        let srcY1 = min(canvasHeight, y1 + blurRadius)
+        let srcWidth = srcX1 - srcX0
+        let srcHeight = srcY1 - srcY0
+        guard srcWidth > 0, srcHeight > 0 else {
+            return
         }
 
-        for blockY in firstBlockY ... lastBlockY {
-            let blockY0 = max(canvasY0, blockY * blockSize - originY)
-            let blockY1 = min(canvasY1, blockY * blockSize - originY + blockSize)
-            guard blockY0 < blockY1 else { continue }
+        let srcRowBytes = srcWidth * 4
+        var srcBytes = [UInt8](repeating: 0, count: srcRowBytes * srcHeight)
+        var midBytes = [UInt8](repeating: 0, count: srcRowBytes * srcHeight)
+        var dstBytes = [UInt8](repeating: 0, count: srcRowBytes * srcHeight)
 
-            for blockX in firstBlockX ... lastBlockX {
-                let blockX0 = max(canvasX0, blockX * blockSize - originX)
-                let blockX1 = min(canvasX1, blockX * blockSize - originX + blockSize)
-                guard blockX0 < blockX1 else { continue }
+        srcBytes.withUnsafeMutableBytes { rawSrc in
+            guard let dstPtr = rawSrc.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            for row in 0 ..< srcHeight {
+                let srcRowPtr = buffer + (srcY0 + row) * bytesPerRow + srcX0 * 4
+                let localPtr = dstPtr + row * srcRowBytes
+                memcpy(localPtr, srcRowPtr, srcRowBytes)
+            }
+        }
 
-                // 块级预筛之一：笔迹的块摘要。摘要为 0 的块整块跳过。
-                //
-                // 这是涂抹最重要的一层优化：包围盒对「手抖、来回涂」的笔迹
-                // 会迅速膨胀（实测弯曲笔迹的包围盒覆盖 11385 块，实际只经过
-                // 约 500 块），多算的二十倍全花在空块上。
-                if let digestBuffer, let digestContext {
-                    let dx = blockX - firstBlockX
-                    let dy = blockY - firstBlockY
-                    if digestBuffer[dy * digestContext.bytesPerRow + dx] == 0 {
-                        continue
+        let tentOK: vImage_Error = srcBytes.withUnsafeMutableBytes { rawSrc in
+            midBytes.withUnsafeMutableBytes { rawMid in
+                dstBytes.withUnsafeMutableBytes { rawDst in
+                    var srcBuf = vImage_Buffer(
+                        data: rawSrc.baseAddress,
+                        height: vImagePixelCount(srcHeight),
+                        width: vImagePixelCount(srcWidth),
+                        rowBytes: srcRowBytes
+                    )
+                    var midBuf = vImage_Buffer(
+                        data: rawMid.baseAddress,
+                        height: vImagePixelCount(srcHeight),
+                        width: vImagePixelCount(srcWidth),
+                        rowBytes: srcRowBytes
+                    )
+                    var dstBuf = vImage_Buffer(
+                        data: rawDst.baseAddress,
+                        height: vImagePixelCount(srcHeight),
+                        width: vImagePixelCount(srcWidth),
+                        rowBytes: srcRowBytes
+                    )
+
+                    let tentTempSize = vImageTentConvolve_ARGB8888(
+                        &srcBuf,
+                        &midBuf,
+                        nil,
+                        0,
+                        0,
+                        kernelSize,
+                        kernelSize,
+                        nil,
+                        vImage_Flags(kvImageEdgeExtend | kvImageGetTempBufferSize)
+                    )
+                    let boxTempSize = vImageBoxConvolve_ARGB8888(
+                        &midBuf,
+                        &dstBuf,
+                        nil,
+                        0,
+                        0,
+                        kernelSize,
+                        kernelSize,
+                        nil,
+                        vImage_Flags(kvImageEdgeExtend | kvImageGetTempBufferSize)
+                    )
+                    let tempBytes = max(0, max(tentTempSize, boxTempSize))
+                    var tempBuffer = [UInt8](repeating: 0, count: max(1, tempBytes))
+                    return tempBuffer.withUnsafeMutableBytes { rawTemp in
+                        let tempPtr = tempBytes > 0 ? rawTemp.baseAddress : nil
+                        let e1 = vImageTentConvolve_ARGB8888(
+                            &srcBuf,
+                            &midBuf,
+                            tempPtr,
+                            0,
+                            0,
+                            kernelSize,
+                            kernelSize,
+                            nil,
+                            vImage_Flags(kvImageEdgeExtend)
+                        )
+                        guard e1 == kvImageNoError else { return e1 }
+                        return vImageBoxConvolve_ARGB8888(
+                            &midBuf,
+                            &dstBuf,
+                            tempPtr,
+                            0,
+                            0,
+                            kernelSize,
+                            kernelSize,
+                            nil,
+                            vImage_Flags(kvImageEdgeExtend)
+                        )
                     }
                 }
+            }
+        }
+        guard tentOK == kvImageNoError else {
+            return
+        }
 
-                // 块级预筛之二（仅几何覆盖需要，矩形与笔迹都走不到这里）：
-                // 块很小，块中心到路径的距离与块内任意点的偏差不超过半对角线。
-                if maskBuffer == nil, digestBuffer == nil, case let .stroke(_, radius) = coverage {
-                    let centerX = Double((blockX0 + blockX1) / 2 + originX)
-                    let centerY = Double((blockY0 + blockY1) / 2 + originY)
-                    if coverage.distanceToPath(x: centerX, y: centerY) - halfDiagonal > radius {
+        // 将卷积结果按掩码写回主画布：矩形走覆盖判定，涂抹按局部灰度掩码平滑混合。
+        for y in y0 ..< y1 {
+            let localY = y - srcY0
+            let maskRowOffset = (y - y0) * maskBytesPerRow
+            for x in x0 ..< x1 {
+                let dstOffset = y * bytesPerRow + x * 4
+                let blurredOffset = localY * srcRowBytes + (x - srcX0) * 4
+
+                if let mask {
+                    let alpha = Int(mask[maskRowOffset + (x - x0)])
+                    if alpha == 0 {
                         continue
                     }
+                    if alpha == 255 {
+                        buffer[dstOffset] = dstBytes[blurredOffset]
+                        buffer[dstOffset + 1] = dstBytes[blurredOffset + 1]
+                        buffer[dstOffset + 2] = dstBytes[blurredOffset + 2]
+                        buffer[dstOffset + 3] = dstBytes[blurredOffset + 3]
+                    } else {
+                        let inv = 255 - alpha
+                        buffer[dstOffset] = UInt8((Int(dstBytes[blurredOffset]) * alpha + Int(buffer[dstOffset]) * inv + 127) / 255)
+                        buffer[dstOffset + 1] = UInt8((Int(dstBytes[blurredOffset + 1]) * alpha + Int(buffer[dstOffset + 1]) * inv + 127) / 255)
+                        buffer[dstOffset + 2] = UInt8((Int(dstBytes[blurredOffset + 2]) * alpha + Int(buffer[dstOffset + 2]) * inv + 127) / 255)
+                        buffer[dstOffset + 3] = UInt8((Int(dstBytes[blurredOffset + 3]) * alpha + Int(buffer[dstOffset + 3]) * inv + 127) / 255)
+                    }
+                } else if coverage.covers(backdropX: Double(x + originX), backdropY: Double(y + originY)) {
+                    buffer[dstOffset] = dstBytes[blurredOffset]
+                    buffer[dstOffset + 1] = dstBytes[blurredOffset + 1]
+                    buffer[dstOffset + 2] = dstBytes[blurredOffset + 2]
+                    buffer[dstOffset + 3] = dstBytes[blurredOffset + 3]
                 }
+            }
+        }
+    }
 
-                pixelateBlock(
-                    x0: blockX0,
-                    x1: blockX1,
-                    y0: blockY0,
-                    y1: blockY1,
-                    coverage: coverage,
-                    mask: maskBuffer,
-                    maskBytesPerRow: maskContext?.bytesPerRow ?? 0,
-                    originX: originX,
-                    originY: originY,
-                    buffer: buffer,
-                    bytesPerRow: bytesPerRow
-                )
+    /// 纯色遮盖打码：按覆盖区域与涂抹掩码填充不透明纯黑遮盖（BGRA = `0, 0, 0, 255`）。
+    private static func applySolid(
+        x0: Int,
+        x1: Int,
+        y0: Int,
+        y1: Int,
+        coverage: MosaicCoverage,
+        mask: UnsafeMutablePointer<UInt8>?,
+        maskBytesPerRow: Int,
+        originX: Int,
+        originY: Int,
+        buffer: UnsafeMutablePointer<UInt8>,
+        bytesPerRow: Int
+    ) {
+        for y in y0 ..< y1 {
+            let maskRowOffset = (y - y0) * maskBytesPerRow
+            for x in x0 ..< x1 {
+                let offset = y * bytesPerRow + x * 4
+                if let mask {
+                    let alpha = Int(mask[maskRowOffset + (x - x0)])
+                    if alpha == 0 {
+                        continue
+                    }
+                    if alpha == 255 {
+                        buffer[offset] = 0
+                        buffer[offset + 1] = 0
+                        buffer[offset + 2] = 0
+                        buffer[offset + 3] = 255
+                    } else {
+                        let inv = 255 - alpha
+                        buffer[offset] = UInt8((Int(buffer[offset]) * inv + 127) / 255)
+                        buffer[offset + 1] = UInt8((Int(buffer[offset + 1]) * inv + 127) / 255)
+                        buffer[offset + 2] = UInt8((Int(buffer[offset + 2]) * inv + 127) / 255)
+                        buffer[offset + 3] = UInt8((255 * alpha + Int(buffer[offset + 3]) * inv + 127) / 255)
+                    }
+                } else if coverage.covers(backdropX: Double(x + originX), backdropY: Double(y + originY)) {
+                    buffer[offset] = 0
+                    buffer[offset + 1] = 0
+                    buffer[offset + 2] = 0
+                    buffer[offset + 3] = 255
+                }
             }
         }
     }
@@ -1158,29 +1699,32 @@ public enum AnnotationRenderer {
         return digest
     }
 
-    /// 把笔迹描成一条粗线，作为涂抹的覆盖掩码。
+    /// 把笔迹描成一条粗线，作为涂抹的局部覆盖掩码。
     ///
     /// 描线交给 CoreGraphics：它是高度优化的扫描线填充，比在 Swift 里
     /// 逐像素算距离快几个数量级，也不需要自己处理圆头、圆转角与重叠段。
     ///
-    /// 掩码是 8 位灰度、与画布同尺寸，**非零即覆盖**。
+    /// 掩码仅按笔迹在画布内的裁剪包围盒 `maskWidth × maskHeight` 分配，
+    /// **非零即覆盖**，可将大图单笔涂抹内存开销降低百倍。
     private static func makeStrokeMask(
         points: [PixelPoint],
         radius: Double,
         originX: Int,
         originY: Int,
-        canvasWidth: Int,
-        canvasHeight: Int
+        maskOriginX: Int,
+        maskOriginY: Int,
+        maskWidth: Int,
+        maskHeight: Int
     ) -> CGContext? {
-        guard canvasWidth > 0, canvasHeight > 0, let first = points.first else {
+        guard maskWidth > 0, maskHeight > 0, let first = points.first else {
             return nil
         }
         guard let mask = CGContext(
             data: nil,
-            width: canvasWidth,
-            height: canvasHeight,
+            width: maskWidth,
+            height: maskHeight,
             bitsPerComponent: 8,
-            bytesPerRow: canvasWidth,
+            bytesPerRow: maskWidth,
             space: CGColorSpaceCreateDeviceGray(),
             bitmapInfo: CGImageAlphaInfo.none.rawValue
         ) else {
@@ -1188,30 +1732,32 @@ public enum AnnotationRenderer {
         }
 
         mask.setFillColor(gray: 0, alpha: 1)
-        mask.fill(CGRect(x: 0, y: 0, width: canvasWidth, height: canvasHeight))
+        mask.fill(CGRect(x: 0, y: 0, width: maskWidth, height: maskHeight))
         mask.setStrokeColor(gray: 1, alpha: 1)
         // 直径 = 2 × 半径。半径可能小于 1（阈值下限），描出 0 宽度会什么都画不出。
         mask.setLineWidth(max(1, CGFloat(radius) * 2))
         mask.setLineCap(.round)
         mask.setLineJoin(.round)
 
-        // 画布坐标是**左上原点**（模型坐标 − 画布原点），而 CGContext 位图
-        // 的原点在左下。不翻的话笔迹会上下镜像——马赛克会出现在对称的位置。
-        mask.translateBy(x: 0, y: CGFloat(canvasHeight))
+        // 局部掩码坐标是（模型坐标 − 画布原点 − 局部包围盒偏移），
+        // 而 CGContext 位图原点在左下，因此沿 maskHeight 翻转 Y 轴。
+        mask.translateBy(x: 0, y: CGFloat(maskHeight))
         mask.scaleBy(x: 1, y: -1)
 
-        func canvasPoint(_ point: PixelPoint) -> CGPoint {
-            CGPoint(x: CGFloat(point.x) - CGFloat(originX), y: CGFloat(point.y) - CGFloat(originY))
+        let localOriginX = CGFloat(originX + maskOriginX)
+        let localOriginY = CGFloat(originY + maskOriginY)
+        func localPoint(_ point: PixelPoint) -> CGPoint {
+            CGPoint(x: CGFloat(point.x) - localOriginX, y: CGFloat(point.y) - localOriginY)
         }
 
         mask.beginPath()
-        mask.move(to: canvasPoint(first))
+        mask.move(to: localPoint(first))
         for point in points.dropFirst() {
-            mask.addLine(to: canvasPoint(point))
+            mask.addLine(to: localPoint(point))
         }
         // 单点笔迹：补一段零长度线段，靠 round cap 画出一个圆盘。
         if points.count == 1 {
-            mask.addLine(to: canvasPoint(first))
+            mask.addLine(to: localPoint(first))
         }
         mask.strokePath()
 
@@ -1233,6 +1779,8 @@ public enum AnnotationRenderer {
         y1: Int,
         coverage: MosaicCoverage,
         mask: UnsafeMutablePointer<UInt8>?,
+        maskOriginX: Int,
+        maskOriginY: Int,
         maskBytesPerRow: Int,
         originX: Int,
         originY: Int,
@@ -1247,11 +1795,11 @@ public enum AnnotationRenderer {
 
         /// 像素是否被马赛克覆盖。
         ///
-        /// 涂抹走掩码查表（O(1)），矩形仍走几何判定（本身就是 O(1)）。
+        /// 涂抹走局部掩码查表（O(1)），矩形仍走几何判定（本身就是 O(1)）。
         /// 两者语义相同：掩码就是「几何判定」预先光栅化的结果。
         func isCovered(_ x: Int, _ y: Int) -> Bool {
             if let mask {
-                return mask[y * maskBytesPerRow + x] != 0
+                return mask[(y - maskOriginY) * maskBytesPerRow + (x - maskOriginX)] != 0
             }
             return coverage.covers(
                 backdropX: Double(x + originX),
@@ -1291,6 +1839,115 @@ public enum AnnotationRenderer {
                 buffer[offset + 3] = avgA
             }
         }
+    }
+
+    // MARK: - 手绘微扰渲染辅助
+
+    /// 基于标注 UUID 字节序列的确定性伪随机数生成器，保证重绘不抖动且跨进程一致。
+    private struct SketchyRandom {
+        private var state: UInt64
+
+        init(seedID: UUID?) {
+            if let uuid = seedID?.uuid {
+                let hi = UInt64(uuid.0) << 56 | UInt64(uuid.1) << 48 | UInt64(uuid.2) << 40 | UInt64(uuid.3) << 32
+                    | UInt64(uuid.4) << 24 | UInt64(uuid.5) << 16 | UInt64(uuid.6) << 8 | UInt64(uuid.7)
+                let lo = UInt64(uuid.8) << 56 | UInt64(uuid.9) << 48 | UInt64(uuid.10) << 40 | UInt64(uuid.11) << 32
+                    | UInt64(uuid.12) << 24 | UInt64(uuid.13) << 16 | UInt64(uuid.14) << 8 | UInt64(uuid.15)
+                var mixed = hi ^ (lo &* 0x9E37_79B9_7F4A_7C15)
+                mixed ^= mixed >> 30
+                mixed &*= 0xBF58_476D_1CE4_E5B9
+                mixed ^= mixed >> 27
+                mixed &*= 0x94D0_49BB_1331_11EB
+                mixed ^= mixed >> 31
+                state = mixed == 0 ? 0x9E37_79B9_7F4A_7C15 : mixed
+            } else {
+                state = 0x9E37_79B9_7F4A_7C15
+            }
+        }
+
+        mutating func nextUInt64() -> UInt64 {
+            state &+= 0x9E37_79B9_7F4A_7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+            z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+            return z ^ (z >> 31)
+        }
+
+        /// 生成 `[-1.0, 1.0]` 范围内的确定性随机浮点数。
+        mutating func nextUnit() -> Double {
+            let value = Double(nextUInt64() >> 11) / Double(1 << 53)
+            return value * 2.0 - 1.0
+        }
+    }
+
+    private static func sketchyAmplitude(for stroke: StrokeStyle, span: Double) -> Double {
+        let base = min(max(1.2, stroke.width * 0.45), 3.5)
+        return min(base, max(0.4, span * 0.06))
+    }
+
+    private static func appendSketchySegment(
+        from a: CGPoint,
+        to b: CGPoint,
+        amplitude: Double,
+        rng: inout SketchyRandom,
+        to path: CGMutablePath,
+        moveToStart: Bool
+    ) {
+        let dx = Double(b.x - a.x)
+        let dy = Double(b.y - a.y)
+        let len = (dx * dx + dy * dy).squareRoot()
+        let nx = len > 0 ? -dy / len : 0
+        let ny = len > 0 ? dx / len : 0
+
+        let startJitter = CGPoint(
+            x: Double(a.x) + rng.nextUnit() * amplitude * 0.35,
+            y: Double(a.y) + rng.nextUnit() * amplitude * 0.35
+        )
+        let endJitter = CGPoint(
+            x: Double(b.x) + rng.nextUnit() * amplitude * 0.35,
+            y: Double(b.y) + rng.nextUnit() * amplitude * 0.35
+        )
+        let bow = rng.nextUnit() * amplitude
+        let along = rng.nextUnit() * amplitude * 0.4
+        let control = CGPoint(
+            x: Double(a.x + b.x) / 2 + nx * bow + (len > 0 ? (dx / len) * along : 0),
+            y: Double(a.y + b.y) / 2 + ny * bow + (len > 0 ? (dy / len) * along : 0)
+        )
+
+        if moveToStart {
+            path.move(to: startJitter)
+        } else {
+            path.addLine(to: startJitter)
+        }
+        path.addQuadCurve(to: endJitter, control: control)
+    }
+
+    private static func strokeSketchyPass(
+        _ path: CGPath,
+        stroke: StrokeStyle,
+        pass: Int,
+        in context: CGContext
+    ) {
+        let passStyle: StrokeStyle
+        if pass == 0 {
+            passStyle = stroke
+        } else {
+            let secondaryColor = RGBAColor(
+                r: stroke.color.r,
+                g: stroke.color.g,
+                b: stroke.color.b,
+                a: stroke.color.a * 0.72
+            )
+            passStyle = StrokeStyle(
+                color: secondaryColor,
+                width: max(0.8, stroke.width * 0.78),
+                dash: stroke.dash,
+                isSketchy: stroke.isSketchy
+            )
+        }
+        context.addPath(path)
+        configureStroke(passStyle, in: context)
+        context.strokePath()
     }
 
     // MARK: - 描边配置
@@ -1339,7 +1996,7 @@ extension RGBAColor {
     /// 因此这里不需要做任何预乘处理。
     public var cgColor: CGColor {
         CGColor(
-            colorSpace: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            colorSpace: ImageColorSpace.sRGB,
             components: [CGFloat(r), CGFloat(g), CGFloat(b), CGFloat(a)]
         ) ?? CGColor(gray: 0, alpha: CGFloat(a))
     }

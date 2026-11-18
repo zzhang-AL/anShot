@@ -49,10 +49,19 @@ extension Annotation {
         case let .line(start, end, stroke):
             return Self.distanceToSegment(point, start, end) <= slack + stroke.width / 2
 
-        case let .arrow(start, end, stroke, _, _):
-            // 头部是贴在终点附近的三角形，落在 end 这一点上，
-            // 线段距离已经覆盖；不必单独测三角形。
-            return Self.distanceToSegment(point, start, end) <= slack + stroke.width / 2
+        case let .arrow(start, end, stroke, headLength, headWidth):
+            let threshold = slack + stroke.width / 2
+            if Self.distanceToSegment(point, start, end) <= threshold {
+                return true
+            }
+            return Self.hitTestArrowHead(
+                point: point,
+                tip: end,
+                directionFrom: start,
+                headLength: headLength,
+                headWidth: headWidth,
+                tolerance: threshold
+            )
 
         case let .text(origin, text, font, _, _, maxWidth):
             let box = Self.measuredTextRect(
@@ -83,10 +92,70 @@ extension Annotation {
         case let .freehand(points, stroke):
             return Self.distanceToPolyline(point, points) <= slack + stroke.width / 2
 
-        case let .curvedArrow(start, control, end, stroke, _, _):
+        case let .curvedArrow(start, control, end, stroke, headLength, headWidth):
+            let threshold = slack + stroke.width / 2
             let samples = Self.quadraticSamples(from: start, control: control, to: end)
-            return Self.distanceToPolyline(point, samples) <= slack + stroke.width / 2
+            if Self.distanceToPolyline(point, samples) <= threshold {
+                return true
+            }
+            let tangentOrigin = Self.distance(control, end) > 0 ? control : start
+            return Self.hitTestArrowHead(
+                point: point,
+                tip: end,
+                directionFrom: tangentOrigin,
+                headLength: headLength,
+                headWidth: headWidth,
+                tolerance: threshold
+            )
         }
+    }
+
+    /// 椭圆标注命中测试辅助函数（预留供集成阶段接入 `Kind.ellipse` 复用）。
+    ///
+    /// - Parameters:
+    ///   - point: 测试点（底图像素坐标）
+    ///   - rect: 椭圆外接矩形
+    ///   - stroke: 描边样式
+    ///   - fill: 可选填充颜色；非 `nil` 时按面状区域命中，否则按椭圆轮廓距离命中
+    ///   - tolerance: 额外命中容差（底图像素）
+    public static func hitTestEllipse(
+        point: PixelPoint,
+        rect: PixelRect,
+        stroke: StrokeStyle,
+        fill: RGBAColor?,
+        tolerance: Double
+    ) -> Bool {
+        let rx = rect.size.width / 2
+        let ry = rect.size.height / 2
+        guard rx > 0, ry > 0 else {
+            return false
+        }
+
+        let slack = max(0, tolerance)
+        let threshold = slack + stroke.width / 2
+        let cx = rect.origin.x + rx
+        let cy = rect.origin.y + ry
+
+        if fill != nil {
+            let ex = rx + threshold
+            let ey = ry + threshold
+            let nx = (point.x - cx) / ex
+            let ny = (point.y - cy) / ey
+            return nx * nx + ny * ny <= 1
+        }
+
+        // 将椭圆轮廓离散为 96 段闭合折线，在任意长宽比下精确测量点到椭圆边界的最短距离。
+        let steps = 96
+        var samples: [PixelPoint] = []
+        samples.reserveCapacity(steps + 1)
+        for step in 0 ... steps {
+            let angle = (Double(step) / Double(steps)) * (.pi * 2)
+            samples.append(PixelPoint(
+                x: cx + rx * Foundation.cos(angle),
+                y: cy + ry * Foundation.sin(angle)
+            ))
+        }
+        return distanceToPolyline(point, samples) <= threshold
     }
 
     /// 命中测试与选中框使用的紧致包围盒。
@@ -288,13 +357,63 @@ extension Annotation {
         }
     }
 
+    /// 点是否命中箭头头部三角形（含三角形内部与三边外扩容差）。
+    fileprivate static func hitTestArrowHead(
+        point: PixelPoint,
+        tip: PixelPoint,
+        directionFrom: PixelPoint,
+        headLength: Double,
+        headWidth: Double,
+        tolerance: Double
+    ) -> Bool {
+        let dx = tip.x - directionFrom.x
+        let dy = tip.y - directionFrom.y
+        let length = (dx * dx + dy * dy).squareRoot()
+        let head = max(0, headLength)
+        let halfWidth = max(0, headWidth) / 2
+        guard length > 0, head > 0, halfWidth > 0 else {
+            return false
+        }
+
+        let ux = dx / length
+        let uy = dy / length
+        let nx = -uy
+        let ny = ux
+
+        let headBase = PixelPoint(x: tip.x - ux * head, y: tip.y - uy * head)
+        let left = PixelPoint(x: headBase.x + nx * halfWidth, y: headBase.y + ny * halfWidth)
+        let right = PixelPoint(x: headBase.x - nx * halfWidth, y: headBase.y - ny * halfWidth)
+
+        if pointInTriangle(point, tip, left, right) {
+            return true
+        }
+        return distanceToSegment(point, tip, left) <= tolerance
+            || distanceToSegment(point, left, right) <= tolerance
+            || distanceToSegment(point, right, tip) <= tolerance
+    }
+
+    /// 判定点是否位于三角形内部（含边界）。
+    fileprivate static func pointInTriangle(
+        _ p: PixelPoint,
+        _ a: PixelPoint,
+        _ b: PixelPoint,
+        _ c: PixelPoint
+    ) -> Bool {
+        func cross(_ p1: PixelPoint, _ p2: PixelPoint, _ p3: PixelPoint) -> Double {
+            (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y)
+        }
+        let d1 = cross(p, a, b)
+        let d2 = cross(p, b, c)
+        let d3 = cross(p, c, a)
+        let hasNegative = (d1 < 0) || (d2 < 0) || (d3 < 0)
+        let hasPositive = (d1 > 0) || (d2 > 0) || (d3 > 0)
+        return !(hasNegative && hasPositive)
+    }
+
     /// 文字标注的实际排版包围盒。
     ///
-    /// 与 `AnnotationRenderer.drawText` 保持同一套排版路径：
-    /// - 有 `maxWidth` 时用 `CTTypesetter` 断行（与渲染一致）；
-    /// - 无 `maxWidth` 时只在显式换行符处分行。
-    /// 两条路径若各写一份算法，「点得到但看不见」「看得见却点不到」
-    /// 的偏差就会长期存在。
+    /// 与 `AnnotationRenderer.drawText` 共用 `TextMetrics.layoutLines` 同一套排版路径，
+    /// 保证断行宽度、行高及末尾换行高度完全一致。
     ///
     /// `origin` 是**基线起点**，因此包围盒上边为 `origin.y - ascent`。
     fileprivate static func measuredTextRect(
@@ -307,60 +426,17 @@ extension Annotation {
             return PixelRect(origin: origin, size: PixelSize.zero)
         }
 
-        let ctFont = TextMetrics.font(for: font)
-        let ascent = Double(CTFontGetAscent(ctFont))
-        let attributes: [NSAttributedString.Key: Any] = [
-            kCTFontAttributeName as NSAttributedString.Key: ctFont,
-        ]
-        let emptyLineHeight = TextMetrics.lineHeight(for: font)
-
+        let layout = TextMetrics.layoutLines(text: text, font: font, maxWidth: maxWidth)
         var lineWidth = 0.0
         var totalHeight = 0.0
-
-        if let maxWidth, maxWidth > 0 {
-            let attributed = NSAttributedString(string: text, attributes: attributes)
-            let typesetter = CTTypesetterCreateWithAttributedString(attributed)
-            var index = 0
-            while index < attributed.length {
-                let count = CTTypesetterSuggestLineBreak(typesetter, index, maxWidth)
-                guard count > 0 else { break }
-                let line = CTTypesetterCreateLine(
-                    typesetter,
-                    CFRange(location: index, length: count)
-                )
-                let metrics = lineMetrics(line)
-                lineWidth = max(lineWidth, metrics.width)
-                totalHeight += metrics.height
-                index += count
-            }
-        } else {
-            for fragment in text.split(separator: "\n", omittingEmptySubsequences: false) {
-                if fragment.isEmpty {
-                    // 空行没有字形，按字体行高推进，与渲染时的处理一致。
-                    totalHeight += emptyLineHeight
-                    continue
-                }
-                let line = CTLineCreateWithAttributedString(
-                    NSAttributedString(string: String(fragment), attributes: attributes)
-                )
-                let metrics = lineMetrics(line)
-                lineWidth = max(lineWidth, metrics.width)
-                totalHeight += metrics.height
-            }
+        for line in layout.lines {
+            lineWidth = max(lineWidth, line.width)
+            totalHeight += line.height
         }
 
         return PixelRect(
-            origin: PixelPoint(x: origin.x, y: origin.y - ascent),
+            origin: PixelPoint(x: origin.x, y: origin.y - layout.ascent),
             size: PixelSize(width: lineWidth, height: totalHeight)
         )
-    }
-
-    /// 单行的排版宽高。
-    fileprivate static func lineMetrics(_ line: CTLine) -> (width: Double, height: Double) {
-        var ascent: CGFloat = 0
-        var descent: CGFloat = 0
-        var leading: CGFloat = 0
-        let width = CTLineGetTypographicBounds(line, &ascent, &descent, &leading)
-        return (Double(width), Double(ascent + descent + leading))
     }
 }

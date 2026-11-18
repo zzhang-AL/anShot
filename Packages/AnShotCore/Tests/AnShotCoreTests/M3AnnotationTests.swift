@@ -118,16 +118,16 @@ struct M3AnnotationModelTests {
         #expect(box.size.height == 26)
     }
 
-    @Test("弯曲箭头用控制点包围盒作为保守上界")
+    @Test("弯曲箭头用二次贝塞尔解析极值求紧致包围盒")
     func curvedArrowBoundingRect() {
         let annotation = m3Kinds[5]
         let box = annotation.boundingRect
-        // 三个点：(10,10) (50,80) (90,10) → 上界必须包含控制点，
-        // 即使曲线的真实极值可能略超出它（不可低估为更小的盒子）。
+        // 三个点：(10,10) (50,80) (90,10) → y 在 t=0.5 处取得解析极值 (0.25*10 + 0.5*80 + 0.25*10) = 45，
+        // 紧致包围盒高度为 35（y ∈ [10, 45]），而不是控制点盒的 70。
         #expect(box.origin.x == 10)
         #expect(box.origin.y == 10)
         #expect(box.size.width == 80)
-        #expect(box.size.height == 70)
+        #expect(abs(box.size.height - 35) < 1e-9)
     }
 }
 
@@ -227,21 +227,52 @@ struct M3AnnotationRendererTests {
         expectColor(pixels.rgb(x: 50, y: 60), (0, 0, 0), "远离连线处应保持底图")
     }
 
-    @Test("放大镜：把中心处底图放大后画回圆内")
+    @Test("放大镜：把中心处底图放大后正立画回圆内，且在非零选区下不偏离")
     func magnifierZoomsBackdrop() throws {
-        // 底图上半白、下半黑：放大镜取圆心附近更小的源区域，
-        // 因此圆内黑白分界会被推开（黑区在圆内出现的位置更靠下）。
-        let backdrop = splitImage(width: 200, height: 200, top: white, bottom: black)
+        // 构造非对称彩色条纹底图（上白，y ∈ [90,100) 红，y ∈ [100,110) 绿，下黑）：
+        // 放大镜中心 (100,100)、半径 30、倍率 2：
+        // - 圆心上方 10px 处（y=90..99 红）放大 2 倍后应正立映射到圆心上方 20px（y=80..99）；
+        // - 圆心下方 10px 处（y=100..109 绿）放大 2 倍后应正立映射到圆心下方 20px（y=100..119）；
+        // 若 CTM 导致上下倒置，y=85 会变绿、y=115 会变红，直接检出。
+        let backdrop = regionedImage(
+            width: 300,
+            height: 300,
+            background: black,
+            regions: [
+                (0, 0, 300, 90, white),
+                (0, 90, 300, 10, red),
+                (0, 100, 300, 10, green),
+            ]
+        )
         let pixels = try render(m3Kinds[3], on: backdrop)
 
-        // 源区域是以 (100,100) 为中心、60/2=30 的一半：y ∈ [85,115]，
-        // 放大 2 倍后黑色（y>100）应从 destRect 的中间略下开始。
-        // 这里只断言「圆心下方为黑、上方为白」，与不分界时相同，
-        // 但额外断言圆外的分界位置未被影响。
-        expectColor(pixels.rgb(x: 100, y: 60), (255, 255, 255), "圆内上半应为白色（放大后的黑区尚未开始）")
-        expectColor(pixels.rgb(x: 100, y: 140), (0, 0, 0), "圆内下半应为黑色")
-        expectColor(pixels.rgb(x: 5, y: 95), (255, 255, 255), "圆外分界上侧应保持底图")
-        expectColor(pixels.rgb(x: 5, y: 105), (0, 0, 0), "圆外分界下侧应保持底图")
+        // 圆内采样（圆内 y ∈ [70, 130]）：
+        expectColor(pixels.rgb(x: 100, y: 85), (255, 0, 0), "圆内上半（y=85）应映射自红带，证明正立放大")
+        expectColor(pixels.rgb(x: 100, y: 115), (0, 255, 0), "圆内下半（y=115）应映射自绿带，证明正立放大")
+        // 放大推开更远：原图 y=85 为白，放大 2 倍映射到 y=70；取 y=74 仍在圆内且映射自原 y=87（白）
+        expectColor(pixels.rgb(x: 100, y: 74), (255, 255, 255), "圆内顶部应映射自白色区域")
+
+        // 圆外底图保持原样：
+        expectColor(pixels.rgb(x: 5, y: 95), (255, 0, 0), "圆外红带保持不变")
+        expectColor(pixels.rgb(x: 5, y: 105), (0, 255, 0), "圆外绿带保持不变")
+
+        // 非零 selection.origin = (80, 60) 下再次验证：
+        let offsetSelection = rect(80, 60, 160, 160)
+        let offsetMagnifier = Annotation(kind: .magnifier(
+            center: PixelPoint(x: 160, y: 100),
+            radius: 30,
+            zoom: 2,
+            border: redStroke
+        ))
+        let offsetImage = try #require(AnnotationRenderer.render(
+            backdrop: backdrop,
+            selection: offsetSelection,
+            annotations: [offsetMagnifier]
+        ))
+        let offsetPixels = PixelBuffer(offsetImage)
+        // 画布坐标 (80, 40) 对应模型中心 (160, 100)：
+        expectColor(offsetPixels.rgb(x: 80, y: 25), (255, 0, 0), "非零选区圆内上半应为红色（正立）")
+        expectColor(offsetPixels.rgb(x: 80, y: 55), (0, 255, 0), "非零选区圆内下半应为绿色（正立）")
     }
 
     @Test("自由绘制：笔迹经过采样点附近")
