@@ -101,10 +101,10 @@ final class ScrollshotController {
     /// 增长轴。会话内部永远按**竖直**工作，横向靠出入口转置映射。
     private let axis: ScrollAxis
 
-    /// 世界坐标追踪与采纳决策——会话的唯一状态持有者。
-    private var session: ScrollshotSession
-    /// 上一提交的帧，用于廉价变化检测。
-    private var lastSubmitted: ScrollshotImage?
+    /// 世界坐标追踪与采纳决策最新快照（供主线程同步读取进度、切片与诊断字节数）。
+    private var sessionSnapshot: ScrollshotSession
+    /// 后台串行配准执行器：把像素转置、抽样对比与 `ScrollshotSession.submit` / `result` 移出主线程。
+    private var worker: ScrollshotSessionWorker
     private var captureTask: Task<Void, Never>?
     /// 旧会话异步返回时不能提交到取消后重新启动的会话。
     private var sessionGeneration = 0
@@ -130,7 +130,7 @@ final class ScrollshotController {
     ///
     /// 定得太低会把鼠标悬停动画、光标闪烁这类噪声当成滚动；
     /// 定得太高则会漏掉缓慢滚动。3 是实测下的折中。
-    private static let changeThreshold = 3.0
+    private nonisolated static let changeThreshold = 3.0
 
     /// 目标抓帧间隔（秒）。默认最高 30 Hz，实际速率受抓帧与配准耗时约束。
     ///
@@ -175,7 +175,8 @@ final class ScrollshotController {
         // 保留完整选区，在对齐的重叠内容中接缝；不自动裁掉侧栏或窗口界面。
         let resolved = options ?? ScrollStitcher.Options(joinsInsideOverlap: true, retainsSourceFrames: false)
         self.options = resolved
-        self.session = ScrollshotSession(options: resolved)
+        self.sessionSnapshot = ScrollshotSession(options: resolved)
+        self.worker = ScrollshotSessionWorker(options: resolved, axis: axis)
     }
 
     /// 开始会话：先抓首帧，然后按间隔轮询。
@@ -230,8 +231,11 @@ final class ScrollshotController {
             guard sessionGeneration == generation else { return }
             let frames = (returnedWhileFinishing.map { [$0] } ?? []) + pending
             returnedWhileFinishing = nil
-            for frame in frames where session.decisions.count < Self.maxObservedFrames {
-                processCapturedFrame(frame, began: Date())
+            let observedNow = sessionSnapshot.decisions.count
+            let remainingSlots = max(0, Self.maxObservedFrames - observedNow)
+            for frame in frames.prefix(remainingSlots) {
+                await processCapturedFrame(frame, began: Date(), generation: generation)
+                guard sessionGeneration == generation else { return }
             }
             let dropped = await buffered.droppedFrames
             ScrollshotLogStore.shared.appendEvent("capture-buffer 峰值=\(await buffered.peakBufferedFrames) 丢弃=\(dropped)")
@@ -245,30 +249,19 @@ final class ScrollshotController {
         lastPreviewAt = .distantPast
         emitPreviewIfDue()
 
-        let result = session.result()
-        // 收尾摘要与 `Outcome` 都要用**重建前**的计数：下面重建会话后它们归零。
-        let frameCount = session.acceptedFrameCount
-        let observed = session.decisions.count
-        let stalled = session.isStalled
-        let plan = result.plan
+        let finished = await worker.finishAndReset()
+        guard sessionGeneration == generation else { return }
+        sessionSnapshot = finished.freshSnapshot
         ScrollshotLogStore.shared.appendEvent(
-            "session-finish 采纳=\(frameCount) 观察=\(observed) 输出高=\(result.image?.height ?? 0) 跟丢=\(stalled)"
+            "session-finish 采纳=\(finished.capturedFrames) 观察=\(finished.observedFrames) 输出高=\(finished.outputHeight) 跟丢=\(finished.stalled)"
         )
-        // 会话持有每一段的像素缓冲；在转 `CGImage` 之前就释放它，峰值内存才
-        // 不会叠加「段缓冲 + 长图缓冲」。`result.image` 自带独立缓冲，重建
-        // 会话不影响它，所以转换必须留在重建之后。
-        session = ScrollshotSession(options: options)
-        // 会话产出的是**会话空间**的长图（横向时躺倒），归还原方向再交给界面。
-        let image = result.image
-            .flatMap { convertAxis($0) }
-            .flatMap { $0.makeCGImage() }
         onFinish?(Outcome(
-            image: image,
-            plan: plan,
-            failure: captureFailure ?? result.failure.map(String.init(describing:)),
-            capturedFrames: frameCount,
-            observedFrames: observed,
-            stalled: stalled
+            image: finished.image,
+            plan: finished.plan,
+            failure: captureFailure ?? finished.failure,
+            capturedFrames: finished.capturedFrames,
+            observedFrames: finished.observedFrames,
+            stalled: finished.stalled
         ))
     }
 
@@ -293,8 +286,8 @@ final class ScrollshotController {
             Task { _ = await buffered.stopAndDrain() }
         }
         ScrollshotLogStore.shared.appendEvent("session-cancel 用户取消")
-        session = ScrollshotSession(options: options)
-        lastSubmitted = nil
+        sessionSnapshot = ScrollshotSession(options: options)
+        worker = ScrollshotSessionWorker(options: options, axis: axis)
     }
 
     // MARK: - 抓帧
@@ -330,8 +323,8 @@ final class ScrollshotController {
         let frame = try? await capturer.captureFrame(scope: scope)
         guard isRunning, sessionGeneration == generation, !Task.isCancelled else { return }
         guard let frame,
-              let raw = ScrollshotImage(frame.image),
-              let image = convertAxis(raw) else {
+              let submitted = await worker.submitInitial(cgImage: frame.image) else {
+            guard sessionGeneration == generation else { return }
             isRunning = false
             if let buffered = capturer as? ScrollshotFrameCapturer { _ = await buffered.stopAndDrain() }
             onFinish?(Outcome(
@@ -340,15 +333,15 @@ final class ScrollshotController {
             ))
             return
         }
-        lastSubmitted = image
+        guard isRunning, sessionGeneration == generation, !Task.isCancelled else { return }
+        sessionSnapshot = submitted.snapshot
         lastSubmittedAt = .now
         // 帧录制改为**运行时开关**（`-recordFrames` / `-recordAllFrames`）：Release
         // 构建下也能留证据，而 Debug 构建里配准要 437ms/帧、根本不适合日常使用。
         ScrollshotFrameRecorder.begin()
-        let firstDecision = session.submit(image)
-        recordFrame(image, index: firstDecision.inputIndex, decision: firstDecision)
+        recordFrame(submitted.image, index: submitted.decision.inputIndex, decision: submitted.decision)
         onReady?()
-        onProgress?(session.acceptedFrameCount, session.coveredWorldHeight)
+        onProgress?(sessionSnapshot.acceptedFrameCount, sessionSnapshot.coveredWorldHeight)
         emitPreviewIfDue()
     }
 
@@ -364,12 +357,12 @@ final class ScrollshotController {
         let generation = sessionGeneration
         let began = Date()
 
-        guard session.acceptedFrameCount < Self.maxFrames,
-              session.decisions.count < Self.maxObservedFrames else {
+        guard sessionSnapshot.acceptedFrameCount < Self.maxFrames,
+              sessionSnapshot.decisions.count < Self.maxObservedFrames else {
             // 「帧数到顶」不是跟丢：已经采够了，该收尾而不是重来。
             if !hasReportedFrameLimit {
                 hasReportedFrameLimit = true
-                onLimitReached?(.frameCount(session.acceptedFrameCount >= Self.maxFrames
+                onLimitReached?(.frameCount(sessionSnapshot.acceptedFrameCount >= Self.maxFrames
                     ? Self.maxFrames : Self.maxObservedFrames))
             }
             await finish(waitForCaptureTask: false)
@@ -394,63 +387,63 @@ final class ScrollshotController {
             return
         }
         guard isRunning, sessionGeneration == generation, !Task.isCancelled else { return }
-        processCapturedFrame(frame, began: began)
+        await processCapturedFrame(frame, began: began, generation: generation)
     }
 
-    private func processCapturedFrame(_ frame: CapturedFrame, began: Date) {
-        guard let raw = ScrollshotImage(frame.image), let image = convertAxis(raw) else { return }
+    private func processCapturedFrame(_ frame: CapturedFrame, began: Date, generation: Int) async {
+        let outcome = await worker.processFrame(cgImage: frame.image)
+        guard sessionGeneration == generation, !Task.isCancelled else { return }
 
-        // 廉价变化检测：画面没变就整帧跳过，连配准都不跑。
-        if let previous = lastSubmitted, !Self.isDifferent(previous, image) {
+        switch outcome {
+        case .invalidImage:
+            return
+        case .unchanged:
             nextCaptureInterval = max(frameInterval, 0.125)
             emitPreviewIfDue()
             return
+        case let .processed(image, decision, snapshot):
+            sessionSnapshot = snapshot
+            let now = ContinuousClock.now
+            let elapsed = lastSubmittedAt.duration(to: now)
+            let elapsedSeconds = Double(elapsed.components.seconds)
+                + Double(elapsed.components.attoseconds) / 1e18
+            lastSubmittedAt = now
+            if decision.verdict == .unresolved {
+                // 未对齐时尽快保留后续重叠，不再继续拉大与可信参考帧的间距。
+                nextCaptureInterval = frameInterval
+            } else if decision.deltaY != 0 {
+                // 让相邻采样的预期位移保持在约 1/5 屏；慢滚回到 8 Hz，快滚最高 30 Hz。
+                let target = elapsedSeconds * Double(image.height) / (5 * Double(abs(decision.deltaY)))
+                nextCaptureInterval = max(frameInterval, min(max(frameInterval, 0.125), target))
+            }
+            AnShotLog.capture.notice("""
+                scrollshot timing: frame=\(decision.inputIndex, privacy: .public) \
+                prepare=\(Int(Date().timeIntervalSince(began) * 1000), privacy: .public)ms \
+                verdict=\(decision.verdict.rawValue, privacy: .public)
+                """)
+            recordFrame(image, index: decision.inputIndex, decision: decision)
+            // 跟丢要当场告诉用户，并只报一次。
+            if decision.stalled, !hasReportedStall {
+                hasReportedStall = true
+                onStall?()
+            } else if hasReportedStall, !sessionSnapshot.isStalled {
+                hasReportedStall = false
+                onRecovery?()
+            }
+            // 高度到顶单独判：帧被拒收但配准成功，所以它不会表现为 `stalled`。
+            // 比较与上报都用宽度感知的有效上限（`session.outputHeightLimit`），
+            // 否则窄窗口下内存已经吃紧、回调却还说没到顶。
+            if sessionSnapshot.coveredWorldHeight >= sessionSnapshot.outputHeightLimit, !hasReportedHeightLimit {
+                hasReportedHeightLimit = true
+                onLimitReached?(.outputHeight(sessionSnapshot.outputHeightLimit))
+            }
+            guard decision.isAccepted else { return }
+            onProgress?(sessionSnapshot.acceptedFrameCount, sessionSnapshot.coveredWorldHeight)
+            emitPreviewIfDue()
         }
-        lastSubmitted = image
-
-        let alignmentBegan = Date()
-        let decision = session.submit(image)
-        let now = ContinuousClock.now
-        let elapsed = lastSubmittedAt.duration(to: now)
-        let elapsedSeconds = Double(elapsed.components.seconds)
-            + Double(elapsed.components.attoseconds) / 1e18
-        lastSubmittedAt = now
-        if decision.verdict == .unresolved {
-            // 未对齐时尽快保留后续重叠，不再继续拉大与可信参考帧的间距。
-            nextCaptureInterval = frameInterval
-        } else if decision.deltaY != 0 {
-            // 让相邻采样的预期位移保持在约 1/5 屏；慢滚回到 8 Hz，快滚最高 30 Hz。
-            let target = elapsedSeconds * Double(image.height) / (5 * Double(abs(decision.deltaY)))
-            nextCaptureInterval = max(frameInterval, min(max(frameInterval, 0.125), target))
-        }
-        AnShotLog.capture.notice("""
-            scrollshot timing: frame=\(decision.inputIndex, privacy: .public) \
-            prepare=\(Int(alignmentBegan.timeIntervalSince(began) * 1000), privacy: .public)ms \
-            align=\(Int(Date().timeIntervalSince(alignmentBegan) * 1000), privacy: .public)ms \
-            verdict=\(decision.verdict.rawValue, privacy: .public)
-            """)
-        recordFrame(image, index: decision.inputIndex, decision: decision)
-        // 跟丢要当场告诉用户，并只报一次。
-        if decision.stalled, !hasReportedStall {
-            hasReportedStall = true
-            onStall?()
-        } else if hasReportedStall, !session.isStalled {
-            hasReportedStall = false
-            onRecovery?()
-        }
-        // 高度到顶单独判：帧被拒收但配准成功，所以它不会表现为 `stalled`。
-        // 比较与上报都用宽度感知的有效上限（`session.outputHeightLimit`），
-        // 否则窄窗口下内存已经吃紧、回调却还说没到顶。
-        if session.coveredWorldHeight >= session.outputHeightLimit, !hasReportedHeightLimit {
-            hasReportedHeightLimit = true
-            onLimitReached?(.outputHeight(session.outputHeightLimit))
-        }
-        guard decision.isAccepted else { return }
-        onProgress?(session.acceptedFrameCount, session.coveredWorldHeight)
-        emitPreviewIfDue()
     }
 
-    var retainedPixelBytesForDiagnostics: Int { session.retainedPixelBytes }
+    var retainedPixelBytesForDiagnostics: Int { sessionSnapshot.retainedPixelBytes }
 
     /// 诊断：把本帧的结论写成一行，并在「可疑帧」时把画面也落盘。
     ///
@@ -475,7 +468,7 @@ final class ScrollshotController {
         ScrollshotLogStore.shared.appendFrame(
             index: index,
             decision: decision,
-            coveredHeight: session.coveredWorldHeight,
+            coveredHeight: sessionSnapshot.coveredWorldHeight,
             suspicious: suspicious
         )
 
@@ -483,7 +476,7 @@ final class ScrollshotController {
         // 拆成多个短表达式：拼成一个长串会让类型检查器超时。
         let confidence = String(format: "%.3f", decision.confidence)
         let sourceY = decision.sourceY.map(String.init) ?? "-"
-        let coveredHeight = session.coveredWorldHeight
+        let coveredHeight = sessionSnapshot.coveredWorldHeight
         let warnings = decision.warnings.joined(separator: " | ")
         let parts = [
             "verdict=\(decision.verdict)",
@@ -493,8 +486,8 @@ final class ScrollshotController {
             "sourceY=\(sourceY)",
             "rows=\(decision.acceptedRows)",
             "sticky=\(decision.stickyRows)",
-            "coveredStart=\(session.coveredWorldStart)",
-            "coveredEnd=\(session.coveredWorldEnd)",
+            "coveredStart=\(sessionSnapshot.coveredWorldStart)",
+            "coveredEnd=\(sessionSnapshot.coveredWorldEnd)",
             "coveredHeight=\(coveredHeight)",
             "vision=\(decision.visionArbitrated)",
             "src=\(decision.matchSource?.rawValue ?? "-")",
@@ -511,7 +504,7 @@ final class ScrollshotController {
         guard now.timeIntervalSince(lastPreviewAt) >= Self.previewInterval else { return }
         lastPreviewAt = now
 
-        guard let preview = session.preview(
+        guard let preview = sessionSnapshot.preview(
             fittingWidth: Self.navigatorWidth,
             fittingHeight: Self.navigatorHeight
         ), let cgImage = preview.image.makeCGImage() else {
@@ -567,7 +560,7 @@ final class ScrollshotController {
         let sliceWidth = axis == .horizontal
             ? max(1, Int(selection.size.height))
             : targetWidth
-        guard let slice = session.slice(worldRows: worldRows, targetWidth: sliceWidth) else {
+        guard let slice = sessionSnapshot.slice(worldRows: worldRows, targetWidth: sliceWidth) else {
             return nil
         }
         // 切片是会话空间，横向时转回正向再显示（与预览相反：内容要看得懂）。
@@ -576,7 +569,7 @@ final class ScrollshotController {
     }
 
     /// 廉价变化检测：抽样比较（不进入配准）。
-    static func isDifferent(_ a: ScrollshotImage, _ b: ScrollshotImage) -> Bool {
+    nonisolated static func isDifferent(_ a: ScrollshotImage, _ b: ScrollshotImage) -> Bool {
         guard a.width == b.width, a.height == b.height else { return true }
         let stepY = max(1, a.height / 128)
         let stepX = max(1, a.width / 96)
@@ -610,5 +603,102 @@ final class ScrollshotController {
         // 等下一帧再提交时已经跨过重叠范围。保留绝对数量下限以过滤小光标闪烁。
         return Double(sum) / Double(count) / 3 > changeThreshold
             || changed >= max(8, count / 500)
+    }
+}
+
+/// 滚动截图后台串行配准执行器。
+///
+/// 将像素转置、抽样对比、`ScrollshotSession.submit` 配准及收尾拼接从 `@MainActor` 移至
+/// 独立 Actor 串行执行，彻底避免长截图滚屏期间卡死主线程交互与进度浮层。
+private actor ScrollshotSessionWorker {
+    struct InitialSubmitResult: Sendable {
+        let image: ScrollshotImage
+        let decision: ScrollshotSession.Decision
+        let snapshot: ScrollshotSession
+    }
+
+    enum FrameProcessResult: Sendable {
+        case invalidImage
+        case unchanged
+        case processed(image: ScrollshotImage, decision: ScrollshotSession.Decision, snapshot: ScrollshotSession)
+    }
+
+    struct FinishResult: Sendable {
+        let image: CGImage?
+        let plan: ScrollStitcher.Plan?
+        let failure: String?
+        let capturedFrames: Int
+        let observedFrames: Int
+        let stalled: Bool
+        let outputHeight: Int
+        let freshSnapshot: ScrollshotSession
+    }
+
+    private let options: ScrollStitcher.Options
+    private let axis: ScrollAxis
+    private var session: ScrollshotSession
+    private var lastSubmitted: ScrollshotImage?
+
+    init(options: ScrollStitcher.Options, axis: ScrollAxis) {
+        self.options = options
+        self.axis = axis
+        self.session = ScrollshotSession(options: options)
+    }
+
+    func submitInitial(cgImage: CGImage) -> InitialSubmitResult? {
+        guard let raw = ScrollshotImage(cgImage),
+              let image = convertAxis(raw) else {
+            return nil
+        }
+        lastSubmitted = image
+        let decision = session.submit(image)
+        return InitialSubmitResult(image: image, decision: decision, snapshot: session)
+    }
+
+    func processFrame(cgImage: CGImage) -> FrameProcessResult {
+        guard let raw = ScrollshotImage(cgImage),
+              let image = convertAxis(raw) else {
+            return .invalidImage
+        }
+        if let previous = lastSubmitted, !ScrollshotController.isDifferent(previous, image) {
+            return .unchanged
+        }
+        lastSubmitted = image
+        let decision = session.submit(image)
+        return .processed(image: image, decision: decision, snapshot: session)
+    }
+
+    func finishAndReset() -> FinishResult {
+        let result = session.result()
+        let capturedFrames = session.acceptedFrameCount
+        let observedFrames = session.decisions.count
+        let stalled = session.isStalled
+        let outputHeight = result.image?.height ?? 0
+        let plan = result.plan
+        let failure = result.failure.map(String.init(describing:))
+
+        // 在转 CGImage 前即重置会话以释放每段像素缓冲，压低收尾内存峰值。
+        session = ScrollshotSession(options: options)
+        lastSubmitted = nil
+        let freshSnapshot = session
+
+        let image = result.image
+            .flatMap { convertAxis($0) }
+            .flatMap { $0.makeCGImage() }
+
+        return FinishResult(
+            image: image,
+            plan: plan,
+            failure: failure,
+            capturedFrames: capturedFrames,
+            observedFrames: observedFrames,
+            stalled: stalled,
+            outputHeight: outputHeight,
+            freshSnapshot: freshSnapshot
+        )
+    }
+
+    private func convertAxis(_ image: ScrollshotImage) -> ScrollshotImage? {
+        axis == .horizontal ? image.transposed() : image
     }
 }

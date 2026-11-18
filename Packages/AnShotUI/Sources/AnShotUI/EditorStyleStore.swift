@@ -83,9 +83,11 @@ final class EditorStyleStore {
 private struct EditorStyleRecord: Codable {
     var shapeColor: RGBAColor?
     var shapeLineWidth: Double?
+    var shapeIsSketchy: Bool?
     var textColor: RGBAColor?
     var textFontSize: Double?
     var mosaicMode: String?
+    var mosaicEffectMode: String?
     var mosaicBlockSize: Double?
     var mosaicBrushRadius: Double?
     var highlightColor: RGBAColor?
@@ -98,11 +100,13 @@ private struct EditorStyleRecord: Codable {
     init(_ style: AnnotationStyle) {
         shapeColor = style.shapeColor
         shapeLineWidth = style.shapeLineWidth
+        shapeIsSketchy = style.shapeIsSketchy
         textColor = style.textColor
         textFontSize = style.textFontSize
         // 枚举存 rawValue：落盘的是字符串，读回时按当前枚举定义解释，
         // 未来增删子模式也不会让整份记录解不出来。
         mosaicMode = style.mosaicMode.rawValue
+        mosaicEffectMode = style.mosaicEffectMode.rawValue
         mosaicBlockSize = style.mosaicBlockSize
         mosaicBrushRadius = style.mosaicBrushRadius
         highlightColor = style.highlightColor
@@ -116,16 +120,25 @@ private struct EditorStyleRecord: Codable {
     /// 以 `AnnotationStyle.default` 为底，逐字段覆盖并夹回界面能表达的取值。
     func resolved() -> AnnotationStyle {
         let fallback = AnnotationStyle.default
+        let resolvedEffectMode: MosaicMode = {
+            guard let raw = mosaicEffectMode, let mode = MosaicMode(rawValue: raw),
+                  mode == .pixelate || mode == .blur else {
+                return fallback.mosaicEffectMode
+            }
+            return mode
+        }()
         return AnnotationStyle(
             shapeColor: shapeColor?.clamped() ?? fallback.shapeColor,
             shapeLineWidth: shapeLineWidth.map {
                 Self.continuous($0, in: AnnotationStyle.lineWidthRange)
             } ?? fallback.shapeLineWidth,
+            shapeIsSketchy: shapeIsSketchy ?? fallback.shapeIsSketchy,
             textColor: textColor?.clamped() ?? fallback.textColor,
             textFontSize: textFontSize.flatMap {
                 Self.option($0, in: AnnotationStyle.fontSizes)
             } ?? fallback.textFontSize,
             mosaicMode: mosaicMode.flatMap { MosaicToolMode(rawValue: $0) } ?? fallback.mosaicMode,
+            mosaicEffectMode: resolvedEffectMode,
             mosaicBlockSize: mosaicBlockSize.flatMap {
                 Self.option($0, in: AnnotationStyle.mosaicBlockSizes)
             } ?? fallback.mosaicBlockSize,

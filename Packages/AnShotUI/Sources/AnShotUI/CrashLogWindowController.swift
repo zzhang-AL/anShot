@@ -441,9 +441,15 @@ final class CrashLogWindowController: NSObject, NSWindowDelegate {
     }
 
     @objc private func copySelectedDetails() {
-        let text = detailTextView.string
-        guard !text.isEmpty else { return }
-        let redacted = Self.redactSensitiveDetails(text)
+        let redacted: String
+        if let entry = selectedEntry {
+            redacted = CrashLogStore.redactedDetails(for: entry)
+        } else {
+            let text = detailTextView.string
+            guard !text.isEmpty else { return }
+            redacted = Self.redactSensitiveDetails(text)
+        }
+        guard !redacted.isEmpty else { return }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         let ok = pasteboard.setString(redacted, forType: .string)

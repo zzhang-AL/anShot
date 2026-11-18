@@ -1114,4 +1114,68 @@ struct AnnotationEditorEnhancementTests {
         )
         #expect(abs(horizontal.y - 100) < 0.001, "接近水平应吸附到 0°")
     }
+
+    @Test("椭圆工具（O 键）、高斯模糊效果与手绘风格端到端接通")
+    func ellipseBlurAndSketchyEndToEnd() {
+        #expect(AnnotationTool.ellipse.keyCharacter == "o")
+        #expect(AnnotationTool.ellipse.family == .shape)
+
+        let editor = AnnotationEditorState(selection: makeRect(0, 0, 400, 400))
+
+        // 1. 开启手绘风并绘制椭圆（含 Shift 正圆约束）
+        editor.select(.ellipse)
+        editor.toggleSketchy()
+        #expect(editor.style.shapeIsSketchy)
+        editor.beginDraft(at: PixelPoint(x: 40, y: 40))
+        editor.updateDraft(to: PixelPoint(x: 120, y: 90), isShiftPressed: true)
+        #expect(editor.commitDraft())
+
+        guard case let .ellipse(ellipseRect, ellipseStroke, _) = editor.annotations.last?.kind else {
+            Issue.record("应生成椭圆标注")
+            return
+        }
+        #expect(ellipseRect.size.width == 80 && ellipseRect.size.height == 80, "Shift 约束椭圆为正圆")
+        #expect(ellipseStroke.isSketchy, "新绘椭圆应携带手绘风格标记")
+
+        // 2. 切换为高斯模糊并绘制框选与涂抹马赛克
+        editor.select(.mosaic)
+        editor.selectMosaicEffectMode(.blur)
+        #expect(editor.style.mosaicEffectMode == .blur)
+        editor.beginDraft(at: PixelPoint(x: 200, y: 40))
+        editor.updateDraft(to: PixelPoint(x: 280, y: 100))
+        #expect(editor.commitDraft())
+
+        guard case let .mosaic(_, mode, _) = editor.annotations.last?.kind else {
+            Issue.record("应生成马赛克标注")
+            return
+        }
+        #expect(mode == .blur, "马赛克标注应使用高斯模糊模式")
+
+        // 3. 指针选中后可反向切换手绘风与打码效果
+        editor.select(.pointer)
+        #expect(editor.selectAnnotation(at: PixelPoint(x: 80, y: 40), tolerance: 4))
+        #expect(editor.selectedAnnotationSupportsSketchy)
+        #expect(editor.selectedAnnotationIsSketchy)
+        editor.toggleSketchy()
+        #expect(!editor.selectedAnnotationIsSketchy)
+
+        #expect(editor.selectAnnotation(at: PixelPoint(x: 240, y: 70), tolerance: 4))
+        #expect(editor.selectedAnnotationSupportsMosaicEffect)
+        #expect(editor.selectedAnnotationMosaicMode == .blur)
+        editor.selectMosaicEffectMode(.pixelate)
+        #expect(editor.selectedAnnotationMosaicMode == .pixelate)
+
+        // 4. EditorStyleStore 持久化保留 shapeIsSketchy 与 mosaicEffectMode
+        let suiteName = "com.anshot.tests.style.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = EditorStyleStore(defaults: defaults)
+        var saved = AnnotationStyle.default
+        saved.shapeIsSketchy = true
+        saved.mosaicEffectMode = .blur
+        store.save(saved)
+        let loaded = store.load()
+        #expect(loaded.shapeIsSketchy)
+        #expect(loaded.mosaicEffectMode == .blur)
+    }
 }

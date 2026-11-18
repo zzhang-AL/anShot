@@ -608,6 +608,12 @@ final class OverlayView: NSView {
         view.onSelectMosaicMode = { [weak self] mode in
             self?.editorState?.selectMosaicMode(mode)
         }
+        view.onSelectMosaicEffectMode = { [weak self] mode in
+            self?.editorState?.selectMosaicEffectMode(mode)
+        }
+        view.onToggleSketchy = { [weak self] in
+            self?.editorState?.toggleSketchy()
+        }
         view.onSelectMosaicBlockSize = { [weak self] size in
             self?.editorState?.selectMosaicBlockSize(size)
         }
@@ -727,6 +733,10 @@ final class OverlayView: NSView {
         let capabilities = selectedAnnotationStyleCapabilities
         toolbar.selectedAnnotationSupportsColor = capabilities.color
         toolbar.selectedAnnotationSupportsLineWidth = capabilities.lineWidth
+        toolbar.selectedAnnotationSupportsSketchy = editorState.selectedAnnotationSupportsSketchy
+        toolbar.selectedAnnotationIsSketchy = editorState.selectedAnnotationIsSketchy
+        toolbar.selectedAnnotationSupportsMosaicEffect = editorState.selectedAnnotationSupportsMosaicEffect
+        toolbar.selectedAnnotationMosaicMode = editorState.selectedAnnotationMosaicMode
         toolbar.isHidden = false
 
         // 输入中的文字也要跟随面板设置：改字号/颜色后，

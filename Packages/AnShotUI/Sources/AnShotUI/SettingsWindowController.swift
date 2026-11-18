@@ -1907,13 +1907,10 @@ private final class SettingsViewController: NSViewController {
         aboutUpdateCheckButton?.isEnabled = canCheck
     }
 
-    /// 读取最近崩溃报告数量。
-    ///
-    /// `CrashLogStore` 只做同步目录枚举，不联网、不写盘；但它要扫多个目录，
-    /// 所以在页面真正显示（或显式重新同步）时才调用，而不是预建所有页面时。
+    /// 读取最近崩溃报告数量（使用轻量头扫描 `reportCount`，避免全量解析报告体）。
     private func refreshAboutCrashCount() {
         guard let label = aboutCrashCountLabel else { return }
-        let count = CrashLogStore.reports(limit: 99).count
+        let count = CrashLogStore.reportCount(limit: 99)
         label.stringValue = count == 0
             ? "最近没有找到崩溃日志"
             : "最近 \(count) 份崩溃报告"

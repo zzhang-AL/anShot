@@ -287,6 +287,15 @@ public enum AnnotationRenderer {
                 in: context
             )
 
+        case let .ellipse(rect, stroke, fill):
+            drawEllipse(
+                rect,
+                stroke: stroke,
+                fill: fill,
+                id: annotation.id,
+                in: context
+            )
+
         case let .line(start, end, stroke):
             drawLine(start, end, stroke: stroke, id: annotation.id, in: context)
 

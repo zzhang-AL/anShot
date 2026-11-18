@@ -26,6 +26,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 历史记录（M3-6）：本机索引 + 缩略图，只记路径不存位图。
     private let historyStore = HistoryStore(directory: HistoryStore.defaultDirectory())
 
+    /// 最近一次长截图缓存入账的代次与条目 ID，用于在结果窗口点击「保存」时原地升级历史条目。
+    private var longScreenshotArtifactGeneration = 0
+    private var latestLongScreenshotEntry: (generation: Int, entryID: UUID)?
+    private var pendingLongScreenshotSave: (generation: Int, url: URL)?
+
     /// 长截图日志窗口（懒建：不用就不占内存）。
     ///
     /// 它看的是 `ScrollshotLogStore` 里**跨会话**保留的最近逐帧结论。
@@ -201,6 +206,9 @@ private let recordingFrame = RecordingRegionFrame()
         overlayController.onArtifact = { [weak self] artifact in
             self?.handleArtifact(artifact)
         }
+        overlayController.onPromoteLongScreenshotHistory = { [weak self] url in
+            self?.promoteLatestLongScreenshotHistory(to: url)
+        }
 
         // 固定截图达到上限时的提示。不走模态框：用户此刻要么在继续标注，
         // 要么正要去关掉几张再回来钉——两种情形都不该被一个对话框截断。
@@ -259,6 +267,7 @@ private let recordingFrame = RecordingRegionFrame()
             installGlobalHotKey()
         }
         scheduleOCRPreheat()
+        scheduleHistoryMaintenance()
 
         // 自动检查更新：诊断/验收进程不联网，避免测试环境产生副作用。
         if !isDiagnosticRun {
@@ -332,6 +341,35 @@ private let recordingFrame = RecordingRegionFrame()
         }
     }
 
+    /// 启动后在后台巡检并按需清理历史缓存与缩略图孤儿文件（跳过诊断进程）。
+    private func scheduleHistoryMaintenance() {
+        guard !isDiagnosticRun else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(4))
+            guard let self, !Task.isCancelled else { return }
+            let historyDir = HistoryStore.defaultDirectory()
+            let validIDs = Set(self.historyStore.entries.map(\.id))
+            let ownedCachedPaths = Set(
+                self.historyStore.entries
+                    .filter(\.isCached)
+                    .map { $0.fileURL.standardizedFileURL.path }
+            )
+            let hasOrphans = await Task.detached(priority: .utility) {
+                HistoryStore.hasOrphanedFiles(
+                    in: historyDir,
+                    validEntryIDs: validIDs,
+                    ownedCachedPaths: ownedCachedPaths
+                )
+            }.value
+            guard hasOrphans, !Task.isCancelled else { return }
+            let removed = self.historyStore.pruneOrphanedFiles()
+            if removed > 0 {
+                logger.notice("启动后台历史孤儿文件清理完成：移除 \(removed, privacy: .public) 个文件")
+                self.refreshHistoryPanel()
+            }
+        }
+    }
+
     // MARK: - 产物账本
 
     /// 交付产物：先记账，再提示。
@@ -369,7 +407,24 @@ private let recordingFrame = RecordingRegionFrame()
         case .longShot:
             // 长截图由结果窗口承担复制/保存/钉住的后续反馈；
             // 这里只负责把它登记进历史，保证窗口关掉也不会丢。
-            cacheArtifact(artifact)
+            longScreenshotArtifactGeneration += 1
+            latestLongScreenshotEntry = nil
+            pendingLongScreenshotSave = nil
+            cacheArtifact(artifact, longShotGeneration: longScreenshotArtifactGeneration)
+        }
+    }
+
+    /// 长截图结果窗口另存为后，将对应缓存历史条目原地升级为永久文件并回收 cache 副本。
+    private func promoteLatestLongScreenshotHistory(to savedURL: URL) {
+        let generation = longScreenshotArtifactGeneration
+        if let latest = latestLongScreenshotEntry, latest.generation == generation {
+            if historyStore.promoteCachedEntry(id: latest.entryID, toSavedURL: savedURL) {
+                latestLongScreenshotEntry = nil
+                refreshHistoryPanel()
+                logger.notice("长截图历史条目已升级为永久路径：\(latest.entryID.uuidString, privacy: .public)")
+            }
+        } else {
+            pendingLongScreenshotSave = (generation, savedURL)
         }
     }
 
@@ -402,10 +457,11 @@ private let recordingFrame = RecordingRegionFrame()
     /// 复制 / 钉住 / 长截图：把位图复制进历史缓存。
     ///
     /// 这些交付没有用户文件可引用，不缓存就等于「关了会话即丢」。
-    private func cacheArtifact(_ artifact: CaptureArtifact) {
+    private func cacheArtifact(_ artifact: CaptureArtifact, longShotGeneration: Int? = nil) {
         guard let image = artifact.image else { return }
         let kind = artifact.kind
         let source = artifact.source
+        let isLongShot = artifact.delivery == .longShot
         // 复制/长截图的交付路径已经编码过 PNG：直接复用，避免同一张图
         // 在这里再全量编码一次。只取需要的字段，不把整个产物带进后台任务。
         let preEncodedPNG = artifact.pngData
@@ -434,6 +490,14 @@ private let recordingFrame = RecordingRegionFrame()
                 logger.error("artifact cache failed: \(self.historyStore.lastError ?? "unknown", privacy: .public)")
                 ToastPresenter.show("这张图没能存入历史")
                 return
+            }
+            if isLongShot, let longShotGeneration, longShotGeneration == self.longScreenshotArtifactGeneration {
+                if let pending = self.pendingLongScreenshotSave, pending.generation == longShotGeneration {
+                    self.pendingLongScreenshotSave = nil
+                    _ = self.historyStore.promoteCachedEntry(id: entry.id, toSavedURL: pending.url)
+                } else {
+                    self.latestLongScreenshotEntry = (longShotGeneration, entry.id)
+                }
             }
             logger.notice("artifact cached; id=\(entry.id.uuidString, privacy: .public) kind=\(kind.rawValue, privacy: .public)")
             self.refreshHistoryPanel()

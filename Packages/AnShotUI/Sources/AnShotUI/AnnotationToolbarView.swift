@@ -148,6 +148,38 @@ final class AnnotationToolbarView: NSView {
         }
     }
 
+    /// 选中的标注是否支持手绘风格开关。
+    var selectedAnnotationSupportsSketchy = false {
+        didSet {
+            guard selectedAnnotationSupportsSketchy != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    /// 选中的标注当前是否处于手绘风格。
+    var selectedAnnotationIsSketchy = false {
+        didSet {
+            guard selectedAnnotationIsSketchy != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    /// 选中的标注是否支持马赛克打码效果切换（像素化 / 高斯模糊）。
+    var selectedAnnotationSupportsMosaicEffect = false {
+        didSet {
+            guard selectedAnnotationSupportsMosaicEffect != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    /// 选中的马赛克标注当前效果模式。
+    var selectedAnnotationMosaicMode: MosaicMode? {
+        didSet {
+            guard selectedAnnotationMosaicMode != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
     // MARK: - 回调
 
     var onSelectTool: ((AnnotationTool) -> Void)?
@@ -157,8 +189,12 @@ final class AnnotationToolbarView: NSView {
     /// 删除当前选中的标注（指针 + 选中时面板里的删除按钮）。
     var onDeleteSelected: (() -> Void)?
     var onSelectMosaicMode: ((MosaicToolMode) -> Void)?
+    /// 切换马赛克打码效果（像素化 / 高斯模糊）。
+    var onSelectMosaicEffectMode: ((MosaicMode) -> Void)?
     var onSelectMosaicBlockSize: ((Double) -> Void)?
     var onSelectMosaicBrushDiameter: ((Double) -> Void)?
+    /// 切换手绘风格。
+    var onToggleSketchy: (() -> Void)?
     var onUndo: (() -> Void)?
     var onRedo: (() -> Void)?
     var onRecord: (() -> Void)?
@@ -259,6 +295,8 @@ final class AnnotationToolbarView: NSView {
         input.selectedAnnotationIsHighlight = selectedAnnotationIsHighlight
         input.selectedAnnotationSupportsColor = selectedAnnotationSupportsColor
         input.selectedAnnotationSupportsLineWidth = selectedAnnotationSupportsLineWidth
+        input.selectedAnnotationSupportsSketchy = selectedAnnotationSupportsSketchy
+        input.selectedAnnotationSupportsMosaicEffect = selectedAnnotationSupportsMosaicEffect
         return input
     }
 
@@ -321,6 +359,10 @@ final class AnnotationToolbarView: NSView {
         renderer.activeFontSizeForToolbar = activeFontSizeForToolbar
         renderer.selectedAnnotationSupportsColor = selectedAnnotationSupportsColor
         renderer.selectedAnnotationSupportsLineWidth = selectedAnnotationSupportsLineWidth
+        renderer.selectedAnnotationSupportsSketchy = selectedAnnotationSupportsSketchy
+        renderer.selectedAnnotationIsSketchy = selectedAnnotationIsSketchy
+        renderer.selectedAnnotationSupportsMosaicEffect = selectedAnnotationSupportsMosaicEffect
+        renderer.selectedAnnotationMosaicMode = selectedAnnotationMosaicMode
         renderer.hoveredKind = hoveredKind
         renderer.draw(in: context)
     }
@@ -539,6 +581,12 @@ final class AnnotationToolbarView: NSView {
         case let .mosaicMode(mode):
             onSelectMosaicMode?(mode)
 
+        case let .mosaicEffectMode(mode):
+            onSelectMosaicEffectMode?(mode)
+
+        case .sketchyToggle:
+            onToggleSketchy?()
+
         case let .mosaicBlockSize(size):
             onSelectMosaicBlockSize?(size)
 
@@ -616,6 +664,10 @@ final class AnnotationToolbarView: NSView {
             return "字号 \(Int(size))pt"
         case let .mosaicMode(mode):
             return "马赛克模式：\(mode.displayName)"
+        case let .mosaicEffectMode(mode):
+            return "打码效果：\(AnnotationToolbarLayout.mosaicEffectLabel(mode))"
+        case .sketchyToggle:
+            return "手绘风格"
         case let .mosaicBlockSize(size):
             return "马赛克块大小 \(Int(size))"
         case .mosaicBrushDiameterSlider:

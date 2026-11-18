@@ -46,6 +46,15 @@ extension Annotation {
             }
             return Self.distanceToRectBoundary(point, rect) <= slack + stroke.width / 2
 
+        case let .ellipse(rect, stroke, fill):
+            return Self.hitTestEllipse(
+                point: point,
+                rect: rect,
+                stroke: stroke,
+                fill: fill,
+                tolerance: slack
+            )
+
         case let .line(start, end, stroke):
             return Self.distanceToSegment(point, start, end) <= slack + stroke.width / 2
 
@@ -206,6 +215,9 @@ extension Annotation.Kind {
         switch self {
         case let .rectangle(rect, stroke, fill, cornerRadius):
             return .rectangle(rect: moved(rect), stroke: stroke, fill: fill, cornerRadius: cornerRadius)
+
+        case let .ellipse(rect, stroke, fill):
+            return .ellipse(rect: moved(rect), stroke: stroke, fill: fill)
 
         case let .line(start, end, stroke):
             return .line(start: moved(start), end: moved(end), stroke: stroke)

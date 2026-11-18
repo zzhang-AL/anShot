@@ -50,9 +50,13 @@ final class AnnotationToolbarRenderer {
     var selectedAnnotationColor: RGBAColor?
     /// 当前在面板高亮匹配的逻辑点字号（来自选中文字或正在编辑的草稿）。
     var activeFontSizeForToolbar: Double?
-    /// 选中的标注是否有颜色 / 线宽可改（决定面板条目的存在与否）。
+    /// 选中的标注是否有颜色 / 线宽 / 手绘 / 打码效果可改（决定面板条目的存在与否）。
     var selectedAnnotationSupportsColor = true
     var selectedAnnotationSupportsLineWidth = true
+    var selectedAnnotationSupportsSketchy = false
+    var selectedAnnotationIsSketchy = false
+    var selectedAnnotationSupportsMosaicEffect = false
+    var selectedAnnotationMosaicMode: MosaicMode?
     var hoveredKind: AnnotationToolbarLayout.Kind?
 
     // MARK: - 布局
@@ -70,6 +74,8 @@ final class AnnotationToolbarRenderer {
         input.selectedAnnotationIsHighlight = selectedAnnotationIsHighlight
         input.selectedAnnotationSupportsColor = selectedAnnotationSupportsColor
         input.selectedAnnotationSupportsLineWidth = selectedAnnotationSupportsLineWidth
+        input.selectedAnnotationSupportsSketchy = selectedAnnotationSupportsSketchy
+        input.selectedAnnotationSupportsMosaicEffect = selectedAnnotationSupportsMosaicEffect
         return input
     }
 
@@ -189,7 +195,7 @@ final class AnnotationToolbarRenderer {
     private static func drawsItemHighlight(_ kind: Kind) -> Bool {
         switch kind {
         case .lineWidthSlider, .arrowHeadScaleSlider, .mosaicBrushDiameterSlider,
-             .color, .magnifierZoom, .mosaicMode:
+             .color, .magnifierZoom, .mosaicMode, .mosaicEffectMode:
             return false
         default:
             return true
@@ -276,6 +282,19 @@ final class AnnotationToolbarRenderer {
                 alpha: alpha,
                 in: context
             )
+
+        case let .mosaicEffectMode(mode):
+            drawTextButton(
+                AnnotationToolbarLayout.mosaicEffectLabel(mode),
+                rect: rect,
+                isSelected: selected,
+                isHovered: hover,
+                alpha: alpha,
+                in: context
+            )
+
+        case .sketchyToggle:
+            drawSketchyToggleGlyph(rect: rect, alpha: alpha, in: context)
 
         case let .mosaicBlockSize(size):
             drawMosaicBlockSizeGlyph(size, rect: rect, alpha: alpha, in: context)
@@ -378,6 +397,16 @@ final class AnnotationToolbarRenderer {
             return abs(activeSize - size) < 0.01
         case let .mosaicMode(mode):
             return style.mosaicMode == mode
+        case let .mosaicEffectMode(mode):
+            if tool == .pointer, hasSelectedAnnotation {
+                return selectedAnnotationMosaicMode == mode
+            }
+            return style.mosaicEffectMode == mode
+        case .sketchyToggle:
+            if tool == .pointer, hasSelectedAnnotation {
+                return selectedAnnotationIsSketchy
+            }
+            return style.shapeIsSketchy
         case let .mosaicBlockSize(size):
             return style.mosaicBlockSize == size
         case let .numberingRadius(radius):
@@ -1301,6 +1330,9 @@ final class AnnotationToolbarRenderer {
         case .rectangle:
             drawRectangleGlyph(box: box, in: context)
 
+        case .ellipse:
+            drawEllipseGlyph(box: box, in: context)
+
         case .line:
             drawLineGlyph(box: box, in: context)
 
@@ -1334,6 +1366,56 @@ final class AnnotationToolbarRenderer {
     /// 矩形：一个空心方框。
     private func drawRectangleGlyph(box: CGRect, in context: CGContext) {
         context.stroke(box)
+    }
+
+    /// 椭圆：一个水平微扁的空心椭圆（区别于编号的圆形外框）。
+    private func drawEllipseGlyph(box: CGRect, in context: CGContext) {
+        context.strokeEllipse(in: box.insetBy(dx: 0.4, dy: 2.2))
+    }
+
+    /// 手绘风格开关：双描边微扰手绘方框，体现随手勾勒效果。
+    private func drawSketchyToggleGlyph(rect: CGRect, alpha: CGFloat, in context: CGContext) {
+        let box = iconBox(in: rect)
+        context.saveGState()
+        context.setStrokeColor(NSColor.white.withAlphaComponent(alpha).cgColor)
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+
+        // 第一遍微倾手绘外框
+        context.setLineWidth(1.4)
+        let first = CGMutablePath()
+        first.move(to: CGPoint(x: box.minX + 0.5, y: box.minY + 1.2))
+        first.addQuadCurve(
+            to: CGPoint(x: box.maxX - 0.6, y: box.minY + 0.5),
+            control: CGPoint(x: box.midX, y: box.minY - 0.8)
+        )
+        first.addQuadCurve(
+            to: CGPoint(x: box.maxX - 0.2, y: box.maxY - 0.8),
+            control: CGPoint(x: box.maxX + 0.9, y: box.midY)
+        )
+        first.addQuadCurve(
+            to: CGPoint(x: box.minX + 0.8, y: box.maxY - 0.3),
+            control: CGPoint(x: box.midX, y: box.maxY + 0.9)
+        )
+        first.addQuadCurve(
+            to: CGPoint(x: box.minX + 0.5, y: box.minY + 1.2),
+            control: CGPoint(x: box.minX - 0.7, y: box.midY)
+        )
+        context.addPath(first)
+        context.strokePath()
+
+        // 第二遍轻量错位复笔
+        context.setStrokeColor(NSColor.white.withAlphaComponent(alpha * 0.65).cgColor)
+        context.setLineWidth(1.0)
+        let second = CGMutablePath()
+        second.move(to: CGPoint(x: box.minX + 1.4, y: box.minY + 2.0))
+        second.addLine(to: CGPoint(x: box.maxX - 1.2, y: box.minY + 1.6))
+        second.addLine(to: CGPoint(x: box.maxX - 1.5, y: box.maxY - 1.5))
+        second.addLine(to: CGPoint(x: box.minX + 1.2, y: box.maxY - 1.2))
+        second.closeSubpath()
+        context.addPath(second)
+        context.strokePath()
+        context.restoreGState()
     }
 
     /// 直线：一条右下到左上的斜线。

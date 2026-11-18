@@ -381,4 +381,24 @@ struct AnnotationToolbarPointerPanelTests {
         )
         #expect(origin.y >= 38 + 8, "整屏选区工具栏顶部必须避开 38pt 刘海区域")
     }
+
+    @Test("形状面板包含椭圆与手绘开关，马赛克面板包含像素化与高斯模糊切换")
+    func shapeAndMosaicPanelsExposeEllipseSketchyAndBlurControls() {
+        var shapeLayout = AnnotationToolbarLayout()
+        shapeLayout.tool = .ellipse
+        let shapeKinds = shapeLayout.layoutPanel().items.map(\.kind)
+        #expect(shapeKinds.contains(.tool(.ellipse)))
+        #expect(shapeKinds.contains(.sketchyToggle))
+
+        var mosaicLayout = AnnotationToolbarLayout()
+        mosaicLayout.tool = .mosaic
+        let mosaicKinds = mosaicLayout.layoutPanel().items.map(\.kind)
+        #expect(mosaicKinds.contains(.mosaicEffectMode(.pixelate)))
+        #expect(mosaicKinds.contains(.mosaicEffectMode(.blur)))
+
+        // 放大镜工具不应显示像素化 / 高斯模糊切换
+        mosaicLayout.tool = .magnifier
+        let magnifierKinds = mosaicLayout.layoutPanel().items.map(\.kind)
+        #expect(!magnifierKinds.contains(.mosaicEffectMode(.blur)))
+    }
 }

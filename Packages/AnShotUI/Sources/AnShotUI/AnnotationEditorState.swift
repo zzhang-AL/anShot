@@ -28,6 +28,8 @@ enum AnnotationTool: String, CaseIterable, Sendable {
     /// 指针：不创建标注，鼠标行为与 P4 一致（调整选区）。
     case pointer
     case rectangle
+    /// 椭圆（快捷键 O）。
+    case ellipse
     case line
     case arrow
     case text
@@ -62,7 +64,7 @@ enum AnnotationTool: String, CaseIterable, Sendable {
         case .pointer: return .pointer
         // 标注增强里的形状与标记都归 `.shape`：它们共用「颜色 + 线宽」这一组样式，
         // 单独开一个 family 只会让工具栏多一层没有区分度的分组。
-        case .rectangle, .line, .arrow, .numbering, .highlight, .measure, .freehand, .curvedArrow:
+        case .rectangle, .ellipse, .line, .arrow, .numbering, .highlight, .measure, .freehand, .curvedArrow:
             return .shape
         case .text: return .text
         // 放大镜与马赛克同类：都要读取底图像素做重采样，因此放在同一分组。
@@ -80,6 +82,7 @@ enum AnnotationTool: String, CaseIterable, Sendable {
         switch self {
         case .pointer: return "指针"
         case .rectangle: return "矩形"
+        case .ellipse: return "椭圆"
         case .line: return "直线"
         case .arrow: return "箭头"
         case .text: return "文字"
@@ -108,6 +111,7 @@ enum AnnotationTool: String, CaseIterable, Sendable {
         switch self {
         case .pointer: return "v"
         case .rectangle: return "r"
+        case .ellipse: return "o"
         case .line: return "l"
         case .arrow: return "a"
         case .text: return "t"
@@ -136,6 +140,16 @@ enum AnnotationTool: String, CaseIterable, Sendable {
     var isDrawingTool: Bool {
         self != .pointer
     }
+
+    /// 是否支持手绘风格开关。
+    var supportsSketchy: Bool {
+        switch self {
+        case .rectangle, .ellipse, .line, .arrow, .freehand, .curvedArrow:
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 /// 马赛克的两种子模式。
@@ -158,9 +172,11 @@ enum MosaicToolMode: String, CaseIterable, Sendable {
 /// 按工具分组保存：改文字颜色不会动到箭头的颜色，
 /// 改字号也不再被线宽牵动。
 struct AnnotationStyle: Equatable, Sendable {
-    // 形状组（矩形 / 直线 / 箭头）
+    // 形状组（矩形 / 椭圆 / 直线 / 箭头等）
     var shapeColor: RGBAColor
     var shapeLineWidth: Double
+    /// 形状线框类标注是否启用手绘微扰风格。
+    var shapeIsSketchy: Bool = false
 
     // 文字组。字号单位是**点**（界面单位），写入模型时按 scaleFactor 换算为像素。
     var textColor: RGBAColor
@@ -168,6 +184,8 @@ struct AnnotationStyle: Equatable, Sendable {
 
     // 马赛克组
     var mosaicMode: MosaicToolMode
+    /// 马赛克打码效果（像素化 / 高斯模糊）。
+    var mosaicEffectMode: MosaicMode = .pixelate
     var mosaicBlockSize: Double
     /// 涂抹笔刷半径（**点**，界面单位），写入模型时同样换算为像素。
     var mosaicBrushRadius: Double
@@ -248,9 +266,11 @@ struct AnnotationStyle: Equatable, Sendable {
     static let `default` = AnnotationStyle(
         shapeColor: palette[0],
         shapeLineWidth: 4,
+        shapeIsSketchy: false,
         textColor: palette[0],
         textFontSize: fontSizes[2],
         mosaicMode: .rectangle,
+        mosaicEffectMode: .pixelate,
         mosaicBlockSize: mosaicBlockSizes[1],
         mosaicBrushRadius: defaultMosaicBrushDiameter / 2,
         highlightColor: highlightColors[0],
@@ -280,7 +300,7 @@ struct AnnotationStyle: Equatable, Sendable {
     func color(for tool: AnnotationTool) -> RGBAColor? {
         switch tool {
         case .text: return textColor
-        case .rectangle, .line, .arrow: return shapeColor
+        case .rectangle, .ellipse, .line, .arrow: return shapeColor
         // 放大镜与马赛克同理：改「颜色」不会让放大出来的像素变色，显示它只会误导。
         case .numbering, .measure, .freehand, .curvedArrow: return shapeColor
         case .highlight: return highlightColor
@@ -436,6 +456,7 @@ final class AnnotationEditorState {
         guard let kind = selectedAnnotation?.kind else { return nil }
         switch kind {
         case let .rectangle(_, stroke, _, _),
+             let .ellipse(_, stroke, _),
              let .line(_, _, stroke),
              let .arrow(_, _, stroke, _, _),
              let .measure(_, _, stroke),
@@ -451,6 +472,56 @@ final class AnnotationEditorState {
         case let .magnifier(_, _, _, border):
             return border.color
         case .mosaic, .mosaicStroke:
+            return nil
+        }
+    }
+
+    /// 当前选中的标注是否支持手绘风格切换。
+    var selectedAnnotationSupportsSketchy: Bool {
+        guard let kind = selectedAnnotation?.kind else { return false }
+        switch kind {
+        case .rectangle, .ellipse, .line, .arrow, .freehand, .curvedArrow:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 当前选中标注是否处于手绘风格。
+    var selectedAnnotationIsSketchy: Bool {
+        guard let kind = selectedAnnotation?.kind else { return false }
+        switch kind {
+        case let .rectangle(_, stroke, _, _),
+             let .ellipse(_, stroke, _),
+             let .line(_, _, stroke),
+             let .arrow(_, _, stroke, _, _),
+             let .freehand(_, stroke),
+             let .curvedArrow(_, _, _, stroke, _, _):
+            return stroke.isSketchy
+        default:
+            return false
+        }
+    }
+
+    /// 当前选中的标注是否支持马赛克打码效果（像素化 / 高斯模糊）切换。
+    var selectedAnnotationSupportsMosaicEffect: Bool {
+        guard let kind = selectedAnnotation?.kind else { return false }
+        switch kind {
+        case .mosaic, .mosaicStroke:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 当前选中马赛克标注的效果模式。
+    var selectedAnnotationMosaicMode: MosaicMode? {
+        guard let kind = selectedAnnotation?.kind else { return nil }
+        switch kind {
+        case let .mosaic(_, mode, _),
+             let .mosaicStroke(_, _, mode, _):
+            return mode
+        default:
             return nil
         }
     }
@@ -580,7 +651,7 @@ final class AnnotationEditorState {
                 style.shapeColor = color
             }
         // 放大镜与马赛克是像素处理，没有颜色槽（面板也不会显示颜色）。
-        case .rectangle, .line, .arrow, .mosaic, .magnifier,
+        case .rectangle, .ellipse, .line, .arrow, .mosaic, .magnifier,
              .numbering, .measure, .freehand, .curvedArrow:
             style.shapeColor = color
         }
@@ -687,6 +758,34 @@ final class AnnotationEditorState {
         guard mode != style.mosaicMode else { return }
         discardDraft()
         style.mosaicMode = mode
+    }
+
+    /// 切换马赛克打码效果（像素化 / 高斯模糊）；在指针选中马赛克时同步更新该标注。
+    func selectMosaicEffectMode(_ mode: MosaicMode) {
+        let resolved: MosaicMode = (mode == .blur) ? .blur : .pixelate
+        style.mosaicEffectMode = resolved
+        if tool == .pointer, hasSelectedAnnotation {
+            updateSelectedMosaicMode(resolved)
+        }
+    }
+
+    /// 切换手绘风格；在指针选中支持手绘的标注时同步更新该标注。
+    func toggleSketchy() {
+        if tool == .pointer, selectedAnnotationSupportsSketchy {
+            let next = !selectedAnnotationIsSketchy
+            style.shapeIsSketchy = next
+            updateSelectedSketchy(next)
+        } else {
+            style.shapeIsSketchy.toggle()
+        }
+    }
+
+    /// 显式设置手绘风格开关；在指针选中支持手绘的标注时同步更新该标注。
+    func selectSketchy(_ isSketchy: Bool) {
+        style.shapeIsSketchy = isSketchy
+        if tool == .pointer, selectedAnnotationSupportsSketchy {
+            updateSelectedSketchy(isSketchy)
+        }
     }
 
     func selectMosaicBlockSize(_ size: Double) {
@@ -881,6 +980,20 @@ final class AnnotationEditorState {
         commitSelectedChange(updated, at: index)
     }
 
+    /// 修改选中标注的手绘风格开关。
+    func updateSelectedSketchy(_ isSketchy: Bool) {
+        guard let index = selectedAnnotationIndex else { return }
+        let updated = Self.restyled(annotations[index], isSketchy: isSketchy)
+        commitSelectedChange(updated, at: index)
+    }
+
+    /// 修改选中马赛克标注的打码效果（像素化 / 高斯模糊）。
+    func updateSelectedMosaicMode(_ mode: MosaicMode) {
+        guard let index = selectedAnnotationIndex else { return }
+        let updated = Self.restyled(annotations[index], mosaicMode: mode)
+        commitSelectedChange(updated, at: index)
+    }
+
     /// 把一条已重新构造的标注写回数组；若在编辑事务中则仅实时预览不写历史。
     ///
     /// 内容没变就不提交：`selectColor` 这类入口会在「点了一个已是当前颜色的色块」
@@ -934,14 +1047,16 @@ final class AnnotationEditorState {
         _ annotation: Annotation,
         color: RGBAColor? = nil,
         lineWidth: Double? = nil,
-        fontSize: Double? = nil
+        fontSize: Double? = nil,
+        isSketchy: Bool? = nil,
+        mosaicMode: MosaicMode? = nil
     ) -> Annotation {
-        func restroke(_ stroke: StrokeStyle) -> StrokeStyle {
+        func restroke(_ stroke: StrokeStyle, allowSketchy: Bool = true) -> StrokeStyle {
             StrokeStyle(
                 color: color ?? stroke.color,
                 width: lineWidth ?? stroke.width,
                 dash: stroke.dash,
-                isSketchy: stroke.isSketchy
+                isSketchy: allowSketchy ? (isSketchy ?? stroke.isSketchy) : stroke.isSketchy
             )
         }
 
@@ -949,6 +1064,9 @@ final class AnnotationEditorState {
         switch annotation.kind {
         case let .rectangle(rect, stroke, fill, cornerRadius):
             kind = .rectangle(rect: rect, stroke: restroke(stroke), fill: fill, cornerRadius: cornerRadius)
+
+        case let .ellipse(rect, stroke, fill):
+            kind = .ellipse(rect: rect, stroke: restroke(stroke), fill: fill)
 
         case let .line(start, end, stroke):
             kind = .line(start: start, end: end, stroke: restroke(stroke))
@@ -987,11 +1105,11 @@ final class AnnotationEditorState {
             )
 
         case let .mosaic(rect, mode, intensity):
-            // 马赛克是像素处理：没有颜色、线宽可言，改了也不会影响成图。
-            kind = .mosaic(rect: rect, mode: mode, intensity: intensity)
+            // 马赛克支持切换像素化 / 高斯模糊效果，但不受颜色和线宽影响。
+            kind = .mosaic(rect: rect, mode: mosaicMode ?? mode, intensity: intensity)
 
         case let .mosaicStroke(points, radius, mode, intensity):
-            kind = .mosaicStroke(points: points, radius: radius, mode: mode, intensity: intensity)
+            kind = .mosaicStroke(points: points, radius: radius, mode: mosaicMode ?? mode, intensity: intensity)
 
         case let .numbering(center, radius, index, stroke, fill, textColor):
             // 编号的描边与序号文字创建时同色，改色时两者一起改，
@@ -1000,7 +1118,7 @@ final class AnnotationEditorState {
                 center: center,
                 radius: radius,
                 index: index,
-                stroke: restroke(stroke),
+                stroke: restroke(stroke, allowSketchy: false),
                 fill: fill,
                 textColor: color ?? textColor
             )
@@ -1010,10 +1128,10 @@ final class AnnotationEditorState {
             kind = .highlight(rect: rect, color: resolved ?? highlightColor)
 
         case let .measure(start, end, stroke):
-            kind = .measure(start: start, end: end, stroke: restroke(stroke))
+            kind = .measure(start: start, end: end, stroke: restroke(stroke, allowSketchy: false))
 
         case let .magnifier(center, radius, zoom, border):
-            kind = .magnifier(center: center, radius: radius, zoom: zoom, border: restroke(border))
+            kind = .magnifier(center: center, radius: radius, zoom: zoom, border: restroke(border, allowSketchy: false))
 
         case let .freehand(points, stroke):
             kind = .freehand(points: points, stroke: restroke(stroke))
@@ -1109,7 +1227,7 @@ final class AnnotationEditorState {
         let dx = end.x - start.x
         let dy = end.y - start.y
         switch tool {
-        case .rectangle, .highlight, .mosaic:
+        case .rectangle, .ellipse, .highlight, .mosaic:
             let side = max(abs(dx), abs(dy))
             return PixelPoint(
                 x: start.x + (dx >= 0 ? side : -side),
@@ -1477,16 +1595,35 @@ final class AnnotationEditorState {
         case .rectangle:
             return Annotation(kind: .rectangle(
                 rect: Self.rect(from: start, to: end),
-                stroke: StrokeStyle(color: style.shapeColor, width: style.shapeLineWidth),
+                stroke: StrokeStyle(
+                    color: style.shapeColor,
+                    width: style.shapeLineWidth,
+                    isSketchy: style.shapeIsSketchy
+                ),
                 fill: nil,
                 cornerRadius: 0
+            ))
+
+        case .ellipse:
+            return Annotation(kind: .ellipse(
+                rect: Self.rect(from: start, to: end),
+                stroke: StrokeStyle(
+                    color: style.shapeColor,
+                    width: style.shapeLineWidth,
+                    isSketchy: style.shapeIsSketchy
+                ),
+                fill: nil
             ))
 
         case .line:
             return Annotation(kind: .line(
                 start: start,
                 end: end,
-                stroke: StrokeStyle(color: style.shapeColor, width: style.shapeLineWidth)
+                stroke: StrokeStyle(
+                    color: style.shapeColor,
+                    width: style.shapeLineWidth,
+                    isSketchy: style.shapeIsSketchy
+                )
             ))
 
         case .arrow:
@@ -1495,7 +1632,11 @@ final class AnnotationEditorState {
             return Annotation(kind: .arrow(
                 start: start,
                 end: end,
-                stroke: StrokeStyle(color: style.shapeColor, width: style.shapeLineWidth),
+                stroke: StrokeStyle(
+                    color: style.shapeColor,
+                    width: style.shapeLineWidth,
+                    isSketchy: style.shapeIsSketchy
+                ),
                 headLength: style.arrowHeadLength,
                 headWidth: style.arrowHeadWidth
             ))
@@ -1552,7 +1693,11 @@ final class AnnotationEditorState {
             //（见 `simplifiedForCommit`）。
             return Annotation(kind: .freehand(
                 points: strokePoints.count >= 2 ? strokePoints : [start, end],
-                stroke: StrokeStyle(color: style.shapeColor, width: style.shapeLineWidth)
+                stroke: StrokeStyle(
+                    color: style.shapeColor,
+                    width: style.shapeLineWidth,
+                    isSketchy: style.shapeIsSketchy
+                )
             ))
 
         case .curvedArrow:
@@ -1560,24 +1705,29 @@ final class AnnotationEditorState {
                 start: start,
                 control: Self.bendControl(from: start, to: end, bend: style.curvedArrowBend),
                 end: end,
-                stroke: StrokeStyle(color: style.shapeColor, width: style.shapeLineWidth),
+                stroke: StrokeStyle(
+                    color: style.shapeColor,
+                    width: style.shapeLineWidth,
+                    isSketchy: style.shapeIsSketchy
+                ),
                 headLength: style.arrowHeadLength,
                 headWidth: style.arrowHeadWidth
             ))
 
         case .mosaic:
+            let effectMode = style.mosaicEffectMode
             switch style.mosaicMode {
             case .rectangle:
                 return Annotation(kind: .mosaic(
                     rect: Self.rect(from: start, to: end),
-                    mode: .pixelate,
+                    mode: effectMode,
                     intensity: style.mosaicBlockSize
                 ))
             case .brush:
                 return Annotation(kind: .mosaicStroke(
                     points: strokePoints,
                     radius: style.mosaicBrushRadius,
-                    mode: .pixelate,
+                    mode: effectMode,
                     intensity: style.mosaicBlockSize
                 ))
             }
@@ -1624,7 +1774,9 @@ final class AnnotationEditorState {
     /// 草稿是否值得提交。
     private static func isMeaningful(_ annotation: Annotation) -> Bool {
         switch annotation.kind {
-        case let .rectangle(rect, _, _, _), let .mosaic(rect, _, _):
+        case let .rectangle(rect, _, _, _),
+             let .ellipse(rect, _, _),
+             let .mosaic(rect, _, _):
             return rect.size.width >= 2 && rect.size.height >= 2
 
         case let .line(start, end, _), let .arrow(start, end, _, _, _):
@@ -1674,6 +1826,7 @@ final class AnnotationEditorState {
     ) -> [(handle: AnnotationControlHandle, point: PixelPoint)] {
         switch annotation.kind {
         case let .rectangle(rect, _, _, _),
+             let .ellipse(rect, _, _),
              let .highlight(rect, _),
              let .mosaic(rect, _, _):
             let cgRect = CGRect(
@@ -1719,6 +1872,10 @@ final class AnnotationEditorState {
         case let (.rectangle(rect, stroke, fill, cornerRadius), .rect(rectHandle)):
             let resized = resizedPixelRect(rect, handle: rectHandle, to: clamped, keepSquare: isShiftPressed)
             updatedKind = .rectangle(rect: resized, stroke: stroke, fill: fill, cornerRadius: cornerRadius)
+
+        case let (.ellipse(rect, stroke, fill), .rect(rectHandle)):
+            let resized = resizedPixelRect(rect, handle: rectHandle, to: clamped, keepSquare: isShiftPressed)
+            updatedKind = .ellipse(rect: resized, stroke: stroke, fill: fill)
 
         case let (.highlight(rect, color), .rect(rectHandle)):
             let resized = resizedPixelRect(rect, handle: rectHandle, to: clamped, keepSquare: isShiftPressed)

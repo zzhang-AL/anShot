@@ -112,9 +112,13 @@ struct AnnotationToolbarLayout {
         case arrowHeadScaleSlider
         case fontSize(Double)
         case mosaicMode(MosaicToolMode)
+        /// 马赛克打码效果（像素化 / 高斯模糊）。
+        case mosaicEffectMode(MosaicMode)
         case mosaicBlockSize(Double)
         /// 涂抹笔刷大小滑块（连续值，仅涂抹模式）。
         case mosaicBrushDiameterSlider
+        /// 形状工具的手绘风格开关。
+        case sketchyToggle
         /// 编号圆的半径（仅编号工具）。
         case numberingRadius(Double)
         /// 放大镜倍率（仅放大镜工具）。
@@ -178,6 +182,10 @@ struct AnnotationToolbarLayout {
     /// 不支持的条目连位置都不占：摆一个点了没反应的滑块
     /// 与工具栏里放一个无效按钮是同一种缺陷。
     var selectedAnnotationSupportsLineWidth = true
+    /// 选中的标注是否支持手绘风格开关。
+    var selectedAnnotationSupportsSketchy = false
+    /// 选中的标注是否支持马赛克打码效果切换（像素化 / 高斯模糊）。
+    var selectedAnnotationSupportsMosaicEffect = false
 
     // MARK: - 查询
 
@@ -481,6 +489,34 @@ struct AnnotationToolbarLayout {
             x += Self.sliderWidth
         }
 
+        if selectedAnnotationSupportsSketchy {
+            x += Self.groupSpacing
+            items.append(Item(
+                kind: .sketchyToggle,
+                rect: CGRect(x: x, y: iconY, width: Self.iconButtonSize, height: Self.iconButtonSize),
+                isEnabled: true
+            ))
+            x += Self.iconButtonSize
+        }
+
+        if selectedAnnotationSupportsMosaicEffect {
+            let effectModes: [MosaicMode] = [.pixelate, .blur]
+            for (index, mode) in effectModes.enumerated() {
+                if index > 0 {
+                    x += Self.itemSpacing
+                } else if !items.isEmpty {
+                    x += Self.groupSpacing
+                }
+                let width = textButtonWidth(for: Self.mosaicEffectLabel(mode))
+                items.append(Item(
+                    kind: .mosaicEffectMode(mode),
+                    rect: CGRect(x: x, y: buttonY, width: width, height: buttonHeight),
+                    isEnabled: true
+                ))
+                x += width
+            }
+        }
+
         // 删除放在最后：它是面板里唯一「破坏性」的动作，与样式控件隔开。
         if !items.isEmpty {
             x += Self.groupSpacing
@@ -583,6 +619,11 @@ struct AnnotationToolbarLayout {
         // 线宽：一个连续滑块（取代原来的三档按钮）。
         cursor.append(.lineWidthSlider, leading: Self.groupSpacing, size: sliderSize, y: buttonY)
 
+        // 手绘风格开关：支持手绘的线框工具（矩形/椭圆/直线/箭头/手绘/曲线箭头）可切换。
+        if tool.supportsSketchy {
+            cursor.append(.sketchyToggle, leading: Self.groupSpacing, size: iconSize, y: iconY)
+        }
+
         // 右侧留白
         cursor.advance(Self.padding)
 
@@ -657,6 +698,24 @@ struct AnnotationToolbarLayout {
             x += width
         }
 
+        // 打码效果（像素化 / 高斯模糊）：仅马赛克工具显示，放大镜无效果模式切换。
+        if tool == .mosaic {
+            x += Self.groupSpacing
+            let effectModes: [MosaicMode] = [.pixelate, .blur]
+            for (index, effectMode) in effectModes.enumerated() {
+                if index > 0 {
+                    x += Self.itemSpacing
+                }
+                let width = textButtonWidth(for: Self.mosaicEffectLabel(effectMode))
+                items.append(Item(
+                    kind: .mosaicEffectMode(effectMode),
+                    rect: CGRect(x: x, y: buttonY, width: width, height: buttonHeight),
+                    isEnabled: true
+                ))
+                x += width
+            }
+        }
+
         x += Self.groupSpacing
 
         // 块大小：档位画的是粒度递增的块阵，用图标按钮尺寸。
@@ -700,6 +759,15 @@ struct AnnotationToolbarLayout {
 
         x += Self.padding
         return (items, CGSize(width: x, height: Self.panelHeight))
+    }
+
+    /// 马赛克打码效果的展示文案。
+    static func mosaicEffectLabel(_ mode: MosaicMode) -> String {
+        switch mode {
+        case .pixelate: return "像素化"
+        case .blur: return "高斯模糊"
+        case .solid: return "纯色"
+        }
     }
 
     private func textButtonWidth(for text: String) -> CGFloat {

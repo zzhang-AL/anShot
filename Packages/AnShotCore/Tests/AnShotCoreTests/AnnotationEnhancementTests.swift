@@ -484,4 +484,43 @@ struct AnnotationEnhancementTests {
         expectColor(pixels.rgb(x: 70, y: 20), (255, 0, 0), "椭圆顶点轮廓应为红色描边")
         expectColor(pixels.rgb(x: 22, y: 22), (255, 255, 255), "外接矩形角落应保持白底")
     }
+
+    @Test("Annotation.Kind.ellipse 端到端序列化、命中、平移、校验与渲染（含手绘风）")
+    func ellipseKindEndToEnd() throws {
+        let bounds = rect(10, 15, 80, 50)
+        let ellipse = Annotation(kind: .ellipse(
+            rect: bounds,
+            stroke: StrokeStyle(color: red, width: 4, isSketchy: true),
+            fill: nil
+        ))
+
+        // 1. 扁平 JSON 序列化往返
+        let data = try JSONEncoder().encode(ellipse)
+        let decoded = try JSONDecoder().decode(Annotation.self, from: data)
+        #expect(decoded == ellipse)
+        #expect(decoded.kind.typeName == "ellipse")
+        #expect(decoded.boundingRect == bounds)
+
+        // 2. 平移与命中测试
+        let moved = ellipse.translated(by: PixelPoint(x: 5, y: 10))
+        #expect(moved.boundingRect == rect(15, 25, 80, 50))
+        #expect(moved.hitTest(PixelPoint(x: 55, y: 25), tolerance: 1))
+        #expect(!moved.hitTest(PixelPoint(x: 55, y: 50), tolerance: 1))
+
+        // 3. 会话不变量校验与完整渲染
+        let backdrop = regionedImage(width: 120, height: 100, background: white, regions: [])
+        let session = CaptureSession(
+            backdrop: Backdrop(pixelWidth: 120, pixelHeight: 100, scaleFactor: 1),
+            selection: rect(0, 0, 120, 100),
+            annotations: [moved]
+        )
+        try session.validate()
+        let rendered = try #require(AnnotationRenderer.render(
+            backdrop: backdrop,
+            selection: rect(0, 0, 120, 100),
+            annotations: [moved]
+        ))
+        let pixels = PixelBuffer(rendered)
+        expectColor(pixels.rgb(x: 55, y: 50), (255, 255, 255), "空心椭圆中心保持白底")
+    }
 }

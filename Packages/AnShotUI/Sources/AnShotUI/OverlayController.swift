@@ -1107,6 +1107,9 @@ public final class OverlayController {
     /// 剪贴板一被覆盖就永久丢失。本层只负责描述产物，不决定怎么记账或提示。
     var onArtifact: ((CaptureArtifact) -> Void)?
 
+    /// 长截图结果窗口另存为文件后，将此前已写入历史缓存的条目原地升级为永久文件路径。
+    var onPromoteLongScreenshotHistory: ((URL) -> Void)?
+
     /// 识别当前选区里的文字并展示结果。
     ///
     /// 不结束截图会话：用户常要对着原文核对，且识别后往往还要接着标注。
@@ -1434,6 +1437,7 @@ public final class OverlayController {
         )
         switch outcome {
         case .saved(let url):
+            onPromoteLongScreenshotHistory?(url)
             ToastPresenter.show(
                 "长截图已保存：\(url.lastPathComponent)",
                 actionTitle: "在访达中显示"

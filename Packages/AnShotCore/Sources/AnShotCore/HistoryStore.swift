@@ -399,6 +399,43 @@ public final class HistoryStore {
         }
     }
 
+    /// 后台只读巡检：判断 `thumbnails/` 与 `cache/` 是否存在孤儿文件，避免主线程启动时同步扫描。
+    public nonisolated static func hasOrphanedFiles(
+        in directory: URL,
+        validEntryIDs: Set<UUID>,
+        ownedCachedPaths: Set<String>
+    ) -> Bool {
+        let fm = FileManager.default
+        let validThumbNames = Set(validEntryIDs.map { "\($0.uuidString).png" })
+        let thumbDir = directory.appendingPathComponent(thumbnailsDirectoryName)
+        if let thumbURLs = try? fm.contentsOfDirectory(
+            at: thumbDir,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for url in thumbURLs {
+                let isRegular = (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile ?? false
+                if isRegular, !validThumbNames.contains(url.lastPathComponent) {
+                    return true
+                }
+            }
+        }
+        let cacheDir = directory.appendingPathComponent(cacheDirectoryName)
+        if let cacheURLs = try? fm.contentsOfDirectory(
+            at: cacheDir,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for url in cacheURLs {
+                let isRegular = (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile ?? false
+                if isRegular, !ownedCachedPaths.contains(url.standardizedFileURL.path) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
     /// 对账清理不在当前 `entries` 中的 `cache/` 与 `thumbnails/` 孤儿文件。
     ///
     /// - Returns: 实际删除的孤儿文件数量。

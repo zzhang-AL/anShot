@@ -36,12 +36,13 @@ do {
 // ── 单实例守卫（必须在创建 NSApplication 之前）────────────────────
 //
 // 两个 GUI 进程同时存活会各自注册同一组 Carbon 热键、各装一整套覆盖层：
-// 按一次 Esc 每个进程各关一层。这里用文件锁把「纯 GUI 启动」限制成单实例。
+// 按一次 Esc 每个进程各关一层。这里用文件锁把「非诊断的 GUI 启动」限制成单实例。
 //
 // 注意：**不要**改用 LSMultipleInstancesProhibited —— 那会连
 // `open -n app --args -diagnose...` 一起禁掉，诊断入口就没了。
-// 因此只对「没有额外参数」的启动生效，带诊断参数的启动照旧放行。
-if isPlainGUILaunch(CommandLine.arguments) {
+// 统一调用 `AppDelegate.isDiagnosticLaunch` 作为单一事实来源（#if DEBUG 下放行诊断入口，
+// Release 构建恒返回 false，确保任何参数都不会绕过单实例锁）。
+if !AppDelegate.isDiagnosticLaunch(arguments: CommandLine.arguments) {
     enforceSingleInstance()
 }
 
@@ -60,51 +61,6 @@ app.delegate = delegate
 app.run()
 
 // ── 单实例守卫的实现 ─────────────────────────────────────────────
-
-/// 是否应当施加单实例守卫。
-///
-/// 只有**不注册热键**的诊断/展示入口才放行第二个进程：
-/// `-diagnose*`、`-show*`、`-editImage`、`-checkUpdates`、
-/// `-requestMicrophoneAccess`。它们对应 `AppDelegate.isDiagnosticRun`，
-/// 不会抢 Carbon 热键，因此 `open -n app --args -diagnose...` 必须继续可用。
-///
-/// 其余参数（包括 `-recordFrames` / `-recordAllFrames`）仍按普通 GUI 处理：
-/// 它们会注册热键、创建覆盖层，允许第二个实例就会重新出现「按两次 Esc」。
-private func isPlainGUILaunch(_ arguments: [String]) -> Bool {
-    // 这些是 macOS 自己注入的、带值的参数（值形如 `YES`、`(en)`）。
-    let injectedWithValue: Set<String> = [
-        "-NSDocumentRevisionsDebugMode",
-        "-ApplePersistenceIgnoreState",
-        "-AppleLanguages",
-        "-AppleLocale",
-    ]
-
-    var index = 1  // arguments[0] 是可执行文件路径
-    while index < arguments.count {
-        let argument = arguments[index]
-        if argument.hasPrefix("-psn_") {
-            index += 1  // 进程序列号，无值
-            continue
-        }
-        if injectedWithValue.contains(argument) {
-            index += 2  // 连同它的值一起跳过
-            continue
-        }
-        #if DEBUG
-        // 与 AppDelegate.isDiagnosticRun 保持严格的 Debug 宏对齐：
-        // Release 包下不得放行这些参数绕过单实例锁，避免双进程互抢热键。
-        if argument.hasPrefix("-diagnose")
-            || argument.hasPrefix("-show")
-            || argument == "-requestMicrophoneAccess"
-            || argument == "-checkUpdates"
-            || argument == "-editImage" {
-            return false
-        }
-        #endif
-        index += 1
-    }
-    return true
-}
 
 /// 用 `flock` 保证纯 GUI 启动只有一个实例。
 ///

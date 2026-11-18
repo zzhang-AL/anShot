@@ -138,6 +138,9 @@ public struct Annotation: Equatable, Sendable, Identifiable {
         /// 矩形。
         case rectangle(rect: PixelRect, stroke: StrokeStyle, fill: RGBAColor?, cornerRadius: Double)
 
+        /// 椭圆（圆与椭圆统一用外接矩形表达）。
+        case ellipse(rect: PixelRect, stroke: StrokeStyle, fill: RGBAColor?)
+
         /// 直线。
         case line(start: PixelPoint, end: PixelPoint, stroke: StrokeStyle)
 
@@ -223,6 +226,7 @@ public struct Annotation: Equatable, Sendable, Identifiable {
         public var typeName: String {
             switch self {
             case .rectangle: "rectangle"
+            case .ellipse: "ellipse"
             case .line: "line"
             case .arrow: "arrow"
             case .text: "text"
@@ -244,7 +248,9 @@ public struct Annotation: Equatable, Sendable, Identifiable {
     /// 因此只返回基线起点处的零尺寸矩形。
     public var boundingRect: PixelRect {
         switch kind {
-        case let .rectangle(rect, _, _, _), let .mosaic(rect, _, _):
+        case let .rectangle(rect, _, _, _),
+             let .ellipse(rect, _, _),
+             let .mosaic(rect, _, _):
             return rect
         case let .line(start, end, _), let .arrow(start, end, _, _, _):
             return PixelRect(
@@ -464,6 +470,12 @@ extension Annotation: Codable {
                 fill: container.decodeIfPresent(RGBAColor.self, forKey: .fill),
                 cornerRadius: container.decode(Double.self, forKey: .cornerRadius)
             )
+        case "ellipse":
+            kind = try .ellipse(
+                rect: container.decode(PixelRect.self, forKey: .rect),
+                stroke: container.decode(StrokeStyle.self, forKey: .stroke),
+                fill: container.decodeIfPresent(RGBAColor.self, forKey: .fill)
+            )
         case "line":
             kind = try .line(
                 start: container.decode(PixelPoint.self, forKey: .start),
@@ -558,6 +570,12 @@ extension Annotation: Codable {
             // 契约要求字段存在：不填充时写 null，而不是省略字段。
             try container.encode(fill, forKey: .fill)
             try container.encode(cornerRadius, forKey: .cornerRadius)
+
+        case let .ellipse(rect, stroke, fill):
+            try container.encode(rect, forKey: .rect)
+            try container.encode(stroke, forKey: .stroke)
+            // 契约要求字段存在：不填充时写 null，而不是省略字段。
+            try container.encode(fill, forKey: .fill)
 
         case let .line(start, end, stroke):
             try container.encode(start, forKey: .start)
