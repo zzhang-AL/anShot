@@ -30,6 +30,25 @@
 
 import AnShotCore
 import Foundation
+import os
+
+/// 线程安全的 `UserDefaults` 轻量包装器，避免持有它的外层配置类整体豁免 `@unchecked Sendable`。
+struct SendableUserDefaults: @unchecked Sendable {
+    let raw: UserDefaults
+}
+
+/// 本地密钥文件存储错误。
+public enum SecretStoreError: Error, LocalizedError, Equatable {
+    /// 密钥文件已损坏，拒绝覆盖写入以防既有的 API Key 丢失。
+    case corruptedStore(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .corruptedStore(let detail):
+            return "密钥文件已损坏（\(detail)），已中止覆盖以保护既有密钥"
+        }
+    }
+}
 
 // MARK: - 配置
 
@@ -118,7 +137,9 @@ public struct LocalFileSecretStore: SecretStoring {
     }
 
     public func secret(for account: String) -> String? {
-        readAll()[account]
+        Self.writeLock.withLock {
+            try? readAll()[account]
+        }
     }
 
     public func setSecret(_ value: String?, for account: String) throws {
@@ -126,7 +147,7 @@ public struct LocalFileSecretStore: SecretStoring {
         // 刷新 token 缓存可能同时发生，不加锁时后写的一方会带着旧快照覆盖
         // 先写的那一条（例如刚保存的密钥被 token 写入悄悄抹掉）。
         try Self.writeLock.withLock {
-            var all = readAll()
+            var all = try readAll()
             let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
             if let trimmed, !trimmed.isEmpty {
                 all[account] = trimmed
@@ -144,12 +165,25 @@ public struct LocalFileSecretStore: SecretStoring {
         try setSecret(nil, for: account)
     }
 
-    private func readAll() -> [String: String] {
-        guard let data = try? Data(contentsOf: fileURL),
-              let dictionary = try? JSONDecoder().decode([String: String].self, from: data) else {
+    /// 仅当密钥文件不存在时返回空字典；若文件存在但读取或解码失败则抛错保护原文件不被覆写清零。
+    private func readAll() throws -> [String: String] {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
             return [:]
         }
-        return dictionary
+        let data: Data
+        do {
+            data = try Data(contentsOf: fileURL)
+        } catch {
+            throw SecretStoreError.corruptedStore(error.localizedDescription)
+        }
+        guard !data.isEmpty else {
+            throw SecretStoreError.corruptedStore("文件内容为空")
+        }
+        do {
+            return try JSONDecoder().decode([String: String].self, from: data)
+        } catch {
+            throw SecretStoreError.corruptedStore("JSON 解码失败：\(error.localizedDescription)")
+        }
     }
 
     private func writeAll(_ dictionary: [String: String]) throws {
@@ -159,62 +193,78 @@ public struct LocalFileSecretStore: SecretStoring {
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: directory.path
+        )
 
         let data = try JSONEncoder().encode(dictionary)
-        // 原子写：先写临时文件再替换。中途失败若留下半截 JSON，
-        // 读回来就是空字典——所有密钥一起消失，而不是坏掉一条。
-        try data.write(to: fileURL, options: [.atomic])
-        // 显式收权。不依赖 umask，也不怕「文件已存在且权限更宽」的情况：
-        // atomic 写在某些情况下会保留目标文件的原有权限。
+        // 先以 0600 权限创建同目录隐藏临时文件，再原子替换，消除短暂 0644 权限窗口。
+        var tempURL = directory.appendingPathComponent(".\(fileURL.lastPathComponent).\(UUID().uuidString).tmp")
+        defer {
+            if FileManager.default.fileExists(atPath: tempURL.path) {
+                try? FileManager.default.removeItem(at: tempURL)
+            }
+        }
+        guard FileManager.default.createFile(
+            atPath: tempURL.path,
+            contents: data,
+            attributes: [.posixPermissions: 0o600]
+        ) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        var tempValues = URLResourceValues()
+        tempValues.isExcludedFromBackup = true
+        try? tempURL.setResourceValues(tempValues)
+
+        _ = try FileManager.default.replaceItemAt(
+            fileURL,
+            withItemAt: tempURL,
+            backupItemName: nil,
+            options: .usingNewMetadataOnly
+        )
+
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o600],
             ofItemAtPath: fileURL.path
         )
+        var finalURL = fileURL
+        var finalValues = URLResourceValues()
+        finalValues.isExcludedFromBackup = true
+        try? finalURL.setResourceValues(finalValues)
     }
 }
 
 /// 内存实现：测试与诊断使用，不做任何持久化。
-public final class InMemorySecretStore: SecretStoring, @unchecked Sendable {
+public final class InMemorySecretStore: SecretStoring {
 
-    private var storage: [String: String] = [:]
-    private let lock = NSLock()
+    private let storage = OSAllocatedUnfairLock<[String: String]>(initialState: [:])
 
     public init() {}
 
     public func secret(for account: String) -> String? {
-        lock.lock()
-        defer { lock.unlock() }
-        return storage[account]
+        storage.withLock { $0[account] }
     }
 
     public func setSecret(_ value: String?, for account: String) throws {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let value, !value.isEmpty else {
-            storage[account] = nil
-            return
+        storage.withLock { map in
+            guard let value, !value.isEmpty else {
+                map[account] = nil
+                return
+            }
+            map[account] = value
         }
-        storage[account] = value
     }
 
     public func removeSecret(for account: String) throws {
-        lock.lock()
-        defer { lock.unlock() }
-        storage[account] = nil
+        storage.withLock { $0[account] = nil }
     }
 }
 
 // MARK: - 配置读写
 
 /// 配置的持久化入口：endpoint / model 走 UserDefaults，API Key 走密钥存储。
-///
-/// `@unchecked Sendable` 的依据：三个存储面都是线程安全的——
-/// `UserDefaults` 本身可跨线程访问，`SecretStoring` 的两个实现
-///（本地文件 / 内存）各自同步，且属性全是 `let`，
-/// 没有任何可变共享状态需要额外保护。
-/// 不标它的话 `OCRService` 就无法在 `Task` 里使用：编译器会把
-/// 「把 service 送出去」判为数据竞争。
-public final class OCRProviderSettings: @unchecked Sendable {
+public final class OCRProviderSettings: Sendable {
 
     /// 当前生效的 provider。
     public static let selectedKindKey = "ocr.provider.selected"
@@ -234,14 +284,15 @@ public final class OCRProviderSettings: @unchecked Sendable {
         "ocr.\(kind.rawValue).secretKey"
     }
 
-    private let defaults: UserDefaults
+    private let defaultsStore: SendableUserDefaults
+    private var defaults: UserDefaults { defaultsStore.raw }
     private let secrets: SecretStoring
 
     public init(
         defaults: UserDefaults = .standard,
         secrets: SecretStoring = LocalFileSecretStore()
     ) {
-        self.defaults = defaults
+        self.defaultsStore = SendableUserDefaults(raw: defaults)
         self.secrets = secrets
     }
 
@@ -304,6 +355,11 @@ public final class OCRProviderSettings: @unchecked Sendable {
         defaults.removeObject(forKey: Self.configKey(for: kind))
         try secrets.removeSecret(for: Self.secretAccount(for: kind))
         try secrets.removeSecret(for: Self.secretKeyAccount(for: kind))
+        if kind == .baiduPPOCR {
+            try secrets.removeSecret(for: BaiduAccessTokenStore.tokenAccount)
+            try secrets.removeSecret(for: BaiduAccessTokenStore.expiryAccount)
+            try secrets.removeSecret(for: BaiduAccessTokenStore.ownerAccount)
+        }
     }
 
     /// 读取密钥存储里的任意条目。

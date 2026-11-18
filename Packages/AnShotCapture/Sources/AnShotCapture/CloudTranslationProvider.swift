@@ -111,10 +111,24 @@ public enum TranslationResponseParser {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
-        // ① 带编号的输出：`1. 译文` / `1、译文` / `1) 译文`。
-        let numbered = rows.compactMap { stripNumberPrefix($0) }
-        if numbered.count == expectedCount, numbered.count == rows.count {
-            return numbered.map { Optional($0) }
+        // ③ 带编号或行标时支持按行号容错对齐（缺号单行保留原文，不再差 1 行整篇清零）。
+        //    支持 `[[1]] 译文`、`[1] 译文`、`1. 译文`、`1、译文`、`1) 译文` 等格式。
+        let parsedNumbered = rows.map { parseNumberedRow($0) }
+        var aligned = [String?](repeating: nil, count: expectedCount)
+        var validIndexedHits = 0
+        for entry in parsedNumbered {
+            guard let number = entry.number,
+                  number >= 1,
+                  number <= expectedCount else {
+                continue
+            }
+            if aligned[number - 1] == nil {
+                validIndexedHits += 1
+            }
+            aligned[number - 1] = entry.text
+        }
+        if validIndexedHits > 0 {
+            return aligned
         }
 
         // ② 不带编号，但行数刚好对上：按顺序采信。
@@ -122,9 +136,7 @@ public enum TranslationResponseParser {
             return rows.map { Optional($0) }
         }
 
-        // ③ 对不上：整体降级。
-        //
-        // 不做「尽力对齐」——那会把错位藏起来，而错位比不翻译更难发现。
+        // ③ 无编号且行数不匹配：无法判定对应关系，整体降级。
         translationProviderLogger.notice("""
             translation-provider: 行数不匹配，整体降级 \
             期望=\(expectedCount, privacy: .public) 实得=\(rows.count, privacy: .public)
@@ -132,8 +144,40 @@ public enum TranslationResponseParser {
         return Array(repeating: nil, count: expectedCount)
     }
 
-    /// 去掉行首编号；没有编号则返回 nil。
-    private static func stripNumberPrefix(_ row: String) -> String? {
+    /// 解析带显式行标的行（`[[N]] ...` / `[N] ...` / `N. ...`）；非行标行返回 `number = nil`。
+    private static func parseNumberedRow(_ row: String) -> (number: Int?, text: String) {
+        if row.hasPrefix("[[") {
+            if let closeRange = row.range(of: "]]") {
+                let digits = row[row.index(row.startIndex, offsetBy: 2)..<closeRange.lowerBound]
+                    .trimmingCharacters(in: .whitespaces)
+                if let number = Int(digits) {
+                    let rest = row[closeRange.upperBound...].trimmingCharacters(in: .whitespaces)
+                    if !rest.isEmpty {
+                        return (number, rest)
+                    }
+                }
+            }
+        }
+        if row.hasPrefix("[") {
+            if let closeIndex = row.firstIndex(of: "]") {
+                let digits = row[row.index(after: row.startIndex)..<closeIndex]
+                    .trimmingCharacters(in: .whitespaces)
+                if let number = Int(digits) {
+                    let rest = row[row.index(after: closeIndex)...].trimmingCharacters(in: .whitespaces)
+                    if !rest.isEmpty {
+                        return (number, rest)
+                    }
+                }
+            }
+        }
+        if let stripped = stripNumberPrefixWithIndex(row) {
+            return stripped
+        }
+        return (nil, row)
+    }
+
+    /// 提取行首编号与正文；没有编号分隔符则返回 nil。
+    private static func stripNumberPrefixWithIndex(_ row: String) -> (number: Int, text: String)? {
         var index = row.startIndex
         var digits = 0
         while index < row.endIndex, row[index].isNumber {
@@ -143,8 +187,9 @@ public enum TranslationResponseParser {
         guard digits > 0, index < row.endIndex else { return nil }
         // 编号后必须紧跟分隔符，否则「2024年营收」这种正文会被当成编号行。
         guard ".、)）:：".contains(row[index]) else { return nil }
+        guard let number = Int(row[..<index]) else { return nil }
         let rest = row[row.index(after: index)...].trimmingCharacters(in: .whitespaces)
-        return rest.isEmpty ? nil : rest
+        return rest.isEmpty ? nil : (number, rest)
     }
 }
 
@@ -153,16 +198,16 @@ public enum TranslationResponseParser {
 /// 云端翻译的公共流程。
 enum CloudTranslationRunner {
 
-    /// 发请求 → 取文本 → 拆行 → 装配。
-    static func run(
+    /// 发请求 → 取文本 → 拆行 → 装配（同时返回诊断错误信息，若无失败则为 nil）。
+    static func runWithDiagnostics(
         lines: [OCRTextLine],
         source: String?,
         target: String,
         request: URLRequest,
         extractText: (Data) throws -> String
-    ) async -> TranslationResult {
+    ) async -> TranslationExecutionResult {
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await EndpointSecurity.ephemeralSession.data(for: request)
             guard let http = response as? HTTPURLResponse else {
                 throw OCRProviderFailure.badResponse
             }
@@ -174,20 +219,44 @@ enum CloudTranslationRunner {
             }
             let raw = try extractText(data)
             let translations = TranslationResponseParser.parse(raw, expectedCount: lines.count)
-            return TranslationAligner.align(
+            let result = TranslationAligner.align(
                 lines: lines,
                 translations: translations,
                 sourceLanguage: source ?? "",
                 targetLanguage: target
             )
+            let parseError = result.isEntirelyUntranslated && !lines.isEmpty
+                ? "云端返回内容无法按行对齐解析"
+                : nil
+            return TranslationExecutionResult(result: result, errorMessage: parseError)
         } catch {
+            let message = error.localizedDescription
             // 翻译失败不改动原文：面板会把每一行显示成原文，用户至少还能用
             // 识别结果本身，而不是得到一片空白。
             translationProviderLogger.notice("""
                 translation-provider: 请求失败，降级为原文 → \(String(describing: error), privacy: .public)
                 """)
-            return untranslatedResult(lines: lines, source: source, target: target)
+            return TranslationExecutionResult(
+                result: untranslatedResult(lines: lines, source: source, target: target),
+                errorMessage: message
+            )
         }
+    }
+
+    static func run(
+        lines: [OCRTextLine],
+        source: String?,
+        target: String,
+        request: URLRequest,
+        extractText: (Data) throws -> String
+    ) async -> TranslationResult {
+        await runWithDiagnostics(
+            lines: lines,
+            source: source,
+            target: target,
+            request: request,
+            extractText: extractText
+        ).result
     }
 
     /// 目标语言名（提示词里用）。
@@ -199,7 +268,7 @@ enum CloudTranslationRunner {
 // MARK: - OpenAI 兼容
 
 /// 任何 chat-completions 兼容的翻译服务。
-public struct OpenAICompatibleTranslationProvider: TranslationProvider {
+public struct OpenAICompatibleTranslationProvider: DiagnosticTranslationProvider {
 
     private let config: TranslationProviderConfig
 
@@ -214,12 +283,23 @@ public struct OpenAICompatibleTranslationProvider: TranslationProvider {
         from source: String?,
         to target: String
     ) async -> TranslationResult {
+        await translateWithDiagnostics(lines, from: source, to: target).result
+    }
+
+    public func translateWithDiagnostics(
+        _ lines: [OCRTextLine],
+        from source: String?,
+        to target: String
+    ) async -> TranslationExecutionResult {
         guard !lines.isEmpty else {
-            return untranslatedResult(lines: lines, source: source, target: target)
+            return TranslationExecutionResult(result: untranslatedResult(lines: lines, source: source, target: target))
         }
         let apiKey = config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !apiKey.isEmpty else {
-            return untranslatedResult(lines: lines, source: source, target: target)
+            return TranslationExecutionResult(
+                result: untranslatedResult(lines: lines, source: source, target: target),
+                errorMessage: OCRProviderFailure.missingAPIKey.localizedDescription
+            )
         }
         do {
             let request = try Self.makeRequest(
@@ -229,7 +309,7 @@ public struct OpenAICompatibleTranslationProvider: TranslationProvider {
                 lines: lines.map(\.text),
                 target: target
             )
-            return await CloudTranslationRunner.run(
+            return await CloudTranslationRunner.runWithDiagnostics(
                 lines: lines,
                 source: source,
                 target: target,
@@ -237,7 +317,10 @@ public struct OpenAICompatibleTranslationProvider: TranslationProvider {
                 extractText: Self.extractText
             )
         } catch {
-            return untranslatedResult(lines: lines, source: source, target: target)
+            return TranslationExecutionResult(
+                result: untranslatedResult(lines: lines, source: source, target: target),
+                errorMessage: error.localizedDescription
+            )
         }
     }
 
@@ -249,9 +332,7 @@ public struct OpenAICompatibleTranslationProvider: TranslationProvider {
         lines: [String],
         target: String
     ) throws -> URLRequest {
-        guard let url = URL(string: endpoint), url.scheme != nil else {
-            throw OCRProviderFailure.badEndpoint
-        }
+        let url = try EndpointSecurity.validatedURL(from: endpoint)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = 60
@@ -272,20 +353,14 @@ public struct OpenAICompatibleTranslationProvider: TranslationProvider {
     }
 
     static func extractText(_ data: Data) throws -> String {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = json["choices"] as? [[String: Any]],
-              let message = choices.first?["message"] as? [String: Any],
-              let content = message["content"] as? String else {
-            throw OCRProviderFailure.badResponse
-        }
-        return content
+        try extractOpenAICompatibleText(from: data)
     }
 }
 
 // MARK: - Claude
 
 /// Anthropic Claude Messages API 翻译。
-public struct ClaudeTranslationProvider: TranslationProvider {
+public struct ClaudeTranslationProvider: DiagnosticTranslationProvider {
 
     private let config: TranslationProviderConfig
 
@@ -300,12 +375,23 @@ public struct ClaudeTranslationProvider: TranslationProvider {
         from source: String?,
         to target: String
     ) async -> TranslationResult {
+        await translateWithDiagnostics(lines, from: source, to: target).result
+    }
+
+    public func translateWithDiagnostics(
+        _ lines: [OCRTextLine],
+        from source: String?,
+        to target: String
+    ) async -> TranslationExecutionResult {
         guard !lines.isEmpty else {
-            return untranslatedResult(lines: lines, source: source, target: target)
+            return TranslationExecutionResult(result: untranslatedResult(lines: lines, source: source, target: target))
         }
         let apiKey = config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !apiKey.isEmpty else {
-            return untranslatedResult(lines: lines, source: source, target: target)
+            return TranslationExecutionResult(
+                result: untranslatedResult(lines: lines, source: source, target: target),
+                errorMessage: OCRProviderFailure.missingAPIKey.localizedDescription
+            )
         }
         do {
             let request = try Self.makeRequest(
@@ -315,7 +401,7 @@ public struct ClaudeTranslationProvider: TranslationProvider {
                 lines: lines.map(\.text),
                 target: target
             )
-            return await CloudTranslationRunner.run(
+            return await CloudTranslationRunner.runWithDiagnostics(
                 lines: lines,
                 source: source,
                 target: target,
@@ -323,7 +409,10 @@ public struct ClaudeTranslationProvider: TranslationProvider {
                 extractText: Self.extractText
             )
         } catch {
-            return untranslatedResult(lines: lines, source: source, target: target)
+            return TranslationExecutionResult(
+                result: untranslatedResult(lines: lines, source: source, target: target),
+                errorMessage: error.localizedDescription
+            )
         }
     }
 
@@ -334,9 +423,7 @@ public struct ClaudeTranslationProvider: TranslationProvider {
         lines: [String],
         target: String
     ) throws -> URLRequest {
-        guard let url = URL(string: endpoint), url.scheme != nil else {
-            throw OCRProviderFailure.badEndpoint
-        }
+        let url = try EndpointSecurity.validatedURL(from: endpoint)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = 60
@@ -359,11 +446,6 @@ public struct ClaudeTranslationProvider: TranslationProvider {
     }
 
     static func extractText(_ data: Data) throws -> String {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = json["content"] as? [[String: Any]],
-              let text = content.first?["text"] as? String else {
-            throw OCRProviderFailure.badResponse
-        }
-        return text
+        try extractClaudeText(from: data)
     }
 }

@@ -11,6 +11,7 @@
 //
 
 import AnShotCore
+import ApplicationServices
 import CoreGraphics
 import Foundation
 import ScreenCaptureKit
@@ -103,13 +104,36 @@ public protocol ScreenElementDetecting: AnyObject, Sendable {
 }
 
 /// 基于 ScreenCaptureKit 与辅助功能 API 的实现。
-public final class SystemElementDetector: ScreenElementDetecting, @unchecked Sendable {
+///
+/// 仅持有不可变值属性 `ownProcessID`，无需 `@unchecked Sendable`。
+public final class SystemElementDetector: ScreenElementDetecting {
     /// 本进程 pid：用于把自己的窗口排除在识别结果之外。
     ///
     /// **这一步不能省。** 覆盖层本身就是本进程的一个（或多个）窗口，
     /// 它会出现在 `SCShareableContent.windows` 里；不过滤的话，
     /// 鼠标一移动就可能「识别到自己」，选中框永远是整屏。
     private let ownProcessID: pid_t
+
+    /// 跨进程 AX IPC 单次超时上限（秒），杜绝无响应应用冻结主线程 6 秒。
+    static let axMessagingTimeoutSeconds: Float = 0.04
+
+    /// 允许向上回溯归并的碎片叶子角色。
+    static let fragmentLeafRoles: Set<String> = [
+        kAXStaticTextRole as String,
+        kAXImageRole as String
+    ]
+
+    /// 回溯归并时应当止步的顶层/大容器角色，避免把控件直接放大成整个窗口。
+    static let stopAscendRoles: Set<String> = [
+        kAXWindowRole as String,
+        kAXApplicationRole as String,
+        kAXScrollAreaRole as String,
+        "AXWebArea",
+        kAXSplitGroupRole as String
+    ]
+
+    /// 向上回溯的最大层数。
+    static let maxAscendDepth = 3
 
     public init(ownProcessID: pid_t = ProcessInfo.processInfo.processIdentifier) {
         self.ownProcessID = ownProcessID
@@ -141,7 +165,7 @@ public final class SystemElementDetector: ScreenElementDetecting, @unchecked Sen
             throw DetectionError.displayUnavailable(displayID)
         }
 
-        return content.windows
+        let detected = content.windows
             .filter { isSelectable($0, onDisplay: displayID) }
             .map { window in
                 DetectedWindow(
@@ -153,19 +177,65 @@ public final class SystemElementDetector: ScreenElementDetecting, @unchecked Sen
                     applicationName: window.owningApplication?.applicationName
                 )
             }
+
+        // SCShareableContent.windows 不保证按屏幕 Z-Order 排序，
+        // 必须结合 CGWindowListCopyWindowInfo 的权威前到后顺序表重排。
+        let windowInfoList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]]
+        let orderMap = Self.zOrderMap(from: windowInfoList)
+        return Self.sortWindowsByZOrder(detected, orderMap: orderMap)
+    }
+
+    /// 判断窗口层号是否属于可拾取的可见用户窗口层级。
+    ///
+    /// 放宽 `windowLayer == 0` 的限制，允许拾取置顶浮动窗口、模态面板与弹出菜单，
+    /// 同时排除负值桌面背板（Wallpaper / Backstop）以及屏保/系统顶层遮罩。
+    static func isSelectableLayer(_ layer: Int) -> Bool {
+        let screenSaverLayer = Int(CGWindowLevelForKey(.screenSaverWindow))
+        return layer >= 0 && layer < screenSaverLayer
+    }
+
+    /// 从 `CGWindowListCopyWindowInfo` 输出提取权威的 front-to-back 索引表。
+    static func zOrderMap(from windowInfoList: [[String: Any]]?) -> [CGWindowID: Int] {
+        guard let windowInfoList else { return [:] }
+        var map: [CGWindowID: Int] = [:]
+        map.reserveCapacity(windowInfoList.count)
+        for (index, info) in windowInfoList.enumerated() {
+            guard let number = info[kCGWindowNumber as String] as? NSNumber else { continue }
+            let windowID = CGWindowID(number.uint32Value)
+            if map[windowID] == nil {
+                map[windowID] = index
+            }
+        }
+        return map
+    }
+
+    /// 按权威 Z-Order（前到后）重排窗口列表；未出现在索引表中的窗口维持原有相对顺序置于末尾。
+    static func sortWindowsByZOrder(
+        _ windows: [DetectedWindow],
+        orderMap: [CGWindowID: Int]
+    ) -> [DetectedWindow] {
+        windows.enumerated().sorted { lhs, rhs in
+            let leftOrder = orderMap[lhs.element.windowID] ?? Int.max
+            let rightOrder = orderMap[rhs.element.windowID] ?? Int.max
+            if leftOrder != rightOrder {
+                return leftOrder < rightOrder
+            }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
     }
 
     /// 某个窗口是否应当作为识别候选。
     ///
-    /// 三条过滤缺一不可，都由实测驱动：
-    /// - `windowLayer == 0`：实测 7 个在屏窗口里只有 2 个是层 0，
-    ///   其余是 Wallpaper / Backstop / Fullscreen Backdrop（层号是
-    ///   -2147483622 这类极端负值）。不过滤就会把这些整屏背板识别成窗口。
+    /// 三条过滤缺一不可：
+    /// - 合理可见层级：排除负值桌面背板与全屏级以上系统遮罩，支持置顶浮动窗口。
     /// - `owningApplication != nil`：拿不到归属应用的条目没有意义，
     ///   也无法参与应用级聚合。
     /// - 排除本进程：见 `ownProcessID` 的说明。
     private func isSelectable(_ window: SCWindow, onDisplay displayID: CGDirectDisplayID) -> Bool {
-        guard window.windowLayer == 0 else {
+        guard Self.isSelectableLayer(window.windowLayer) else {
             return false
         }
         guard let application = window.owningApplication else {
@@ -193,6 +263,9 @@ public final class SystemElementDetector: ScreenElementDetecting, @unchecked Sen
 
         // 用目标应用的元素而不是 system-wide：见协议里的说明。
         let application = AXUIElementCreateApplication(processID)
+        // 为应用句柄与后续命中的元素设置 40ms IPC 硬超时，彻底避免卡顿应用阻塞 6 秒。
+        AXUIElementSetMessagingTimeout(application, Self.axMessagingTimeoutSeconds)
+
         var element: AXUIElement?
         // 坐标是**左上原点**的全局屏幕坐标（AXUIElement.h:334）。
         // 覆盖层视图的坐标也是左上原点，因此这里不需要翻转 y。
@@ -206,66 +279,121 @@ public final class SystemElementDetector: ScreenElementDetecting, @unchecked Sen
             return nil
         }
 
-        guard let frame = frame(of: element) else {
-            return nil
-        }
-
-        // 控件常常只有几个像素（分隔线、图标），太小的结果没有选中价值，
-        // 交给窗口层更实用。
-        guard frame.width >= 8, frame.height >= 8 else {
-            return nil
-        }
-
-        return ControlHit(frame: frame, role: role(of: element))
+        return resolveControlHit(startingAt: element)
     }
 
-    /// 读取元素角色。
-    private func role(of element: AXUIElement) -> String? {
-        var roleValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            element,
-            kAXRoleAttribute as CFString,
-            &roleValue
-        ) == .success else {
+    /// 一次性读取元素的 Position / Size / Role / Parent，并在命中过碎叶子节点时向上归并（限 3 层）。
+    private func resolveControlHit(startingAt element: AXUIElement) -> ControlHit? {
+        guard var currentSnapshot = readSnapshot(of: element) else {
             return nil
         }
-        return roleValue as? String
+
+        var bestHit: ControlHit?
+        if let frame = currentSnapshot.frame, Self.isValidControlFrame(frame) {
+            bestHit = ControlHit(frame: frame, role: currentSnapshot.role)
+        }
+
+        // 命中非碎片且尺寸足够的控件，直接返回。
+        if let bestHit, !Self.shouldAscendFromLeaf(role: currentSnapshot.role, frame: currentSnapshot.frame) {
+            return bestHit
+        }
+
+        // 过碎叶子节点（如 AXStaticText、AXImage）或尺寸过小节点，向上回溯归并到语义控件容器。
+        var depth = 0
+        var parentElement = currentSnapshot.parent
+        while depth < Self.maxAscendDepth, let parent = parentElement {
+            depth += 1
+            guard let parentSnapshot = readSnapshot(of: parent) else {
+                break
+            }
+            if Self.shouldStopAscending(parentRole: parentSnapshot.role) {
+                break
+            }
+            if let parentFrame = parentSnapshot.frame, Self.isValidControlFrame(parentFrame) {
+                bestHit = ControlHit(frame: parentFrame, role: parentSnapshot.role)
+                if !Self.shouldAscendFromLeaf(role: parentSnapshot.role, frame: parentFrame) {
+                    return bestHit
+                }
+            }
+            currentSnapshot = parentSnapshot
+            parentElement = currentSnapshot.parent
+        }
+
+        return bestHit
     }
 
-    /// 读取辅助功能元素的 frame。
-    private func frame(of element: AXUIElement) -> CGRect? {
-        var positionValue: CFTypeRef?
-        var sizeValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            element,
+    /// 判断节点尺寸是否满足控件最小有效阈值（过滤分隔线、微小图标）。
+    static func isValidControlFrame(_ frame: CGRect) -> Bool {
+        frame.width >= 8 && frame.height >= 8
+    }
+
+    /// 判断当前命中节点是否属于需要向上归并的碎片叶子或过小节点。
+    static func shouldAscendFromLeaf(role: String?, frame: CGRect?) -> Bool {
+        if let frame, !isValidControlFrame(frame) {
+            return true
+        }
+        guard let role else { return false }
+        return fragmentLeafRoles.contains(role)
+    }
+
+    /// 判断父节点是否已越过控件边界进入窗口或顶层大容器。
+    static func shouldStopAscending(parentRole: String?) -> Bool {
+        guard let parentRole else { return false }
+        return stopAscendRoles.contains(parentRole)
+    }
+
+    /// 单个元素属性快照。
+    private struct AXElementSnapshot {
+        let frame: CGRect?
+        let role: String?
+        let parent: AXUIElement?
+    }
+
+    /// 使用 `AXUIElementCopyMultipleAttributeValues` 将 Position / Size / Role / Parent 合并为 1 次 IPC。
+    private func readSnapshot(of element: AXUIElement) -> AXElementSnapshot? {
+        AXUIElementSetMessagingTimeout(element, Self.axMessagingTimeoutSeconds)
+
+        let attributes = [
             kAXPositionAttribute as CFString,
-            &positionValue
-        ) == .success,
-        AXUIElementCopyAttributeValue(
-            element,
             kAXSizeAttribute as CFString,
-            &sizeValue
-        ) == .success else {
+            kAXRoleAttribute as CFString,
+            kAXParentAttribute as CFString
+        ] as CFArray
+
+        var valuesRef: CFArray?
+        let status = AXUIElementCopyMultipleAttributeValues(
+            element,
+            attributes,
+            AXCopyMultipleAttributeOptions(),
+            &valuesRef
+        )
+        guard status == .success,
+              let values = valuesRef as? [AnyObject],
+              values.count == 4 else {
             return nil
         }
 
         var origin = CGPoint.zero
         var size = CGSize.zero
-
-        // AXValue 是 CFTypeRef，必须先确认类型再解引用；
-        // 直接强转在部分应用上会崩（有的属性返回的是 CFString）。
-        guard let positionValue, let sizeValue,
-              CFGetTypeID(positionValue) == AXValueGetTypeID(),
-              CFGetTypeID(sizeValue) == AXValueGetTypeID() else {
-            return nil
+        let frame: CGRect?
+        if CFGetTypeID(values[0]) == AXValueGetTypeID(),
+           CFGetTypeID(values[1]) == AXValueGetTypeID(),
+           AXValueGetValue(values[0] as! AXValue, .cgPoint, &origin),
+           AXValueGetValue(values[1] as! AXValue, .cgSize, &size) {
+            frame = CGRect(origin: origin, size: size)
+        } else {
+            frame = nil
         }
 
-        guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &origin),
-              AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) else {
-            return nil
+        let role = values[2] as? String
+        let parent: AXUIElement?
+        if CFGetTypeID(values[3]) == AXUIElementGetTypeID() {
+            parent = (values[3] as! AXUIElement)
+        } else {
+            parent = nil
         }
 
-        return CGRect(origin: origin, size: size)
+        return AXElementSnapshot(frame: frame, role: role, parent: parent)
     }
 
 }

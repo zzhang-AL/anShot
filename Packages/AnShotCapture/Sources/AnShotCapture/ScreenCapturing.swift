@@ -40,6 +40,7 @@
 import AppKit
 import CoreGraphics
 import Foundation
+import os
 
 // MARK: - 捕获范围
 
@@ -296,13 +297,18 @@ public enum DisplayGeometry {
 
     /// 拿不到 display mode 时的回退链。
     ///
-    /// 顺序体现可靠性排序：`NSScreen.backingScaleFactor` 来自窗口系统本身，
-    /// 与前台应用看到的缩放一致；`CGDisplayPixelsWide` 虽然在本机实测中
-    /// 返回的是**逻辑点宽**（见 `scaleFactor` 的说明），但当它与
-    /// `CGDisplayBounds` 不一致时，那个比值仍是有意义的像素/点比。
+    /// 顺序体现可靠性排序：优先使用主线程采集并缓存的 `NSScreen.backingScaleFactor`，
+    /// 严禁在后台并发线程直接访问 AppKit 的 `NSScreen.screens`；
+    /// 缓存未命中且处于后台线程时安全回退到 `CGDisplayPixelsWide` 比值。
     private static func fallbackScaleFactor(for displayID: CGDirectDisplayID) -> CGFloat {
-        if let screen = screen(for: displayID), screen.backingScaleFactor > 0 {
-            return screen.backingScaleFactor
+        if Thread.isMainThread {
+            if let screen = mainThreadScreen(for: displayID), screen.backingScaleFactor > 0 {
+                let scale = screen.backingScaleFactor
+                screenScaleCache.withLock { $0[displayID] = scale }
+                return scale
+            }
+        } else if let cached = screenScaleCache.withLock({ $0[displayID] }), cached > 0 {
+            return cached
         }
 
         let pointWidth = CGDisplayBounds(displayID).width
@@ -314,11 +320,12 @@ public enum DisplayGeometry {
         return 1.0
     }
 
-    /// 找到 displayID 对应的 `NSScreen`。
-    ///
-    /// 关联键是 `NSScreenNumber`，它是 `CGDirectDisplayID` 的装箱值。
-    private static func screen(for displayID: CGDirectDisplayID) -> NSScreen? {
-        NSScreen.screens.first { screen in
+    private static let screenScaleCache = OSAllocatedUnfairLock<[CGDirectDisplayID: CGFloat]>(initialState: [:])
+
+    /// 仅在主线程安全读取 `NSScreen.screens` 并定位对应显示器。
+    private static func mainThreadScreen(for displayID: CGDirectDisplayID) -> NSScreen? {
+        assert(Thread.isMainThread)
+        return NSScreen.screens.first { screen in
             let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
             return (number as? NSNumber)?.uint32Value == displayID
         }

@@ -25,14 +25,29 @@ import AnShotCore
 import AVFoundation
 import CoreMedia
 import Foundation
+import os
 
 private let microphoneLogger = AnShotLog.recording
+
+/// 可用的音频输入设备描述，供设置面板与录制配置选择。
+public struct AudioInputDevice: Equatable, Sendable, Identifiable {
+    public let id: String
+    public let name: String
+    public let isDefault: Bool
+
+    public init(id: String, name: String, isDefault: Bool) {
+        self.id = id
+        self.name = name
+        self.isDefault = isDefault
+    }
+}
+
 /// 麦克风采集器。
 ///
 /// 样本回调**直接发生在调用方指定的串行队列上**，不做二次派发——
 /// `CMSampleBuffer` 不满足 `Sendable`，跨队列传递只能靠 `@unchecked` 包装掩盖问题，
 /// 而让回调落在录制器自己的串行队列上则完全没有这个问题。
-final class MicrophoneCapturer: NSObject, @unchecked Sendable {
+public final class MicrophoneCapturer: NSObject, @unchecked Sendable {
 
     private let session = AVCaptureSession()
     private let output = AVCaptureAudioDataOutput()
@@ -44,15 +59,41 @@ final class MicrophoneCapturer: NSObject, @unchecked Sendable {
     /// 实测在 async 上下文中同步调用会让整个会话启动挂起、诊断永远等不到结果。
     private let sessionQueue = DispatchQueue(label: "com.anshot.recording.microphone.session")
 
-    /// 样本回调。
-    ///
-    /// 标 `@Sendable` 的依据：它会被传入 `sessionQueue.async`，
-    /// 即**必然跨线程**被调用（在调用方指定的输出队列上）。
-    /// 不标注只是把这个事实藏起来——`DispatchQueue.async` 是 `@Sendable`
-    /// 闭包，捕获非 `@Sendable` 的 `handler` 正是编译器警告的
-    /// `SendableClosureCaptures`。真实表达契约优于用 `@unchecked` 掩盖。
+    /// 样本回调与运行时状态。
     private var handler: (@Sendable (CMSampleBuffer) -> Void)?
+    private var outputQueue: DispatchQueue?
+    private var activeDeviceID: String?
+    private var disconnectObserver: NSObjectProtocol?
     private var isRunning = false
+
+    /// 枚举当前可用的全部音频输入设备（默认设备排在首位）。
+    public static func availableInputDevices() -> [AudioInputDevice] {
+        let deviceTypes: [AVCaptureDevice.DeviceType]
+        if #available(macOS 14.0, *) {
+            deviceTypes = [.microphone, .external]
+        } else {
+            deviceTypes = [.builtInMicrophone, .externalUnknown]
+        }
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: deviceTypes,
+            mediaType: .audio,
+            position: .unspecified
+        )
+        let defaultID = AVCaptureDevice.default(for: .audio)?.uniqueID
+        let mapped = discovery.devices.map { device in
+            AudioInputDevice(
+                id: device.uniqueID,
+                name: device.localizedName,
+                isDefault: device.uniqueID == defaultID
+            )
+        }
+        return mapped.sorted { lhs, rhs in
+            if lhs.isDefault != rhs.isDefault {
+                return lhs.isDefault
+            }
+            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        }
+    }
 
     /// 开始采集。
     ///
@@ -118,6 +159,7 @@ final class MicrophoneCapturer: NSObject, @unchecked Sendable {
             throw RecordingError.writerFailed("无法添加麦克风输入：\(device.localizedName)")
         }
         session.addInput(input)
+        activeDeviceID = device.uniqueID
 
         output.setSampleBufferDelegate(self, queue: queue)
         guard session.canAddOutput(output) else {
@@ -136,7 +178,9 @@ final class MicrophoneCapturer: NSObject, @unchecked Sendable {
         guard !isRunning else { return }
 
         self.handler = handler
+        self.outputQueue = queue
         try configure(on: queue, deviceID: deviceID)
+        installDisconnectObserverIfNeeded()
 
         microphoneLogger.notice("麦克风启动：调用 startRunning")
         session.startRunning()
@@ -145,7 +189,13 @@ final class MicrophoneCapturer: NSObject, @unchecked Sendable {
     }
 
     private func performStop() {
-        guard isRunning else { return }
+        removeDisconnectObserver()
+        outputQueue = nil
+        activeDeviceID = nil
+        guard isRunning else {
+            handler = nil
+            return
+        }
         session.stopRunning()
         session.beginConfiguration()
         session.inputs.forEach { session.removeInput($0) }
@@ -156,8 +206,59 @@ final class MicrophoneCapturer: NSObject, @unchecked Sendable {
         microphoneLogger.notice("麦克风已停止")
     }
 
+    /// 监听麦克风设备断开通知，蓝牙或外接麦拔出时平滑回退到默认设备。
+    private func installDisconnectObserverIfNeeded() {
+        guard disconnectObserver == nil else { return }
+        disconnectObserver = NotificationCenter.default.addObserver(
+            forName: AVCaptureDevice.wasDisconnectedNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] notification in
+            guard let self else { return }
+            let disconnectedID = (notification.object as? AVCaptureDevice)?.uniqueID
+            self.sessionQueue.async {
+                self.handleDeviceDisconnected(deviceID: disconnectedID)
+            }
+        }
+    }
+
+    private func removeDisconnectObserver() {
+        if let observer = disconnectObserver {
+            NotificationCenter.default.removeObserver(observer)
+            disconnectObserver = nil
+        }
+    }
+
+    private func handleDeviceDisconnected(deviceID disconnectedID: String?) {
+        guard isRunning else { return }
+        if let disconnectedID, let current = activeDeviceID, disconnectedID != current {
+            return
+        }
+
+        microphoneLogger.notice("检测到当前麦克风断开，尝试平滑回退到系统默认输入设备")
+        guard let fallback = AVCaptureDevice.default(for: .audio),
+              fallback.uniqueID != activeDeviceID,
+              let fallbackInput = try? AVCaptureDeviceInput(device: fallback) else {
+            microphoneLogger.notice("无可用回退麦克风，停止麦克风采集（不影响画面与系统音频录制）")
+            performStop()
+            return
+        }
+
+        session.beginConfiguration()
+        session.inputs.forEach { session.removeInput($0) }
+        if session.canAddInput(fallbackInput) {
+            session.addInput(fallbackInput)
+            activeDeviceID = fallback.uniqueID
+            session.commitConfiguration()
+            microphoneLogger.notice("麦克风已平滑切换到：\(fallback.localizedName, privacy: .public)")
+        } else {
+            session.commitConfiguration()
+            performStop()
+        }
+    }
+
     private func resolveDevice(preferredID: String?) throws -> AVCaptureDevice {
-        if let preferredID, let device = AVCaptureDevice(uniqueID: preferredID) {
+        if let preferredID, !preferredID.isEmpty, let device = AVCaptureDevice(uniqueID: preferredID) {
             return device
         }
         guard let device = AVCaptureDevice.default(for: .audio) else {
@@ -169,7 +270,7 @@ final class MicrophoneCapturer: NSObject, @unchecked Sendable {
 
 extension MicrophoneCapturer: AVCaptureAudioDataOutputSampleBufferDelegate {
 
-    func captureOutput(
+    public func captureOutput(
         _ output: AVCaptureOutput,
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection

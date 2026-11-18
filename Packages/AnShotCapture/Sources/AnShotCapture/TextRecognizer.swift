@@ -21,6 +21,7 @@ import AnShotCore
 import CoreGraphics
 import CoreText
 import Foundation
+import os
 import Vision
 
 /// 文字识别。
@@ -92,47 +93,66 @@ public enum TextRecognizer {
         cachedAvailability
     }
 
-    /// 预热：把 Vision 的一次性加载成本从「用户第一次点识别」挪到后台。
-    ///
-    /// 本机实测（Apple Silicon）：
-    ///
-    /// | 场景 | 耗时 |
-    /// | --- | --- |
-    /// | 进程内第一次识别（小图 240x60 也一样） | **约 13.7 秒** |
-    /// | 同一进程第二次 | 约 140ms |
-    /// | 进程内第一次处理 3840x2160 | 约 13.3 秒 |
-    /// | 之后的 3840x2160 | 约 550ms |
-    ///
-    /// 十几秒里绝大部分是**模型与计算图的加载/编译**，与图像大小基本无关：
-    /// 喂一张 240x60 的小图同样要 13.7 秒。这笔成本只需付一次，
-    /// 但在此之前没人先付，于是它一直由用户的第一次点击承担——
-    /// 而那时界面上毫无动静，看起来就是「按了没反应」。
-    ///
-    /// 这里刻意用一张很小的图：既然成本与尺寸无关，喂大图只会更慢。
-    /// 预热失败不影响任何主流程（结果被丢弃）。
-    public static func prewarm() async {
-        guard let image = sampleImage() else { return }
-        _ = try? await recognize(in: image)
+    private struct PrewarmState {
+        var inFlightTask: Task<Void, Never>?
+        var completed = false
     }
 
-    /// 一张带文字的小图（白底 + 一行英文）。
+    private static let prewarmLock = OSAllocatedUnfairLock<PrewarmState>(initialState: PrewarmState())
+
+    /// 预热：把 Vision 的一次性加载成本从「用户第一次点识别」挪到后台（单飞去重）。
     ///
-    /// 两个用途，共同点是「需要一张确定的、确实有文字的图」：
-    /// - `prewarm()` 预热识别能力；
+    /// 并发或重复调用时复用同一个预热任务，避免重复启动十余秒的模型加载。
+    public static func prewarm() async {
+        enum Action {
+            case alreadyDone
+            case join(Task<Void, Never>)
+        }
+
+        let action = prewarmLock.withLock { state -> Action in
+            if state.completed {
+                return .alreadyDone
+            }
+            if let existing = state.inFlightTask {
+                return .join(existing)
+            }
+            let task = Task(priority: .utility) {
+                if let image = sampleImage() {
+                    _ = try? await recognize(in: image)
+                }
+                prewarmLock.withLock { current in
+                    current.completed = true
+                    current.inFlightTask = nil
+                }
+            }
+            state.inFlightTask = task
+            return .join(task)
+        }
+
+        switch action {
+        case .alreadyDone:
+            return
+        case .join(let task):
+            await task.value
+        }
+    }
+
+    /// 一张带中英混合文字的小图（白底 + `"预热 Prewarm"`）。
+    ///
+    /// 两个用途，共同点是「需要一张确定的、确实有中英文文字的图」：
+    /// - `prewarm()` 同时预热中英文识别模型管线；
     /// - 设置界面的「测试连接」按钮拿它做一次真实识别。
-    ///
-    /// 不画文字而留白的话，Vision 有可能走「图里没有文本」的捷径，
-    /// 预热会变成空转——模型根本没加载。
     public static func sampleImage() -> CGImage? {
-        let width = 240
+        let width = 280
         let height = 60
+        let srgb = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         guard let context = CGContext(
             data: nil,
             width: width,
             height: height,
             bitsPerComponent: 8,
             bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(),
+            space: srgb,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
             return nil
@@ -140,9 +160,9 @@ public enum TextRecognizer {
         context.setFillColor(gray: 1, alpha: 1)
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
 
-        let font = CTFontCreateWithName("Helvetica" as CFString, 24, nil)
+        let font = CTFontCreateWithName("PingFang SC" as CFString, 24, nil)
         let attributed = NSAttributedString(
-            string: "prewarm",
+            string: "预热 Prewarm",
             attributes: [
                 NSAttributedString.Key(kCTFontAttributeName as String): font,
                 NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(gray: 0, alpha: 1),
@@ -158,7 +178,7 @@ public enum TextRecognizer {
     /// - Parameters:
     ///   - image: 待识别的图像（像素尺寸即结果包围盒的参照系）。
     ///   - languages: 指定语言；nil 表示用 `availability()` 挑出的偏好集。
-    /// - Returns: 按阅读顺序排好的结果，包围盒为**模型坐标系（像素、原点左上）**。
+    /// - Returns: 按分栏阅读序与代码块缩进整理后的结果，包围盒为**模型坐标系（像素、原点左上）**。
     public static func recognize(
         in image: CGImage,
         languages: [String]? = nil
@@ -174,6 +194,8 @@ public enum TextRecognizer {
         return try await Task.detached(priority: .userInitiated) {
             let request = VNRecognizeTextRequest()
             request.recognitionLevel = .accurate
+            // 显式锁定 Revision3，与能力探测保持一致。
+            request.revision = VNRecognizeTextRequestRevision3
             request.usesLanguageCorrection = true
             if !chosen.isEmpty {
                 request.recognitionLanguages = chosen
@@ -188,7 +210,7 @@ public enum TextRecognizer {
             }
 
             let observations = request.results ?? []
-            let lines: [OCRTextLine] = observations.compactMap { observation in
+            let rawLines: [OCRTextLine] = observations.compactMap { observation in
                 let candidates = observation.topCandidates(3)
                 guard let best = candidates.first else { return nil }
                 return OCRTextLine(
@@ -203,9 +225,183 @@ public enum TextRecognizer {
                 )
             }
             return OCRResult(
-                lines: OCRResult.readingOrder(lines),
+                lines: layoutLines(rawLines, imagePixelSize: pixelSize),
                 imagePixelSize: pixelSize
             )
         }.value
+    }
+
+    // MARK: - 版面与缩进还原
+
+    /// 基于几何包围盒还原多栏阅读序与代码块左缩进。
+    public static func layoutLines(
+        _ lines: [OCRTextLine],
+        imagePixelSize: PixelSize
+    ) -> [OCRTextLine] {
+        guard lines.count > 1 else { return lines }
+
+        // 先检测是否存在显著垂直分栏缝隙，将页面切分为左右独立栏再分别按序整理。
+        if let splitX = detectColumnSplitX(in: lines, imageWidth: imagePixelSize.width) {
+            let left = lines.filter { $0.boundingBox.origin.x + $0.boundingBox.size.width * 0.5 < splitX }
+            let right = lines.filter { $0.boundingBox.origin.x + $0.boundingBox.size.width * 0.5 >= splitX }
+            if left.count >= 2 && right.count >= 2 {
+                return layoutSingleColumn(left) + layoutSingleColumn(right)
+            }
+        }
+        return layoutSingleColumn(lines)
+    }
+
+    /// 探测显著的双栏垂直分界线：要求左右两栏各自有多行且纵向跨度交错，中间存在空白隔离带。
+    private static func detectColumnSplitX(
+        in lines: [OCRTextLine],
+        imageWidth: Double
+    ) -> Double? {
+        guard lines.count >= 4, imageWidth > 0 else { return nil }
+        let averageHeight = lines.map(\.boundingBox.size.height).reduce(0, +) / Double(lines.count)
+        let minGap = max(averageHeight * 1.8, imageWidth * 0.05)
+
+        let narrowLines = lines.filter { $0.boundingBox.size.width < imageWidth * 0.65 }
+        guard narrowLines.count >= 4 else { return nil }
+
+        let sortedByX = narrowLines.sorted { $0.boundingBox.origin.x < $1.boundingBox.origin.x }
+        var runningMaxX = sortedByX[0].boundingBox.origin.x + sortedByX[0].boundingBox.size.width
+        var bestSplit: (x: Double, gap: Double)?
+
+        for line in sortedByX.dropFirst() {
+            let minX = line.boundingBox.origin.x
+            let gap = minX - runningMaxX
+            if gap >= minGap {
+                let candidateX = runningMaxX + gap * 0.5
+                if bestSplit == nil || gap > bestSplit!.gap {
+                    bestSplit = (candidateX, gap)
+                }
+            }
+            runningMaxX = max(runningMaxX, minX + line.boundingBox.size.width)
+        }
+
+        guard let split = bestSplit else { return nil }
+        let left = lines.filter { $0.boundingBox.origin.x + $0.boundingBox.size.width * 0.5 < split.x }
+        let right = lines.filter { $0.boundingBox.origin.x + $0.boundingBox.size.width * 0.5 >= split.x }
+        guard left.count >= 2, right.count >= 2 else { return nil }
+
+        // 校验左右两栏在垂直 Y 方向确实交错重叠（否则只是上下两段不同偏移）。
+        let leftMinY = left.map(\.boundingBox.origin.y).min() ?? 0
+        let leftMaxY = left.map { $0.boundingBox.origin.y + $0.boundingBox.size.height }.max() ?? 0
+        let rightMinY = right.map(\.boundingBox.origin.y).min() ?? 0
+        let rightMaxY = right.map { $0.boundingBox.origin.y + $0.boundingBox.size.height }.max() ?? 0
+        let verticalOverlap = min(leftMaxY, rightMaxY) - max(leftMinY, rightMinY)
+        guard verticalOverlap > averageHeight else { return nil }
+
+        return split.x
+    }
+
+    /// 单栏内按行带聚类排序，并基于左基准线还原代码块前导缩进空格。
+    private static func layoutSingleColumn(_ lines: [OCRTextLine]) -> [OCRTextLine] {
+        let ordered = deterministicReadingOrder(lines)
+        return restoringIndentation(in: ordered)
+    }
+
+    /// 确定性两阶段行带聚类排序（严格弱序安全，避免循环比较）。
+    private static func deterministicReadingOrder(_ lines: [OCRTextLine]) -> [OCRTextLine] {
+        guard lines.count > 1 else { return lines }
+        let sortedByMidY = lines.sorted { lhs, rhs in
+            let lMid = lhs.boundingBox.origin.y + lhs.boundingBox.size.height * 0.5
+            let rMid = rhs.boundingBox.origin.y + rhs.boundingBox.size.height * 0.5
+            if lMid != rMid { return lMid < rMid }
+            return lhs.boundingBox.origin.x < rhs.boundingBox.origin.x
+        }
+
+        var bands: [[OCRTextLine]] = []
+        var bandTops: [Double] = []
+        var bandBottoms: [Double] = []
+
+        for line in sortedByMidY {
+            let top = line.boundingBox.origin.y
+            let bottom = top + line.boundingBox.size.height
+            if let lastIndex = bands.indices.last {
+                let overlap = min(bandBottoms[lastIndex], bottom) - max(bandTops[lastIndex], top)
+                let minHeight = min(bandBottoms[lastIndex] - bandTops[lastIndex], line.boundingBox.size.height)
+                if overlap > minHeight * 0.5 {
+                    bands[lastIndex].append(line)
+                    bandTops[lastIndex] = min(bandTops[lastIndex], top)
+                    bandBottoms[lastIndex] = max(bandBottoms[lastIndex], bottom)
+                    continue
+                }
+            }
+            bands.append([line])
+            bandTops.append(top)
+            bandBottoms.append(bottom)
+        }
+
+        return bands.flatMap { band in
+            band.sorted { $0.boundingBox.origin.x < $1.boundingBox.origin.x }
+        }
+    }
+
+    /// 当存在明确左对齐基线与多级缩进时，基于 `boundingBox.origin.x` 还原行首缩进空格。
+    private static func restoringIndentation(in lines: [OCRTextLine]) -> [OCRTextLine] {
+        guard lines.count >= 2 else { return lines }
+
+        let charWidths: [Double] = lines.compactMap { line in
+            let count = line.text.count
+            guard count >= 3, line.boundingBox.size.width > 0 else { return nil }
+            return line.boundingBox.size.width / Double(count)
+        }.sorted()
+
+        guard !charWidths.isEmpty else { return lines }
+        let medianCharWidth = charWidths[charWidths.count / 2]
+        guard medianCharWidth > 1 else { return lines }
+
+        let baseX = lines.map(\.boundingBox.origin.x).min() ?? 0
+        let baselineCount = lines.filter {
+            ($0.boundingBox.origin.x - baseX) <= medianCharWidth * 0.8
+        }.count
+        let indentedCount = lines.filter {
+            ($0.boundingBox.origin.x - baseX) >= medianCharWidth * 1.5
+        }.count
+
+        // 仅当存在明确左基线（>=2 行贴左边界）且有显著缩进行时才还原，避免误改居中标题。
+        guard baselineCount >= 2, indentedCount >= 1 else {
+            return lines
+        }
+
+        // 同行多框时只对每条物理行最左侧首个片段补齐缩进。
+        var result: [OCRTextLine] = []
+        var previousRow: OCRTextLine?
+        for line in lines {
+            let isSameRowAsPrevious: Bool
+            if let prev = previousRow {
+                let overlap = min(
+                    prev.boundingBox.origin.y + prev.boundingBox.size.height,
+                    line.boundingBox.origin.y + line.boundingBox.size.height
+                ) - max(prev.boundingBox.origin.y, line.boundingBox.origin.y)
+                let minH = min(prev.boundingBox.size.height, line.boundingBox.size.height)
+                isSameRowAsPrevious = overlap > minH * 0.5
+            } else {
+                isSameRowAsPrevious = false
+            }
+
+            if !isSameRowAsPrevious {
+                let deltaX = line.boundingBox.origin.x - baseX
+                let leadingSpaces = deltaX >= medianCharWidth * 1.5
+                    ? min(24, max(1, Int((deltaX / medianCharWidth).rounded())))
+                    : 0
+                if leadingSpaces > 0, !line.text.hasPrefix(" ") {
+                    let prefix = String(repeating: " ", count: leadingSpaces)
+                    let adjusted = OCRTextLine(
+                        text: prefix + line.text,
+                        candidates: line.candidates.map { prefix + $0 },
+                        confidence: line.confidence,
+                        boundingBox: line.boundingBox
+                    )
+                    result.append(adjusted)
+                    previousRow = line
+                    continue
+                }
+            }
+            result.append(line)
+            previousRow = line
+        }
+        return result
     }
 }

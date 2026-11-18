@@ -74,6 +74,13 @@ enum GIFExporter {
         if FileManager.default.fileExists(atPath: gifURL.path) {
             try? FileManager.default.removeItem(at: gifURL)
         }
+        var didFinalize = false
+        defer {
+            // 若因任务取消或异常中途退出，清理尚未写完的残缺 GIF 文件。
+            if !didFinalize {
+                try? FileManager.default.removeItem(at: gifURL)
+            }
+        }
         guard let destination = CGImageDestinationCreateWithURL(
             gifURL as CFURL,
             UTType.gif.identifier as CFString,
@@ -123,36 +130,40 @@ enum GIFExporter {
         }
         var processed = 0
         for await result in generator.images(for: times) {
-            // 以请求时间换回格序号，不依赖结果的到达顺序与计数。
-            let index = min(
-                frameCount - 1,
-                max(0, Int((result.requestedTime.seconds / slotDuration).rounded()))
-            )
-            processed += 1
-            do {
-                let image = try result.image
-                if outputPixelSize == .zero {
-                    outputPixelSize = CGSize(width: image.width, height: image.height)
+            try Task.checkCancellation()
+            autoreleasepool {
+                // 以请求时间换回格序号，不依赖结果的到达顺序与计数。
+                let index = min(
+                    frameCount - 1,
+                    max(0, Int((result.requestedTime.seconds / slotDuration).rounded()))
+                )
+                processed += 1
+                do {
+                    let image = try result.image
+                    if outputPixelSize == .zero {
+                        outputPixelSize = CGSize(width: image.width, height: image.height)
+                    }
+                    write(timeline.accept(GIFSourceFrame(image), at: index))
+                } catch {
+                    // 单帧失败（例如影片末尾越界）不应让整个导出失败：
+                    // 该格的时长并入前一帧，GIF 仍可用且总时长不变。
+                    failedSlots += 1
+                    gifLogger.error("GIF 取帧失败（index=\(index, privacy: .public)）：\(error.localizedDescription, privacy: .public)")
                 }
-                write(timeline.accept(GIFSourceFrame(image), at: index))
-            } catch {
-                // 单帧失败（例如影片末尾越界）不应让整个导出失败：
-                // 该格的时长并入前一帧，GIF 仍可用且总时长不变。
-                failedSlots += 1
-                gifLogger.error("GIF 取帧失败（index=\(index, privacy: .public)）：\(error.localizedDescription, privacy: .public)")
-            }
 
-            let percent = min(100, processed * 100 / frameCount)
-            if percent != lastReportedPercent {
-                lastReportedPercent = percent
-                // 上报**量化后的值**，而不是帧分数（k/frameCount）。
-                //
-                // 两者不相等时，门控（截断）与界面显示（四舍五入）就各有各的算法，
-                // 而契约也说不清进度到底是什么粒度。上报 1% 粒度的值后，
-                // 「回调值 = 界面显示的值」是个可以直接断言的事实。
-                progress?(Double(percent) / 100)
+                let percent = min(100, processed * 100 / frameCount)
+                if percent != lastReportedPercent {
+                    lastReportedPercent = percent
+                    // 上报**量化后的值**，而不是帧分数（k/frameCount）。
+                    //
+                    // 两者不相等时，门控（截断）与界面显示（四舍五入）就各有各的算法，
+                    // 而契约也说不清进度到底是什么粒度。上报 1% 粒度的值后，
+                    // 「回调值 = 界面显示的值」是个可以直接断言的事实。
+                    progress?(Double(percent) / 100)
+                }
             }
         }
+        try Task.checkCancellation()
         write(timeline.finish(totalSlots: frameCount))
 
         guard writtenFrames > 0 else {
@@ -162,6 +173,7 @@ enum GIFExporter {
         guard CGImageDestinationFinalize(destination) else {
             throw RecordingError.gifExportFailed("GIF 编码失败")
         }
+        didFinalize = true
 
         // 终值必达：最后一帧若未跨越百分比边界（如整除后停在 99），
         // 进度会停在那里——界面此时正处在「生成 GIF…」文案上，不补上就等于永远差一点。
@@ -258,28 +270,72 @@ struct GIFFrameTimeline<Frame> {
     }
 }
 
-/// 一帧 GIF 源图，附带用于判等的像素字节。
+/// 一帧 GIF 源图，附带轻量降采样指纹（避免整幅像素拷贝导致的 GB 级内存开销）。
 ///
-/// 判等只用**逐字节完全相同**：这里的目的是合并静止画面，宁可漏合并也不能误合并
-/// （误合并会直接丢掉画面变化）。
+/// 在保证不误合并的前提下容忍 H.264 压缩导致的 `±2` 灰阶量化底噪。
 struct GIFSourceFrame {
 
+    private static let maxFingerprintSide = 128
+    private static let noiseTolerance: Int = 2
+
     let image: CGImage
-    private let pixels: Data?
+    private let fingerprintWidth: Int
+    private let fingerprintHeight: Int
+    private let fingerprint: [UInt8]?
 
     init(_ image: CGImage) {
         self.image = image
-        self.pixels = image.dataProvider?.data as Data?
+        let targetWidth = max(1, min(image.width, Self.maxFingerprintSide))
+        let targetHeight = max(1, min(image.height, Self.maxFingerprintSide))
+        self.fingerprintWidth = targetWidth
+        self.fingerprintHeight = targetHeight
+        self.fingerprint = Self.makeFingerprint(
+            for: image,
+            width: targetWidth,
+            height: targetHeight
+        )
     }
 
-    func hasSamePixels(as other: GIFSourceFrame) -> Bool {
+    func hasSamePixels(as other: GIFSourceFrame, tolerance: Int = GIFSourceFrame.noiseTolerance) -> Bool {
         guard image.width == other.image.width,
               image.height == other.image.height,
-              image.bytesPerRow == other.image.bytesPerRow,
-              image.bitmapInfo == other.image.bitmapInfo,
-              let pixels, let otherPixels = other.pixels else {
+              fingerprintWidth == other.fingerprintWidth,
+              fingerprintHeight == other.fingerprintHeight,
+              let lhs = fingerprint,
+              let rhs = other.fingerprint,
+              lhs.count == rhs.count else {
             return false
         }
-        return pixels == otherPixels
+        for index in lhs.indices {
+            if abs(Int(lhs[index]) - Int(rhs[index])) > tolerance {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func makeFingerprint(for image: CGImage, width: Int, height: Int) -> [UInt8]? {
+        guard width > 0, height > 0 else { return nil }
+        let bytesPerRow = width * 4
+        var buffer = [UInt8](repeating: 0, count: bytesPerRow * height)
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let ok = buffer.withUnsafeMutableBytes { rawBuffer -> Bool in
+            guard let baseAddress = rawBuffer.baseAddress,
+                  let context = CGContext(
+                      data: baseAddress,
+                      width: width,
+                      height: height,
+                      bitsPerComponent: 8,
+                      bytesPerRow: bytesPerRow,
+                      space: colorSpace,
+                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                  ) else {
+                return false
+            }
+            context.interpolationQuality = .low
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        return ok ? buffer : nil
     }
 }

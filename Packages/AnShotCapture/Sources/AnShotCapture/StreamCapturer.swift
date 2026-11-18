@@ -31,6 +31,7 @@ import CoreGraphics
 import CoreImage
 import CoreMedia
 import Foundation
+import os
 import ScreenCaptureKit
 
 private let streamLogger = AnShotLog.capture
@@ -152,16 +153,27 @@ public struct StreamCapturer: ScreenCapturing {
         }
     }
 
-    /// 从 sampleBuffer 取出图像。
+    /// 从 sampleBuffer 取出图像，保留像素缓冲源色彩空间（如 Display P3）。
     ///
     /// 在回调内立即调用：`CMSampleBuffer` 不能跳并发域传递
     /// （它在 macOS 上不满足 `Sendable`），因此帧一到达就转成 `CGImage`，
     /// 只让 `CGImage` 进入等待方。
-    fileprivate static func makeImage(from sampleBuffer: CMSampleBuffer) -> CGImage? {
+    static func makeImage(from sampleBuffer: CMSampleBuffer) -> CGImage? {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
             return nil
         }
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let colorSpace = CVImageBufferGetColorSpace(pixelBuffer)?.takeUnretainedValue()
+            ?? CGColorSpace(name: CGColorSpace.displayP3)
+            ?? CGColorSpace(name: CGColorSpace.sRGB)
+        if let colorSpace {
+            return ciContext.createCGImage(
+                ciImage,
+                from: ciImage.extent,
+                format: .BGRA8,
+                colorSpace: colorSpace
+            )
+        }
         return ciContext.createCGImage(ciImage, from: ciImage.extent)
     }
 
@@ -175,42 +187,60 @@ public struct StreamCapturer: ScreenCapturing {
 /// 收集流输出的第一个**完整**帧。
 ///
 /// 线程模型：`SCStreamOutput` 的回调在 `outputQueue` 上发生，
-/// 而等待方在 Swift 并发域上，故用锁保护共享状态。
+/// 而等待方在 Swift 并发域上，故使用 `OSAllocatedUnfairLock` 保护共享状态，
+/// 并严格区分外部 `CancellationError` 与超时 `CaptureError.timedOut`。
 final class FirstFrameCollector: NSObject, SCStreamOutput, @unchecked Sendable {
 
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<CGImage, Error>?
-    private var result: Result<CGImage, Error>?
+    private struct CollectorState {
+        var continuation: CheckedContinuation<CGImage, Error>?
+        var result: Result<CGImage, Error>?
+    }
 
-    /// 等待首帧，超时抛 `CaptureError.timedOut`。
+    private let stateLock = OSAllocatedUnfairLock(initialState: CollectorState())
+
+    /// 等待首帧，超时抛 `CaptureError.timedOut`，外部取消抛 `CancellationError`。
     func waitForFirstFrame(timeout: TimeInterval) async throws -> CGImage {
-        try await withThrowingTaskGroup(of: CGImage.self) { group in
+        try Task.checkCancellation()
+        return try await withThrowingTaskGroup(of: CGImage.self) { group in
             group.addTask { [self] in
                 try await withTaskCancellationHandler {
                     try await withCheckedThrowingContinuation { continuation in
-                        lock.lock()
-                        if let result {
-                            // 首帧可能早于 startCapture 返回，必须保留它。
-                            lock.unlock()
+                        enum ImmediateAction {
+                            case resume(Result<CGImage, Error>)
+                            case cancel
+                            case suspended
+                        }
+
+                        let action = stateLock.withLock { state -> ImmediateAction in
+                            if let result = state.result {
+                                // 首帧可能早于 startCapture 返回，必须保留它。
+                                return .resume(result)
+                            }
+                            if Task.isCancelled {
+                                return .cancel
+                            }
+                            state.continuation = continuation
+                            return .suspended
+                        }
+
+                        switch action {
+                        case .resume(let result):
                             continuation.resume(with: result)
-                            return
+                        case .cancel:
+                            continuation.resume(throwing: CancellationError())
+                        case .suspended:
+                            break
                         }
-                        if Task.isCancelled {
-                            lock.unlock()
-                            continuation.resume(throwing: CaptureError.timedOut)
-                            return
-                        }
-                        self.continuation = continuation
-                        lock.unlock()
                     }
                 } onCancel: {
-                    // 超时分支取消本任务时必须恢复 continuation，任务组才能退出。
-                    self.cancel()
+                    // 外部任务取消或任务组取消时唤醒 continuation，区分取消与超时。
+                    self.cancel(with: CancellationError())
                 }
             }
 
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            group.addTask { [self] in
+                try await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
+                self.cancel(with: CaptureError.timedOut)
                 throw CaptureError.timedOut
             }
 
@@ -223,9 +253,9 @@ final class FirstFrameCollector: NSObject, SCStreamOutput, @unchecked Sendable {
         }
     }
 
-    /// 主动结束等待。用于超时或错误路径，确保没有悬挂的 continuation。
-    func cancel() {
-        finish(with: .failure(CaptureError.timedOut))
+    /// 主动结束等待。默认按取消语义抛 `CancellationError`，也可指定具体错误。
+    func cancel(with error: Error = CancellationError()) {
+        finish(with: .failure(error))
     }
 
     // MARK: SCStreamOutput
@@ -246,16 +276,16 @@ final class FirstFrameCollector: NSObject, SCStreamOutput, @unchecked Sendable {
     // MARK: 内部
 
     func finish(with result: Result<CGImage, Error>) {
-        lock.lock()
-        guard self.result == nil else {
-            // exactly-once：重复回调是正常的（流在停止前可能继续产帧）
-            lock.unlock()
-            return
+        let pending = stateLock.withLock { state -> CheckedContinuation<CGImage, Error>? in
+            guard state.result == nil else {
+                // exactly-once：重复回调是正常的（流在停止前可能继续产帧）
+                return nil
+            }
+            state.result = result
+            let pending = state.continuation
+            state.continuation = nil
+            return pending
         }
-        self.result = result
-        let pending = continuation
-        continuation = nil
-        lock.unlock()
 
         pending?.resume(with: result)
     }

@@ -51,32 +51,32 @@ final class MovieWriter: RecordingSampleSink {
 
     // MARK: 时间轴状态
 
-    /// 第一帧的原始 PTS，作为文件时间轴的原点。
+    /// 第一帧完整视频帧的原始 PTS，作为文件时间轴的原点。
     private var originPTS: CMTime?
 
-    /// 最近一个样本的原始 PTS，**视频与音频共享**。
-    ///
-    /// 可以共享的依据：SCStream 的视频与音频来自**同一时钟域**（plan.md §3.1/§6），
-    /// 与 M2-4 的麦克风不同。暂停锚点需要的正是「暂停前最后一个样本」，
-    /// 不必区分来自哪条轨。
-    private var lastOriginalPTS: CMTime?
+    /// 所有已写入轨道样本在原始时钟域推进到的最大结束时刻，用于结算暂停时长。
+    private var maxOriginalSampleEndPTS: CMTime?
 
-    /// 累计暂停时长。由 `notePauseResumed` 之后的第一个样本结算。
+    /// 累计暂停时长。由恢复后的第一个样本到达时按单调下界安全结算。
     private var accumulatedPause: CMTime = .zero
 
-    /// 暂停锚点：进入暂停时最后一帧的 PTS。
-    ///
-    /// 非 nil 表示「正在等待恢复后的第一个样本来结算暂停时长」。
-    private var pauseAnchorPTS: CMTime?
+    /// 暂停标记：进入暂停时是否等待恢复后的首个样本结算暂停时长。
+    private var awaitingPauseSettle = false
 
-    /// 最近一次写入的输出时间戳。
-    private var lastOutputPTS: CMTime = .zero
+    /// 进入暂停时刻的原始时钟最大结束位置。
+    private var pauseAnchorOriginalPTS: CMTime?
+
+    /// 进入暂停时刻所有轨道在文件时间轴上的最大已写入终点，防止暂停扣除过多导致任何轨道倒退。
+    private var maxFileEndBeforePause: CMTime = .zero
+
+    /// 视频轨最近一次写入的输出时间戳。
+    private var lastVideoOutputPTS: CMTime?
 
     private var writtenFrameCount = 0
     private var writtenAudioBufferCount = 0
     private var writtenMicrophoneBufferCount = 0
 
-    /// 各音频轨上一块的**结束时刻**（文件时间轴）。用于检测并补齐空隙。
+    /// 各音频轨上一块的**结束时刻**（文件时间轴）。用于检测、单调对齐并补齐空隙。
     private var lastSystemAudioEndTime: CMTime?
     private var lastMicrophoneEndTime: CMTime?
     private var filledSilenceBufferCount = 0
@@ -119,9 +119,15 @@ final class MovieWriter: RecordingSampleSink {
         } catch {
             throw RecordingError.writerFailed("无法创建写入器：\(error.localizedDescription)")
         }
+        // 分片写入保护：每隔 2 秒写入一次片段索引，防止异常中断或磁盘满导致整片损坏。
+        writer.movieFragmentInterval = CMTime(seconds: 2, preferredTimescale: 600)
 
+        let alignedPixelSize = CGSize(
+            width: CGFloat(max(2, Int(pixelSize.width.rounded()) & ~1)),
+            height: CGFloat(max(2, Int(pixelSize.height.rounded()) & ~1))
+        )
         outputURL = url
-        self.pixelSize = pixelSize
+        self.pixelSize = alignedPixelSize
         frameStep = CMTime(value: 1, timescale: CMTimeScale(max(1, video.frameRate)))
 
         let compression: [String: Any] = [
@@ -132,8 +138,8 @@ final class MovieWriter: RecordingSampleSink {
 
         var outputSettings: [String: Any] = [
             AVVideoCodecKey: video.codec == .h264 ? AVVideoCodecType.h264 : AVVideoCodecType.hevc,
-            AVVideoWidthKey: Int(pixelSize.width.rounded()),
-            AVVideoHeightKey: Int(pixelSize.height.rounded()),
+            AVVideoWidthKey: Int(alignedPixelSize.width),
+            AVVideoHeightKey: Int(alignedPixelSize.height),
             AVVideoCompressionPropertiesKey: compression
         ]
         outputSettings[AVVideoColorPropertiesKey] = [
@@ -190,24 +196,57 @@ final class MovieWriter: RecordingSampleSink {
         }
     }
 
-    // MARK: - 暂停边界
+    // MARK: - 暂停边界与轨道终点
+
+    /// 若底层 `AVAssetWriter` 已进入失败状态，返回对应错误。
+    var failureError: Error? {
+        guard writer.status == .failed else { return nil }
+        return writer.error ?? RecordingError.writerFailed("写入器状态异常")
+    }
 
     /// 告知写入器「暂停开始」。
     func notePauseStarted() {
-        pauseAnchorPTS = lastOriginalPTS
+        guard isStarted else { return }
+        awaitingPauseSettle = true
+        pauseAnchorOriginalPTS = maxOriginalSampleEndPTS
+        maxFileEndBeforePause = currentMaxWrittenEndTime()
     }
 
-    /// 暂停时长在恢复后的第一个样本到达时结算（此时才能算出真实间隔）。
-    private func settlePauseIfNeeded(currentPTS: CMTime) {
-        guard let anchor = pauseAnchorPTS else { return }
-        pauseAnchorPTS = nil
+    /// 当前所有轨道在文件时间轴上的最大已写入终点。
+    private func currentMaxWrittenEndTime() -> CMTime {
+        var maxEnd: CMTime = .zero
+        if let videoPTS = lastVideoOutputPTS {
+            maxEnd = CMTimeMaximum(maxEnd, CMTimeAdd(videoPTS, frameStep))
+        }
+        if let audioEnd = lastSystemAudioEndTime {
+            maxEnd = CMTimeMaximum(maxEnd, audioEnd)
+        }
+        if let micEnd = lastMicrophoneEndTime {
+            maxEnd = CMTimeMaximum(maxEnd, micEnd)
+        }
+        return maxEnd
+    }
 
-        // 从间隔中**保留一帧**：恢复后的第一帧与暂停前最后一帧之间，本来就应当相隔一帧。
-        // 若把整个间隔都扣掉，这两帧会得到相同、或因 CMTime 精度而略微倒退的时间戳，
-        // 而 AVAssetWriter 要求时间戳严格递增——实测后果是 finishWriting 直接失败
-        // （错误为「The operation could not be completed」，已写入的部分文件保留在磁盘上）。
+    /// 暂停时长在恢复后的第一个样本到达时结算，并保证不超越任何已写入轨道的时间轴终点。
+    private func settlePauseIfNeeded(currentPTS: CMTime) {
+        guard awaitingPauseSettle else { return }
+        awaitingPauseSettle = false
+
+        guard let anchor = pauseAnchorOriginalPTS,
+              let origin = originPTS else {
+            pauseAnchorOriginalPTS = nil
+            return
+        }
+        pauseAnchorOriginalPTS = nil
+
         let gap = CMTimeSubtract(currentPTS, anchor)
-        let pauseLength = CMTimeSubtract(gap, frameStep)
+        let candidatePause = CMTimeSubtract(gap, frameStep)
+        guard candidatePause.isValid, candidatePause.seconds > 0 else { return }
+
+        // 单调下界约束：扣除暂停后，恢复后的当前样本时间戳不得落到暂停前任何轨道已写入终点之前。
+        let projectedWithoutNewPause = CMTimeSubtract(CMTimeSubtract(currentPTS, origin), accumulatedPause)
+        let maxSafePause = CMTimeSubtract(projectedWithoutNewPause, maxFileEndBeforePause)
+        let pauseLength = CMTimeMinimum(candidatePause, maxSafePause)
         guard pauseLength.isValid, pauseLength.seconds > 0 else { return }
 
         accumulatedPause = CMTimeAdd(accumulatedPause, pauseLength)
@@ -220,11 +259,12 @@ final class MovieWriter: RecordingSampleSink {
     // MARK: - RecordingSampleSink
 
     func consumeVideo(_ sampleBuffer: CMSampleBuffer) -> Bool {
-        guard !isFinished else { return false }
+        guard !isFinished, writer.status != .failed else { return false }
 
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         guard pts.isValid else { return false }
 
+        // 仅由首帧完整视频帧初始化会话时间轴原点。
         if !isStarted {
             guard startIfNeeded(originPTS: pts) else { return false }
         }
@@ -236,7 +276,14 @@ final class MovieWriter: RecordingSampleSink {
             return false
         }
 
-        let outputPTS = adjustedTime(for: pts)
+        var outputPTS = adjustedTime(for: pts)
+        if CMTimeCompare(outputPTS, .zero) < 0 {
+            outputPTS = .zero
+        }
+        if let lastVideo = lastVideoOutputPTS, CMTimeCompare(outputPTS, lastVideo) <= 0 {
+            outputPTS = CMTimeAdd(lastVideo, CMTime(value: 1, timescale: 600))
+        }
+
         guard let adjusted = Self.retimed(sampleBuffer, to: outputPTS) else {
             return false
         }
@@ -248,67 +295,33 @@ final class MovieWriter: RecordingSampleSink {
             return false
         }
 
-        lastOriginalPTS = pts
-        lastOutputPTS = outputPTS
+        lastVideoOutputPTS = outputPTS
+        recordOriginalSampleEnd(CMTimeAdd(pts, frameStep))
         writtenFrameCount += 1
         return true
     }
 
     func consumeSystemAudio(_ sampleBuffer: CMSampleBuffer) -> Bool {
-        guard !isFinished, let audioInput else { return false }
-
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        guard pts.isValid else { return false }
-
-        if !isStarted {
-            guard startIfNeeded(originPTS: pts) else { return false }
+        guard let audioInput else { return false }
+        var endTime = lastSystemAudioEndTime
+        let accepted = consumeAudioSample(
+            sampleBuffer,
+            into: audioInput,
+            lastEndTime: &endTime,
+            trackLabel: "音频"
+        )
+        lastSystemAudioEndTime = endTime
+        if accepted {
+            writtenAudioBufferCount += 1
+            logFormatsIfNeeded(systemBuffer: sampleBuffer)
         }
-
-        settlePauseIfNeeded(currentPTS: pts)
-
-        guard audioInput.isReadyForMoreMediaData else {
-            // 写入器跟不上：如实报告未消费，由录制器计入丢弃
-            return false
-        }
-
-        let outputPTS = adjustedTime(for: pts)
-        // 补齐上一块与本块之间的空隙，否则该轨时长会短于视频
-        if let lastEnd = lastSystemAudioEndTime, CMTimeCompare(lastEnd, outputPTS) < 0 {
-            guard fillSilence(into: audioInput, like: sampleBuffer, from: lastEnd, to: outputPTS) else {
-                return false
-            }
-        }
-
-        guard let adjusted = Self.retimed(sampleBuffer, to: outputPTS) else {
-            return false
-        }
-        guard audioInput.append(adjusted) else {
-            writerLogger.error("""
-                音频样本写入失败：\(Self.diagnose(sampleBuffer), privacy: .public) \
-                \(String(describing: self.writer.error), privacy: .public)
-                """)
-            return false
-        }
-
-        lastOriginalPTS = pts
-        lastSystemAudioEndTime = Self.sampleEndTime(of: sampleBuffer, startingAt: outputPTS)
-        writtenAudioBufferCount += 1
-        logFormatsIfNeeded(systemBuffer: sampleBuffer)
-        return true
+        return accepted
     }
 
     func consumeMicrophone(_ sampleBuffer: CMSampleBuffer) -> Bool {
-        guard !isFinished, let microphoneInput else { return false }
-
+        guard let microphoneInput else { return false }
         let rawPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        guard rawPTS.isValid else { return false }
-
-        if !isStarted {
-            guard startIfNeeded(originPTS: rawPTS) else { return false }
-        }
-
-        // 诊断记录（仅一次）：确认两路确实同处一个时钟域
-        if !hasLoggedMicrophoneClock, let origin = originPTS {
+        if rawPTS.isValid, !hasLoggedMicrophoneClock, let origin = originPTS {
             hasLoggedMicrophoneClock = true
             writerLogger.notice("""
                 麦克风时钟校验：rawPTS=\(String(format: "%.3f", rawPTS.seconds), privacy: .public) \
@@ -317,35 +330,108 @@ final class MovieWriter: RecordingSampleSink {
                 """)
         }
 
-        settlePauseIfNeeded(currentPTS: rawPTS)
+        var endTime = lastMicrophoneEndTime
+        let accepted = consumeAudioSample(
+            sampleBuffer,
+            into: microphoneInput,
+            lastEndTime: &endTime,
+            trackLabel: "麦克风"
+        )
+        lastMicrophoneEndTime = endTime
+        if accepted {
+            writtenMicrophoneBufferCount += 1
+            logFormatsIfNeeded(microphoneBuffer: sampleBuffer)
+        }
+        return accepted
+    }
 
-        guard microphoneInput.isReadyForMoreMediaData else { return false }
-        // 与视频、系统音频使用**同一个**换算：三者同处一个时钟域，各用一套偏移
-        // 会让轨间同步随时间漂移。
-        let outputPTS = adjustedTime(for: rawPTS)
-        // 麦克风启动晚于视频（实测差 108ms），首块之前必然有一段空隙；
-        // 运行中也可能因写入器未就绪而丢帧。不补齐会让该轨比视频短。
-        if let lastEnd = lastMicrophoneEndTime, CMTimeCompare(lastEnd, outputPTS) < 0 {
-            guard fillSilence(into: microphoneInput, like: sampleBuffer, from: lastEnd, to: outputPTS) else {
+    /// 音频样本通用写入流程：
+    /// 1. 会话必须已由视频首帧确立时间轴原点，原点前极早期音频直接丢弃；
+    /// 2. 首块到达时以 `lastEndTime ?? .zero` 自动补齐 `[.zero, outputPTS)` 起始静音；
+    /// 3. 按当前轨独立 `lastEndTime` 做单调下界裁剪/对齐，彻底防止跨轨 PTS 倒退。
+    private func consumeAudioSample(
+        _ sampleBuffer: CMSampleBuffer,
+        into input: AVAssetWriterInput,
+        lastEndTime: inout CMTime?,
+        trackLabel: String
+    ) -> Bool {
+        guard !isFinished, isStarted, originPTS != nil, writer.status != .failed else {
+            return false
+        }
+
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        guard pts.isValid else { return false }
+
+        settlePauseIfNeeded(currentPTS: pts)
+
+        let rawOutputPTS = adjustedTime(for: pts)
+        // 原点前到达的极早期音频直接丢弃，避免向会话传入负时间戳。
+        guard CMTimeCompare(rawOutputPTS, .zero) >= 0 else {
+            return false
+        }
+
+        guard input.isReadyForMoreMediaData else {
+            return false
+        }
+
+        let expectedStart = lastEndTime ?? .zero
+        var workingBuffer = sampleBuffer
+        var effectiveOutputPTS = rawOutputPTS
+
+        if CMTimeCompare(rawOutputPTS, expectedStart) < 0 {
+            let candidateEnd = Self.sampleEndTime(of: sampleBuffer, startingAt: rawOutputPTS)
+            guard CMTimeCompare(candidateEnd, expectedStart) > 0 else {
+                // 整块已落在本轨已写时间轴之前，直接丢弃以免倒退报错。
+                return false
+            }
+            let overlap = CMTimeSubtract(expectedStart, rawOutputPTS)
+            if let trimmed = Self.trimHead(of: sampleBuffer, by: overlap) {
+                workingBuffer = trimmed
+                effectiveOutputPTS = expectedStart
+            } else {
+                effectiveOutputPTS = expectedStart
+            }
+        }
+
+        if CMTimeCompare(expectedStart, effectiveOutputPTS) < 0 {
+            guard fillSilence(
+                into: input,
+                like: workingBuffer,
+                from: expectedStart,
+                to: effectiveOutputPTS,
+                updatedEnd: &lastEndTime
+            ) else {
                 return false
             }
         }
-        guard let adjusted = Self.retimed(sampleBuffer, to: outputPTS) else {
+
+        guard let adjusted = Self.retimed(workingBuffer, to: effectiveOutputPTS) else {
             return false
         }
-        guard microphoneInput.append(adjusted) else {
+        guard input.append(adjusted) else {
             writerLogger.error("""
-                麦克风样本写入失败：\(Self.diagnose(sampleBuffer), privacy: .public) \
+                \(trackLabel, privacy: .public)样本写入失败：\(Self.diagnose(workingBuffer), privacy: .public) \
                 \(String(describing: self.writer.error), privacy: .public)
                 """)
             return false
         }
 
-        lastOriginalPTS = rawPTS
-        lastMicrophoneEndTime = Self.sampleEndTime(of: sampleBuffer, startingAt: outputPTS)
-        writtenMicrophoneBufferCount += 1
-        logFormatsIfNeeded(microphoneBuffer: sampleBuffer)
+        lastEndTime = Self.sampleEndTime(of: workingBuffer, startingAt: effectiveOutputPTS)
+        let originalDuration = CMSampleBufferGetDuration(sampleBuffer)
+        let originalEnd = (originalDuration.isValid && originalDuration.seconds > 0)
+            ? CMTimeAdd(pts, originalDuration)
+            : pts
+        recordOriginalSampleEnd(originalEnd)
         return true
+    }
+
+    private func recordOriginalSampleEnd(_ candidate: CMTime) {
+        guard candidate.isValid else { return }
+        if let existing = maxOriginalSampleEndPTS {
+            maxOriginalSampleEndPTS = CMTimeMaximum(existing, candidate)
+        } else {
+            maxOriginalSampleEndPTS = candidate
+        }
     }
 
     // MARK: - 收尾
@@ -378,7 +464,8 @@ final class MovieWriter: RecordingSampleSink {
         // 若 endSession 的终点早于某轨的末尾，该轨会被截断并使收尾失败
         // （实测表现为 finishWriting 报「The operation could not be completed」）。
         let requestedEnd = CMTime(seconds: max(duration, 0), preferredTimescale: 600)
-        var endTime = CMTimeMaximum(requestedEnd, lastOutputPTS)
+        let videoEnd = lastVideoOutputPTS ?? .zero
+        var endTime = CMTimeMaximum(requestedEnd, videoEnd)
         if let audioEnd = lastSystemAudioEndTime {
             endTime = CMTimeMaximum(endTime, audioEnd)
         }
@@ -387,7 +474,7 @@ final class MovieWriter: RecordingSampleSink {
         }
         writerLogger.notice("""
             时间轴终点：requested=\(String(format: "%.3f", requestedEnd.seconds), privacy: .public) \
-            video=\(String(format: "%.3f", self.lastOutputPTS.seconds), privacy: .public) \
+            video=\(String(format: "%.3f", videoEnd.seconds), privacy: .public) \
             sysAudio=\(self.lastSystemAudioEndTime.map { String(format: "%.3f", $0.seconds) } ?? "-", privacy: .public) \
             mic=\(self.lastMicrophoneEndTime.map { String(format: "%.3f", $0.seconds) } ?? "-", privacy: .public) \
             → 采用=\(String(format: "%.3f", endTime.seconds), privacy: .public)
@@ -472,7 +559,8 @@ final class MovieWriter: RecordingSampleSink {
         into input: AVAssetWriterInput,
         like reference: CMSampleBuffer,
         from start: CMTime,
-        to end: CMTime
+        to end: CMTime,
+        updatedEnd: inout CMTime?
     ) -> Bool {
         guard start.isValid, end.isValid, CMTimeCompare(start, end) < 0,
               let format = CMSampleBufferGetFormatDescription(reference),
@@ -517,6 +605,7 @@ final class MovieWriter: RecordingSampleSink {
 
             filledSilenceBufferCount += 1
             cursor = CMTimeAdd(cursor, CMTime(value: CMTimeValue(frames), timescale: sampleRate))
+            updatedEnd = cursor
         }
         return true
     }
@@ -667,9 +756,60 @@ final class MovieWriter: RecordingSampleSink {
         }
         writer.startSession(atSourceTime: .zero)
         self.originPTS = originPTS
-        self.lastOriginalPTS = originPTS
+        self.maxOriginalSampleEndPTS = originPTS
         isStarted = true
         return true
+    }
+
+    /// 裁剪音频缓冲头部的重叠采样，保证恢复后单轨时间戳严格不倒退。
+    static func trimHead(of sampleBuffer: CMSampleBuffer, by overlap: CMTime) -> CMSampleBuffer? {
+        guard overlap.isValid, overlap.seconds > 0,
+              let format = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
+              asbd.mFormatID == kAudioFormatLinearPCM,
+              asbd.mSampleRate > 0 else {
+            return nil
+        }
+
+        let totalSamples = CMSampleBufferGetNumSamples(sampleBuffer)
+        let samplesToDrop = Int((overlap.seconds * asbd.mSampleRate).rounded(.up))
+        guard samplesToDrop > 0, samplesToDrop < totalSamples else {
+            return nil
+        }
+
+        var trimmed: CMSampleBuffer?
+        let range = CFRange(location: samplesToDrop, length: totalSamples - samplesToDrop)
+        let status = CMSampleBufferCopySampleBufferForRange(
+            allocator: kCFAllocatorDefault,
+            sampleBuffer: sampleBuffer,
+            sampleRange: range,
+            sampleBufferOut: &trimmed
+        )
+        guard status == noErr else { return nil }
+        return trimmed
+    }
+
+    /// 测试专用状态快照，用于验证起始静音填充与暂停恢复时间轴对齐。
+    var timelineSnapshotForTesting: (
+        isStarted: Bool,
+        originPTS: CMTime?,
+        lastVideoOutputPTS: CMTime?,
+        lastSystemAudioEndTime: CMTime?,
+        lastMicrophoneEndTime: CMTime?,
+        filledSilenceBufferCount: Int,
+        accumulatedPause: CMTime,
+        movieFragmentInterval: CMTime
+    ) {
+        (
+            isStarted,
+            originPTS,
+            lastVideoOutputPTS,
+            lastSystemAudioEndTime,
+            lastMicrophoneEndTime,
+            filledSilenceBufferCount,
+            accumulatedPause,
+            writer.movieFragmentInterval
+        )
     }
 
     /// 用新的呈现时间戳复制一份样本缓冲。

@@ -17,6 +17,17 @@
 import AnShotCore
 import Foundation
 
+/// 附带诊断错误信息的翻译执行结果（用于向结果面板与设置页透传云端失败原因）。
+public struct TranslationExecutionResult: Equatable, Sendable {
+    public let result: TranslationResult
+    public let errorMessage: String?
+
+    public init(result: TranslationResult, errorMessage: String? = nil) {
+        self.result = result
+        self.errorMessage = errorMessage
+    }
+}
+
 /// 翻译提供者。
 public protocol TranslationProvider: Sendable {
 
@@ -37,6 +48,15 @@ public protocol TranslationProvider: Sendable {
         from source: String?,
         to target: String
     ) async -> TranslationResult
+}
+
+/// 支持透传失败诊断信息的翻译提供者（如云端翻译）。
+public protocol DiagnosticTranslationProvider: TranslationProvider {
+    func translateWithDiagnostics(
+        _ lines: [OCRTextLine],
+        from source: String?,
+        to target: String
+    ) async -> TranslationExecutionResult
 }
 
 /// 全部未翻译的结果（降级用）。

@@ -51,6 +51,9 @@ public enum OCRProviderFailure: Error, LocalizedError, Equatable {
     /// 响应体是模型退化产物（重复 token 循环），详见 `OCRTextSanity`。
     case degenerateOutput
 
+    /// 云端响应因达到 `max_tokens` / `length` 上限被截断，内容可能不完整。
+    case truncatedResponse
+
     /// 服务端在 200 响应里返回的业务错误。
     ///
     /// 百度把「token 失效 / 额度用尽 / 图片超限」都放在 200 的 `error_code` 里，
@@ -76,6 +79,8 @@ public enum OCRProviderFailure: Error, LocalizedError, Equatable {
             return "响应格式无法解析"
         case .degenerateOutput:
             return "云端返回的内容异常（疑似模型重复输出），请更换识别模型后重试"
+        case .truncatedResponse:
+            return "云端返回内容达到长度上限被截断，请缩小截图或调整模型后重试"
         case let .serviceError(code, message):
             return "服务返回错误 \(code)：\(message)"
         case .unsupportedImage:
@@ -182,13 +187,14 @@ enum OCRImageEncoder {
         let targetWidth = max(1, Int((width * ratio).rounded()))
         let targetHeight = max(1, Int((height * ratio).rounded()))
 
+        let srgb = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         guard let context = CGContext(
             data: nil,
             width: targetWidth,
             height: targetHeight,
             bitsPerComponent: 8,
             bytesPerRow: 0,
-            space: image.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+            space: srgb,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
             return nil
@@ -197,6 +203,87 @@ enum OCRImageEncoder {
         context.draw(image, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
         return context.makeImage()
     }
+}
+
+// MARK: - 网络安全与响应解包
+
+/// 云端接口公共校验与无缓存网络会话。
+enum EndpointSecurity {
+
+    /// 使用无磁盘缓存与无 Cookie 持久化的临时会话，避免截图与识别文本滞留本地缓存库。
+    static let ephemeralSession: URLSession = URLSession(configuration: .ephemeral)
+
+    /// 校验远程 Endpoint：强制使用 `https`，仅本地回环地址允许 `http`。
+    static func validatedURL(from rawEndpoint: String) throws -> URL {
+        let trimmed = rawEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host?.lowercased(),
+              !host.isEmpty else {
+            throw OCRProviderFailure.badEndpoint
+        }
+        if scheme == "https" {
+            return url
+        }
+        if scheme == "http" {
+            let normalizedHost = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            if normalizedHost == "localhost" || normalizedHost == "127.0.0.1" || normalizedHost == "::1" {
+                return url
+            }
+        }
+        throw OCRProviderFailure.badEndpoint
+    }
+}
+
+/// 解析 OpenAI Chat Completions 兼容响应（同时兼容字符串与多块数组 `content`，并检测 `length` 截断）。
+func extractOpenAICompatibleText(from data: Data) throws -> String {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let choices = json["choices"] as? [[String: Any]],
+          let firstChoice = choices.first,
+          let message = firstChoice["message"] as? [String: Any] else {
+        throw OCRProviderFailure.badResponse
+    }
+    if (firstChoice["finish_reason"] as? String) == "length" {
+        throw OCRProviderFailure.truncatedResponse
+    }
+    if let text = message["content"] as? String {
+        return text
+    }
+    if let blocks = message["content"] as? [[String: Any]] {
+        let text = blocks
+            .filter { block in
+                let type = block["type"] as? String
+                return type == nil || type == "text"
+            }
+            .compactMap { $0["text"] as? String }
+            .joined()
+        guard !text.isEmpty else { throw OCRProviderFailure.badResponse }
+        return text
+    }
+    throw OCRProviderFailure.badResponse
+}
+
+/// 解析 Anthropic Claude Messages API 响应（过滤 `type == "text"` 兼容 Extended Thinking，并检测 `max_tokens` 截断）。
+func extractClaudeText(from data: Data) throws -> String {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw OCRProviderFailure.badResponse
+    }
+    if (json["stop_reason"] as? String) == "max_tokens" {
+        throw OCRProviderFailure.truncatedResponse
+    }
+    if let text = json["content"] as? String {
+        guard !text.isEmpty else { throw OCRProviderFailure.badResponse }
+        return text
+    }
+    guard let content = json["content"] as? [[String: Any]] else {
+        throw OCRProviderFailure.badResponse
+    }
+    let text = content
+        .filter { ($0["type"] as? String) == "text" }
+        .compactMap { $0["text"] as? String }
+        .joined()
+    guard !text.isEmpty else { throw OCRProviderFailure.badResponse }
+    return text
 }
 
 // MARK: - 执行流程
@@ -225,9 +312,7 @@ enum CloudOCRRunner {
         let apiKey = config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !apiKey.isEmpty else { throw OCRProviderFailure.missingAPIKey }
 
-        guard let url = URL(string: config.resolvedEndpoint(for: kind)), url.scheme != nil else {
-            throw OCRProviderFailure.badEndpoint
-        }
+        let url = try EndpointSecurity.validatedURL(from: config.resolvedEndpoint(for: kind))
 
         guard let png = OCRImageEncoder.pngData(from: image) else {
             throw OCRProviderFailure.unsupportedImage
@@ -246,7 +331,7 @@ enum CloudOCRRunner {
         image: CGImage,
         extractText: (Data) throws -> String
     ) async throws -> OCRResult {
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await EndpointSecurity.ephemeralSession.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw OCRProviderFailure.badResponse
         }
@@ -342,13 +427,7 @@ public struct OpenAICompatibleOCRProvider: HTTPOCRProvider {
     }
 
     static func extractText(_ data: Data) throws -> String {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = json["choices"] as? [[String: Any]],
-              let message = choices.first?["message"] as? [String: Any],
-              let content = message["content"] as? String else {
-            throw OCRProviderFailure.badResponse
-        }
-        return content
+        try extractOpenAICompatibleText(from: data)
     }
 }
 
@@ -428,16 +507,6 @@ public struct ClaudeOCRProvider: HTTPOCRProvider {
     }
 
     static func extractText(_ data: Data) throws -> String {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = json["content"] as? [[String: Any]] else {
-            throw OCRProviderFailure.badResponse
-        }
-        // content 是块数组，取所有 text 块拼接：只有第一个块时行为与取首个一致。
-        let text = content
-            .filter { ($0["type"] as? String) == "text" }
-            .compactMap { $0["text"] as? String }
-            .joined()
-        guard !text.isEmpty else { throw OCRProviderFailure.badResponse }
-        return text
+        try extractClaudeText(from: data)
     }
 }
