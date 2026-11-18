@@ -20,7 +20,7 @@ import Testing
 
 // MARK: - 测试
 
-@Suite("滚动截图拼接编排")
+@Suite("滚动截图拼接编排", .serialized)
 struct ScrollStitcherTests {
 
     @Test("连续滚动：拼接结果与整页对应区间逐像素一致")
@@ -122,9 +122,10 @@ struct ScrollStitcherTests {
             var data = buffer.data
             let headerSource = slice(page, offset: 0, height: headerRows)
             let bytesPerRow = buffer.width * 4
-            data.withUnsafeMutableBufferPointer { target in
+            data.withUnsafeMutableBytes { rawTarget in
                 headerSource.withPixels { source in
-                    guard let dst = target.baseAddress, let src = source.baseAddress else { return }
+                    guard let dst = rawTarget.bindMemory(to: UInt8.self).baseAddress,
+                          let src = source.baseAddress else { return }
                     memcpy(dst, src, bytesPerRow * headerRows)
                 }
             }
@@ -226,7 +227,35 @@ struct ScrollStitcherTests {
         let result = ScrollStitcher.stitch(frames: frames)
         let elapsed = Date().timeIntervalSince(start) * 1000
         #expect(result.image != nil)
-        // Debug（-Onone）构建下放宽；Release 实测见诊断输出。
-        #expect(elapsed < 3000, "耗时 \(elapsed)ms")
+        // Debug（-Onone）与全套件并发下放宽墙钟阈值；Release 保持严格门槛。
+        #if DEBUG
+        let thresholdMs = 15_000.0
+        #else
+        let thresholdMs = 3000.0
+        #endif
+        #expect(elapsed < thresholdMs, "耗时 \(elapsed)ms")
+    }
+
+    @Test("默认不保留全部原帧，且保留广色域色彩空间与零拷贝 Data")
+    func defaultsToCompactStorageAndPreservesDisplayP3ColorSpace() throws {
+        #expect(ScrollStitcher.Options().retainsSourceFrames == false)
+
+        let p3 = try #require(CGColorSpace(name: CGColorSpace.displayP3))
+        let ctx1 = try #require(CGContext(
+            data: nil, width: 120, height: 120, bitsPerComponent: 8, bytesPerRow: 0,
+            space: p3, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        ctx1.setFillColor(CGColor(colorSpace: p3, components: [1.0, 0.0, 0.0, 1.0])!)
+        ctx1.fill(CGRect(x: 0, y: 0, width: 120, height: 120))
+        ctx1.setFillColor(CGColor(colorSpace: p3, components: [0.0, 1.0, 0.0, 1.0])!)
+        for y in stride(from: 0, to: 120, by: 16) {
+            ctx1.fill(CGRect(x: 10, y: y, width: 90, height: 6))
+        }
+        let cg1 = try #require(ctx1.makeImage())
+        let img1 = try #require(ScrollshotImage(cg1))
+        #expect(img1.colorSpace.name == CGColorSpace.displayP3)
+
+        let exported = try #require(img1.makeCGImage())
+        #expect(exported.colorSpace?.name == CGColorSpace.displayP3)
     }
 }

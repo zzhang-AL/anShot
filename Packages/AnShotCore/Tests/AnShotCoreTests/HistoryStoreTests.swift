@@ -459,20 +459,177 @@ struct HistoryStoreTests {
 
     // MARK: - 健壮性
 
-    @Test("索引损坏时降级为空列表并留档，不抛错")
+    @Test("索引损坏时降级为空列表并带时间戳留档，不覆盖首次现场")
     func corruptedIndexDegradesGracefully() throws {
         let root = try makeTemp()
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        try Data("{ 这不是 JSON".utf8).write(to: root.appendingPathComponent("index.json"))
+        try Data("{ 首次损坏".utf8).write(to: root.appendingPathComponent("index.json"))
 
-        let store = HistoryStore(directory: root)
+        let firstStore = HistoryStore(directory: root)
 
-        #expect(store.entries.isEmpty)
-        #expect(store.lastError != nil)
-        // 损坏的索引被改名保留，而不是被静默删除。
-        #expect(FileManager.default.fileExists(
-            atPath: root.appendingPathComponent("index.corrupted.json").path
+        #expect(firstStore.entries.isEmpty)
+        #expect(firstStore.lastError != nil)
+
+        // 连续第二次损坏时，必须生成新的带时间戳备份而不是覆盖首次现场。
+        try Data("{ 二次损坏".utf8).write(to: root.appendingPathComponent("index.json"))
+        let secondStore = HistoryStore(directory: root)
+        #expect(secondStore.entries.isEmpty)
+
+        let files = try FileManager.default.contentsOfDirectory(atPath: root.path)
+            .filter { $0.hasPrefix("index.corrupted-") && $0.hasSuffix(".json") }
+        #expect(files.count == 2)
+        let contents = try files.map {
+            try String(contentsOf: root.appendingPathComponent($0), encoding: .utf8)
+        }
+        #expect(contents.contains { $0.contains("首次损坏") })
+        #expect(contents.contains { $0.contains("二次损坏") })
+    }
+
+    @Test("淘汰时优先保护收藏条目，仅全为收藏且超上限才淘汰最旧收藏")
+    func trimProtectsFavorites() throws {
+        let root = try makeTemp()
+        let store = HistoryStore(directory: root, maximumEntries: 3)
+
+        let favOld = try #require(store.addCachedImage(
+            pngData: Data(repeating: 0x01, count: 64),
+            thumbnailPNG: thumbnail(1), pixelWidth: 1, pixelHeight: 1, kind: .screenshot
         ))
+        store.setFavorite(favOld.id, isFavorite: true)
+
+        let normal1 = try #require(store.addCachedImage(
+            pngData: Data(repeating: 0x02, count: 64),
+            thumbnailPNG: thumbnail(2), pixelWidth: 1, pixelHeight: 1, kind: .screenshot
+        ))
+        let normal2 = store.add(
+            fileURL: try makeSourceFile(in: root, name: "n2.png"),
+            thumbnailPNG: thumbnail(3), pixelWidth: 1, pixelHeight: 1
+        )
+        let normal3 = store.add(
+            fileURL: try makeSourceFile(in: root, name: "n3.png"),
+            thumbnailPNG: thumbnail(4), pixelWidth: 1, pixelHeight: 1
+        )
+
+        // 第 4 条加入后应淘汰最旧的非收藏 normal1，而不是最旧的收藏 favOld。
+        #expect(store.entries.count == 3)
+        #expect(store.entries.contains { $0.id == favOld.id })
+        #expect(!store.entries.contains { $0.id == normal1.id })
+        #expect(!FileManager.default.fileExists(atPath: normal1.filePath))
+        #expect(FileManager.default.fileExists(atPath: favOld.filePath))
+        #expect(store.entries.map(\.id) == [normal3.id, normal2.id, favOld.id])
+
+        // 全为收藏且继续超出上限时，才淘汰最旧的收藏。
+        store.setFavorite(normal2.id, isFavorite: true)
+        store.setFavorite(normal3.id, isFavorite: true)
+        let favNew = store.add(
+            fileURL: try makeSourceFile(in: root, name: "fav-new.png"),
+            thumbnailPNG: thumbnail(5), pixelWidth: 1, pixelHeight: 1
+        )
+        #expect(store.entries.count == 3)
+        #expect(!store.entries.contains { $0.id == favOld.id })
+        #expect(!FileManager.default.fileExists(atPath: favOld.filePath))
+        #expect(store.entries.map(\.id) == [favNew.id, normal3.id, normal2.id])
+    }
+
+    @Test("缓存总字节水位超限时优先淘汰最旧非收藏缓存")
+    func trimsByMaximumCacheBytes() throws {
+        let root = try makeTemp()
+        let store = HistoryStore(directory: root, maximumEntries: 20, maximumCacheBytes: 250)
+
+        let normalOld = try #require(store.addCachedImage(
+            pngData: Data(repeating: 0x10, count: 100),
+            thumbnailPNG: nil, pixelWidth: 10, pixelHeight: 10, kind: .screenshot
+        ))
+        let favCached = try #require(store.addCachedImage(
+            pngData: Data(repeating: 0x20, count: 100),
+            thumbnailPNG: nil, pixelWidth: 10, pixelHeight: 10, kind: .screenshot
+        ))
+        store.setFavorite(favCached.id, isFavorite: true)
+
+        let normalNew = try #require(store.addCachedImage(
+            pngData: Data(repeating: 0x30, count: 100),
+            thumbnailPNG: nil, pixelWidth: 10, pixelHeight: 10, kind: .screenshot
+        ))
+
+        // 总缓存 300 > 250，应淘汰最旧非收藏缓存 normalOld，保留 favCached 与 normalNew。
+        #expect(store.entries.count == 2)
+        #expect(!store.entries.contains { $0.id == normalOld.id })
+        #expect(!FileManager.default.fileExists(atPath: normalOld.filePath))
+        #expect(store.entries.map(\.id) == [normalNew.id, favCached.id])
+        #expect(FileManager.default.fileExists(atPath: favCached.filePath))
+    }
+
+    @Test("孤儿文件清理：仅删除不在 entries 中的 cache 与 thumbnails 文件")
+    func pruneOrphanedFilesRemovesOnlyOrphans() throws {
+        let root = try makeTemp()
+        let store = HistoryStore(directory: root)
+        let keptCached = try #require(store.addCachedImage(
+            pngData: Data(repeating: 0x42, count: 128),
+            thumbnailPNG: thumbnail(7), pixelWidth: 10, pixelHeight: 10, kind: .screenshot
+        ))
+
+        let orphanCache = store.cacheDirectoryURL().appendingPathComponent("\(UUID().uuidString).png")
+        let orphanThumb = root.appendingPathComponent("thumbnails/\(UUID().uuidString).png")
+        try Data([1, 2, 3]).write(to: orphanCache)
+        try Data([4, 5, 6]).write(to: orphanThumb)
+
+        let removed = store.pruneOrphanedFiles()
+
+        #expect(removed == 2)
+        #expect(!FileManager.default.fileExists(atPath: orphanCache.path))
+        #expect(!FileManager.default.fileExists(atPath: orphanThumb.path))
+        #expect(FileManager.default.fileExists(atPath: keptCached.filePath))
+        #expect(store.thumbnailURL(for: keptCached) != nil)
+    }
+
+    @Test("promoteCachedEntry 原地升级条目路径并回收旧 cache 文件")
+    func promoteCachedEntryUpgradesPathAndDeletesCache() throws {
+        let root = try makeTemp()
+        let store = HistoryStore(directory: root)
+        let cached = try #require(store.addCachedImage(
+            pngData: Data(repeating: 0x88, count: 256),
+            thumbnailPNG: thumbnail(9), pixelWidth: 800, pixelHeight: 2400, kind: .longScreenshot
+        ))
+        store.setFavorite(cached.id, isFavorite: true)
+        let oldCachePath = cached.filePath
+        #expect(FileManager.default.fileExists(atPath: oldCachePath))
+
+        let savedURL = try makeSourceFile(in: root, name: "longshot-final.png")
+        let promoted = store.promoteCachedEntry(id: cached.id, toSavedURL: savedURL)
+
+        #expect(promoted)
+        #expect(!FileManager.default.fileExists(atPath: oldCachePath))
+        let updated = try #require(store.entries.first { $0.id == cached.id })
+        #expect(updated.filePath == savedURL.path)
+        #expect(updated.isCached == false)
+        #expect(updated.isFavorite == true)
+        #expect(store.thumbnailURL(for: updated) != nil)
+
+        // 重新从磁盘加载也保持一致。
+        let reopened = HistoryStore(directory: root)
+        let persisted = try #require(reopened.entries.first { $0.id == cached.id })
+        #expect(persisted.filePath == savedURL.path)
+        #expect(persisted.isCached == false)
+        #expect(persisted.isFavorite == true)
+    }
+
+    @Test("clear 删除目录失败时不静默吞错")
+    func clearReportsRemovalFailure() throws {
+        let root = try makeTemp()
+        let store = HistoryStore(directory: root)
+        _ = try #require(store.addCachedImage(
+            pngData: Data(repeating: 0x55, count: 64),
+            thumbnailPNG: thumbnail(), pixelWidth: 10, pixelHeight: 10, kind: .screenshot
+        ))
+        let cacheDir = store.cacheDirectoryURL()
+        // 通过剥夺 cache 目录写权限使其内部文件无法被 removeItem 清理，并在结束时恢复权限。
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: cacheDir.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cacheDir.path)
+        }
+
+        store.clear()
+
+        #expect(store.lastError != nil)
     }
 
     @Test("缩略图写入失败不影响条目本身")

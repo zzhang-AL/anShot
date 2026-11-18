@@ -42,8 +42,8 @@ struct ScrollshotSessionTests {
         let body = slice(page, offset: scrollOffset, height: frameHeight)
         var data = body.data
         let bytesPerRow = body.width * 4
-        data.withUnsafeMutableBufferPointer { target in
-            guard let dst = target.baseAddress else { return }
+        data.withUnsafeMutableBytes { rawTarget in
+            guard let dst = rawTarget.bindMemory(to: UInt8.self).baseAddress else { return }
             for row in 0..<headerRows {
                 for x in 0..<body.width {
                     let offset = row * bytesPerRow + x * 4
@@ -72,8 +72,8 @@ struct ScrollshotSessionTests {
         let bytesPerRow = body.width * 4
         // 取页面本身的背景色（左上角像素）来填充，避免凭空假定颜色。
         let bg = (r: data[0], g: data[1], b: data[2])
-        data.withUnsafeMutableBufferPointer { target in
-            guard let dst = target.baseAddress else { return }
+        data.withUnsafeMutableBytes { rawTarget in
+            guard let dst = rawTarget.bindMemory(to: UInt8.self).baseAddress else { return }
             for row in 0..<blankRows {
                 for x in 0..<body.width {
                     let offset = row * bytesPerRow + x * 4
@@ -104,8 +104,8 @@ struct ScrollshotSessionTests {
         let body = slice(page, offset: scrollOffset, height: frameHeight)
         var data = body.data
         let bytesPerRow = body.width * 4
-        data.withUnsafeMutableBufferPointer { target in
-            guard let dst = target.baseAddress else { return }
+        data.withUnsafeMutableBytes { rawTarget in
+            guard let dst = rawTarget.bindMemory(to: UInt8.self).baseAddress else { return }
             for step in 0..<bandRows {
                 let row = atBottom ? frameHeight - 1 - step : step
                 for x in 0..<body.width {
@@ -204,7 +204,12 @@ struct ScrollshotSessionTests {
         let frameHeight = 480
         // 视口轨迹：0 → 200 → 400 →（回滚）200 → 400 → 600
         let offsets = [0, 200, 400, 200, 400, 600]
-        let (session, verdicts) = drive(page, offsets: offsets, frameHeight: frameHeight)
+        let (session, verdicts) = drive(
+            page,
+            offsets: offsets,
+            frameHeight: frameHeight,
+            options: ScrollStitcher.Options(retainsSourceFrames: true)
+        )
 
         #expect(verdicts[0] == .accepted)
         #expect(verdicts[1] == .accepted)
@@ -236,7 +241,7 @@ struct ScrollshotSessionTests {
         let page = makePage(pageHeight: 3000)
         let frameHeight = 480
 
-        var session = ScrollshotSession()
+        var session = ScrollshotSession(options: ScrollStitcher.Options(retainsSourceFrames: true))
         // 先一路向下滚到 600。
         for offset in [0, 200, 400, 600] {
             session.submit(slice(page, offset: offset, height: frameHeight))
@@ -527,7 +532,12 @@ struct ScrollshotSessionTests {
         let page = makePage(pageHeight: 3000)
         let frameHeight = 480
         let offsets = [0, 200, 400, 200, 400, 600, 600, 100, 600, 800]
-        let (session, _) = drive(page, offsets: offsets, frameHeight: frameHeight)
+        let (session, _) = drive(
+            page,
+            offsets: offsets,
+            frameHeight: frameHeight,
+            options: ScrollStitcher.Options(retainsSourceFrames: true)
+        )
         let plan = session.result().plan
 
         let accepted = plan.frames.filter { $0.verdict == .accepted }
@@ -837,6 +847,175 @@ struct ScrollshotSessionTests {
             abs(fixed.height - (expectedHeight - band)) <= 4,
             "输出高度 \(fixed.height)，期望约 \(expectedHeight - band)"
         )
+    }
+
+    @Test("ScrollshotSession 满足 Sendable 并发安全契约")
+    func sessionConformsToSendable() async {
+        let session = ScrollshotSession()
+        let count = await Task.detached {
+            session.acceptedFrameCount
+        }.value
+        #expect(count == 0)
+    }
+
+    @Test("深底蓝/绿导航栏自动吸顶检测与忽略区同步")
+    func detectsDarkBlueGreenStickyHeader() throws {
+        let page = makePage(width: 320, pageHeight: 3000)
+        let headerRows = 44
+        let frameHeight = 480
+        var session = ScrollshotSession()
+
+        // 构造 R=0 的深底蓝/绿导航栏（含高对比度纯绿/纯蓝图案，旧代码仅读 Red 通道会全判为 0）。
+        func darkCyanStickyFrame(scrollOffset: Int) -> ScrollshotImage {
+            let body = slice(page, offset: scrollOffset, height: frameHeight)
+            var data = body.data
+            let bytesPerRow = body.width * 4
+            data.withUnsafeMutableBytes { rawTarget in
+                guard let dst = rawTarget.bindMemory(to: UInt8.self).baseAddress else { return }
+                for row in 0..<headerRows {
+                    for x in 0..<body.width {
+                        let offset = row * bytesPerRow + x * 4
+                        let isGlyph = (x / 16).isMultiple(of: 2)
+                        dst[offset] = 0
+                        dst[offset + 1] = isGlyph ? 220 : 20
+                        dst[offset + 2] = isGlyph ? 240 : 40
+                        dst[offset + 3] = 255
+                    }
+                }
+            }
+            return ScrollshotImage(width: body.width, height: frameHeight, data: data)!
+        }
+
+        for index in 0..<5 {
+            let step = index * 73
+            session.submit(darkCyanStickyFrame(scrollOffset: step))
+        }
+        #expect(session.detectedStickyRows == headerRows, "深底蓝绿顶栏应被完整检出，实测 \(session.detectedStickyRows)")
+    }
+
+    @Test("高分辨率/横向宽冻结列（超过 240 行）可被吸顶扫描覆盖")
+    func detectsWideStickyRegionBeyond240Rows() throws {
+        let frameHeight = 900
+        let stickyRows = 270
+        let page = makePage(width: 300, pageHeight: 4000)
+        var session = ScrollshotSession()
+
+        func tallStickyFrame(scrollOffset: Int) -> ScrollshotImage {
+            let body = slice(page, offset: scrollOffset, height: frameHeight)
+            var data = body.data
+            let bytesPerRow = body.width * 4
+            data.withUnsafeMutableBytes { rawTarget in
+                guard let dst = rawTarget.bindMemory(to: UInt8.self).baseAddress else { return }
+                // 每行基于行号生成唯一非周期纹理（模拟冻结侧边栏的不同菜单项），避免与滚动步长形成周期碰巧相等。
+                for row in 0..<stickyRows {
+                    var rng = PageRandom(state: UInt64(row + 1) &* 2_654_435_761)
+                    var columnAccent: [Bool] = []
+                    columnAccent.reserveCapacity(body.width)
+                    var x = 0
+                    while x < body.width {
+                        let flag = rng.next() > 0.5
+                        for _ in 0..<12 where x < body.width {
+                            columnAccent.append(flag)
+                            x += 1
+                        }
+                    }
+                    for col in 0..<body.width {
+                        let offset = row * bytesPerRow + col * 4
+                        let bright = columnAccent[col]
+                        dst[offset] = 0
+                        dst[offset + 1] = bright ? 210 : 25
+                        dst[offset + 2] = bright ? 245 : 55
+                        dst[offset + 3] = 255
+                    }
+                }
+            }
+            return ScrollshotImage(width: body.width, height: frameHeight, data: data)!
+        }
+
+        for index in 0..<5 {
+            session.submit(tallStickyFrame(scrollOffset: index * 110))
+        }
+        #expect(session.detectedStickyRows == stickyRows, "应支持检测超过 240 行的宽冻结区，实测 \(session.detectedStickyRows)")
+    }
+
+    @Test("向上扩展长截图的 seamRows 正确反映接缝行号而非顶边 0")
+    func upwardExtensionReportsTrueSeamRows() throws {
+        let page = makePage(pageHeight: 2000)
+        let frameHeight = 400
+        var session = ScrollshotSession()
+        // 首帧在 600，向上扩 200 到 400，再向上扩 200 到 200。
+        session.submit(slice(page, offset: 600, height: frameHeight))
+        session.submit(slice(page, offset: 400, height: frameHeight))
+        session.submit(slice(page, offset: 200, height: frameHeight))
+
+        let result = session.result()
+        let image = try #require(result.image)
+        #expect(image.height == 800)
+        // 3 段共 2 条接缝：第 1 段 [0, 200)，第 2 段 [200, 400)，第 3 段 [400, 800)。
+        #expect(result.plan.seamRows == [200, 400], "向上扩展的接缝行号应为 [200, 400]，实测 \(result.plan.seamRows)")
+    }
+
+    @Test("joinsInsideOverlap 在静止补帧时不渗入固定栏，且被完全覆盖段审计自洽")
+    func joinsInsideOverlapStillFrameGuardsFixedBandsAndAudit() throws {
+        let page = makePage(width: 300, pageHeight: 3000)
+        let topBand = 60
+        let bottomBand = 60
+        let frameHeight = 400
+        let options = ScrollStitcher.Options(
+            minConfidence: 0.99,
+            transientDeltaThreshold: 40,
+            unusableTopRows: topBand,
+            unusableBottomRows: bottomBand,
+            joinsInsideOverlap: true
+        )
+        var session = ScrollshotSession(options: options)
+
+        func chromeFrame(_ offset: Int) -> ScrollshotImage {
+            let img = viewportBandFrame(page, scrollOffset: offset, bandRows: topBand, frameHeight: frameHeight, atBottom: false)
+            var data = img.data
+            let bytesPerRow = img.width * 4
+            data.withUnsafeMutableBytes { raw in
+                guard let dst = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+                for step in 0..<bottomBand {
+                    let row = frameHeight - 1 - step
+                    for x in 0..<img.width {
+                        let o = row * bytesPerRow + x * 4
+                        dst[o] = 250
+                        dst[o + 1] = 20
+                        dst[o + 2] = 200
+                        dst[o + 3] = 255
+                    }
+                }
+            }
+            return ScrollshotImage(width: img.width, height: frameHeight, data: data)!
+        }
+
+        // 先小步滚 25px（低置信度触发 transient），然后停手静止补帧！
+        session.submit(chromeFrame(0))
+        let moving = session.submit(chromeFrame(25))
+        #expect(moving.verdict == .transient)
+        let settled = session.submit(chromeFrame(25))
+        #expect(settled.verdict == .accepted)
+
+        // 再大步下滚 120px，将前面紧接的一小段完全纳入接缝覆盖验证审计状态自洽。
+        session.submit(chromeFrame(145))
+
+        let result = session.result()
+        let image = try #require(result.image)
+        // 固定带只应出现在首段顶部与末段底部，中段正文中不得出现整行品红固定带！
+        let bandRows = fixedBandRows(image)
+        let middleBands = bandRows.filter { $0 >= topBand && $0 < image.height - bottomBand }
+        #expect(middleBands.isEmpty, "静止补帧时接缝渗入了固定栏：\(middleBands)")
+
+        // 验证审计计划与线段输出严格一致。
+        let accepted = result.plan.frames.filter { $0.verdict == .accepted }
+        #expect(result.plan.seamRows.count == accepted.count - 1)
+        for frame in accepted {
+            #expect(frame.outputY != nil && frame.rows > 0)
+        }
+        for frame in result.plan.frames where frame.verdict != .accepted {
+            #expect(frame.outputY == nil && frame.rows == 0)
+        }
     }
 
 }

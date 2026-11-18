@@ -24,6 +24,11 @@ import Foundation
 /// 一块紧凑的 RGBA8 像素图像。
 public struct ScrollshotImage: Equatable, Sendable {
 
+    /// 默认色彩空间（sRGB，无法构造时退化为 DeviceRGB）。
+    private static var defaultColorSpace: CGColorSpace {
+        CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+    }
+
     /// 像素宽度，必须 > 0。
     public let width: Int
 
@@ -31,62 +36,98 @@ public struct ScrollshotImage: Equatable, Sendable {
     public let height: Int
 
     /// 长度恒为 `width * height * 4` 的 RGBA8 缓冲。
-    public let data: [UInt8]
+    public let data: Data
+
+    /// 图像保留的色彩空间（支持 Display P3 等广色域，默认回退 sRGB）。
+    public let colorSpace: CGColorSpace
 
     /// 每行的字节数（等于 `width * 4`；此处显式暴露，避免调用方各处重算）。
     public var bytesPerRow: Int { width * 4 }
 
-    public init?(width: Int, height: Int, data: [UInt8]) {
+    public init?(width: Int, height: Int, data: Data, colorSpace: CGColorSpace? = nil) {
         guard width > 0, height > 0, data.count == width * height * 4 else {
             return nil
         }
         self.width = width
         self.height = height
-        self.data = data
+        // 若传入的是带非零 startIndex 的 Data 切片，需规整到零基索引以保证下标访问安全。
+        self.data = data.startIndex == 0 ? data : Data(data)
+        self.colorSpace = colorSpace ?? Self.defaultColorSpace
+    }
+
+    /// 兼容基于字节数组构造的既有调用方。
+    public init?(width: Int, height: Int, data: [UInt8], colorSpace: CGColorSpace? = nil) {
+        self.init(width: width, height: height, data: Data(data), colorSpace: colorSpace)
     }
 
     /// 从 `CGImage` 摊平。
     ///
     /// 用 `CGContext` 重绘一次而不是读 `CGImage.dataProvider`：后者给出的
     /// 通道序、位深与行填充都取决于图像来源，读之前得先判断一堆条件，
-    /// 判错就是静默的错位。重绘成固定格式是唯一稳妥的做法。
+    /// 判错就是静默的错位。重绘成固定格式是唯一稳妥的做法；同时优先保留
+    /// 源 RGB 色彩空间（如 Display P3），不支持渲染的特殊色域回退到 sRGB。
     public init?(_ image: CGImage) {
         let width = image.width
         let height = image.height
         guard width > 0, height > 0 else { return nil }
 
-        var buffer = [UInt8](repeating: 0, count: width * height * 4)
+        let fallbackSpace = Self.defaultColorSpace
+        let preferredSpace: CGColorSpace
+        if let sourceSpace = image.colorSpace, sourceSpace.model == .rgb {
+            preferredSpace = sourceSpace
+        } else {
+            preferredSpace = fallbackSpace
+        }
+
+        var buffer = Data(count: width * height * 4)
+        var activeSpace = preferredSpace
         let drawn = buffer.withUnsafeMutableBytes { raw -> Bool in
-            guard let context = CGContext(
-                data: raw.baseAddress,
+            guard let baseAddress = raw.baseAddress else { return false }
+            let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+            if let context = CGContext(
+                data: baseAddress,
                 width: width,
                 height: height,
                 bitsPerComponent: 8,
                 bytesPerRow: width * 4,
-                space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                space: preferredSpace,
+                bitmapInfo: bitmapInfo
+            ) {
+                context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+                return true
+            }
+            activeSpace = fallbackSpace
+            guard let fallbackContext = CGContext(
+                data: baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: fallbackSpace,
+                bitmapInfo: bitmapInfo
             ) else { return false }
-            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            fallbackContext.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
             return true
         }
         guard drawn else { return nil }
-        self.init(width: width, height: height, data: buffer)
+        self.init(width: width, height: height, data: buffer, colorSpace: activeSpace)
     }
 
-    /// 转成 `CGImage`（供 Vision 等系统 API 使用）。
+    /// 转成 `CGImage`（供 Vision 等系统 API 及广色域导出使用）。
     ///
     /// 布局与本类型完全一致（左上原点、RGBA8、无行填充），所以
     /// `CGImage.cropping(to:)` 的像素坐标与 `worldOffset` 是同一套方向，
     /// 裁剪时不需要翻转 y——这一点是「两帧做相同裁剪」能成立的前提。
+    /// 通过 `data as CFData` 零拷贝桥接底层像素缓冲。
     public func makeCGImage() -> CGImage? {
-        guard let provider = CGDataProvider(data: Data(data) as CFData) else { return nil }
+        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
         return CGImage(
             width: width,
             height: height,
             bitsPerComponent: 8,
             bitsPerPixel: 32,
             bytesPerRow: width * 4,
-            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            space: colorSpace,
             bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
             provider: provider,
             decode: nil,
@@ -98,11 +139,13 @@ public struct ScrollshotImage: Equatable, Sendable {
     /// 在像素缓冲的裸指针上执行一段计算。
     ///
     /// 配准的热点循环每帧要做几十万次像素读取。用下标访问时，每次读写都会
-    /// 走一遍边界检查与数组缓冲的引用计数，实测比指针版慢一个数量级；
+    /// 走一遍边界检查与缓冲引用计数，实测比指针版慢一个数量级；
     /// 所以热点一律在外层取一次指针，内层只做整数下标运算。
     @inline(__always)
     public func withPixels<R>(_ body: (UnsafeBufferPointer<UInt8>) -> R) -> R {
-        data.withUnsafeBufferPointer(body)
+        data.withUnsafeBytes { raw in
+            body(raw.bindMemory(to: UInt8.self))
+        }
     }
 
     // MARK: - 转置（轴向复用的技术支点）
@@ -147,10 +190,10 @@ public struct ScrollshotImage: Equatable, Sendable {
     public func transposed() -> ScrollshotImage? {
         let newWidth = height
         let newHeight = width
-        var buffer = [UInt8](repeating: 0, count: newWidth * newHeight * 4)
-        buffer.withUnsafeMutableBufferPointer { output in
-            guard let out = output.baseAddress else { return }
-            data.withUnsafeBufferPointer { source in
+        var buffer = Data(count: newWidth * newHeight * 4)
+        buffer.withUnsafeMutableBytes { rawOutput in
+            guard let out = rawOutput.bindMemory(to: UInt8.self).baseAddress else { return }
+            withPixels { source in
                 guard let src = source.baseAddress else { return }
                 // 目标行号即原图列号：转置把「一行」变成「一列」。
                 for y in 0..<height {
@@ -166,7 +209,7 @@ public struct ScrollshotImage: Equatable, Sendable {
                 }
             }
         }
-        return ScrollshotImage(width: newWidth, height: newHeight, data: buffer)
+        return ScrollshotImage(width: newWidth, height: newHeight, data: buffer, colorSpace: colorSpace)
     }
 
     /// 某个像素的 RGB 三通道之和（用于差异比较）。

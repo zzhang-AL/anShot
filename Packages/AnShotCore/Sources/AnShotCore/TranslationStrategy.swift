@@ -88,6 +88,7 @@ public enum TranslationLanguage {
     ///
     /// 只保留主语言码与脚本，丢掉区域与变体：`en`、`en-US`、`en-GB` 是同一
     /// 语言；而 `zh-Hans` 与 `zh-Hant` 不是——那是简繁转换，用户确实可能要。
+    /// 对缺少脚本子标签的中文标识，按区域习惯映射为 `zh-hans` 或 `zh-hant`。
     public static func normalized(_ identifier: String) -> String {
         let unified = identifier
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -96,9 +97,20 @@ public enum TranslationLanguage {
         let subtags = unified.split(separator: "-").map(String.init)
         guard let language = subtags.first, !language.isEmpty else { return "" }
         // 脚本子标签固定四字母（Hans / Hant / Latn…），其余（US / 419 / 变体）都丢掉。
-        let script = subtags.dropFirst().first { $0.count == 4 && $0.allSatisfy { $0.isLetter } }
-        guard let script else { return language }
-        return "\(language)-\(script)"
+        if let script = subtags.dropFirst().first(where: { $0.count == 4 && $0.allSatisfy { $0.isLetter } }) {
+            return "\(language)-\(script)"
+        }
+        // 未显式携带脚本子标签时，将中文常见地区码规范到简繁脚本。
+        if language == "zh" {
+            let regions = Set(subtags.dropFirst())
+            if !regions.isDisjoint(with: ["tw", "hk", "mo"]) {
+                return "zh-hant"
+            }
+            if !regions.isDisjoint(with: ["cn", "sg", "my"]) {
+                return "zh-hans"
+            }
+        }
+        return language
     }
 
     /// 两个标识是否指同一语言；任一为空或无法判定时返回 false（宁可放行）。

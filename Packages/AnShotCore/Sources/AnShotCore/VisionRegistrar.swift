@@ -59,6 +59,11 @@ public enum VisionRegistrar {
 
         /// Vision 报出的原始位移（未取整），用于诊断与亚像素判断。
         public let rawShift: Double
+
+        public init(deltaY: Int, rawShift: Double? = nil) {
+            self.deltaY = deltaY
+            self.rawShift = rawShift ?? Double(deltaY)
+        }
     }
 
     /// 求解 `previous → next` 的竖直位移。

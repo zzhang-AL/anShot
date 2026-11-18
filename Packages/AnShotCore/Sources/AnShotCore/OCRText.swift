@@ -74,18 +74,60 @@ public struct OCRResult: Equatable, Sendable {
 
     public var isEmpty: Bool { lines.isEmpty }
 
-    /// 按阅读顺序排序：先上后下（`minY` 小的在前），同一行内先左后右。
+    /// 按阅读顺序排序：先上后下（`midY` 小的在前），同一行内先左后右。
     ///
     /// Vision 返回的顺序不保证是阅读顺序；不排的话复制出来的文字会是乱的。
-    /// 同一行的判定用**纵向重叠**而不是 `minY` 相等：识别框的行高总会有
-    /// 一两个像素的差异，用相等判定会把同一行拆成两行。
+    /// 同一行的判定用两阶段锚定行带聚类，避免两两比较器在多栏阶梯框上
+    /// 违反严格弱序传递性造成随机错序。
     public static func readingOrder(_ lines: [OCRTextLine]) -> [OCRTextLine] {
-        lines.sorted { a, b in
-            if overlapsVertically(a.boundingBox, b.boundingBox) {
-                return a.boundingBox.origin.x < b.boundingBox.origin.x
+        guard lines.count > 1 else { return lines }
+
+        // 第一阶段：按文本框纵向中心升序排列，次关键字为水平起点，确保比较关系严格弱序。
+        let sortedByVerticalCenter = lines.sorted { lhs, rhs in
+            let lhsMidY = lhs.boundingBox.origin.y + lhs.boundingBox.size.height * 0.5
+            let rhsMidY = rhs.boundingBox.origin.y + rhs.boundingBox.size.height * 0.5
+            if lhsMidY != rhsMidY {
+                return lhsMidY < rhsMidY
             }
-            return a.boundingBox.origin.y < b.boundingBox.origin.y
+            if lhs.boundingBox.origin.x != rhs.boundingBox.origin.x {
+                return lhs.boundingBox.origin.x < rhs.boundingBox.origin.x
+            }
+            return lhs.boundingBox.origin.y < rhs.boundingBox.origin.y
         }
+
+        // 第二阶段：线性扫描聚类为锚定行带，避免后续成员拉偏锚点产生传递漂移。
+        struct RowBand {
+            let anchor: PixelRect
+            var items: [OCRTextLine]
+        }
+
+        var bands: [RowBand] = []
+        bands.reserveCapacity(sortedByVerticalCenter.count)
+        for line in sortedByVerticalCenter {
+            if let lastIndex = bands.indices.last,
+               overlapsVertically(bands[lastIndex].anchor, line.boundingBox) {
+                bands[lastIndex].items.append(line)
+            } else {
+                bands.append(RowBand(anchor: line.boundingBox, items: [line]))
+            }
+        }
+
+        // 行带间按顺序输出，行带内严格按水平起点升序排列。
+        var ordered: [OCRTextLine] = []
+        ordered.reserveCapacity(lines.count)
+        for band in bands {
+            if band.items.count == 1 {
+                ordered.append(band.items[0])
+            } else {
+                ordered.append(contentsOf: band.items.sorted { lhs, rhs in
+                    if lhs.boundingBox.origin.x != rhs.boundingBox.origin.x {
+                        return lhs.boundingBox.origin.x < rhs.boundingBox.origin.x
+                    }
+                    return lhs.boundingBox.origin.y < rhs.boundingBox.origin.y
+                })
+            }
+        }
+        return ordered
     }
 
     /// 两个包围盒在纵向是否属于同一行。

@@ -22,6 +22,7 @@
 //
 
 import Foundation
+import os
 
 /// 产物类型。历史面板按它显示角标，也决定「重新编辑」走哪条路径。
 public enum HistoryEntryKind: String, Codable, Sendable, CaseIterable {
@@ -163,8 +164,11 @@ public final class HistoryStore {
     private let cacheDirectory: URL
     private let fileManager: FileManager
 
-    /// 条目上限；超出时淘汰最旧的。
+    /// 条目上限；超出时淘汰最旧的非收藏条目。
     public let maximumEntries: Int
+
+    /// 缓存目录总字节上限；超出时按时间逆序优先淘汰非收藏缓存副本。
+    public let maximumCacheBytes: Int
 
     /// 当前条目，**按时间倒序**（最新在前）。
     public private(set) var entries: [HistoryEntry] = []
@@ -176,15 +180,18 @@ public final class HistoryStore {
     ///   - directory: 索引与缩略图的存放目录。
     ///   - maximumEntries: 条目上限。
     ///   - fileManager: 便于测试注入。
+    ///   - maximumCacheBytes: 缓存总字节上限，默认 512 MiB。
     public init(
         directory: URL,
         maximumEntries: Int = 200,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        maximumCacheBytes: Int = 512 * 1024 * 1024
     ) {
         self.directory = directory
         self.thumbnailsDirectory = directory.appendingPathComponent(Self.thumbnailsDirectoryName)
         self.cacheDirectory = directory.appendingPathComponent(Self.cacheDirectoryName)
         self.maximumEntries = max(1, maximumEntries)
+        self.maximumCacheBytes = max(0, maximumCacheBytes)
         self.fileManager = fileManager
         reload()
     }
@@ -336,15 +343,118 @@ public final class HistoryStore {
         persist()
     }
 
+    /// 将已缓存条目原地升级为指向用户另存的永久文件，并回收原 `cache/` 副本。
+    ///
+    /// 用于长截图等先写入缓存、用户稍后点击「保存」的场景：避免磁盘上留存双份大图，
+    /// 同时保持历史条目 `id`、收藏状态与缩略图连续性。
+    @discardableResult
+    public func promoteCachedEntry(id: UUID, toSavedURL: URL) -> Bool {
+        lastError = nil
+        guard let index = entries.firstIndex(where: { $0.id == id }) else { return false }
+        let original = entries[index]
+        let targetPath = toSavedURL.standardizedFileURL.path
+        let updated = HistoryEntry(
+            id: original.id,
+            createdAt: original.createdAt,
+            filePath: toSavedURL.path,
+            pixelWidth: original.pixelWidth,
+            pixelHeight: original.pixelHeight,
+            kind: original.kind,
+            source: original.source,
+            isCached: false,
+            isFavorite: original.isFavorite
+        )
+        entries[index] = updated
+        if original.isCached, original.fileURL.standardizedFileURL.path != targetPath {
+            removeCachedCopyIfOwned(by: original)
+        }
+        persist()
+        return true
+    }
+
     /// 一键清空（契约要求的隐私保证）。
     ///
     /// 同样**不动用户文件**，只清索引、缩略图与缓存目录。
+    /// 若物理清理失败（如权限或占用冲突），必须显式记录错误而非静默吞掉。
     public func clear() {
         lastError = nil
         entries.removeAll()
-        try? fileManager.removeItem(at: thumbnailsDirectory)
-        try? fileManager.removeItem(at: cacheDirectory)
+
+        var errors: [String] = []
+        if let thumbError = removeDirectoryIfExists(thumbnailsDirectory) {
+            errors.append("缩略图目录删除失败：\(thumbError)")
+        }
+        if let cacheError = removeDirectoryIfExists(cacheDirectory) {
+            errors.append("缓存目录删除失败：\(cacheError)")
+        }
+
         persist()
+        if let persistError = lastError {
+            errors.append(persistError)
+        }
+        if !errors.isEmpty {
+            let message = errors.joined(separator: "；")
+            lastError = message
+            AnShotLog.history.error("清空历史记录未完全成功：\(message, privacy: .public)")
+        }
+    }
+
+    /// 对账清理不在当前 `entries` 中的 `cache/` 与 `thumbnails/` 孤儿文件。
+    ///
+    /// - Returns: 实际删除的孤儿文件数量。
+    @discardableResult
+    public func pruneOrphanedFiles() -> Int {
+        let validThumbnailNames = Set(entries.map { "\($0.id.uuidString).png" })
+        let validCachePaths = Set(
+            entries
+                .filter { isOwnedCachedEntry($0) }
+                .map { $0.fileURL.standardizedFileURL.path }
+        )
+
+        var removedCount = 0
+        var errors: [String] = []
+
+        if let thumbURLs = try? fileManager.contentsOfDirectory(
+            at: thumbnailsDirectory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for url in thumbURLs {
+                let isRegular = (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile ?? false
+                guard isRegular, !validThumbnailNames.contains(url.lastPathComponent) else { continue }
+                do {
+                    try fileManager.removeItem(at: url)
+                    removedCount += 1
+                } catch {
+                    errors.append("清理孤儿缩略图失败：\(error.localizedDescription)")
+                }
+            }
+        }
+
+        if let cacheURLs = try? fileManager.contentsOfDirectory(
+            at: cacheDirectory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for url in cacheURLs {
+                let isRegular = (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile ?? false
+                let path = url.standardizedFileURL.path
+                guard isRegular, !validCachePaths.contains(path) else { continue }
+                do {
+                    try fileManager.removeItem(at: url)
+                    removedCount += 1
+                } catch {
+                    errors.append("清理孤儿缓存失败：\(error.localizedDescription)")
+                }
+            }
+        }
+
+        if !errors.isEmpty {
+            let message = errors.joined(separator: "；")
+            lastError = message
+            AnShotLog.history.error("历史孤儿文件清理部分失败：\(message, privacy: .public)")
+        }
+        return removedCount
     }
 
     /// 移除所有源文件已丢失的条目（用户主动整理）。
@@ -364,14 +474,56 @@ public final class HistoryStore {
         return missing.count
     }
 
-    /// 超出上限时按时间淘汰最旧。
+    /// 超出条目上限或缓存字节水位时，从最旧条目逆序优先淘汰非收藏条目。
+    ///
+    /// 保留刚刚插入的最新条目（下标 0），避免已有旧记录全为收藏时新记录刚入库即被淘汰。
     private func trim() {
-        guard entries.count > maximumEntries else { return }
-        let dropped = entries[maximumEntries...]
-        for entry in dropped {
-            deleteArtifacts(for: entry)
+        // 1. 按条目上限淘汰：第一轮优先淘汰最旧的非收藏条目（不触碰下标 0 的最新条目）。
+        if entries.count > maximumEntries {
+            var index = entries.count - 1
+            while entries.count > maximumEntries, index >= 1 {
+                if !entries[index].isFavorite {
+                    let evicted = entries.remove(at: index)
+                    deleteArtifacts(for: evicted)
+                }
+                index -= 1
+            }
         }
-        entries.removeSubrange(maximumEntries...)
+
+        // 若旧条目全部为收藏且仍超出硬上限，才从最旧的收藏开始淘汰。
+        while entries.count > maximumEntries {
+            let evicted = entries.removeLast()
+            deleteArtifacts(for: evicted)
+        }
+
+        // 2. 按缓存总字节水位淘汰：同样优先保住收藏缓存与最新条目。
+        var totalCacheBytes = entries.reduce(0) { partial, entry in
+            partial + cachedFileBytes(for: entry)
+        }
+        if totalCacheBytes > maximumCacheBytes {
+            var index = entries.count - 1
+            while totalCacheBytes > maximumCacheBytes, index >= 1 {
+                let entry = entries[index]
+                if !entry.isFavorite, isOwnedCachedEntry(entry) {
+                    totalCacheBytes -= cachedFileBytes(for: entry)
+                    entries.remove(at: index)
+                    deleteArtifacts(for: entry)
+                }
+                index -= 1
+            }
+        }
+        if totalCacheBytes > maximumCacheBytes {
+            var index = entries.count - 1
+            while totalCacheBytes > maximumCacheBytes, index >= 1 {
+                let entry = entries[index]
+                if isOwnedCachedEntry(entry) {
+                    totalCacheBytes -= cachedFileBytes(for: entry)
+                    entries.remove(at: index)
+                    deleteArtifacts(for: entry)
+                }
+                index -= 1
+            }
+        }
     }
 
     // MARK: - 产物文件
@@ -408,16 +560,47 @@ public final class HistoryStore {
         removeCachedCopyIfOwned(by: entry)
     }
 
+    /// 判断条目的文件路径是否确属当前存储的 `cache/` 目录。
+    private func isOwnedCachedEntry(_ entry: HistoryEntry) -> Bool {
+        guard entry.isCached else { return false }
+        let cachePrefix = cacheDirectory.standardizedFileURL.path + "/"
+        let filePath = entry.fileURL.standardizedFileURL.path
+        return filePath.hasPrefix(cachePrefix)
+    }
+
+    /// 计算缓存条目的磁盘占用字节数。
+    private func cachedFileBytes(for entry: HistoryEntry) -> Int {
+        guard isOwnedCachedEntry(entry) else { return 0 }
+        let attributes = try? fileManager.attributesOfItem(atPath: entry.fileURL.standardizedFileURL.path)
+        if let size = attributes?[.size] as? NSNumber {
+            return max(0, size.intValue)
+        }
+        return 0
+    }
+
+    /// 删除指定目录；目录不存在时不视为错误，其余错误返回描述文本。
+    private func removeDirectoryIfExists(_ url: URL) -> String? {
+        do {
+            try fileManager.removeItem(at: url)
+            return nil
+        } catch let error as CocoaError where error.code == .fileNoSuchFile {
+            return nil
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
+            return nil
+        } catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT) {
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
     /// 只删除缓存目录内的副本。
     ///
     /// 除 `isCached` 外再按路径兜一层：索引可能被旧版本或手工编辑成
     /// 「用户文件 + isCached = true」，那种情况下也不能删用户的图。
     private func removeCachedCopyIfOwned(by entry: HistoryEntry) {
-        guard entry.isCached else { return }
-        let cachePrefix = cacheDirectory.standardizedFileURL.path + "/"
-        let filePath = entry.fileURL.standardizedFileURL.path
-        guard filePath.hasPrefix(cachePrefix) else { return }
-        try? fileManager.removeItem(atPath: filePath)
+        guard isOwnedCachedEntry(entry) else { return }
+        try? fileManager.removeItem(atPath: entry.fileURL.standardizedFileURL.path)
     }
 
     /// 写回索引。
@@ -433,11 +616,21 @@ public final class HistoryStore {
         }
     }
 
-    /// 把损坏的索引改名留档，不静默删除。
+    /// 把损坏的索引改名留档（带时间戳防覆盖首次现场），不静默删除。
     private func preserveCorruptedIndex() {
-        let broken = directory.appendingPathComponent("index.corrupted.json")
-        try? fileManager.removeItem(at: broken)
-        try? fileManager.moveItem(at: indexURL, to: broken)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyyMMdd-HHmmss-SSS"
+        let timestamp = formatter.string(from: Date())
+
+        var candidate = directory.appendingPathComponent("index.corrupted-\(timestamp).json")
+        var suffix = 1
+        while fileManager.fileExists(atPath: candidate.path) {
+            candidate = directory.appendingPathComponent("index.corrupted-\(timestamp)-\(suffix).json")
+            suffix += 1
+        }
+        try? fileManager.moveItem(at: indexURL, to: candidate)
     }
 
     private var indexURL: URL {

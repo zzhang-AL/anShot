@@ -28,6 +28,7 @@
 //  `outputY` / `rows` / `warnings`，以及接缝行号。
 //
 
+import CoreGraphics
 import Foundation
 
 /// 滚动截图的拼接编排。
@@ -103,7 +104,7 @@ public enum ScrollStitcher {
             unusableTopRows: Int = 0,
             unusableBottomRows: Int = 0,
             joinsInsideOverlap: Bool = false,
-            retainsSourceFrames: Bool = true
+            retainsSourceFrames: Bool = false
         ) {
             self.stickyHeaderRows = stickyHeaderRows
             self.duplicateDeltaThreshold = duplicateDeltaThreshold
@@ -238,17 +239,18 @@ public enum ScrollStitcher {
     static func compose(
         segments: [(source: ScrollshotImage, sourceY: Int, rows: Int, outputY: Int)],
         width: Int,
-        height: Int
+        height: Int,
+        colorSpace: CGColorSpace? = nil
     ) -> ScrollshotImage? {
         guard width > 0, height > 0 else { return nil }
-        var buffer = [UInt8](repeating: 0, count: width * height * 4)
+        var buffer = Data(count: width * height * 4)
         // 直接在预分配缓冲上写完，再把这块内存**移交**给结果。
         //
         // 早期版本在闭包里把指针缓冲再复制成数组后返回：那会额外复制一整张
         // 宽×高×4 的输出图（长图常达数百 MB），峰值内存瞬间翻倍——正是本模块
         // 要防的 OOM。闭包只负责填像素，结果在闭包外用同一块 `buffer` 构造。
-        let filled = buffer.withUnsafeMutableBufferPointer { output -> Bool in
-            guard let out = output.baseAddress else { return false }
+        let filled = buffer.withUnsafeMutableBytes { rawOutput -> Bool in
+            guard let out = rawOutput.bindMemory(to: UInt8.self).baseAddress else { return false }
             let bytesPerRow = width * 4
             let totalBytes = width * height * 4
             for segment in segments {
@@ -268,6 +270,11 @@ public enum ScrollStitcher {
             return true
         }
         guard filled else { return nil }
-        return ScrollshotImage(width: width, height: height, data: buffer)
+        return ScrollshotImage(
+            width: width,
+            height: height,
+            data: buffer,
+            colorSpace: colorSpace ?? segments.first?.source.colorSpace
+        )
     }
 }
