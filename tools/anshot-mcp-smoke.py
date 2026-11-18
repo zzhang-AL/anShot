@@ -28,13 +28,22 @@ import base64
 import json
 import os
 import pathlib
+import plistlib
 import subprocess
 import sys
 import threading
 import time
 
 PROTOCOL_VERSION = "2025-06-18"
-EXPECTED_TOOLS = {"list_displays", "list_desktops", "list_windows", "capture_screenshot"}
+EXPECTED_TOOLS = {
+    "list_displays",
+    "list_desktops",
+    "list_windows",
+    "capture_screenshot",
+    "ocr_screenshot",
+    "inspect_window_elements",
+    "record_screen",
+}
 
 
 class Failure(Exception):
@@ -134,6 +143,20 @@ class Server:
             pass
 
 
+def supports_automation(app_bundle: pathlib.Path) -> bool:
+    """检查 Info.plist 是否包含非空的 AnShotAutomationVersion 标记。"""
+    plist_path = app_bundle / "Contents/Info.plist"
+    if not plist_path.is_file():
+        return False
+    try:
+        with plist_path.open("rb") as fp:
+            info = plistlib.load(fp)
+    except Exception:
+        return False
+    version = info.get("AnShotAutomationVersion")
+    return isinstance(version, str) and bool(version.strip())
+
+
 def find_binary() -> str:
     """定位一个支持自动化接口的 anShot 可执行文件。"""
     repo = pathlib.Path(__file__).resolve().parent.parent
@@ -144,9 +167,9 @@ def find_binary() -> str:
         pathlib.Path("/Applications/anShot.app"),
     ):
         executable = candidate / "Contents/MacOS/anShot"
-        if executable.is_file():
+        if executable.is_file() and supports_automation(candidate):
             return str(executable)
-    raise Failure("找不到 anShot.app，请先构建或用 --binary 指定")
+    raise Failure("找不到包含 AnShotAutomationVersion 的 anShot.app，请先构建或用 --binary 指定")
 
 
 def tool_text(tool_result: dict) -> str:
@@ -227,11 +250,26 @@ def run(
             "list_desktops 声明为只读",
             str(annotations.get("list_desktops")),
         )
-        # capture_screenshot 能经 save_path 写盘，不能声明只读
+        # capture_screenshot / record_screen 可写盘或产生产物，不能声明只读
         check(
             annotations.get("capture_screenshot", {}).get("readOnlyHint") is False,
             "capture_screenshot 未谎报只读",
             str(annotations.get("capture_screenshot")),
+        )
+        check(
+            annotations.get("ocr_screenshot", {}).get("readOnlyHint") is True,
+            "ocr_screenshot 声明为只读",
+            str(annotations.get("ocr_screenshot")),
+        )
+        check(
+            annotations.get("inspect_window_elements", {}).get("readOnlyHint") is True,
+            "inspect_window_elements 声明为只读",
+            str(annotations.get("inspect_window_elements")),
+        )
+        check(
+            annotations.get("record_screen", {}).get("readOnlyHint") is False,
+            "record_screen 未谎报只读",
+            str(annotations.get("record_screen")),
         )
 
         print("\n[4/7] tools/call list_displays")

@@ -2,41 +2,14 @@
 //  CommandLineInterface.swift
 //  AnShotAutomation
 //
-//  命令行截图入口。给脚本、CI 与不想起 MCP 的场景用。
-//
-//  ── 为什么不只做 MCP ─────────────────────────────────────────
-//
-//  MCP 面向「模型自己决定要不要截图」；而调试现场还有另一类需求：
-//  「我（或脚本）已经知道要截什么，只想拿个文件」。
-//  这类需求套一层协议只是多一个会坏的环节，一条命令更直接。
-//
-//  两条入口共用 `CaptureService`，所以行为不会分叉。
-//
-//  ── 输出约定 ─────────────────────────────────────────────────
-//
-//      stdout       → 结果 JSON（**成功与失败都写**）
-//      stderr       → 人类可读的简短诊断
-//      --json-out   → 同一份 JSON 写入文件
-//
-//  stdout 上始终是合法 JSON：脚本可以无脑 `| jq .ok`，
-//  不必按「这次是不是失败了」决定要不要解析。
-//  给眼睛看的信息走 stderr，两者不混。
-//
-//  ── `--json-out` 为何必需（而不是多余的）────────────────────
-//
-//  屏幕录制权限记在**发起进程**头上（本项目 M1 阶段已有一手记录）。因此：
-//
-//      anShot --capture …                     → 权限归因给当前终端 / 宿主
-//      open -n anShot.app --args --capture …   → 权限归因给 anShot.app
-//
-//  后者能**直接复用 anShot.app 已有的授权**（已实测可成功截图），
-//  但它同时丢掉了 stdout/stderr（`open` 不转发管道）——
-//  于是失败会变成「什么都没有发生」。`--json-out` 把结果写进文件，
-//  补回这个缺口，使「零额外授权」的调用方式真正可用。
+//  命令行自动化入口。给脚本、CI 与 AI 工具调用。
+//  使用从左到右单遍游标状态机解析参数，支持 `--option=value`，
+//  彻底杜绝跨参数前置扫描造成的参数注入漏洞。
 //
 
 import AnShotCapture
 import CoreGraphics
+import Darwin
 import Foundation
 
 /// 命令行动作。
@@ -46,6 +19,10 @@ public enum CommandLineAction: Equatable, Sendable {
     case listDesktops
     case listWindows
     case capture(CaptureParameters)
+    case ocr(OCRParameters)
+    case inspectElements(InspectElementsParameters)
+    case record(RecordingParameters)
+    case ipcRequest(path: String)
 }
 
 /// 一次解析完成的命令行调用。
@@ -56,7 +33,7 @@ public struct Outcome: Equatable, Sendable {
     /// 结果 JSON 的落盘路径。`nil` 表示只写 stdout。
     public var jsonOutPath: String?
 
-    /// 截图由谁执行。默认复用 anShot.app 已有的屏幕录制授权。
+    /// 截图/录制由谁执行。默认复用 anShot.app 已有的屏幕录制授权。
     public var execution: CaptureExecution
 
     public init(
@@ -73,223 +50,364 @@ public struct Outcome: Equatable, Sendable {
 /// 命令行界面。
 public enum CommandLineInterface {
 
-    /// 默认输出目录（相对家目录）。仅在 `--capture` 未给 `--out` 时使用。
-    ///
-    /// 选 `~/Pictures/anShot` 而不是临时目录：调试用的截图通常要回头再看，
-    /// 而临时目录会被系统清理，「刚截的图不见了」是比多一个文件夹更差的体验。
+    /// 默认输出目录（相对家目录）。仅在未给 `--out` 时使用。
     static let defaultOutputDirectoryName = "Pictures/anShot"
 
     /// 本工具的命令行帮助文本。
     public static var usage: String {
         """
-        anShot —— 屏幕截图的命令行入口
+        anShot —— 屏幕截图、OCR、UI 探测与录制的命令行入口
 
         用法：
           anShot --list-displays
           anShot --list-desktops
           anShot --list-windows
           anShot --capture [选项]
+          anShot --ocr [选项]
+          anShot --elements [选项]
+          anShot --record [选项]
 
-        选项：
+        截图选项（--capture）：
           --display <id>        目标显示器 ID（来自 --list-displays）。默认主显示器。
           --space <id>          目标桌面 ID（来自 --list-desktops）。默认不切换桌面。
           --switch-desktop      明确允许切换到目标桌面并在截图后恢复。
-                                可与 --display / --region 组合，不可与 --window / --app 混用。
           --region x,y,w,h      截取区域，单位是**显示器内逻辑点**，原点在该显示器左上角。
-                                省略则截取整块显示器。
-          --window <id>         截取指定窗口（ID 来自 --list-windows）。
-                                **窗口被遮挡、不在最顶层时同样能截到完整内容**——
-                                这正是它存在的理由：显示器 + 区域要求调用方先知道
-                                窗口在哪，而调用方看不到才要截图。
-                                其他桌面的窗口可尝试截图；隐藏或最小化时可能不可用。
+          --window <id>         截取指定窗口（ID 来自 --list-windows，遮挡/后台窗口亦可）。
           --app <name>          按应用名截取窗口（当前在屏优先，其次面积最大）。
-                                与 --window 二选一；两者都不能与 --display/--region 混用。
           --max-size <n>        输出长边像素上限。默认 \(ImageScaling.defaultMaxLongEdge)，0 表示不缩放。
+          --format <png|jpeg>   输出图像格式。默认 png。
+          --quality <1..100>    JPEG 压缩质量（仅 jpeg 格式生效，默认 82）。
+          --coordinate-grid     在导出图边缘绘制逻辑点坐标标尺网格，辅助定位点击坐标。
           --out <path>          截图保存路径。省略则存到 ~/\(defaultOutputDirectoryName)/。
                                 已存在时自动追加序号，绝不覆盖。
-          --json-out <path>     把结果 JSON 额外写入该文件（成功或失败都写）。
-          --via-app             **默认行为**（写出仅为显式表达）：让 anShot.app 自己截图，
+
+        离线 OCR 选项（--ocr）：
+          --image <path>        识别本地图片文件（与屏幕/窗口/区域参数互斥）。
+          --lang <c1,c2,...>    偏好识别语言（如 zh-Hans,en-US）。
+          （亦可使用 --display / --space / --switch-desktop / --region / --window / --app）
+
+        UI 控件树探测选项（--elements）：
+          --window <id>         目标窗口 ID。
+          --app <name>          目标应用名。
+          --pid <pid>           目标进程 PID（与 --window / --app 三选一）。
+          --max-depth <n>       最大遍历深度（1...12，默认 4）。
+          --max-elements <n>    最大返回控件数（1...1000，默认 200）。
+
+        有界时长录制选项（--record）：
+          --duration <sec>      录制时长（强制 1...15 秒，默认 3）。
+          --format <gif|mp4>    录制输出格式（默认 gif）。
+          --fps <n>             帧率（GIF 默认 12，上限 30；MP4 默认 30，上限 60）。
+          --max-size <n>        GIF 最大边长（100...1600，默认 800）。
+          --out <path>          输出路径。省略则存到 ~/\(defaultOutputDirectoryName)/。
+          （目标支持 --display / --region / --window / --app）
+
+        通用选项：
+          --json-out <path>     把结果 JSON 额外写入该文件（成功或失败都写，绝不覆盖产物）。
+          --via-app             **默认行为**（写出仅为显式表达）：让 anShot.app 自己执行，
                                 复用它已有的屏幕录制授权。
-          --direct              就地截图，用当前终端 / AI 宿主的授权。仅在已给当前进程
-                                授权、或环境里没有可启动的 anShot.app 时才需要。
+          --direct              就地执行，用当前终端 / AI 宿主的授权。
           --mcp                 以 MCP stdio 服务端运行（供 AI 客户端调用）。
           -h, --help            显示本帮助。
 
         权限：
           屏幕录制授权记在**发起进程**的代码身份上，而不是可执行文件上。
-          默认的 --via-app 经 LaunchServices 启动 anShot.app，由它以自己的身份
-          截图，因此**不需要**给终端或 AI 客户端任何授权。
-          --direct 才会把授权要求落到当前进程——那是显式选择，不是默认。
-
-          注意：窗口**标题**（--list-windows 的 title 字段）同样受这项权限管控。
-          无权限的进程枚举出的窗口只有应用名，没有标题。
-          --list-windows 包含其他桌面及可能已隐藏、最小化的窗口；
-          切换桌面需要同时指定 --space 和 --switch-desktop，并需要辅助功能权限。
+          默认的 --via-app 经 LaunchServices 启动 anShot.app，复用它已有的授权。
+          --direct 才会把授权要求落到当前进程。
 
         输出：
           stdout 始终是结果 JSON（含 "ok" 字段）；诊断信息走 stderr。
-          典型成功输出：
-            {"capture":{"savedPath":"…/anshot-20260916-173100.png", …},"ok":true}
-          典型失败输出：
-            {"error":"…","ok":false}
-
-        示例：
-          anShot --list-displays
-          anShot --list-desktops
-          anShot --list-windows
-          anShot --capture --out ~/Desktop/shot.png
-          anShot --capture --display 1 --region 0,0,800,600 --max-size 0 --out /tmp/ui.png
-          anShot --capture --app Safari --out /tmp/safari.png
-          anShot --capture --window 1234 --out /tmp/window.png
-          anShot --capture --direct --out /tmp/ui.png   # 用当前进程的授权
         """
     }
 
-    // MARK: - 解析
+    // MARK: - 单遍游标参数解析
 
-    /// 解析命令行参数。
+    private enum PrimaryAction: Equatable {
+        case help
+        case listDisplays
+        case listDesktops
+        case listWindows
+        case capture
+        case ocr
+        case elements
+        case record
+        case ipcRequest(String)
+
+        var flagName: String {
+            switch self {
+            case .help:           return "--help"
+            case .listDisplays:   return "--list-displays"
+            case .listDesktops:   return "--list-desktops"
+            case .listWindows:    return "--list-windows"
+            case .capture:        return "--capture"
+            case .ocr:            return "--ocr"
+            case .elements:       return "--elements"
+            case .record:         return "--record"
+            case .ipcRequest:     return "--ipc-request"
+            }
+        }
+    }
+
+    /// 内部选项采集状态，用于单遍扫描后按动作精确校验合法性。
+    private struct ParsedTokens {
+        var action: PrimaryAction?
+        var sawHelp = false
+        var jsonOutPath: String?
+        var execution: CaptureExecution = .reuseApplicationAuthorization
+        var executionWasSpecified = false
+
+        var displayID: CGDirectDisplayID?
+        var spaceID: UInt64?
+        var allowDesktopSwitch = false
+        var region: CGRect?
+        var windowID: CGWindowID?
+        var applicationName: String?
+        var maxLongEdge: Int?
+        var savePath: String?
+        var rawFormat: String?
+        var quality: Int?
+        var coordinateGrid = false
+
+        var imagePath: String?
+        var languages: [String]?
+
+        var pid: Int32?
+        var maxDepth: Int?
+        var maxElements: Int?
+
+        var durationSeconds: TimeInterval?
+        var fps: Int?
+
+        /// 记录已出现的非全局选项名称，以便在动作不兼容时给出精准提示。
+        var specificOptionFlags: Set<String> = []
+    }
+
+    /// 从左到右单遍游标状态机解析命令行参数（支持 `--option=value`）。
     ///
     /// - Throws: `AutomationError.invalidArgument`（未知选项、缺值、格式错误、路径冲突）
     public static func parse(arguments: [String]) throws -> Outcome {
-        // 跳过可执行文件路径
-        var args = arguments.dropFirst().map { $0 }
-
-        // `--json-out` 对任何动作都适用，故先摘出来，
-        // 各动作分支不必各自处理它。
-        let jsonOutPath = try extractOption("--json-out", from: &args)
-
-        let wantsHelp = args.contains("--help") || args.contains("-h")
-        if args.isEmpty || wantsHelp {
-            return Outcome(action: .help, jsonOutPath: jsonOutPath)
+        var cursor = arguments.dropFirst()
+        if cursor.isEmpty {
+            return Outcome(action: .help)
         }
 
-        if args.contains("--mcp") {
-            // `--mcp` 由 AutomationRunner.detect 在更早处拦截（含与其它选项
-            // 混用的拒绝）。走到这里通常意味着有人直接调用了本解析器。
-            throw AutomationError.invalidArgument("--mcp 不能与其它选项同时使用。")
-        }
+        var state = ParsedTokens()
 
-        if args.contains("--list-displays") {
-            args.removeAll { $0 == "--list-displays" }
-            // 与 `--list-windows` 不同，这里**刻意不接受** `--direct` / `--via-app`：
-            // 列举显示器是纯 CoreGraphics 查询，不需要屏幕录制权限，
-            // 两种执行方式的结果完全一样。接受一个无效果的标志只会让调用方
-            // 以为自己切换了什么，而行为毫无变化。
-            guard args.isEmpty else {
+        func setAction(_ next: PrimaryAction) throws {
+            if let existing = state.action, existing != next {
                 throw AutomationError.invalidArgument(
-                    "--list-displays 不接受其它选项（收到：\(args.joined(separator: " "))）。"
+                    "\(existing.flagName) 与 \(next.flagName) 不能同时使用。"
                 )
             }
-            return Outcome(action: .listDisplays, jsonOutPath: jsonOutPath)
+            state.action = next
         }
 
-        if args.contains("--list-desktops") {
-            args.removeAll { $0 == "--list-desktops" }
-            guard args.isEmpty else {
-                throw AutomationError.invalidArgument(
-                    "--list-desktops 不接受其它选项（收到：\(args.joined(separator: " "))）。"
-                )
-            }
-            return Outcome(action: .listDesktops, jsonOutPath: jsonOutPath)
-        }
+        while let token = cursor.first {
+            cursor = cursor.dropFirst()
 
-        if args.contains("--list-windows") {
-            args.removeAll { $0 == "--list-windows" }
-            // 这里的 `--direct` 还承担一个**防递归**职责：
-            // 默认路径下本进程会让 anShot.app 去枚举（标题需要屏幕录制权限），
-            // 而它启动的子实例同样是这个 CLI —— 子实例若不改成就地执行，
-            // 就会再启动一个孙实例，无限递归。
-            // 因此 `OutOfProcessCapture.listWindows` 固定给子实例传 `--direct`。
-            let execution = try extractExecutionFlag(from: &args, into: .reuseApplicationAuthorization)
-            guard args.isEmpty else {
-                throw AutomationError.invalidArgument(
-                    "--list-windows 不接受其它选项（收到：\(args.joined(separator: " "))）。"
-                )
-            }
-            return Outcome(action: .listWindows, jsonOutPath: jsonOutPath, execution: execution)
-        }
-
-        guard args.contains("--capture") else {
-            throw AutomationError.invalidArgument(
-                "缺少动作。可用：--capture、--list-displays、--list-desktops、--list-windows、--help。"
-            )
-        }
-        args.removeAll { $0 == "--capture" }
-
-        var parameters = CaptureParameters()
-
-        // 执行位置。默认复用 anShot.app 已有的授权——这是**默认**而不是可选
-        // 优化：被 AI 宿主 spawn 的进程没有自己的 TCC 身份，就地截图会要求
-        // 宿主再授权一次，而 anShot 明明已经授权过了。
-        var execution = CaptureExecution.reuseApplicationAuthorization
-        var executionWasSpecified = false
-
-        // 用 while 而非 for：每个选项都要从数组里摘掉自己的值，
-        // 否则循环体会把值当成下一个选项。
-        while !args.isEmpty {
-            let option = args.removeFirst()
+            let (option, inlineValue) = splitOptionToken(token)
 
             switch option {
+            case "--help", "-h":
+                guard inlineValue == nil else {
+                    throw AutomationError.invalidArgument("\(option) 不接受参数值。")
+                }
+                state.sawHelp = true
+
+            case "--mcp":
+                throw AutomationError.invalidArgument("--mcp 不能与其它选项同时使用。")
+
+            case "--list-displays":
+                guard inlineValue == nil else {
+                    throw AutomationError.invalidArgument("--list-displays 不接受参数值。")
+                }
+                try setAction(.listDisplays)
+
+            case "--list-desktops":
+                guard inlineValue == nil else {
+                    throw AutomationError.invalidArgument("--list-desktops 不接受参数值。")
+                }
+                try setAction(.listDesktops)
+
+            case "--list-windows":
+                guard inlineValue == nil else {
+                    throw AutomationError.invalidArgument("--list-windows 不接受参数值。")
+                }
+                try setAction(.listWindows)
+
+            case "--capture":
+                guard inlineValue == nil else {
+                    throw AutomationError.invalidArgument("--capture 不接受参数值。")
+                }
+                try setAction(.capture)
+
+            case "--ocr":
+                guard inlineValue == nil else {
+                    throw AutomationError.invalidArgument("--ocr 不接受参数值。")
+                }
+                try setAction(.ocr)
+
+            case "--elements":
+                guard inlineValue == nil else {
+                    throw AutomationError.invalidArgument("--elements 不接受参数值。")
+                }
+                try setAction(.elements)
+
+            case "--record":
+                guard inlineValue == nil else {
+                    throw AutomationError.invalidArgument("--record 不接受参数值。")
+                }
+                try setAction(.record)
+
+            case "--ipc-request":
+                let value = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
+                try setAction(.ipcRequest(value))
+
+            case "--json-out":
+                state.jsonOutPath = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
+
+            case "--direct", "--via-app":
+                guard inlineValue == nil else {
+                    throw AutomationError.invalidArgument("\(option) 不接受参数值。")
+                }
+                let requested: CaptureExecution =
+                    option == "--direct" ? .currentProcess : .reuseApplicationAuthorization
+                if state.executionWasSpecified, state.execution != requested {
+                    throw AutomationError.invalidArgument(
+                        "--direct 与 --via-app 含义相反，不能同时使用。"
+                    )
+                }
+                state.execution = requested
+                state.executionWasSpecified = true
+
             case "--display":
-                let value = try takeValue(for: option, from: &args)
+                let value = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
                 guard let id = UInt32(value) else {
                     throw AutomationError.invalidArgument(
                         "--display 需要一个无符号整数 ID，收到「\(value)」。"
                     )
                 }
-                parameters.displayID = CGDirectDisplayID(id)
-
-            case "--region":
-                let value = try takeValue(for: option, from: &args)
-                parameters.region = try parseRegion(value)
+                state.displayID = CGDirectDisplayID(id)
+                state.specificOptionFlags.insert(option)
 
             case "--space":
-                let value = try takeValue(for: option, from: &args)
+                let value = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
                 guard let id = UInt64(value), id > 0 else {
                     throw AutomationError.invalidArgument("--space 需要大于 0 的桌面 ID，收到「\(value)」。")
                 }
-                parameters.spaceID = id
+                state.spaceID = id
+                state.specificOptionFlags.insert(option)
 
             case "--switch-desktop":
-                parameters.allowDesktopSwitch = true
+                guard inlineValue == nil else {
+                    throw AutomationError.invalidArgument("--switch-desktop 不接受参数值。")
+                }
+                state.allowDesktopSwitch = true
+                state.specificOptionFlags.insert(option)
+
+            case "--region":
+                let value = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
+                state.region = try parseRegion(value)
+                state.specificOptionFlags.insert(option)
 
             case "--window":
-                let value = try takeValue(for: option, from: &args)
+                let value = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
                 guard let id = UInt32(value) else {
                     throw AutomationError.invalidArgument(
-                        "--window 需要一个无符号整数 ID，收到「\(value)」。"
-                        + "可用 --list-windows 获取窗口 ID。"
+                        "--window 需要一个无符号整数 ID，收到「\(value)」。可用 --list-windows 获取窗口 ID。"
                     )
                 }
-                parameters.windowID = CGWindowID(id)
+                state.windowID = CGWindowID(id)
+                state.specificOptionFlags.insert(option)
 
             case "--app":
-                parameters.applicationName = try takeValue(for: option, from: &args)
+                state.applicationName = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
+                state.specificOptionFlags.insert(option)
 
             case "--max-size":
-                let value = try takeValue(for: option, from: &args)
+                let value = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
                 guard let size = Int(value) else {
                     throw AutomationError.invalidArgument(
                         "--max-size 需要一个整数，收到「\(value)」。"
                     )
                 }
-                parameters.maxLongEdge = size
+                state.maxLongEdge = size
+                state.specificOptionFlags.insert(option)
 
             case "--out":
-                parameters.savePath = try takeValue(for: option, from: &args)
+                state.savePath = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
+                state.specificOptionFlags.insert(option)
 
-            case "--direct", "--via-app":
-                // 这两个是**一对反义**标志，同时给出说明调用方自己没想清楚
-                // 要哪种权限归属，静默取其一是不合适的。
-                let requested: CaptureExecution =
-                    option == "--direct" ? .currentProcess : .reuseApplicationAuthorization
-                if executionWasSpecified, execution != requested {
-                    throw AutomationError.invalidArgument(
-                        "--direct 与 --via-app 含义相反，不能同时使用。"
-                    )
+            case "--format":
+                state.rawFormat = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                state.specificOptionFlags.insert(option)
+
+            case "--quality":
+                let value = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
+                guard let q = Int(value) else {
+                    throw AutomationError.invalidArgument("--quality 需要一个整数（1...100），收到「\(value)」。")
                 }
-                execution = requested
-                executionWasSpecified = true
+                state.quality = q
+                state.specificOptionFlags.insert(option)
+
+            case "--coordinate-grid":
+                guard inlineValue == nil else {
+                    throw AutomationError.invalidArgument("--coordinate-grid 不接受参数值。")
+                }
+                state.coordinateGrid = true
+                state.specificOptionFlags.insert(option)
+
+            case "--image":
+                state.imagePath = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
+                state.specificOptionFlags.insert(option)
+
+            case "--lang":
+                let value = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
+                state.languages = value
+                    .split(separator: ",", omittingEmptySubsequences: false)
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                state.specificOptionFlags.insert(option)
+
+            case "--pid":
+                let value = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
+                guard let pid = Int32(value) else {
+                    throw AutomationError.invalidArgument("--pid 需要一个整数 PID，收到「\(value)」。")
+                }
+                state.pid = pid
+                state.specificOptionFlags.insert(option)
+
+            case "--max-depth":
+                let value = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
+                guard let depth = Int(value) else {
+                    throw AutomationError.invalidArgument("--max-depth 需要一个整数，收到「\(value)」。")
+                }
+                state.maxDepth = depth
+                state.specificOptionFlags.insert(option)
+
+            case "--max-elements":
+                let value = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
+                guard let count = Int(value) else {
+                    throw AutomationError.invalidArgument("--max-elements 需要一个整数，收到「\(value)」。")
+                }
+                state.maxElements = count
+                state.specificOptionFlags.insert(option)
+
+            case "--duration":
+                let value = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
+                guard let seconds = Double(value), seconds.isFinite else {
+                    throw AutomationError.invalidArgument("--duration 需要一个有限数字（1...15 秒），收到「\(value)」。")
+                }
+                state.durationSeconds = seconds
+                state.specificOptionFlags.insert(option)
+
+            case "--fps":
+                let value = try takeValue(for: option, inlineValue: inlineValue, cursor: &cursor)
+                guard let fps = Int(value) else {
+                    throw AutomationError.invalidArgument("--fps 需要一个整数，收到「\(value)」。")
+                }
+                state.fps = fps
+                state.specificOptionFlags.insert(option)
 
             default:
                 throw AutomationError.invalidArgument(
@@ -298,68 +416,267 @@ public enum CommandLineInterface {
             }
         }
 
-        try validatePathSeparation(
-            savePath: parameters.savePath,
-            jsonOutPath: jsonOutPath
-        )
-
-        return Outcome(
-            action: .capture(parameters),
-            jsonOutPath: jsonOutPath,
-            execution: execution
-        )
-    }
-
-    /// 从参数里摘出「由谁执行」的开关。
-    ///
-    /// 两个标志是**反义**的，同时给出说明调用方自己没想清楚要哪种权限归属，
-    /// 静默取其一是不合适的。
-    ///
-    /// 抽成独立函数是因为它现在有三个使用点（列举显示器 / 列举窗口 / 截图）：
-    /// 原先只有截图分支处理它，于是 `--list-windows --direct` 会被当成
-    /// 「多余的选项」拒绝——而那个标志恰恰是防自我递归所必需的。
-    private static func extractExecutionFlag(
-        from args: inout [String],
-        into defaultValue: CaptureExecution
-    ) throws -> CaptureExecution {
-        var execution = defaultValue
-        var wasSpecified = false
-
-        for option in ["--direct", "--via-app"] where args.contains(option) {
-            let requested: CaptureExecution =
-                option == "--direct" ? .currentProcess : .reuseApplicationAuthorization
-
-            if wasSpecified, execution != requested {
-                throw AutomationError.invalidArgument(
-                    "--direct 与 --via-app 含义相反，不能同时使用。"
-                )
-            }
-            execution = requested
-            wasSpecified = true
+        if state.sawHelp {
+            return Outcome(action: .help, jsonOutPath: state.jsonOutPath)
         }
 
-        args.removeAll { $0 == "--direct" || $0 == "--via-app" }
-        return execution
+        guard let action = state.action else {
+            throw AutomationError.invalidArgument(
+                "缺少动作。可用：--capture、--ocr、--elements、--record、--list-displays、--list-desktops、--list-windows、--help。"
+            )
+        }
+
+        return try finalizeOutcome(action: action, state: state)
     }
 
-    /// 拒绝「截图与报告写到同一个文件」。
-    ///
-    /// 不拦的后果很隐蔽：PNG 先写成功，紧接着 JSON 把它覆盖掉，
-    /// 调用方拿到一个后缀是 `.png` 却装着 JSON 的文件，
-    /// 而退出码是 0——看起来一切正常。
+    private static func finalizeOutcome(action: PrimaryAction, state: ParsedTokens) throws -> Outcome {
+        switch action {
+        case .help:
+            return Outcome(action: .help, jsonOutPath: state.jsonOutPath)
+
+        case .listDisplays:
+            try rejectDisallowedOptions(
+                actionFlag: "--list-displays",
+                state: state,
+                allowed: [],
+                allowExecutionFlag: false
+            )
+            return Outcome(action: .listDisplays, jsonOutPath: state.jsonOutPath)
+
+        case .listDesktops:
+            try rejectDisallowedOptions(
+                actionFlag: "--list-desktops",
+                state: state,
+                allowed: [],
+                allowExecutionFlag: false
+            )
+            return Outcome(action: .listDesktops, jsonOutPath: state.jsonOutPath)
+
+        case .listWindows:
+            try rejectDisallowedOptions(
+                actionFlag: "--list-windows",
+                state: state,
+                allowed: [],
+                allowExecutionFlag: true
+            )
+            return Outcome(action: .listWindows, jsonOutPath: state.jsonOutPath, execution: state.execution)
+
+        case .ipcRequest(let path):
+            try rejectDisallowedOptions(
+                actionFlag: "--ipc-request",
+                state: state,
+                allowed: [],
+                allowExecutionFlag: false
+            )
+            guard state.jsonOutPath == nil else {
+                throw AutomationError.invalidArgument("--ipc-request 不允许与 --json-out 同时使用。")
+            }
+            return Outcome(action: .ipcRequest(path: path))
+
+        case .capture:
+            let allowed: Set<String> = [
+                "--display", "--space", "--switch-desktop", "--region",
+                "--window", "--app", "--max-size", "--out",
+                "--format", "--quality", "--coordinate-grid"
+            ]
+            try rejectDisallowedOptions(
+                actionFlag: "--capture",
+                state: state,
+                allowed: allowed,
+                allowExecutionFlag: true
+            )
+
+            let imageFormat: CaptureImageFormat?
+            if let raw = state.rawFormat {
+                guard let parsed = CaptureImageFormat(rawValue: raw) else {
+                    throw AutomationError.invalidArgument(
+                        "--format 仅支持 png 或 jpeg（收到「\(raw)」）。"
+                    )
+                }
+                imageFormat = parsed
+            } else {
+                imageFormat = nil
+            }
+
+            try validatePathSeparation(savePath: state.savePath, jsonOutPath: state.jsonOutPath)
+
+            let parameters = CaptureParameters(
+                displayID: state.displayID,
+                spaceID: state.spaceID,
+                allowDesktopSwitch: state.allowDesktopSwitch,
+                region: state.region,
+                windowID: state.windowID,
+                applicationName: state.applicationName,
+                maxLongEdge: state.maxLongEdge,
+                savePath: state.savePath,
+                outputFormat: imageFormat,
+                jpegQuality: state.quality,
+                autoFallbackToJPEG: false,
+                coordinateGrid: state.coordinateGrid
+            )
+            return Outcome(
+                action: .capture(parameters),
+                jsonOutPath: state.jsonOutPath,
+                execution: state.execution
+            )
+
+        case .ocr:
+            let allowed: Set<String> = [
+                "--image", "--lang",
+                "--display", "--space", "--switch-desktop", "--region", "--window", "--app"
+            ]
+            try rejectDisallowedOptions(
+                actionFlag: "--ocr",
+                state: state,
+                allowed: allowed,
+                allowExecutionFlag: true
+            )
+            let parameters = OCRParameters(
+                imagePath: state.imagePath,
+                displayID: state.displayID,
+                spaceID: state.spaceID,
+                allowDesktopSwitch: state.allowDesktopSwitch,
+                region: state.region,
+                windowID: state.windowID,
+                applicationName: state.applicationName,
+                languages: state.languages
+            )
+            return Outcome(
+                action: .ocr(parameters),
+                jsonOutPath: state.jsonOutPath,
+                execution: state.execution
+            )
+
+        case .elements:
+            let allowed: Set<String> = [
+                "--window", "--app", "--pid", "--max-depth", "--max-elements"
+            ]
+            try rejectDisallowedOptions(
+                actionFlag: "--elements",
+                state: state,
+                allowed: allowed,
+                allowExecutionFlag: true
+            )
+            let parameters = InspectElementsParameters(
+                windowID: state.windowID,
+                applicationName: state.applicationName,
+                pid: state.pid,
+                maxDepth: state.maxDepth ?? InspectElementsParameters.defaultMaxDepth,
+                maxElements: state.maxElements ?? InspectElementsParameters.defaultMaxElements
+            )
+            return Outcome(
+                action: .inspectElements(parameters),
+                jsonOutPath: state.jsonOutPath,
+                execution: state.execution
+            )
+
+        case .record:
+            let allowed: Set<String> = [
+                "--display", "--region", "--window", "--app",
+                "--duration", "--format", "--fps", "--max-size", "--out"
+            ]
+            try rejectDisallowedOptions(
+                actionFlag: "--record",
+                state: state,
+                allowed: allowed,
+                allowExecutionFlag: true
+            )
+
+            let recordFormat: RecordingOutputFormat
+            if let raw = state.rawFormat {
+                guard let parsed = RecordingOutputFormat(rawValue: raw) else {
+                    throw AutomationError.invalidArgument(
+                        "--record 下 --format 仅支持 gif 或 mp4（收到「\(raw)」）。"
+                    )
+                }
+                recordFormat = parsed
+            } else {
+                recordFormat = .gif
+            }
+
+            try validatePathSeparation(savePath: state.savePath, jsonOutPath: state.jsonOutPath)
+
+            let parameters = RecordingParameters(
+                displayID: state.displayID,
+                region: state.region,
+                windowID: state.windowID,
+                applicationName: state.applicationName,
+                durationSeconds: state.durationSeconds ?? RecordingParameters.defaultDurationSeconds,
+                format: recordFormat,
+                fps: state.fps,
+                maxDimension: state.maxLongEdge,
+                savePath: state.savePath
+            )
+            return Outcome(
+                action: .record(parameters),
+                jsonOutPath: state.jsonOutPath,
+                execution: state.execution
+            )
+        }
+    }
+
+    private static func rejectDisallowedOptions(
+        actionFlag: String,
+        state: ParsedTokens,
+        allowed: Set<String>,
+        allowExecutionFlag: Bool
+    ) throws {
+        if !allowExecutionFlag && state.executionWasSpecified {
+            let flag = state.execution == .currentProcess ? "--direct" : "--via-app"
+            throw AutomationError.invalidArgument(
+                "\(actionFlag) 不接受其它选项（收到：\(flag)）。"
+            )
+        }
+        let extra = state.specificOptionFlags.subtracting(allowed).sorted()
+        guard extra.isEmpty else {
+            throw AutomationError.invalidArgument(
+                "\(actionFlag) 不接受其它选项（收到：\(extra.joined(separator: " "))）。"
+            )
+        }
+    }
+
+    /// 拆分 `--option=value` 形式的 token。
+    private static func splitOptionToken(_ token: String) -> (option: String, inlineValue: String?) {
+        guard token.hasPrefix("--"), let eqIndex = token.firstIndex(of: "=") else {
+            return (token, nil)
+        }
+        let option = String(token[..<eqIndex])
+        let value = String(token[token.index(after: eqIndex)...])
+        return (option, value)
+    }
+
+    /// 取选项值：优先取 `--option=value` 中的内联值，否则从游标消费下一项。
+    private static func takeValue(
+        for option: String,
+        inlineValue: String?,
+        cursor: inout ArraySlice<String>
+    ) throws -> String {
+        if let inlineValue {
+            return inlineValue
+        }
+        guard let value = cursor.first else {
+            throw AutomationError.invalidArgument("\(option) 缺少值。")
+        }
+        cursor = cursor.dropFirst()
+        guard !value.hasPrefix("--") else {
+            throw AutomationError.invalidArgument(
+                "\(option) 缺少值（下一个参数是选项「\(value)」）。"
+            )
+        }
+        return value
+    }
+
+    /// 拒绝「输出产物与报告写到同一个文件」（含 APFS 大小写折叠与 inode 比对）。
     static func validatePathSeparation(
         savePath: String?,
         jsonOutPath: String?
     ) throws {
         guard let savePath, let jsonOutPath else { return }
-
-        // 经 PathIdentity 比较：折叠 `.`/`..`、解析符号链接。
-        // 直接比字符串会漏判（macOS 上 `/tmp` 本身就是指向 /private/tmp 的链接）。
         guard PathIdentity.areSame(savePath, jsonOutPath) else { return }
 
         throw AutomationError.outputPathConflict(
             "--out 与 --json-out 指向同一个文件（\(PathIdentity.canonical(savePath))）。"
-            + "结果是 JSON 覆盖掉刚写好的 PNG；请给两者不同的路径。"
+            + "结果是 JSON 覆盖掉刚写好的产物；请给两者不同的路径。"
         )
     }
 
@@ -369,31 +686,28 @@ public enum CommandLineInterface {
     ///
     /// - Returns: 进程退出码（0 成功；非 0 失败）。
     public static func run(_ outcome: Outcome) async -> Int32 {
-        // 帮助不是「机器接口」，不产出 JSON 报告。
         if case .help = outcome.action {
             emit(usage)
             return 0
         }
 
-        // 报告目标要排除在 PNG 的候选名之外：否则
-        // `--out shot.png --json-out shot-2.png`（shot.png 已存在）
-        // 会让 PNG 排他到 shot-2.png，随后报告把它覆盖掉。
+        if case .ipcRequest(let requestPath) = outcome.action {
+            return await executeIPCRequest(at: requestPath)
+        }
+
         let reservedPaths: Set<String> = outcome.jsonOutPath
-            .map { [PathIdentity.canonical($0)] } ?? []
+            .map { [PathIdentity.comparisonKey($0)] } ?? []
 
         var report: CommandReport
         var exitCode: Int32 = 0
 
         switch outcome.action {
-        case .help:
-            // 上面已返回；此分支只为穷尽性
-            report = CommandReport.failure("帮助已输出。")
+        case .help, .ipcRequest:
+            report = CommandReport.failure("未预期的动作分发。")
+            exitCode = 1
 
         case .listDisplays:
-            report = CommandReport(
-                ok: true,
-                displays: DisplayCatalog.all()
-            )
+            report = CommandReport(ok: true, displays: DisplayCatalog.all())
 
         case .listDesktops:
             do {
@@ -404,12 +718,6 @@ public enum CommandLineInterface {
             }
 
         case .listWindows:
-            // 窗口**标题**受屏幕录制权限管控：当前进程若没有这个权限，
-            // 枚举出的窗口只有应用名、没有标题，而「选哪个窗口」几乎全靠标题。
-            //
-            // 所以默认同样经 anShot.app 执行（与截图路径同一套授权复用）。
-            // `--direct` 明确要求就地运行，此时才退回本进程枚举——那是显式
-            // 选择，不是默认。
             do {
                 let windows: [WindowInfo]
                 if outcome.execution == .reuseApplicationAuthorization,
@@ -430,7 +738,7 @@ public enum CommandLineInterface {
         case .capture(let parameters):
             var effective = parameters
             if effective.savePath == nil || effective.savePath?.isEmpty == true {
-                effective.savePath = defaultOutputPath()
+                effective.savePath = defaultOutputPath(format: effective.outputFormat ?? .png)
             }
 
             do {
@@ -450,35 +758,77 @@ public enum CommandLineInterface {
                 report = CommandReport.failure("截图失败：\(error.localizedDescription)")
                 exitCode = 1
             }
+
+        case .ocr(let parameters):
+            do {
+                let ocr = try await AutomationOCRService.recognize(
+                    parameters,
+                    execution: outcome.execution
+                )
+                report = CommandReport(ok: true, ocr: ocr)
+            } catch let error as AutomationError {
+                report = CommandReport.failure(error.localizedDescription)
+                exitCode = 1
+            } catch {
+                report = CommandReport.failure("离线文字识别失败：\(error.localizedDescription)")
+                exitCode = 1
+            }
+
+        case .inspectElements(let parameters):
+            do {
+                let elements = try await AccessibilityInspector.inspect(
+                    parameters,
+                    execution: outcome.execution
+                )
+                report = CommandReport(ok: true, elements: elements)
+            } catch let error as AutomationError {
+                report = CommandReport.failure(error.localizedDescription)
+                exitCode = 1
+            } catch {
+                report = CommandReport.failure("控件树探测失败：\(error.localizedDescription)")
+                exitCode = 1
+            }
+
+        case .record(let parameters):
+            do {
+                let recording = try await RecordingService.record(
+                    parameters,
+                    execution: outcome.execution,
+                    reservedOutputPaths: reservedPaths
+                )
+                report = CommandReport(ok: true, recording: recording)
+            } catch let error as AutomationError {
+                report = CommandReport.failure(error.localizedDescription)
+                exitCode = 1
+            } catch {
+                report = CommandReport.failure("屏幕录制失败：\(error.localizedDescription)")
+                exitCode = 1
+            }
         }
 
-        // 报告落盘失败必须让退出码非零，且**替调用方保住产物信息**。
-        //
-        // 理由：调用方显式要求了 `--json-out`，而在 `open -n` 那种方式下
-        // 这个文件是**唯一**的信息通道——它没写成功就等于整个调用没有结果。
-        // 若此时仍输出 `ok: true`，调用方会以为报告已就位；
-        // 而截图其实已经生成了，所以失败报告里要保留 `capture`（含 savedPath）。
-        if let path = outcome.jsonOutPath, !writeReport(report, to: path) {
+        let protectedPath = report.capture?.savedPath ?? report.recording?.savedPath
+        if let path = outcome.jsonOutPath,
+           !writeReport(report, to: path, protectedOutputPath: protectedPath) {
             report = CommandReport(
                 ok: false,
-                error: "结果 JSON 写入失败：\(path)。截图本身可能已生成，见 capture.savedPath。",
+                error: "结果 JSON 写入失败（或目标与已保存产物路径重合）：\(path)。",
                 displays: report.displays,
                 desktops: report.desktops,
                 windows: report.windows,
-                capture: report.capture
+                capture: report.capture,
+                ocr: report.ocr,
+                elements: report.elements,
+                recording: report.recording
             )
             exitCode = 1
         }
 
         guard let json = encode(report) else {
-            // 序列化失败属于实现缺陷；仍然要让 stdout 上是合法 JSON，
-            // 否则脚本会拿到空输出而无法区分「失败」与「工具没跑」。
             emit(#"{"ok":false,"error":"结果序列化失败"}"#)
             emitDiagnostic("结果序列化失败")
             return 1
         }
 
-        // stdout 始终给 JSON（成功与失败都给）；诊断信息走 stderr。
         emit(json)
         if !report.ok, let message = report.error {
             emitDiagnostic(message)
@@ -487,14 +837,135 @@ public enum CommandLineInterface {
         return exitCode
     }
 
-    /// 统一的「失败出口」。
-    ///
-    /// 供所有**在解析之前**就失败的情形复用（参数解析错误、模式冲突等），
-    /// 保证它们与解析之后的失败在两条通道上表现一致：
-    /// stdout 是合法失败 JSON，stderr 是可读诊断。
-    ///
-    /// - Parameter jsonOutPath: 报告目标。传 `nil` 表示不写文件。
-    /// - Returns: 退出码，恒为非零。
+    // MARK: - 跨进程请求执行与 Watchdog
+
+    private static func executeIPCRequest(at requestPath: String) async -> Int32 {
+        let request: IPCRequest
+        do {
+            request = try IPCRequest.load(from: requestPath)
+        } catch {
+            emitDiagnostic("IPC 请求加载失败：\(error.localizedDescription)")
+            return 1
+        }
+
+        // 启动后第一时间写入 child.pid，便于父进程超时/取消时回收本进程。
+        IPCRequest.writeCurrentPID(to: request.pidFilePath)
+
+        // 挂载进程内硬超时 Watchdog 自毁兜底，防止父进程意外退出时子实例残留成孤儿。
+        let watchdogDelay = max(5, request.watchdogTimeoutSeconds + 5)
+        let watchdogReportPath = request.reportPath
+        let watchdogTask = Task.detached {
+            try? await Task.sleep(nanoseconds: UInt64((watchdogDelay * 1_000_000_000).rounded()))
+            guard !Task.isCancelled else { return }
+            let timeoutReport = CommandReport.failure(
+                "anShot 子实例执行超出硬超时上限（\(Int(watchdogDelay)) 秒），已自动终止。"
+            )
+            if let data = encode(timeoutReport).map({ Data($0.utf8) }) {
+                try? IPCRequest.writePrivateFile(data, to: URL(fileURLWithPath: watchdogReportPath))
+            }
+            Darwin._exit(124)
+        }
+        defer { watchdogTask.cancel() }
+
+        var report: CommandReport
+        var exitCode: Int32 = 0
+
+        switch request.action {
+        case .listWindows:
+            report = CommandReport(ok: true, windows: WindowCatalog.all())
+
+        case .capture(var params):
+            params.savePath = nil
+            do {
+                let timeout = max(10, request.watchdogTimeoutSeconds)
+                let outcome = try await CaptureService.capture(params, lockTimeout: timeout)
+                guard let outputPath = request.outputPath else {
+                    throw AutomationError.outputFailed("IPC 请求缺少中转输出路径。")
+                }
+                try IPCRequest.writePrivateFile(outcome.imageData, to: URL(fileURLWithPath: outputPath))
+                report = CommandReport(
+                    ok: true,
+                    capture: CaptureOutput(outcome: outcome, overrideSavedPath: outputPath)
+                )
+            } catch let error as AutomationError {
+                report = CommandReport.failure(error.localizedDescription)
+                exitCode = 1
+            } catch {
+                report = CommandReport.failure("截图失败：\(error.localizedDescription)")
+                exitCode = 1
+            }
+
+        case .ocr(let params):
+            do {
+                let ocr = try await AutomationOCRService.recognize(params, execution: .currentProcess)
+                report = CommandReport(ok: true, ocr: ocr)
+            } catch let error as AutomationError {
+                report = CommandReport.failure(error.localizedDescription)
+                exitCode = 1
+            } catch {
+                report = CommandReport.failure("离线文字识别失败：\(error.localizedDescription)")
+                exitCode = 1
+            }
+
+        case .inspectElements(let params):
+            do {
+                let elements = try await AccessibilityInspector.inspect(params, execution: .currentProcess)
+                report = CommandReport(ok: true, elements: elements)
+            } catch let error as AutomationError {
+                report = CommandReport.failure(error.localizedDescription)
+                exitCode = 1
+            } catch {
+                report = CommandReport.failure("控件树探测失败：\(error.localizedDescription)")
+                exitCode = 1
+            }
+
+        case .record(let params):
+            do {
+                let artifact = try await RecordingService.recordLocallyToTemporaryFile(params)
+                defer {
+                    try? FileManager.default.removeItem(
+                        at: artifact.temporaryURL.deletingLastPathComponent()
+                    )
+                }
+                guard let outputPath = request.outputPath else {
+                    throw AutomationError.outputFailed("IPC 请求缺少录制中转输出路径。")
+                }
+                let data = try Data(contentsOf: artifact.temporaryURL, options: [.mappedIfSafe])
+                try IPCRequest.writePrivateFile(data, to: URL(fileURLWithPath: outputPath))
+                let rec = RecordingOutcomeOutput(
+                    savedPath: outputPath,
+                    format: artifact.format,
+                    durationSeconds: artifact.durationSeconds,
+                    pixelWidth: artifact.pixelWidth,
+                    pixelHeight: artifact.pixelHeight,
+                    frameRate: artifact.frameRate,
+                    fileSizeBytes: artifact.fileSizeBytes
+                )
+                report = CommandReport(ok: true, recording: rec)
+            } catch let error as AutomationError {
+                report = CommandReport.failure(error.localizedDescription)
+                exitCode = 1
+            } catch {
+                report = CommandReport.failure("屏幕录制失败：\(error.localizedDescription)")
+                exitCode = 1
+            }
+        }
+
+        if let data = encode(report).map({ Data($0.utf8) }) {
+            do {
+                try IPCRequest.writePrivateFile(data, to: URL(fileURLWithPath: request.reportPath))
+            } catch {
+                emitDiagnostic("IPC 报告写入失败：\(error.localizedDescription)")
+                return 1
+            }
+        } else {
+            return 1
+        }
+        return exitCode
+    }
+
+    // MARK: - 失败出口与尽力写报告
+
     @discardableResult
     public static func emitFailure(
         _ message: String,
@@ -518,89 +989,56 @@ public enum CommandLineInterface {
         return 1
     }
 
-    /// 该错误是否属于「报告目标本身就是危险目标」。
-    ///
-    /// 这类失败**不得**再往那个路径写报告：调用方明确要求的正是
-    /// 「不要覆盖那个文件」，而失败处理去写它就把初衷破坏了。
     static func isPathConflict(_ error: Error) -> Bool {
         if case .outputPathConflict = (error as? AutomationError) { return true }
         return false
     }
 
-    /// 从参数中尽力取出 `--json-out` 的值。
-    ///
-    /// 用途：整体解析**失败**时仍要写报告（文档承诺「成功或失败都写」），
-    /// 而此时没有解析结果可用。这里只做最朴素的扫描，取不到就放弃——
-    /// 它服务于「尽力保留证据」，本身不该产生新的错误。
+    /// 解析失败时从左到右尽力提取 `--json-out`（支持 `--json-out=path` 并跳过其他选项的值）。
     static func bestEffortJSONOutPath(arguments: [String]) -> String? {
-        let args = Array(arguments.dropFirst())
-        guard let index = args.firstIndex(of: "--json-out"),
-              index + 1 < args.count else {
-            return nil
+        let valueOptions: Set<String> = [
+            "--display", "--space", "--region", "--window", "--app",
+            "--max-size", "--out", "--format", "--quality",
+            "--image", "--lang", "--duration", "--fps", "--pid",
+            "--max-depth", "--max-elements", "--ipc-request"
+        ]
+        var cursor = arguments.dropFirst()
+        while let token = cursor.first {
+            cursor = cursor.dropFirst()
+            let (option, inlineValue) = splitOptionToken(token)
+            if option == "--json-out" {
+                if let inlineValue {
+                    return inlineValue.isEmpty ? nil : inlineValue
+                }
+                guard let next = cursor.first, !next.hasPrefix("--") else {
+                    return nil
+                }
+                return next
+            }
+            if valueOptions.contains(option), inlineValue == nil,
+               let next = cursor.first, !next.hasPrefix("--") {
+                cursor = cursor.dropFirst()
+            }
         }
-        let value = args[index + 1]
-        return value.hasPrefix("--") ? nil : value
+        return nil
     }
-
 
     // MARK: - 默认路径
 
-    /// 未指定 `--out` 时的默认截图路径。
-    ///
-    /// 带时间戳（秒级）便于人肉辨认；并发调用时若撞名，
-    /// 由 `CaptureService` 的排他创建负责换名，故这里不必再查重。
-    static func defaultOutputPath(now: Date = Date()) -> String {
+    static func defaultOutputPath(
+        format: CaptureImageFormat = .png,
+        now: Date = Date()
+    ) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyyMMdd-HHmmss"
 
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return "\(home)/\(defaultOutputDirectoryName)/anshot-\(formatter.string(from: now)).png"
+        return "\(home)/\(defaultOutputDirectoryName)/anshot-\(formatter.string(from: now)).\(format.fileExtension)"
     }
 
     // MARK: - 参数辅助
 
-    /// 摘出「选项 + 值」并返回其值。
-    ///
-    /// 值以 `--` 开头时视为「选项被当成了值」而报错：
-    /// 若不拦，`--out --max-size` 会把字面量 `--max-size` 当作路径，
-    /// 错误会推迟到落盘时才以「路径奇怪」的形式暴露，排查成本高得多。
-    private static func extractOption(
-        _ name: String,
-        from args: inout [String]
-    ) throws -> String? {
-        guard let index = args.firstIndex(of: name) else { return nil }
-        guard index + 1 < args.count else {
-            throw AutomationError.invalidArgument("\(name) 缺少值。")
-        }
-        let value = args[index + 1]
-        guard !value.hasPrefix("--") else {
-            throw AutomationError.invalidArgument(
-                "\(name) 缺少值（下一个参数是选项「\(value)」）。"
-            )
-        }
-        args.removeSubrange(index...(index + 1))
-        return value
-    }
-
-    /// 从数组头部取一个选项的值。
-    private static func takeValue(
-        for option: String,
-        from args: inout [String]
-    ) throws -> String {
-        guard !args.isEmpty else {
-            throw AutomationError.invalidArgument("\(option) 缺少值。")
-        }
-        let value = args.removeFirst()
-        guard !value.hasPrefix("--") else {
-            throw AutomationError.invalidArgument(
-                "\(option) 缺少值（下一个参数是选项「\(value)」）。"
-            )
-        }
-        return value
-    }
-
-    /// 解析 `x,y,w,h`。
     private static func parseRegion(_ raw: String) throws -> CGRect {
         let parts = raw
             .split(separator: ",", omittingEmptySubsequences: false)
@@ -619,8 +1057,6 @@ public enum CommandLineInterface {
                     "--region 的第 \(index + 1) 项不是数字：「\(part)」。"
                 )
             }
-            // NaN / inf 能被 `Double(_:)` 解析出来，但它们在 CGRect 运算里
-            // 只会产生难以归因的结果，故在这一并拒掉。
             guard value.isFinite else {
                 throw AutomationError.invalidArgument(
                     "--region 的第 \(index + 1) 项不是有限数值：「\(part)」。"
@@ -634,7 +1070,6 @@ public enum CommandLineInterface {
 
     // MARK: - 输出
 
-    /// 统一用排序键，脚本可依赖字段顺序稳定。
     private static func encode<T: Encodable>(_ value: T) -> String? {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
@@ -642,12 +1077,20 @@ public enum CommandLineInterface {
         return String(data: data, encoding: .utf8)
     }
 
-    /// 把结果写入 `--json-out` 指定的文件。
-    ///
-    /// - Returns: 是否成功。未指定路径时返回 `true`（没有要求就没失败）。
+    /// 把结果写入 `--json-out` 指定的文件；写入前校验不与已保存产物重合（含 APFS 大小写与 inode 检查）。
     @discardableResult
-    private static func writeReport(_ report: CommandReport, to path: String?) -> Bool {
+    static func writeReport(
+        _ report: CommandReport,
+        to path: String?,
+        protectedOutputPath: String? = nil
+    ) -> Bool {
         guard let path, !path.isEmpty else { return true }
+        if let protectedOutputPath {
+            if PathIdentity.areSame(path, protectedOutputPath)
+                || PathIdentity.isSameInode(path, protectedOutputPath) {
+                return false
+            }
+        }
         guard let json = encode(report) else { return false }
 
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
@@ -673,30 +1116,28 @@ public enum CommandLineInterface {
 }
 
 /// 命令行结果报告。
-///
-/// 一个类型覆盖三种动作，使 stdout 与 `--json-out` 的内容完全一致，
-/// 且脚本只需检查 `ok` 字段即可判断成败，不必按动作分支解析。
 struct CommandReport: Codable {
 
     let ok: Bool
     let error: String?
     let displays: [DisplayInfo]?
     let desktops: [DesktopInfo]?
-    /// 窗口列表（仅 `--list-windows` 有值）。
     let windows: [WindowInfo]?
     let capture: CaptureOutput?
+    let ocr: OCRResponseOutput?
+    let elements: ElementsInspectionOutput?
+    let recording: RecordingOutcomeOutput?
 
-    /// 显式 init 而不是依赖合成的 memberwise init：
-    /// 三个动作各自只填自己那几个字段，其余必须能省略。
-    /// （合成的 init 不接受默认值，每次都要写四个 nil，漏一个就是编译错误
-    /// 而不是遗漏——但那种噪音会掩盖真正有意义的字段变化。）
     init(
         ok: Bool,
         error: String? = nil,
         displays: [DisplayInfo]? = nil,
         desktops: [DesktopInfo]? = nil,
         windows: [WindowInfo]? = nil,
-        capture: CaptureOutput? = nil
+        capture: CaptureOutput? = nil,
+        ocr: OCRResponseOutput? = nil,
+        elements: ElementsInspectionOutput? = nil,
+        recording: RecordingOutcomeOutput? = nil
     ) {
         self.ok = ok
         self.error = error
@@ -704,6 +1145,9 @@ struct CommandReport: Codable {
         self.desktops = desktops
         self.windows = windows
         self.capture = capture
+        self.ocr = ocr
+        self.elements = elements
+        self.recording = recording
     }
 
     static func failure(_ message: String) -> CommandReport {
@@ -721,25 +1165,33 @@ struct CaptureOutput: Codable {
     let sourcePixelWidth: Int
     let sourcePixelHeight: Int
     let scaleFactor: Double
+    let imageFormat: String?
+    let mimeType: String?
+    let jpegQuality: Int?
+    let didAutoFallbackToJPEG: Bool?
+    let originalPNGByteCount: Int?
+    let coordinateGridEnabled: Bool?
+    let coordinateGridOrigin: PointOutput?
     let region: RegionOutput?
-    /// 窗口来源。整屏 / 区域截图为 nil。
     let window: WindowOutput?
     let savedPath: String?
 
-    /// 区域输出。显式列出四个分量，避免 `CGRect` 的编码形式随平台变化。
+    struct PointOutput: Codable {
+        let x: Double
+        let y: Double
+    }
+
     struct RegionOutput: Codable {
         let x: Double
         let y: Double
         let width: Double
         let height: Double
 
-        /// 还原成 `CGRect`。跨进程读回结果时需要它。
         var rect: CGRect {
             CGRect(x: x, y: y, width: width, height: height)
         }
     }
 
-    /// 窗口输出。同样显式列分量：跨进程读回时要还原成 `CGRect`。
     struct WindowOutput: Codable {
         let windowId: UInt32
         let title: String?
@@ -755,7 +1207,7 @@ struct CaptureOutput: Codable {
         }
     }
 
-    init(outcome: CaptureOutcome) {
+    init(outcome: CaptureOutcome, overrideSavedPath: String? = nil) {
         self.displayId = outcome.displayID
         self.spaceId = outcome.spaceID
         self.pixelWidth = outcome.image.width
@@ -763,6 +1215,15 @@ struct CaptureOutput: Codable {
         self.sourcePixelWidth = Int(outcome.sourcePixelSize.width)
         self.sourcePixelHeight = Int(outcome.sourcePixelSize.height)
         self.scaleFactor = Double(outcome.scaleFactor)
+        self.imageFormat = outcome.imageFormat.rawValue
+        self.mimeType = outcome.mimeType
+        self.jpegQuality = outcome.jpegQuality
+        self.didAutoFallbackToJPEG = outcome.didAutoFallbackToJPEG
+        self.originalPNGByteCount = outcome.originalPNGByteCount
+        self.coordinateGridEnabled = outcome.coordinateGridEnabled
+        self.coordinateGridOrigin = outcome.coordinateGridOrigin.map {
+            PointOutput(x: Double($0.x), y: Double($0.y))
+        }
         self.region = outcome.region.map {
             RegionOutput(
                 x: Double($0.origin.x),
@@ -783,6 +1244,6 @@ struct CaptureOutput: Codable {
                 height: Double($0.frame.height)
             )
         }
-        self.savedPath = outcome.savedURL?.path
+        self.savedPath = overrideSavedPath ?? outcome.savedURL?.path
     }
 }

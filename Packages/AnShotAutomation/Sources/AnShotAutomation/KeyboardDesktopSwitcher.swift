@@ -17,7 +17,7 @@ enum KeyboardDesktopSwitcher {
     }
 
     /// 仅在用户显式允许切换时调用。不能可靠使用快捷键时拒绝切换。
-    static func switchTo(spaceID: UInt64, displayID: UInt32) throws {
+    static func switchTo(spaceID: UInt64, displayID: UInt32) async throws {
         guard AXIsProcessTrusted() else {
             throw AutomationError.captureFailed(
                 "切换桌面需要辅助功能权限。请在「系统设置 → 隐私与安全性 → 辅助功能」"
@@ -29,7 +29,7 @@ enum KeyboardDesktopSwitcher {
             throw AutomationError.invalidArgument("目标桌面已不存在或不属于该显示器，请重新调用 list_desktops。")
         }
         if target.isCurrent { return }
-        guard try trySwitch(target: target, desktops: desktops) else {
+        guard try await trySwitch(target: target, desktops: desktops) else {
             throw AutomationError.captureFailed(
                 "无法使用 Control＋方向键切换目标桌面。请确认系统已启用左右切换空间快捷键，"
                 + "且键盘焦点在目标显示器；也可使用 window_id 进行后台窗口截图。"
@@ -38,7 +38,7 @@ enum KeyboardDesktopSwitcher {
     }
 
     /// 快捷键不可用时返回 false；中途异常不猜测用户意图。
-    static func trySwitch(target: DesktopInfo, desktops: [DesktopInfo]) throws -> Bool {
+    static func trySwitch(target: DesktopInfo, desktops: [DesktopInfo]) async throws -> Bool {
         let ordered = desktops.sorted { $0.position < $1.position }
         guard let original = ordered.first(where: \.isCurrent),
               DesktopCatalog.focusedSpaceID() == original.id,
@@ -54,6 +54,7 @@ enum KeyboardDesktopSwitcher {
         var visited = [original.id]
         var index = start
         while index != end {
+            try Task.checkCancellation()
             let nextIndex = index + step
             let previous = visited[visited.count - 1]
             let next = ordered[nextIndex].id
@@ -62,20 +63,20 @@ enum KeyboardDesktopSwitcher {
                 throw AutomationError.captureFailed("桌面切换期间焦点发生变化，已停止自动切换。")
             }
             let sent = post(forward)
-            let result = sent ? try waitForTransition(
+            let result = sent ? try await waitForTransition(
                 from: previous, to: next, displayID: target.displayID
             ) : false
             if !result {
                 // 快捷键失效时先撤回本次已经完成的步骤。
-                try restoreVisited(visited, shortcut: backward, displayID: target.displayID)
+                try await restoreVisited(visited, shortcut: backward, displayID: target.displayID)
                 return false
             }
             visited.append(next)
             index = nextIndex
         }
 
-        // 空间 ID 往往先于显示动画更新，等待画面稳定再允许抓帧。
-        Thread.sleep(forTimeInterval: 0.6)
+        // 空间 ID 往往先于显示动画更新，使用异步等待释放 Swift 协作式线程池。
+        try await Task.sleep(nanoseconds: 600_000_000)
         guard try activeSpace(displayID: target.displayID) == target.id else {
             throw AutomationError.captureFailed("桌面切换后状态发生变化，已取消截图。")
         }
@@ -86,7 +87,7 @@ enum KeyboardDesktopSwitcher {
         _ visited: [UInt64],
         shortcut: Shortcut,
         displayID: UInt32
-    ) throws {
+    ) async throws {
         guard visited.count > 1 else { return }
         var current = visited[visited.count - 1]
         for previous in visited.dropLast().reversed() {
@@ -94,7 +95,7 @@ enum KeyboardDesktopSwitcher {
                   DesktopCatalog.focusedSpaceID() == current else {
                 throw AutomationError.captureFailed("桌面已被用户或其他程序切换，未强行恢复。")
             }
-            guard post(shortcut), try waitForTransition(from: current, to: previous, displayID: displayID) else {
+            guard post(shortcut), try await waitForTransition(from: current, to: previous, displayID: displayID) else {
                 throw AutomationError.captureFailed("快捷键切换中断且无法自动恢复，请手动切回原桌面。")
             }
             current = previous
@@ -102,15 +103,17 @@ enum KeyboardDesktopSwitcher {
     }
 
     /// 等待相邻空间生效；如果切到了意料之外的空间，视为用户操作并停止。
-    private static func waitForTransition(from: UInt64, to: UInt64, displayID: UInt32) throws -> Bool {
+    private static func waitForTransition(from: UInt64, to: UInt64, displayID: UInt32) async throws -> Bool {
         let deadline = Date().addingTimeInterval(2)
         while Date() < deadline {
+            try Task.checkCancellation()
             let active = try activeSpace(displayID: displayID)
             if active == to { return true }
             guard active == from else {
                 throw AutomationError.captureFailed("桌面被其他操作改变，已停止自动切换。")
             }
-            Thread.sleep(forTimeInterval: 0.05)
+            // 使用 Task.sleep 替代阻塞线程池的 Thread.sleep。
+            try await Task.sleep(nanoseconds: 50_000_000)
         }
         return false
     }

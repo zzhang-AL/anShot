@@ -8,17 +8,17 @@ name: CI
 #
 # 本 workflow 把同一套检查前移到每次 push / PR。
 #
-# ── 为什么不用 xcodebuild 构建 App target ──────────────────────
+# ── 为什么可用 xcodebuild 无签名构建 App target ────────────────
 #
-# App target 使用本机自签证书 `anShot Dev`（见 project.yml 的
-# CODE_SIGN_IDENTITY），该证书不存在于 CI，`xcodebuild` 必然失败。
-#
-# 因此 CI **只覆盖四个 SPM 包**：它们的构建与测试不需要签名。
-# App 层面的验证仍依赖人工冒烟（见 docs/refactor/task.md §八）。
+# App target 默认使用本机自签证书 `anShot Dev`（见 project.yml 的
+# CODE_SIGN_IDENTITY），该证书不存在于 CI。但通过
+# `CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""`
+# 可在 CI 中完整编译验证 App target（包括 App/Sources/main.swift、Info.plist
+# 合并与全包链接）。
 #
 # ── 为什么显式选择 Xcode ──────────────────────────────────────
 #
-# 四个包声明 `swift-tools-version: 6.0` / `6.1`，需要 Xcode 16+ 的工具链。
+# 四个包声明 `swift-tools-version: 6.0`，需要 Xcode 16+ 的工具链。
 # runner 的默认 Xcode 会随 GitHub 的镜像调整而变化，显式选择可避免
 # 「某天 CI 突然因工具链降到 15.x 而全线失败」这类与环境无关的故障。
 #
@@ -52,25 +52,20 @@ jobs:
           sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
           swift --version
 
-      # 构建、告警门禁、单元测试合并在一步，而不是拆成三步。
-      #
-      # 理由：`swift build` 是增量的。若把告警检查放在独立的第二步，
-      # 那时已无源文件需要重编译，构建输出为空，grep 必然什么都找不到——
-      # 门禁会**静默失效**（看起来一直通过，实际从未检查）。
-      # 必须与首次构建共用同一份输出。
-      - name: 构建 + 零告警门禁 + 单元测试
+      # 构建（含测试目标）、告警门禁、单元测试合并在一步，避免增量构建漏掉测试目标告警。
+      - name: 构建（含测试目标）+ 零告警门禁 + 单元测试
         run: |
           set -euo pipefail
           failed=0
           for pkg in ${PACKAGES}; do
             echo "════════════════ ${pkg} ════════════════"
             log="$(mktemp)"
-            swift build --package-path "Packages/${pkg}" 2>&1 | tee "$log"
+            swift build --build-tests --package-path "Packages/${pkg}" 2>&1 | tee "$log"
 
-            # 只统计**本项目源**的告警：依赖包（swift-nio、swift-system 等）
+            # 只统计**本项目源与测试目标**的告警：依赖包（swift-nio、swift-system 等）
             # 的告警不在本仓库的控制范围内。
             if grep -qE "Packages/${pkg}/.*: warning:" "$log"; then
-              echo "::error::${pkg} 存在编译告警"
+              echo "::error::${pkg}（含测试目标）存在编译告警"
               grep -E "Packages/${pkg}/.*: warning:" "$log" | head -20
               failed=1
             fi
@@ -90,6 +85,23 @@ jobs:
             echo "::error::编译告警门禁未通过"
             exit 1
           fi
+
+      - name: 生成 Xcode 工程并验证无签名 App Target 构建
+        run: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen generate
+          xcodebuild \
+            -project anShot.xcodeproj \
+            -scheme anShot \
+            -configuration Debug \
+            -destination 'generic/platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
 
       - name: 格式检查（仅输出报告，不作门禁）
         continue-on-error: true

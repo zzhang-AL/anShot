@@ -278,6 +278,94 @@ struct CommandLineParsingTests {
             _ = try CommandLineInterface.parse(arguments: ["anShot", "--display", "1"])
         }
     }
+
+    // MARK: 参数注入防御与 --option=value
+
+    @Test("单遍游标支持 --option=value，并将 --app 特殊值安全透传而不触发帮助或 MCP")
+    func equalsSyntaxAndInjectionPrevention() throws {
+        let hOutcome = try CommandLineInterface.parse(arguments: [
+            "anShot", "--capture", "--app", "-h"
+        ])
+        guard case .capture(let hParams) = hOutcome.action else {
+            Issue.record("期望 .capture")
+            return
+        }
+        #expect(hParams.applicationName == "-h")
+
+        let mcpOutcome = try CommandLineInterface.parse(arguments: [
+            "anShot", "--capture", "--app=--mcp", "--json-out=/tmp/r.json"
+        ])
+        guard case .capture(let mcpParams) = mcpOutcome.action else {
+            Issue.record("期望 .capture")
+            return
+        }
+        #expect(mcpParams.applicationName == "--mcp")
+        #expect(mcpOutcome.jsonOutPath == "/tmp/r.json")
+        #expect(try AutomationRunner.detect(from: ["anShot", "--capture", "--app=--mcp"]) == .commandLine(["anShot", "--capture", "--app=--mcp"]))
+        #expect(try AutomationRunner.detect(from: ["anShot", "--capture", "--app", "-h"]) == .commandLine(["anShot", "--capture", "--app", "-h"]))
+    }
+
+    @Test("--format、--quality 与 --coordinate-grid 解析与冲突拦截")
+    func formatQualityAndGridOptions() throws {
+        let outcome = try CommandLineInterface.parse(arguments: [
+            "anShot", "--capture", "--format=jpeg", "--quality", "85", "--coordinate-grid"
+        ])
+        guard case .capture(let params) = outcome.action else {
+            Issue.record("期望 .capture")
+            return
+        }
+        #expect(params.outputFormat == .jpeg)
+        #expect(params.jpegQuality == 85)
+        #expect(params.coordinateGrid == true)
+
+        // png 与 quality 互斥在 validate 时拒绝
+        let pngWithQ = try CommandLineInterface.parse(arguments: [
+            "anShot", "--capture", "--format", "png", "--quality=90"
+        ])
+        guard case .capture(let invalidParams) = pngWithQ.action else {
+            Issue.record("期望 .capture")
+            return
+        }
+        #expect(throws: AutomationError.self) {
+            _ = try invalidParams.resolveTarget()
+        }
+    }
+
+    @Test("新增 --ocr、--elements、--record 动作解析与时长约束")
+    func newActionsAreParsed() throws {
+        let ocrOutcome = try CommandLineInterface.parse(arguments: [
+            "anShot", "--ocr", "--image", "/tmp/a.png", "--lang", "zh-Hans,en-US"
+        ])
+        guard case .ocr(let ocrParams) = ocrOutcome.action else {
+            Issue.record("期望 .ocr")
+            return
+        }
+        #expect(ocrParams.imagePath == "/tmp/a.png")
+        #expect(ocrParams.languages == ["zh-Hans", "en-US"])
+
+        let elemOutcome = try CommandLineInterface.parse(arguments: [
+            "anShot", "--elements", "--app", "Safari", "--max-depth", "5", "--max-elements", "150"
+        ])
+        guard case .inspectElements(let elemParams) = elemOutcome.action else {
+            Issue.record("期望 .inspectElements")
+            return
+        }
+        #expect(elemParams.applicationName == "Safari")
+        #expect(elemParams.maxDepth == 5)
+        #expect(elemParams.maxElements == 150)
+
+        let recOutcome = try CommandLineInterface.parse(arguments: [
+            "anShot", "--record", "--duration", "5", "--format", "mp4", "--fps", "30", "--out", "/tmp/demo.mp4"
+        ])
+        guard case .record(let recParams) = recOutcome.action else {
+            Issue.record("期望 .record")
+            return
+        }
+        #expect(recParams.durationSeconds == 5)
+        #expect(recParams.format == .mp4)
+        #expect(recParams.fps == 30)
+        #expect(recParams.savePath == "/tmp/demo.mp4")
+    }
 }
 
 // MARK: - 默认输出路径
@@ -340,6 +428,44 @@ struct PathIdentityTests {
     func differentPathsAreNotSame() {
         #expect(!PathIdentity.areSame("/tmp/a.png", "/tmp/a.json"))
         #expect(!PathIdentity.areSame("/tmp/a.png", "/tmp/b.png"))
+    }
+
+    @Test("APFS 大小写不敏感卷上大小写不同但指向同一文件时必须识别为相同路径，且 writeReport 绝不覆盖截图")
+    func caseInsensitiveVolumeAndInodeProtection() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("anshot-case-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let caseSensitive = (try? dir.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey])
+            .volumeSupportsCaseSensitiveNames) ?? true
+
+        let upper = dir.appendingPathComponent("Shot.png").path
+        let lower = dir.appendingPathComponent("shot.png").path
+        if !caseSensitive {
+            #expect(PathIdentity.areSame(upper, lower))
+            #expect(throws: AutomationError.self) {
+                _ = try CommandLineInterface.parse(arguments: [
+                    "anShot", "--capture", "--out", upper, "--json-out", lower
+                ])
+            }
+        }
+
+        // 测试 writeReport 的 inode 防护（即便是硬链接到同一文件的不同文件名也不得覆盖）。
+        let screenshotURL = dir.appendingPathComponent("real-shot.png")
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: screenshotURL)
+        let hardlinkURL = dir.appendingPathComponent("alias-report.json")
+        try FileManager.default.linkItem(at: screenshotURL, to: hardlinkURL)
+
+        let report = CommandReport(ok: true)
+        let wrote = CommandLineInterface.writeReport(
+            report,
+            to: hardlinkURL.path,
+            protectedOutputPath: screenshotURL.path
+        )
+        #expect(!wrote)
+        // 原截图字节必须保持完好无损。
+        #expect(try Data(contentsOf: screenshotURL) == Data([0x89, 0x50, 0x4E, 0x47]))
     }
 }
 

@@ -29,8 +29,30 @@ import AnShotCapture
 import CoreGraphics
 import Foundation
 
+/// 自动化截图的输出图像编码格式。
+public enum CaptureImageFormat: String, Codable, Sendable, Equatable, CaseIterable {
+    case png
+    case jpeg
+
+    /// 对应的 MIME 类型。
+    public var mimeType: String {
+        switch self {
+        case .png:  return "image/png"
+        case .jpeg: return "image/jpeg"
+        }
+    }
+
+    /// 默认文件扩展名。
+    public var fileExtension: String {
+        switch self {
+        case .png:  return "png"
+        case .jpeg: return "jpg"
+        }
+    }
+}
+
 /// 一次截图请求。
-public struct CaptureParameters: Sendable, Equatable {
+public struct CaptureParameters: Sendable, Equatable, Codable {
 
     /// 长边像素上限的允许最大值。
     ///
@@ -82,6 +104,18 @@ public struct CaptureParameters: Sendable, Equatable {
     /// 见 `AnShotCore.OutputPath` 与 `CaptureService` 的排他创建约定。
     public var savePath: String?
 
+    /// 显式指定的输出图像格式；`nil` 表示未强制指定（默认 PNG，MCP 场景下超阈值可自动转 JPEG）。
+    public var outputFormat: CaptureImageFormat?
+
+    /// JPEG 压缩质量（1...100）；仅在 JPEG 输出时生效。
+    public var jpegQuality: Int?
+
+    /// 当调用方未显式强制 `outputFormat == .png` 且 PNG 体积超过阈值时，自动降级为 JPEG。
+    public var autoFallbackToJPEG: Bool
+
+    /// 是否在导出图像边缘绘制逻辑点坐标标尺与辅助网格。
+    public var coordinateGrid: Bool
+
     public init(
         displayID: CGDirectDisplayID? = nil,
         spaceID: UInt64? = nil,
@@ -90,7 +124,11 @@ public struct CaptureParameters: Sendable, Equatable {
         windowID: CGWindowID? = nil,
         applicationName: String? = nil,
         maxLongEdge: Int? = nil,
-        savePath: String? = nil
+        savePath: String? = nil,
+        outputFormat: CaptureImageFormat? = nil,
+        jpegQuality: Int? = nil,
+        autoFallbackToJPEG: Bool = false,
+        coordinateGrid: Bool = false
     ) {
         self.displayID = displayID
         self.spaceID = spaceID
@@ -100,6 +138,10 @@ public struct CaptureParameters: Sendable, Equatable {
         self.applicationName = applicationName
         self.maxLongEdge = maxLongEdge
         self.savePath = savePath
+        self.outputFormat = outputFormat
+        self.jpegQuality = jpegQuality
+        self.autoFallbackToJPEG = autoFallbackToJPEG
+        self.coordinateGrid = coordinateGrid
     }
 
     /// 解析后的长边上限。`nil` 落到默认值。
@@ -360,6 +402,19 @@ public struct CaptureParameters: Sendable, Equatable {
                 throw AutomationError.invalidArgument(
                     "max_size 过大：\(maxLongEdge)（上限 \(Self.maximumLongEdge)）。"
                     + "传 0 表示保持原始分辨率。"
+                )
+            }
+        }
+
+        if let jpegQuality {
+            guard (1...100).contains(jpegQuality) else {
+                throw AutomationError.invalidArgument(
+                    "quality 必须在 1 到 100 之间（收到 \(jpegQuality)）。"
+                )
+            }
+            if outputFormat == .png {
+                throw AutomationError.invalidArgument(
+                    "quality 仅适用于 jpeg 格式，不能与 format: png 同时使用。"
                 )
             }
         }

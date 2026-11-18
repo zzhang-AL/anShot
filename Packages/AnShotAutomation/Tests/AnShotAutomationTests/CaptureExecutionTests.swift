@@ -106,63 +106,88 @@ struct CaptureExecutionSelectionTests {
     }
 }
 
-// MARK: - 传给子实例的参数
+// MARK: - 传给子实例的 IPC 请求
 
-@Suite("子实例参数构造")
+@Suite("子实例 IPC 请求构造")
 struct ChildArgumentTests {
 
-    private func arguments(
+    private func roundTripIPCRequest(
         displayID: CGDirectDisplayID? = nil,
         region: CGRect? = nil,
-        maxLongEdge: Int? = nil
-    ) -> [String] {
+        maxLongEdge: Int? = nil,
+        applicationName: String? = nil
+    ) throws -> (args: [String], decoded: IPCRequest) {
+        let workspace = try OutOfProcessCapture.createPrivateWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
         let parameters = CaptureParameters(
             displayID: displayID,
             region: region,
+            applicationName: applicationName,
             maxLongEdge: maxLongEdge,
             savePath: nil
         )
-        return OutOfProcessCapture.childArguments(
-            parameters: parameters,
-            outputURL: URL(fileURLWithPath: "/tmp/transfer.png"),
-            reportURL: URL(fileURLWithPath: "/tmp/report.json")
+        let requestURL = workspace.appendingPathComponent("request.json")
+        let request = IPCRequest(
+            action: .capture(parameters),
+            outputPath: workspace.appendingPathComponent("transfer.png").path,
+            reportPath: workspace.appendingPathComponent("report.json").path,
+            pidFilePath: workspace.appendingPathComponent("child.pid").path,
+            watchdogTimeoutSeconds: 30
         )
+        try request.write(to: requestURL)
+        let args = OutOfProcessCapture.childLaunchArguments(requestURL: requestURL)
+        let decoded = try IPCRequest.load(from: requestURL.path)
+        return (args, decoded)
     }
 
-    /// `--direct` 缺了就会无限自我启动：父进程 open 子进程，子进程再 open 孙进程…
-    /// 每一层都看似正常，表现为 cpu 被吃光。
-    @Test("必定带 --direct 以切断自我启动递归")
-    func alwaysIncludesDirect() {
-        for args in [arguments(), arguments(region: CGRect(x: 1, y: 2, width: 3, height: 4))] {
-            #expect(args.contains("--direct"))
-            #expect(args.contains("--capture"))
-            // 只能出现一次，重复无意义但也不该出现
-            #expect(args.filter { $0 == "--direct" }.count == 1)
+    @Test("子进程启动仅传 --ipc-request，彻底阻断命令行参数注入")
+    func alwaysUsesIPCRequestFlag() throws {
+        let (args, decoded) = try roundTripIPCRequest(applicationName: "-h")
+        #expect(args.count == 2)
+        #expect(args[0] == "--ipc-request")
+        #expect(args[1].hasSuffix("/request.json"))
+        guard case .capture(let params) = decoded.action else {
+            Issue.record("期望解码为 .capture")
+            return
         }
+        #expect(params.applicationName == "-h")
     }
 
     @Test("0 与「未指定」必须区分开：0 表示不缩放")
-    func zeroMaxSizeIsPreserved() {
-        let zero = arguments(maxLongEdge: 0)
-        #expect(zero.contains("--max-size"))
-        #expect(zero.firstIndex(of: "--max-size").map { zero[$0 + 1] } == "0")
+    func zeroMaxSizeIsPreserved() throws {
+        let (_, zero) = try roundTripIPCRequest(maxLongEdge: 0)
+        guard case .capture(let zeroParams) = zero.action else {
+            Issue.record("期望 .capture")
+            return
+        }
+        #expect(zeroParams.maxLongEdge == 0)
 
-        let unspecified = arguments(maxLongEdge: nil)
-        #expect(!unspecified.contains("--max-size"))
+        let (_, unspecified) = try roundTripIPCRequest(maxLongEdge: nil)
+        guard case .capture(let nilParams) = unspecified.action else {
+            Issue.record("期望 .capture")
+            return
+        }
+        #expect(nilParams.maxLongEdge == nil)
     }
 
-    @Test("其余参数原样传递")
-    func passesThroughOptions() {
-        let args = arguments(
+    @Test("其余参数通过结构化 JSON 原样传递")
+    func passesThroughOptions() throws {
+        let (_, decoded) = try roundTripIPCRequest(
             displayID: 3,
             region: CGRect(x: 10, y: 20, width: 300, height: 400),
             maxLongEdge: 1280
         )
-        #expect(args.firstIndex(of: "--display").map { args[$0 + 1] } == "3")
-        #expect(args.firstIndex(of: "--region").map { args[$0 + 1] } == "10,20,300,400")
-        #expect(args.firstIndex(of: "--max-size").map { args[$0 + 1] } == "1280")
-        #expect(args.firstIndex(of: "--out").map { args[$0 + 1] } == "/tmp/transfer.png")
-        #expect(args.firstIndex(of: "--json-out").map { args[$0 + 1] } == "/tmp/report.json")
+        guard case .capture(let params) = decoded.action else {
+            Issue.record("期望 .capture")
+            return
+        }
+        #expect(params.displayID == 3)
+        #expect(params.region == CGRect(x: 10, y: 20, width: 300, height: 400))
+        #expect(params.maxLongEdge == 1280)
+        #expect(decoded.outputPath?.hasSuffix("/transfer.png") == true)
+        #expect(decoded.reportPath.hasSuffix("/report.json"))
+        #expect(decoded.pidFilePath.hasSuffix("/child.pid"))
     }
 
     @Test("整数区域不带多余小数位，小数区域保留精度")

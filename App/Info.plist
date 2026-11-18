@@ -30,6 +30,8 @@
 	<string>© 2026 anShot</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>anShot 需要访问麦克风以录制旁白</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>anShot 需要屏幕录制权限以截取屏幕、滚动长截图与录制视频</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>

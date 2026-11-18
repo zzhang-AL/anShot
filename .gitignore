@@ -40,8 +40,11 @@ DerivedData/
 .idea/
 *.swp
 
-# ─── 本地工具状态（Open Context Engine 客户端索引，可重建）───
+# ─── 本地工具状态与 AI Agent 工作目录 ───
 .oce-client/
+.claude/
+.cursor/
+.agents/
 
 # ─── 发布产物（含 DMG/zip，不入库；由 tools/make-release.sh 生成）───
 dist/

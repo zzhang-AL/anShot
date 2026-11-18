@@ -125,6 +125,7 @@ targets:
         # ⚠️ 缺失此项会让进程在首次访问麦克风时**直接崩溃**（而不是被拒绝）。
         # 与屏幕录制权限不同：后者缺失只会导致 preflight 返回 false。
         NSMicrophoneUsageDescription: "anShot 需要访问麦克风以录制旁白"
+        NSScreenCaptureUsageDescription: "anShot 需要屏幕录制权限以截取屏幕、滚动长截图与录制视频"
         # 菜单栏 agent：无 Dock 图标、无主菜单
         LSUIElement: true
         NSPrincipalClass: NSApplication

@@ -13,6 +13,7 @@ enum DesktopCaptureCoordinator {
         spaceID: UInt64?,
         displayID: UInt32,
         allowSwitch: Bool,
+        lockTimeout: TimeInterval = 30,
         operation: @Sendable () async throws -> T
     ) async throws -> T {
         // 非切换截图允许并发；切换期间独占锁，防止另一请求截到过渡桌面。
@@ -25,8 +26,10 @@ enum DesktopCaptureCoordinator {
         defer { close(descriptor) }
 
         let mode = (spaceID == nil ? LOCK_SH : LOCK_EX) | LOCK_NB
-        let deadline = Date().addingTimeInterval(15)
+        // 将内层协调锁等待上限与外层调度超时拉齐，避免排队时提前失配。
+        let deadline = Date().addingTimeInterval(max(1, lockTimeout))
         while flock(descriptor, mode) != 0 {
+            try Task.checkCancellation()
             guard errno == EWOULDBLOCK || errno == EAGAIN else {
                 throw AutomationError.captureFailed("无法获取桌面截图协调锁（错误 \(errno)）。")
             }
@@ -49,7 +52,7 @@ enum DesktopCaptureCoordinator {
                 }
                 return active.id
             },
-            switchTo: { try KeyboardDesktopSwitcher.switchTo(spaceID: $0, displayID: displayID) },
+            switchTo: { try await KeyboardDesktopSwitcher.switchTo(spaceID: $0, displayID: displayID) },
             capture: operation
         )
     }
@@ -62,7 +65,7 @@ enum DesktopTransaction {
         target: UInt64,
         allowSwitch: Bool,
         current: () throws -> UInt64,
-        switchTo: (UInt64) throws -> Void,
+        switchTo: (UInt64) async throws -> Void,
         capture: () async throws -> T
     ) async throws -> T {
         let original = try current()
@@ -84,7 +87,7 @@ enum DesktopTransaction {
 
         let captureResult: Result<T, Error>
         do {
-            try switchTo(target)
+            try await switchTo(target)
             guard try current() == target else {
                 throw AutomationError.captureFailed("未能确认目标桌面，已取消截图。")
             }
@@ -106,7 +109,7 @@ enum DesktopTransaction {
         }
         if active == target {
             do {
-                try switchTo(original)
+                try await switchTo(original)
                 guard try current() == original else {
                     throw AutomationError.captureFailed("系统未确认恢复原桌面。")
                 }

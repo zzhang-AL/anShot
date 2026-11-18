@@ -77,9 +77,17 @@ fi
 TEST_FAILED=0
 for pkg in AnShotCore AnShotCapture AnShotAutomation AnShotUI; do
     echo "   swift test → ${pkg}"
-    if ! swift test --package-path "Packages/${pkg}" >>"${LOG}" 2>&1; then
-        echo "   ✘ ${pkg} 测试失败" >&2
-        TEST_FAILED=1
+    # AnShotUI 含多个 MainActor 与定时抓帧用例，并行跑易因主线程调度超时。
+    if [[ "${pkg}" == "AnShotUI" ]]; then
+        if ! swift test --package-path "Packages/${pkg}" --no-parallel >>"${LOG}" 2>&1; then
+            echo "   ✘ ${pkg} 测试失败" >&2
+            TEST_FAILED=1
+        fi
+    else
+        if ! swift test --package-path "Packages/${pkg}" >>"${LOG}" 2>&1; then
+            echo "   ✘ ${pkg} 测试失败" >&2
+            TEST_FAILED=1
+        fi
     fi
 done
 if [[ ${TEST_FAILED} -ne 0 ]]; then
@@ -135,15 +143,24 @@ PLIST="${APP_PATH}/Contents/Info.plist"
 PLIST_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${PLIST}")"
 PLIST_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "${PLIST}")"
 PLIST_MIN="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "${PLIST}")"
-echo "   CFBundleShortVersionString=${PLIST_VERSION} CFBundleVersion=${PLIST_BUILD} LSMinimumSystemVersion=${PLIST_MIN}"
+PLIST_AUTOMATION="$(/usr/libexec/PlistBuddy -c 'Print :AnShotAutomationVersion' "${PLIST}" 2>/dev/null || true)"
+echo "   CFBundleShortVersionString=${PLIST_VERSION} CFBundleVersion=${PLIST_BUILD} LSMinimumSystemVersion=${PLIST_MIN} AnShotAutomationVersion=${PLIST_AUTOMATION}"
 if [[ "${PLIST_VERSION}" != "${VERSION}" ]]; then
     echo "Info.plist 版本（${PLIST_VERSION}）与 project.yml（${VERSION}）不一致" >&2
+    exit 1
+fi
+if [[ -z "${PLIST_AUTOMATION}" ]]; then
+    echo "Info.plist 缺少非空的 AnShotAutomationVersion 自动化能力标记" >&2
     exit 1
 fi
 
 codesign --verify --strict --verbose=2 "${APP_PATH}" 2>&1 | sed 's/^/   /'
 AUTHORITY="$(codesign -dvvv "${APP_PATH}" 2>&1 | grep -E '^Authority=' || true)"
-echo "   ${AUTHORITY:-Authority=（无）}"
+if [[ -z "${AUTHORITY}" ]]; then
+    echo "产物未包含有效签名身份（Authority 为空），拒绝输出未签名发布包" >&2
+    exit 1
+fi
+echo "   ${AUTHORITY}"
 
 # spctl 的结论**如实打印**：自签未公证必然是 rejected，这不是脚本的失败条件。
 #

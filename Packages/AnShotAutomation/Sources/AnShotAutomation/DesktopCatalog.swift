@@ -33,20 +33,47 @@ public enum DesktopCatalog {
     private typealias CopyWindowSpaces = @convention(c) (UInt32, UInt32, CFArray) -> Unmanaged<CFArray>?
     private typealias GetFocusedSpace = @convention(c) (UInt32) -> UInt64
 
+    /// 一次性加载并缓存 SkyLight 符号，避免轮询期间重复 `dlopen` / `dlclose`。
+    private struct SkyLightSymbols: Sendable {
+        let mainConnection: MainConnection
+        let copyManagedSpaces: CopyManagedSpaces?
+        let copyWindowSpaces: CopyWindowSpaces?
+        let getFocusedSpace: GetFocusedSpace?
+    }
+
+    /// 使用 `static let` 懒初始化并保持框架句柄常驻进程生命周期。
+    private static let cachedSymbols: SkyLightSymbols? = {
+        let path = "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight"
+        guard let handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL),
+              let connectionSymbol = dlsym(handle, "CGSMainConnectionID") else {
+            return nil
+        }
+        let mainConnection = unsafeBitCast(connectionSymbol, to: MainConnection.self)
+        let copyManagedSpaces = dlsym(handle, "CGSCopyManagedDisplaySpaces")
+            .map { unsafeBitCast($0, to: CopyManagedSpaces.self) }
+        let copyWindowSpaces = (dlsym(handle, "SLSCopySpacesForWindows")
+            ?? dlsym(handle, "CGSCopySpacesForWindows"))
+            .map { unsafeBitCast($0, to: CopyWindowSpaces.self) }
+        let getFocusedSpace = (dlsym(handle, "SLSGetActiveSpace")
+            ?? dlsym(handle, "CGSGetActiveSpace"))
+            .map { unsafeBitCast($0, to: GetFocusedSpace.self) }
+        return SkyLightSymbols(
+            mainConnection: mainConnection,
+            copyManagedSpaces: copyManagedSpaces,
+            copyWindowSpaces: copyWindowSpaces,
+            getFocusedSpace: getFocusedSpace
+        )
+    }()
+
     /// 查询当前桌面布局。该查询不切换桌面，也不要求辅助功能权限。
     public static func all() throws -> [DesktopInfo] {
-        let path = "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight"
-        guard let handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL) else {
+        guard let symbols = cachedSymbols else {
             throw AutomationError.captureFailed("系统不支持桌面枚举。")
         }
-        defer { dlclose(handle) }
-
-        guard let connectionSymbol = dlsym(handle, "CGSMainConnectionID"),
-              let spacesSymbol = dlsym(handle, "CGSCopyManagedDisplaySpaces") else {
+        guard let copySpaces = symbols.copyManagedSpaces else {
             throw AutomationError.captureFailed("系统桌面枚举接口不可用，可能不兼容当前 macOS 版本。")
         }
-        let connection = unsafeBitCast(connectionSymbol, to: MainConnection.self)()
-        let copySpaces = unsafeBitCast(spacesSymbol, to: CopyManagedSpaces.self)
+        let connection = symbols.mainConnection()
         guard let raw = copySpaces(connection)?.takeRetainedValue(),
               let records = raw as NSArray as? [[String: Any]] else {
             throw AutomationError.captureFailed("无法读取系统桌面布局。")
@@ -62,14 +89,9 @@ public enum DesktopCatalog {
 
     /// 查询窗口所属空间。接口不可用时返回空映射，窗口列表仍可正常使用。
     static func windowSpaceIDs(for windowIDs: [UInt32]) -> [UInt32: [UInt64]] {
-        let path = "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight"
-        guard let handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL) else { return [:] }
-        defer { dlclose(handle) }
-        guard let connectionSymbol = dlsym(handle, "CGSMainConnectionID"),
-              let spacesSymbol = dlsym(handle, "SLSCopySpacesForWindows")
-                ?? dlsym(handle, "CGSCopySpacesForWindows") else { return [:] }
-        let connection = unsafeBitCast(connectionSymbol, to: MainConnection.self)()
-        let copySpaces = unsafeBitCast(spacesSymbol, to: CopyWindowSpaces.self)
+        guard let symbols = cachedSymbols,
+              let copySpaces = symbols.copyWindowSpaces else { return [:] }
+        let connection = symbols.mainConnection()
         var result: [UInt32: [UInt64]] = [:]
         for id in windowIDs {
             let windows = [NSNumber(value: id)] as CFArray
@@ -82,14 +104,9 @@ public enum DesktopCatalog {
 
     /// 当前键盘焦点所在空间；无法读取时不使用快捷键切换。
     static func focusedSpaceID() -> UInt64? {
-        let path = "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight"
-        guard let handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL) else { return nil }
-        defer { dlclose(handle) }
-        guard let connectionSymbol = dlsym(handle, "CGSMainConnectionID"),
-              let focusedSymbol = dlsym(handle, "SLSGetActiveSpace")
-                ?? dlsym(handle, "CGSGetActiveSpace") else { return nil }
-        let connection = unsafeBitCast(connectionSymbol, to: MainConnection.self)()
-        let getFocused = unsafeBitCast(focusedSymbol, to: GetFocusedSpace.self)
+        guard let symbols = cachedSymbols,
+              let getFocused = symbols.getFocusedSpace else { return nil }
+        let connection = symbols.mainConnection()
         let id = getFocused(connection)
         return id == 0 ? nil : id
     }

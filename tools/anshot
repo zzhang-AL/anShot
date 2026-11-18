@@ -148,6 +148,9 @@ usage() {
   tools/anshot list-desktops
   tools/anshot list-windows
   tools/anshot capture [选项]
+  tools/anshot ocr [选项]
+  tools/anshot elements [选项]
+  tools/anshot record [选项]
   tools/anshot mcp
   tools/anshot path
 
@@ -166,7 +169,28 @@ capture 选项（均透传给 app 的 --capture）：
   --switch-desktop      明确允许切换目标桌面并在截图后恢复。
   --region x,y,w,h      截取区域，单位是显示器内逻辑点，原点在该显示器左上角。
   --max-size <n>        输出长边像素上限，默认 2560，0 表示不缩放。
+  --format <png|jpeg>   输出图像格式，默认 png。
+  --quality <1..100>    JPEG 压缩质量（仅 jpeg 时有效，默认 82）。
+  --coordinate-grid     在导出图边缘绘制逻辑点坐标标尺网格，辅助精准定位点击坐标。
   --out <path>          保存路径。省略则存到 ~/Pictures/anShot/。不覆盖已有文件。
+
+ocr 选项（透传给 --ocr）：
+  --image <path>        识别本地图片文件（与屏幕/窗口参数互斥）。
+  --lang <c1,c2,...>    偏好识别语言（如 zh-Hans,en-US）。
+  （亦支持 --window / --app / --display / --space / --switch-desktop / --region / --direct）
+
+elements 选项（透传给 --elements）：
+  --window <id> / --app <name> / --pid <pid>   探测目标（三选一）。
+  --max-depth <n>       最大遍历深度（1...12，默认 4）。
+  --max-elements <n>    最大返回控件数（1...1000，默认 200）。
+
+record 选项（透传给 --record）：
+  --duration <sec>      录制时长（强制 1...15 秒，默认 3）。
+  --format <gif|mp4>    输出格式（默认 gif）。
+  --fps <n>             帧率（GIF 默认 12，上限 30；MP4 默认 30，上限 60）。
+  --max-size <n>        GIF 最大边长（100...1600，默认 800）。
+  --out <path>          保存路径。不覆盖已有文件。
+  （目标支持 --window / --app / --display / --region）
 
 其它：
   mcp                   以 MCP stdio 服务端运行（前台，供 MCP 客户端配置用）。
@@ -175,13 +199,16 @@ capture 选项（均透传给 app 的 --capture）：
 示例：
   tools/anshot list-windows
   tools/anshot list-desktops
-  tools/anshot capture --app Safari --out /tmp/safari.png
-  tools/anshot capture --window 1234 --out /tmp/win.png
+  tools/anshot capture --app Safari --format jpeg --quality 82 --out /tmp/safari.jpg
+  tools/anshot capture --window 1234 --coordinate-grid --out /tmp/win.png
   tools/anshot capture --region 0,0,800,600 --out /tmp/ui.png
+  tools/anshot ocr --app Safari
+  tools/anshot elements --app Safari
+  tools/anshot record --app Safari --duration 4 --format gif --out /tmp/demo.gif
 
 环境变量：
   ANSHOT_APP            显式指定要使用的 anShot.app（必须支持自动化接口）。
-  说明：capture 的结果 JSON 打到 stdout；失败时 stderr 上有简短诊断。
+  说明：命令的结果 JSON 打到 stdout；失败时 stderr 上有简短诊断。
 EOF
 }
 
@@ -215,14 +242,19 @@ case "${cmd}" in
         ;;
 
     capture)
-        # 不再在本脚本里做 `open -n` + 轮询：那已经内建在 app 里了。
-        #
-        # 首版把「复用 anShot 授权」实现在这个脚本里（见 git 历史），
-        # 结果是命令行能用、MCP 不能用——MCP 服务器必须由宿主 spawn，
-        # 脚本那套 open+轮询根本插不进去，于是 MCP 用户被迫额外授权。
-        # 现在 app 自己负责这件事，两条路径共用同一套逻辑，脚本也不再需要
-        # 维护一份会与 app 行为漂移的等待/超时/取回实现。
         run_direct --capture "$@"
+        ;;
+
+    ocr)
+        run_direct --ocr "$@"
+        ;;
+
+    elements)
+        run_direct --elements "$@"
+        ;;
+
+    record)
+        run_direct --record "$@"
         ;;
 
     mcp)
