@@ -615,7 +615,8 @@ final class OverlayView: NSView {
             self?.editorState?.toggleSketchy()
         }
         view.onSelectMosaicBlockSize = { [weak self] size in
-            self?.editorState?.selectMosaicBlockSize(size)
+            guard let self else { return }
+            self.editorState?.selectMosaicBlockSize(size, scaleFactor: self.backdropScale)
         }
         view.onSelectMosaicBrushDiameter = { [weak self] diameter in
             self?.editorState?.selectMosaicBrushDiameter(diameter)
@@ -737,6 +738,9 @@ final class OverlayView: NSView {
         toolbar.selectedAnnotationIsSketchy = editorState.selectedAnnotationIsSketchy
         toolbar.selectedAnnotationSupportsMosaicEffect = editorState.selectedAnnotationSupportsMosaicEffect
         toolbar.selectedAnnotationMosaicMode = editorState.selectedAnnotationMosaicMode
+        toolbar.selectedAnnotationMosaicBlockSize = editorState.selectedAnnotationMosaicIntensity.map {
+            AnnotationStyle.logicalMosaicBlockSize(forPixelIntensity: $0, scaleFactor: backdropScale)
+        }
         toolbar.isHidden = false
 
         // 输入中的文字也要跟随面板设置：改字号/颜色后，
@@ -1946,7 +1950,7 @@ final class OverlayView: NSView {
                 return
             }
             if editorState.tool.isDraggable {
-                editorState.beginDraft(at: pixelPoint(from: point))
+                editorState.beginDraft(at: pixelPoint(from: point), scaleFactor: backdropScale)
                 return
             }
         }

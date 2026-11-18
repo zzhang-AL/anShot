@@ -235,8 +235,29 @@ struct AnnotationStyle: Equatable, Sendable {
     /// 文字字号档位（点，界面单位）。
     static let fontSizes: [Double] = [16, 20, 28, 40, 56]
 
-    /// 马赛克块大小档位（底图像素）。
-    static let mosaicBlockSizes: [Double] = [6, 12, 20]
+    /// 马赛克与高斯模糊强度档位（逻辑点，界面单位；写入模型时按屏幕缩放折算并设最小像素保底）。
+    ///
+    /// 对应 2x Retina 屏幕的 `24px / 36px / 56px`（1x 屏至少 `17px / 25px / 39px`）：
+    /// 保证即使是最低档也能彻底抹去常规字体与敏感细节的笔画拓扑，无法被肉眼辨认。
+    static let mosaicBlockSizes: [Double] = [12, 18, 28]
+
+    /// 将工具栏马赛克强度档位（逻辑点）折算为底图像素粒度。
+    ///
+    /// - Note: 下限乘数锁定 `1.4`，保证非 Retina（1x）屏幕的最低档仍有 ≥ 17px 物理遮蔽粒度，
+    ///   而在 2x Retina 屏幕上严格遵循 `1pt = 2px`（即 `24px / 36px / 56px`）。
+    static func pixelMosaicIntensity(logicalSize: Double, scaleFactor: CGFloat) -> Double {
+        let safeScale = scaleFactor > 0 ? Double(scaleFactor) : 1
+        let effectiveScale = max(1.4, safeScale)
+        return (logicalSize * effectiveScale).rounded()
+    }
+
+    /// 将模型底图像素粒度反向匹配到工具栏最接近的逻辑点档位（用于指针选中回显）。
+    static func logicalMosaicBlockSize(forPixelIntensity intensity: Double, scaleFactor: CGFloat) -> Double {
+        let safeScale = scaleFactor > 0 ? Double(scaleFactor) : 1
+        let effectiveScale = max(1.4, safeScale)
+        let logical = intensity / effectiveScale
+        return mosaicBlockSizes.min { abs($0 - logical) < abs($1 - logical) } ?? mosaicBlockSizes[1]
+    }
 
     /// 涂抹笔刷直径档位（点，界面单位）。
     /// 涂抹笔刷直径区间（**点**，界面单位）。
@@ -526,6 +547,18 @@ final class AnnotationEditorState {
         }
     }
 
+    /// 当前选中马赛克标注的底图像素强度。
+    var selectedAnnotationMosaicIntensity: Double? {
+        guard let kind = selectedAnnotation?.kind else { return nil }
+        switch kind {
+        case let .mosaic(_, _, intensity),
+             let .mosaicStroke(_, _, _, intensity):
+            return intensity
+        default:
+            return nil
+        }
+    }
+
     /// 若当前选中标注是文字，返回其逻辑点字号。
     func selectedTextLogicalFontSize(scaleFactor: CGFloat) -> Double? {
         guard let kind = selectedAnnotation?.kind,
@@ -538,6 +571,8 @@ final class AnnotationEditorState {
 
     private var history: EditHistory
     private var draftAnchor: PixelPoint?
+    /// 当前拖拽草稿所属画布的像素缩放比例（用于将点单位笔刷半径与马赛克档位转为底图像素）。
+    private var draftScaleFactor: CGFloat = 1
     /// 涂抹草稿累积的路径点（底图像素）。
     private var draftStrokePoints: [PixelPoint] = []
 
@@ -788,8 +823,17 @@ final class AnnotationEditorState {
         }
     }
 
-    func selectMosaicBlockSize(_ size: Double) {
-        style.mosaicBlockSize = size
+    func selectMosaicBlockSize(_ size: Double, scaleFactor: CGFloat = 1) {
+        let resolved = AnnotationStyle.mosaicBlockSizes.min { abs($0 - size) < abs($1 - size) }
+            ?? AnnotationStyle.mosaicBlockSizes[1]
+        style.mosaicBlockSize = resolved
+        if tool == .pointer, hasSelectedAnnotation {
+            let pixelIntensity = AnnotationStyle.pixelMosaicIntensity(
+                logicalSize: resolved,
+                scaleFactor: scaleFactor
+            )
+            updateSelectedMosaicIntensity(pixelIntensity)
+        }
     }
 
     /// 设置涂抹笔刷的大小。
@@ -994,6 +1038,13 @@ final class AnnotationEditorState {
         commitSelectedChange(updated, at: index)
     }
 
+    /// 修改选中马赛克标注的打码强度（底图像素粒度 / 模糊半径）。
+    func updateSelectedMosaicIntensity(_ intensity: Double) {
+        guard let index = selectedAnnotationIndex else { return }
+        let updated = Self.restyled(annotations[index], mosaicIntensity: intensity)
+        commitSelectedChange(updated, at: index)
+    }
+
     /// 把一条已重新构造的标注写回数组；若在编辑事务中则仅实时预览不写历史。
     ///
     /// 内容没变就不提交：`selectColor` 这类入口会在「点了一个已是当前颜色的色块」
@@ -1049,7 +1100,8 @@ final class AnnotationEditorState {
         lineWidth: Double? = nil,
         fontSize: Double? = nil,
         isSketchy: Bool? = nil,
-        mosaicMode: MosaicMode? = nil
+        mosaicMode: MosaicMode? = nil,
+        mosaicIntensity: Double? = nil
     ) -> Annotation {
         func restroke(_ stroke: StrokeStyle, allowSketchy: Bool = true) -> StrokeStyle {
             StrokeStyle(
@@ -1105,11 +1157,20 @@ final class AnnotationEditorState {
             )
 
         case let .mosaic(rect, mode, intensity):
-            // 马赛克支持切换像素化 / 高斯模糊效果，但不受颜色和线宽影响。
-            kind = .mosaic(rect: rect, mode: mosaicMode ?? mode, intensity: intensity)
+            // 马赛克支持切换像素化 / 高斯模糊效果及强度档位，但不受颜色和线宽影响。
+            kind = .mosaic(
+                rect: rect,
+                mode: mosaicMode ?? mode,
+                intensity: mosaicIntensity ?? intensity
+            )
 
         case let .mosaicStroke(points, radius, mode, intensity):
-            kind = .mosaicStroke(points: points, radius: radius, mode: mosaicMode ?? mode, intensity: intensity)
+            kind = .mosaicStroke(
+                points: points,
+                radius: radius,
+                mode: mosaicMode ?? mode,
+                intensity: mosaicIntensity ?? intensity
+            )
 
         case let .numbering(center, radius, index, stroke, fill, textColor):
             // 编号的描边与序号文字创建时同色，改色时两者一起改，
@@ -1155,13 +1216,14 @@ final class AnnotationEditorState {
 
     // MARK: - 拖拽草稿
 
-    /// 开始一个拖拽草稿。`point` 为底图像素坐标。
-    func beginDraft(at point: PixelPoint) {
+    /// 开始一个拖拽草稿。`point` 为底图像素坐标，`scaleFactor` 为当前画布每逻辑点像素数。
+    func beginDraft(at point: PixelPoint, scaleFactor: CGFloat = 1) {
         // 上一次手势若没走完收尾（正常路径不会发生），这里先把它占用的序号还回去，
         // 否则那个号码会永远消失，编号出现肉眼可见的断档。
         releaseDraftNumberingIndex()
 
         draftAnchor = point
+        draftScaleFactor = scaleFactor > 0 ? scaleFactor : 1
         draftStrokePoints = [point]
         // 序号在**手势开始**时分配一次，拖动全程复用（见 `draftNumberingIndex`）。
         if tool == .numbering {
@@ -1267,7 +1329,8 @@ final class AnnotationEditorState {
         if tool == .freehand {
             return max(1.5, style.shapeLineWidth * 0.5)
         }
-        return max(2, style.mosaicBrushRadius * 0.5)
+        let safeScale = draftScaleFactor > 0 ? Double(draftScaleFactor) : 1
+        return max(2, style.mosaicBrushRadius * safeScale * 0.5)
     }
 
     /// 提交草稿。
@@ -1716,19 +1779,24 @@ final class AnnotationEditorState {
 
         case .mosaic:
             let effectMode = style.mosaicEffectMode
+            let safeScale = draftScaleFactor > 0 ? Double(draftScaleFactor) : 1
+            let pixelIntensity = AnnotationStyle.pixelMosaicIntensity(
+                logicalSize: style.mosaicBlockSize,
+                scaleFactor: draftScaleFactor
+            )
             switch style.mosaicMode {
             case .rectangle:
                 return Annotation(kind: .mosaic(
                     rect: Self.rect(from: start, to: end),
                     mode: effectMode,
-                    intensity: style.mosaicBlockSize
+                    intensity: pixelIntensity
                 ))
             case .brush:
                 return Annotation(kind: .mosaicStroke(
                     points: strokePoints,
-                    radius: style.mosaicBrushRadius,
+                    radius: style.mosaicBrushRadius * safeScale,
                     mode: effectMode,
-                    intensity: style.mosaicBlockSize
+                    intensity: pixelIntensity
                 ))
             }
         }

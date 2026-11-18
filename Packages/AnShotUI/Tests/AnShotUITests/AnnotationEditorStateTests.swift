@@ -1178,4 +1178,53 @@ struct AnnotationEditorEnhancementTests {
         #expect(loaded.shapeIsSketchy)
         #expect(loaded.mosaicEffectMode == .blur)
     }
+
+    @Test("马赛克与高斯模糊在各屏幕倍率下均保持强力打码并支持选中调档")
+    func mosaicIntensityScaleAndPointerAdjustment() {
+        let editor = AnnotationEditorState(selection: makeRect(0, 0, 800, 600))
+        editor.select(.mosaic)
+
+        // 1. 选到最低档（12pt）：2x 屏输出 24px，1x 屏保底 >= 17px，且涂抹半径同步乘以 scaleFactor
+        editor.selectMosaicBlockSize(AnnotationStyle.mosaicBlockSizes[0])
+        editor.selectMosaicBrushDiameter(32)
+        editor.selectMosaicMode(.brush)
+        editor.beginDraft(at: PixelPoint(x: 100, y: 100), scaleFactor: 2)
+        editor.updateDraft(to: PixelPoint(x: 240, y: 120))
+        #expect(editor.commitDraft())
+
+        guard case let .mosaicStroke(_, radius2x, _, intensity2x) = editor.annotations.last?.kind else {
+            Issue.record("应生成涂抹马赛克标注")
+            return
+        }
+        #expect(intensity2x == 24, "2x 屏最低档应为 24px，确保常规文字肉眼不可分辨")
+        #expect(radius2x == 32, "2x 屏直径 32pt（半径 16pt）应折算为 32px 半径与屏幕光标一致")
+
+        // 2. 1x 非 Retina 屏下最低档也有保底（>= 17px），防止文字漏出
+        editor.selectMosaicMode(.rectangle)
+        editor.beginDraft(at: PixelPoint(x: 50, y: 50), scaleFactor: 1)
+        editor.updateDraft(to: PixelPoint(x: 200, y: 120))
+        #expect(editor.commitDraft())
+
+        guard case let .mosaic(_, _, intensity1x) = editor.annotations.last?.kind else {
+            Issue.record("应生成框选马赛克标注")
+            return
+        }
+        #expect(intensity1x >= 16, "1x 屏最低档也应有足够遮蔽力度，实际 \(intensity1x)")
+
+        // 3. 指针选中已有马赛克后可直接切换到最高档（28pt -> 56px）且支持撤销还原
+        editor.select(.pointer)
+        #expect(editor.selectAnnotation(at: PixelPoint(x: 100, y: 80), tolerance: 4))
+        editor.selectMosaicBlockSize(AnnotationStyle.mosaicBlockSizes[2], scaleFactor: 2)
+        guard case let .mosaic(_, _, updatedIntensity) = editor.annotations.last?.kind else {
+            Issue.record("选中马赛克应保持马赛克类型")
+            return
+        }
+        #expect(updatedIntensity == 56, "切换最高档后应立即更新选中标注为 56px")
+        #expect(editor.undo())
+        guard case let .mosaic(_, _, restoredIntensity) = editor.annotations.last?.kind else {
+            Issue.record("撤销后应回到马赛克标注")
+            return
+        }
+        #expect(restoredIntensity == intensity1x, "撤销应还原先前强度")
+    }
 }

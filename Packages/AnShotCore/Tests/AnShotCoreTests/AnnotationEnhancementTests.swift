@@ -523,4 +523,113 @@ struct AnnotationEnhancementTests {
         let pixels = PixelBuffer(rendered)
         expectColor(pixels.rgb(x: 55, y: 50), (255, 255, 255), "空心椭圆中心保持白底")
     }
+
+    // MARK: - 最低档马赛克与高斯模糊不可辨识验证
+
+    @Test("最低档高斯模糊与马赛克在真实 2x 文本上彻底破坏可辨识轮廓")
+    func lowestMosaicAndBlurEliminateReadableText() throws {
+        // 模拟 2x Retina 屏常见 14pt 正文（28px 高黑字白底："123456 机密"）
+        let width = 360
+        let height = 100
+        let textContext = try #require(CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: ImageColorSpace.sRGB,
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        ))
+        textContext.setFillColor(white.cgColor)
+        textContext.fill(CGRect(x: 0, y: 0, width: width, height: height))
+
+        let font = CTFontCreateUIFontForLanguage(.system, 28, nil) ?? CTFontCreateWithName("HelveticaNeue-Bold" as CFString, 28, nil)
+        let attrString = NSAttributedString(
+            string: "123456 机密",
+            attributes: [
+                NSAttributedString.Key(kCTFontAttributeName as String): font,
+                NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(gray: 0, alpha: 1),
+            ]
+        )
+        let line = CTLineCreateWithAttributedString(attrString)
+        textContext.textPosition = CGPoint(x: 40, y: 36)
+        CTLineDraw(line, textContext)
+
+        let textBackdrop = try #require(textContext.makeImage())
+        let textPixels = PixelBuffer(textBackdrop)
+        // 验证原图确实存在高对比黑字笔画（最小亮度 ≈ 0，1px 相邻阶跃 > 180）
+        var rawMinLuma = 255
+        var rawMaxStep = 0
+        for y in 20 ..< 80 {
+            for x in 40 ..< 320 {
+                let c = textPixels.rgb(x: x, y: y).r
+                rawMinLuma = min(rawMinLuma, c)
+                let nextC = textPixels.rgb(x: x + 1, y: y).r
+                rawMaxStep = max(rawMaxStep, abs(c - nextC))
+            }
+        }
+        #expect(rawMinLuma < 20, "原图文本应含深黑笔画")
+        #expect(rawMaxStep > 180, "原图文本笔画边缘应有高对比度阶跃")
+
+        let targetRect = rect(20, 10, 320, 80)
+
+        // 1. 最低档高斯模糊（2x 屏最低档 intensity = 24）
+        let lowestBlur = Annotation(kind: .mosaic(rect: targetRect, mode: .blur, intensity: 24))
+        let blurredImage = try #require(AnnotationRenderer.render(
+            backdrop: textBackdrop,
+            selection: rect(0, 0, Double(width), Double(height)),
+            annotations: [lowestBlur]
+        ))
+        let blurredPixels = PixelBuffer(blurredImage)
+        var blurMinLuma = 255
+        var blurMaxStep = 0
+        for y in 20 ..< 80 {
+            for x in 40 ..< 320 {
+                let c = blurredPixels.rgb(x: x, y: y).r
+                blurMinLuma = min(blurMinLuma, c)
+                let nextC = blurredPixels.rgb(x: x + 1, y: y).r
+                blurMaxStep = max(blurMaxStep, abs(c - nextC))
+            }
+        }
+        // 高斯模糊后笔画已完全冲淡化为浅灰雾，且相邻 1px 阶跃从 255 跌破 12
+        #expect(blurMinLuma > 165, "最低档高斯模糊后文字暗部应充分冲淡不可辨认，实际 min=\(blurMinLuma)")
+        #expect(blurMaxStep <= 12, "最低档高斯模糊后不得残留尖锐笔画边缘，实际 maxStep=\(blurMaxStep)")
+
+        // 2. 即便外部传入历史小参数 intensity = 6，最低安全下限也应保证强效模糊
+        let legacySmallBlur = Annotation(kind: .mosaic(rect: targetRect, mode: .blur, intensity: 6))
+        let legacyBlurredImage = try #require(AnnotationRenderer.render(
+            backdrop: textBackdrop,
+            selection: rect(0, 0, Double(width), Double(height)),
+            annotations: [legacySmallBlur]
+        ))
+        let legacyPixels = PixelBuffer(legacyBlurredImage)
+        var legacyMinLuma = 255
+        var legacyMaxStep = 0
+        for y in 20 ..< 80 {
+            for x in 40 ..< 320 {
+                let c = legacyPixels.rgb(x: x, y: y).r
+                legacyMinLuma = min(legacyMinLuma, c)
+                let nextC = legacyPixels.rgb(x: x + 1, y: y).r
+                legacyMaxStep = max(legacyMaxStep, abs(c - nextC))
+            }
+        }
+        #expect(legacyMinLuma > 120, "旧参数保底后也应有效打散字形暗部，实际 min=\(legacyMinLuma)")
+        #expect(legacyMaxStep <= 20, "旧参数保底后不应保留清晰笔画边，实际 maxStep=\(legacyMaxStep)")
+
+        // 3. 最低档像素化马赛克（2x 屏最低档 intensity = 24）：任意完整 24×24 块内部像素完全同色
+        let lowestPixelate = Annotation(kind: .mosaic(rect: targetRect, mode: .pixelate, intensity: 24))
+        let pixelatedImage = try #require(AnnotationRenderer.render(
+            backdrop: textBackdrop,
+            selection: rect(0, 0, Double(width), Double(height)),
+            annotations: [lowestPixelate]
+        ))
+        let pixelatedPixels = PixelBuffer(pixelatedImage)
+        // 检查网格对齐块 [48..<72, 24..<48] 内所有像素严格相同，吞没整块文字细节
+        let anchorColor = pixelatedPixels.rgb(x: 48, y: 24)
+        for y in 24 ..< 48 {
+            for x in 48 ..< 72 {
+                #expect(pixelatedPixels.rgb(x: x, y: y) == anchorColor, "24×24 马赛克块内应完全均色无笔画残留")
+            }
+        }
+    }
 }

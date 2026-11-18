@@ -515,6 +515,20 @@ struct AnnotationToolbarLayout {
                 ))
                 x += width
             }
+
+            // 选中马赛克后允许直接切换细 / 中 / 粗（或模糊程度）三档强度。
+            x += Self.groupSpacing
+            for (index, size) in AnnotationStyle.mosaicBlockSizes.enumerated() {
+                if index > 0 {
+                    x += Self.itemSpacing
+                }
+                items.append(Item(
+                    kind: .mosaicBlockSize(size),
+                    rect: CGRect(x: x, y: iconY, width: Self.iconButtonSize, height: Self.iconButtonSize),
+                    isEnabled: true
+                ))
+                x += Self.iconButtonSize
+            }
         }
 
         // 删除放在最后：它是面板里唯一「破坏性」的动作，与样式控件隔开。

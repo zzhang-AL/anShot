@@ -180,6 +180,14 @@ final class AnnotationToolbarView: NSView {
         }
     }
 
+    /// 选中的马赛克标注对应的逻辑档位（指针选中时用于面板选中态对齐）。
+    var selectedAnnotationMosaicBlockSize: Double? {
+        didSet {
+            guard selectedAnnotationMosaicBlockSize != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
     // MARK: - 回调
 
     var onSelectTool: ((AnnotationTool) -> Void)?
@@ -363,6 +371,7 @@ final class AnnotationToolbarView: NSView {
         renderer.selectedAnnotationIsSketchy = selectedAnnotationIsSketchy
         renderer.selectedAnnotationSupportsMosaicEffect = selectedAnnotationSupportsMosaicEffect
         renderer.selectedAnnotationMosaicMode = selectedAnnotationMosaicMode
+        renderer.selectedAnnotationMosaicBlockSize = selectedAnnotationMosaicBlockSize
         renderer.hoveredKind = hoveredKind
         renderer.draw(in: context)
     }
@@ -493,7 +502,8 @@ final class AnnotationToolbarView: NSView {
         let kind = itemKind(at: point)
         guard kind != hoveredKind else { return }
         hoveredKind = kind
-        toolTip = kind.map { Self.tooltipText(for: $0) }
+        let effectMode = activeMosaicEffectMode
+        toolTip = kind.map { Self.tooltipText(for: $0, mosaicEffectMode: effectMode) }
         needsDisplay = true
     }
 
@@ -643,7 +653,7 @@ final class AnnotationToolbarView: NSView {
     // MARK: - 悬浮提示与无障碍支持
 
     /// 工具栏条目对应的 Tooltip 与无障碍标签文案。
-    static func tooltipText(for kind: Kind) -> String {
+    nonisolated static func tooltipText(for kind: Kind, mosaicEffectMode: MosaicMode = .pixelate) -> String {
         switch kind {
         case let .family(family):
             switch family {
@@ -669,7 +679,13 @@ final class AnnotationToolbarView: NSView {
         case .sketchyToggle:
             return "手绘风格"
         case let .mosaicBlockSize(size):
-            return "马赛克块大小 \(Int(size))"
+            let index = AnnotationStyle.mosaicBlockSizes.firstIndex(of: size) ?? 0
+            if mosaicEffectMode == .blur {
+                let labels = ["标准", "强", "极强"]
+                return "模糊程度：\(labels[min(index, labels.count - 1)])"
+            }
+            let labels = ["细", "中", "粗"]
+            return "马赛克粒度：\(labels[min(index, labels.count - 1)])"
         case .mosaicBrushDiameterSlider:
             return "涂抹笔刷直径"
         case let .numberingRadius(radius):
@@ -709,13 +725,20 @@ final class AnnotationToolbarView: NSView {
 
     override func accessibilityLabel() -> String? { "标注工具栏" }
 
+    private var activeMosaicEffectMode: MosaicMode {
+        (tool == .pointer && hasSelectedAnnotation)
+            ? (selectedAnnotationMosaicMode ?? style.mosaicEffectMode)
+            : style.mosaicEffectMode
+    }
+
     override func accessibilityChildren() -> [Any]? {
         let items = layoutBar().items + layoutPanel().items
+        let effectMode = activeMosaicEffectMode
         return items.map { item in
             let element = NSAccessibilityElement()
             element.setAccessibilityParent(self)
             element.setAccessibilityRole(accessibilityRole(for: item.kind))
-            element.setAccessibilityLabel(Self.tooltipText(for: item.kind))
+            element.setAccessibilityLabel(Self.tooltipText(for: item.kind, mosaicEffectMode: effectMode))
             element.setAccessibilityEnabled(item.isEnabled)
             if let window {
                 let rectInWindow = convert(item.rect, to: nil)

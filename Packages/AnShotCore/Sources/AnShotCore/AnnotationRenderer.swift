@@ -1435,7 +1435,12 @@ public enum AnnotationRenderer {
         }
     }
 
-    /// 使用 Accelerate 高斯近似卷积（Tent + Box + `kvImageEdgeExtend`）实现局部模糊打码。
+    /// 使用 Accelerate 3-Pass 均匀盒滤波（精确收敛至标准高斯分布，搭配 `kvImageEdgeExtend`）
+    /// 实现局部高斯模糊打码。
+    ///
+    /// - Note: 相比单次 Tent + Box（等效 σ 仅约 0.46 × intensity），连续 3 次同半径 `vImageBoxConvolve`
+    ///   的等效高斯标准差为 σ = √(r(r + 1)) ≈ r + 0.5，旁瓣振铃极低、字形笔画彻底混融，
+    ///   且借助滑动和算法复杂度与半径无关（O(W × H)）。
     private static func applyBlur(
         x0: Int,
         x1: Int,
@@ -1452,16 +1457,18 @@ public enum AnnotationRenderer {
         buffer: UnsafeMutablePointer<UInt8>,
         bytesPerRow: Int
     ) {
-        let blurRadius = max(1, min(Int(intensity.rounded()), 120))
-        let subRadius = max(1, Int((Double(blurRadius) * 0.65).rounded()))
-        let kernelSize = UInt32(subRadius * 2 + 1)
+        // 下限 14px 保证即便传入旧版较小 intensity，最低等级也拥有 σ ≥ 14.5px 的有效高斯扩散，
+        // 避免最低档在常规界面字体上出现肉眼仍能辨认轮廓的欠模糊现象。
+        let boxRadius = max(14, min(Int((intensity * 1.05).rounded()), 120))
+        let kernelSize = UInt32(boxRadius * 2 + 1)
 
-        // 向四周借取 `blurRadius` 的真实画布像素，避免打码框内部切边失真；
+        // 3 次卷积主能量跨度约为 2 * boxRadius；向四周借取真实画布像素以防局部裁剪接缝，
         // 遇画布真边界则交由 `kvImageEdgeExtend` 延伸像素，消除边缘黑晕。
-        let srcX0 = max(0, x0 - blurRadius)
-        let srcY0 = max(0, y0 - blurRadius)
-        let srcX1 = min(canvasWidth, x1 + blurRadius)
-        let srcY1 = min(canvasHeight, y1 + blurRadius)
+        let sampleMargin = min(boxRadius * 2, 160)
+        let srcX0 = max(0, x0 - sampleMargin)
+        let srcY0 = max(0, y0 - sampleMargin)
+        let srcX1 = min(canvasWidth, x1 + sampleMargin)
+        let srcY1 = min(canvasHeight, y1 + sampleMargin)
         let srcWidth = srcX1 - srcX0
         let srcHeight = srcY1 - srcY0
         guard srcWidth > 0, srcHeight > 0 else {
@@ -1469,12 +1476,11 @@ public enum AnnotationRenderer {
         }
 
         let srcRowBytes = srcWidth * 4
-        var srcBytes = [UInt8](repeating: 0, count: srcRowBytes * srcHeight)
-        var midBytes = [UInt8](repeating: 0, count: srcRowBytes * srcHeight)
-        var dstBytes = [UInt8](repeating: 0, count: srcRowBytes * srcHeight)
+        var pingBytes = [UInt8](repeating: 0, count: srcRowBytes * srcHeight)
+        var pongBytes = [UInt8](repeating: 0, count: srcRowBytes * srcHeight)
 
-        srcBytes.withUnsafeMutableBytes { rawSrc in
-            guard let dstPtr = rawSrc.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+        pingBytes.withUnsafeMutableBytes { rawPing in
+            guard let dstPtr = rawPing.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
             for row in 0 ..< srcHeight {
                 let srcRowPtr = buffer + (srcY0 + row) * bytesPerRow + srcX0 * 4
                 let localPtr = dstPtr + row * srcRowBytes
@@ -1482,82 +1488,57 @@ public enum AnnotationRenderer {
             }
         }
 
-        let tentOK: vImage_Error = srcBytes.withUnsafeMutableBytes { rawSrc in
-            midBytes.withUnsafeMutableBytes { rawMid in
-                dstBytes.withUnsafeMutableBytes { rawDst in
-                    var srcBuf = vImage_Buffer(
-                        data: rawSrc.baseAddress,
-                        height: vImagePixelCount(srcHeight),
-                        width: vImagePixelCount(srcWidth),
-                        rowBytes: srcRowBytes
-                    )
-                    var midBuf = vImage_Buffer(
-                        data: rawMid.baseAddress,
-                        height: vImagePixelCount(srcHeight),
-                        width: vImagePixelCount(srcWidth),
-                        rowBytes: srcRowBytes
-                    )
-                    var dstBuf = vImage_Buffer(
-                        data: rawDst.baseAddress,
-                        height: vImagePixelCount(srcHeight),
-                        width: vImagePixelCount(srcWidth),
-                        rowBytes: srcRowBytes
-                    )
+        let blurError: vImage_Error = pingBytes.withUnsafeMutableBytes { rawPing in
+            pongBytes.withUnsafeMutableBytes { rawPong in
+                var pingBuf = vImage_Buffer(
+                    data: rawPing.baseAddress,
+                    height: vImagePixelCount(srcHeight),
+                    width: vImagePixelCount(srcWidth),
+                    rowBytes: srcRowBytes
+                )
+                var pongBuf = vImage_Buffer(
+                    data: rawPong.baseAddress,
+                    height: vImagePixelCount(srcHeight),
+                    width: vImagePixelCount(srcWidth),
+                    rowBytes: srcRowBytes
+                )
 
-                    let tentTempSize = vImageTentConvolve_ARGB8888(
-                        &srcBuf,
-                        &midBuf,
-                        nil,
-                        0,
-                        0,
-                        kernelSize,
-                        kernelSize,
-                        nil,
-                        vImage_Flags(kvImageEdgeExtend | kvImageGetTempBufferSize)
+                let tempSize = vImageBoxConvolve_ARGB8888(
+                    &pingBuf,
+                    &pongBuf,
+                    nil,
+                    0,
+                    0,
+                    kernelSize,
+                    kernelSize,
+                    nil,
+                    vImage_Flags(kvImageEdgeExtend | kvImageGetTempBufferSize)
+                )
+                guard tempSize >= 0 else { return tempSize }
+
+                var tempBuffer = [UInt8](repeating: 0, count: max(1, tempSize))
+                return tempBuffer.withUnsafeMutableBytes { rawTemp in
+                    let tempPtr = tempSize > 0 ? rawTemp.baseAddress : nil
+                    let flags = vImage_Flags(kvImageEdgeExtend)
+
+                    // 3-Pass Ping-Pong：ping -> pong -> ping -> pong，最终结果稳定落在 pongBytes。
+                    let e1 = vImageBoxConvolve_ARGB8888(
+                        &pingBuf, &pongBuf, tempPtr, 0, 0, kernelSize, kernelSize, nil, flags
                     )
-                    let boxTempSize = vImageBoxConvolve_ARGB8888(
-                        &midBuf,
-                        &dstBuf,
-                        nil,
-                        0,
-                        0,
-                        kernelSize,
-                        kernelSize,
-                        nil,
-                        vImage_Flags(kvImageEdgeExtend | kvImageGetTempBufferSize)
+                    guard e1 == kvImageNoError else { return e1 }
+
+                    let e2 = vImageBoxConvolve_ARGB8888(
+                        &pongBuf, &pingBuf, tempPtr, 0, 0, kernelSize, kernelSize, nil, flags
                     )
-                    let tempBytes = max(0, max(tentTempSize, boxTempSize))
-                    var tempBuffer = [UInt8](repeating: 0, count: max(1, tempBytes))
-                    return tempBuffer.withUnsafeMutableBytes { rawTemp in
-                        let tempPtr = tempBytes > 0 ? rawTemp.baseAddress : nil
-                        let e1 = vImageTentConvolve_ARGB8888(
-                            &srcBuf,
-                            &midBuf,
-                            tempPtr,
-                            0,
-                            0,
-                            kernelSize,
-                            kernelSize,
-                            nil,
-                            vImage_Flags(kvImageEdgeExtend)
-                        )
-                        guard e1 == kvImageNoError else { return e1 }
-                        return vImageBoxConvolve_ARGB8888(
-                            &midBuf,
-                            &dstBuf,
-                            tempPtr,
-                            0,
-                            0,
-                            kernelSize,
-                            kernelSize,
-                            nil,
-                            vImage_Flags(kvImageEdgeExtend)
-                        )
-                    }
+                    guard e2 == kvImageNoError else { return e2 }
+
+                    return vImageBoxConvolve_ARGB8888(
+                        &pingBuf, &pongBuf, tempPtr, 0, 0, kernelSize, kernelSize, nil, flags
+                    )
                 }
             }
         }
-        guard tentOK == kvImageNoError else {
+        guard blurError == kvImageNoError else {
             return
         }
 
@@ -1575,22 +1556,22 @@ public enum AnnotationRenderer {
                         continue
                     }
                     if alpha == 255 {
-                        buffer[dstOffset] = dstBytes[blurredOffset]
-                        buffer[dstOffset + 1] = dstBytes[blurredOffset + 1]
-                        buffer[dstOffset + 2] = dstBytes[blurredOffset + 2]
-                        buffer[dstOffset + 3] = dstBytes[blurredOffset + 3]
+                        buffer[dstOffset] = pongBytes[blurredOffset]
+                        buffer[dstOffset + 1] = pongBytes[blurredOffset + 1]
+                        buffer[dstOffset + 2] = pongBytes[blurredOffset + 2]
+                        buffer[dstOffset + 3] = pongBytes[blurredOffset + 3]
                     } else {
                         let inv = 255 - alpha
-                        buffer[dstOffset] = UInt8((Int(dstBytes[blurredOffset]) * alpha + Int(buffer[dstOffset]) * inv + 127) / 255)
-                        buffer[dstOffset + 1] = UInt8((Int(dstBytes[blurredOffset + 1]) * alpha + Int(buffer[dstOffset + 1]) * inv + 127) / 255)
-                        buffer[dstOffset + 2] = UInt8((Int(dstBytes[blurredOffset + 2]) * alpha + Int(buffer[dstOffset + 2]) * inv + 127) / 255)
-                        buffer[dstOffset + 3] = UInt8((Int(dstBytes[blurredOffset + 3]) * alpha + Int(buffer[dstOffset + 3]) * inv + 127) / 255)
+                        buffer[dstOffset] = UInt8((Int(pongBytes[blurredOffset]) * alpha + Int(buffer[dstOffset]) * inv + 127) / 255)
+                        buffer[dstOffset + 1] = UInt8((Int(pongBytes[blurredOffset + 1]) * alpha + Int(buffer[dstOffset + 1]) * inv + 127) / 255)
+                        buffer[dstOffset + 2] = UInt8((Int(pongBytes[blurredOffset + 2]) * alpha + Int(buffer[dstOffset + 2]) * inv + 127) / 255)
+                        buffer[dstOffset + 3] = UInt8((Int(pongBytes[blurredOffset + 3]) * alpha + Int(buffer[dstOffset + 3]) * inv + 127) / 255)
                     }
                 } else if coverage.covers(backdropX: Double(x + originX), backdropY: Double(y + originY)) {
-                    buffer[dstOffset] = dstBytes[blurredOffset]
-                    buffer[dstOffset + 1] = dstBytes[blurredOffset + 1]
-                    buffer[dstOffset + 2] = dstBytes[blurredOffset + 2]
-                    buffer[dstOffset + 3] = dstBytes[blurredOffset + 3]
+                    buffer[dstOffset] = pongBytes[blurredOffset]
+                    buffer[dstOffset + 1] = pongBytes[blurredOffset + 1]
+                    buffer[dstOffset + 2] = pongBytes[blurredOffset + 2]
+                    buffer[dstOffset + 3] = pongBytes[blurredOffset + 3]
                 }
             }
         }

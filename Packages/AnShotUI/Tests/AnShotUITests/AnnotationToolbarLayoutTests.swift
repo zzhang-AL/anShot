@@ -400,5 +400,24 @@ struct AnnotationToolbarPointerPanelTests {
         mosaicLayout.tool = .magnifier
         let magnifierKinds = mosaicLayout.layoutPanel().items.map(\.kind)
         #expect(!magnifierKinds.contains(.mosaicEffectMode(.blur)))
+
+        // 指针选中马赛克时同样暴露模式切换与三档打码强度按钮
+        var pointerLayout = AnnotationToolbarLayout()
+        pointerLayout.tool = .pointer
+        pointerLayout.hasSelectedAnnotation = true
+        pointerLayout.selectedAnnotationSupportsColor = false
+        pointerLayout.selectedAnnotationSupportsLineWidth = false
+        pointerLayout.selectedAnnotationSupportsMosaicEffect = true
+        let pointerKinds = pointerLayout.layoutPanel().items.map(\.kind)
+        #expect(pointerKinds.contains(.mosaicEffectMode(.pixelate)))
+        #expect(pointerKinds.contains(.mosaicEffectMode(.blur)))
+        for size in AnnotationStyle.mosaicBlockSizes {
+            #expect(pointerKinds.contains(.mosaicBlockSize(size)))
+        }
+
+        // Tooltip 随打码模式清晰区分像素粒度与模糊程度
+        let minSize = AnnotationStyle.mosaicBlockSizes[0]
+        #expect(AnnotationToolbarView.tooltipText(for: .mosaicBlockSize(minSize), mosaicEffectMode: .pixelate) == "马赛克粒度：细")
+        #expect(AnnotationToolbarView.tooltipText(for: .mosaicBlockSize(minSize), mosaicEffectMode: .blur) == "模糊程度：标准")
     }
 }

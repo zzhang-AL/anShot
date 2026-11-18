@@ -57,6 +57,7 @@ final class AnnotationToolbarRenderer {
     var selectedAnnotationIsSketchy = false
     var selectedAnnotationSupportsMosaicEffect = false
     var selectedAnnotationMosaicMode: MosaicMode?
+    var selectedAnnotationMosaicBlockSize: Double?
     var hoveredKind: AnnotationToolbarLayout.Kind?
 
     // MARK: - 布局
@@ -408,7 +409,10 @@ final class AnnotationToolbarRenderer {
             }
             return style.shapeIsSketchy
         case let .mosaicBlockSize(size):
-            return style.mosaicBlockSize == size
+            if tool == .pointer, hasSelectedAnnotation, let selectedAnnotationMosaicBlockSize {
+                return abs(selectedAnnotationMosaicBlockSize - size) < 0.01
+            }
+            return abs(style.mosaicBlockSize - size) < 0.01
         case let .numberingRadius(radius):
             return abs(style.numberingRadius - radius) < 0.01
         case let .magnifierZoom(zoom):
