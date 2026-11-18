@@ -57,7 +57,7 @@ public enum CaptureRunner {
             return outcome
         }
         let savedURL = try CaptureService.save(
-            outcome.pngData,
+            outcome.imageData,
             to: savePath,
             reservedPaths: reservedOutputPaths
         )
@@ -71,19 +71,21 @@ public enum CaptureRunner {
         execution: CaptureExecution
     ) async throws -> CaptureOutcome {
 
+        let timeout = parameters.spaceID == nil ? OutOfProcessCapture.defaultTimeout : 60
+
         if execution == .reuseApplicationAuthorization,
            let appURL = OutOfProcessCapture.currentAppURL {
 
             return try await OutOfProcessCapture.capture(
                 parameters: parameters,
                 appURL: appURL,
-                timeout: parameters.spaceID == nil ? OutOfProcessCapture.defaultTimeout : 60
+                timeout: timeout
             )
         }
 
         // 走到这里有两种情况，都不需要或无法启动 app：
         //   · 调用方显式要求就地截图（--direct）
         //   · 当前进程不在 .app 里（单测、`swift run`、裸二进制），无从启动自己
-        return try await CaptureService.capture(parameters)
+        return try await CaptureService.capture(parameters, lockTimeout: timeout)
     }
 }

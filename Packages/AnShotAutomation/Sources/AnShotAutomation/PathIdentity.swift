@@ -20,12 +20,43 @@
 //  统一走 `resolvingSymlinksInPath` + `standardizedFileURL`。
 //
 
+import Darwin
 import Foundation
 
 /// 路径同一性。
 enum PathIdentity {
 
-    /// 把一个路径规范化为可用于相等比较的形式。
+    /// 解析路径及其首个已存在祖先的符号链接结果，同时返回所在卷是否区分大小写。
+    private static func resolveWithCaseSensitivity(_ url: URL) -> (resolved: URL, caseSensitive: Bool) {
+        var current = url.standardizedFileURL
+        var missingComponents: [String] = []
+
+        while !FileManager.default.fileExists(atPath: current.path) {
+            let name = current.lastPathComponent
+            // 到达根或拿不到名字就停下，避免死循环
+            guard !name.isEmpty else { break }
+            missingComponents.insert(name, at: 0)
+
+            let parent = current.deletingLastPathComponent()
+            guard parent.path != current.path else { break }
+            current = parent
+        }
+
+        // 到此 current 是第一个存在的祖先（或根）。它可能存在符号链接。
+        let resolvedAncestor = current.resolvingSymlinksInPath()
+        // 查询首个已存在祖先目录所在卷是否区分大小写（APFS 默认大小写不敏感，返回 false）。
+        let caseSensitive = (try? resolvedAncestor
+            .resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey])
+            .volumeSupportsCaseSensitiveNames) ?? true
+
+        var resolved = resolvedAncestor
+        for name in missingComponents {
+            resolved.appendPathComponent(name)
+        }
+        return (resolved.standardizedFileURL, caseSensitive)
+    }
+
+    /// 把一个路径规范化为可读的绝对路径（保留原始大小写）。
     ///
     /// ── 为何不能只调 `resolvingSymlinksInPath()` ────────────────
     ///
@@ -46,31 +77,42 @@ enum PathIdentity {
 
     /// 同上，接受 URL。
     static func canonical(_ url: URL) -> String {
-        var current = url.standardizedFileURL
-        var missingComponents: [String] = []
+        resolveWithCaseSensitivity(url).resolved.path
+    }
 
-        while !FileManager.default.fileExists(atPath: current.path) {
-            let name = current.lastPathComponent
-            // 到达根或拿不到名字就停下，避免死循环
-            guard !name.isEmpty else { break }
-            missingComponents.insert(name, at: 0)
+    /// 生成用于相等性与集合查重的规范键。
+    ///
+    /// 在大小写不敏感卷（如 macOS 默认 APFS）上统一折叠大小写，
+    /// 避免 `/tmp/Shot.png` 与 `/tmp/shot.png` 漏判为不同文件。
+    static func comparisonKey(_ path: String) -> String {
+        comparisonKey(URL(fileURLWithPath: (path as NSString).expandingTildeInPath))
+    }
 
-            let parent = current.deletingLastPathComponent()
-            guard parent.path != current.path else { break }
-            current = parent
-        }
-
-        // 到此 current 是第一个存在的祖先（或根）。它可能存在符号链接。
-        var resolved = current.resolvingSymlinksInPath()
-        for name in missingComponents {
-            resolved.appendPathComponent(name)
-        }
-
-        return resolved.standardizedFileURL.path
+    /// 同上，接受 URL。
+    static func comparisonKey(_ url: URL) -> String {
+        let info = resolveWithCaseSensitivity(url)
+        let path = info.resolved.path
+        return info.caseSensitive ? path : path.lowercased()
     }
 
     /// 两个路径是否指向同一个目标。
     static func areSame(_ lhs: String, _ rhs: String) -> Bool {
-        canonical(lhs) == canonical(rhs)
+        if comparisonKey(lhs) == comparisonKey(rhs) {
+            return true
+        }
+        return isSameInode(lhs, rhs)
+    }
+
+    /// 通过 POSIX `stat` 检查两个**已存在**的路径是否对应同一设备与 inode（防硬链接或大小写别名覆盖）。
+    static func isSameInode(_ lhsPath: String, _ rhsPath: String) -> Bool {
+        let lhsExpanded = (lhsPath as NSString).expandingTildeInPath
+        let rhsExpanded = (rhsPath as NSString).expandingTildeInPath
+        var lhsStat = stat()
+        var rhsStat = stat()
+        guard stat(lhsExpanded, &lhsStat) == 0,
+              stat(rhsExpanded, &rhsStat) == 0 else {
+            return false
+        }
+        return lhsStat.st_dev == rhsStat.st_dev && lhsStat.st_ino == rhsStat.st_ino
     }
 }

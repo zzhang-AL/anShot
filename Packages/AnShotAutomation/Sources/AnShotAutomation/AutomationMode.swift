@@ -45,51 +45,81 @@ public enum AutomationMode: Equatable, Sendable {
 /// 模式识别与运行。
 public enum AutomationRunner {
 
-    /// 命令行选项全集。用于识别「这是自动化调用」而非 GUI 启动。
-    ///
-    /// 刻意不做成「凡是不认识的参数就当 CLI」：GUI 启动也可能带参数
-    /// （macOS 会附加 `-psn_...` 之类的系统参数），把它们误判成 CLI
-    /// 会让用户双击应用时得到一个莫名其妙的报错。
-    private static let cliOptions: Set<String> = [
-        "--capture", "--list-displays", "--list-desktops", "--list-windows", "--help", "-h",
-        "--display", "--space", "--switch-desktop", "--region", "--window", "--app",
-        "--max-size", "--out", "--json-out",
-        "--direct", "--via-app"
+    /// 命令行带值选项集合（用于在模式探测阶段跳过选项的值，防止 `--app --mcp` 等误判）。
+    private static let valueOptions: Set<String> = [
+        "--display", "--space", "--region", "--window", "--app",
+        "--max-size", "--out", "--json-out", "--format", "--quality",
+        "--image", "--lang", "--duration", "--fps", "--pid",
+        "--max-depth", "--max-elements", "--ipc-request"
+    ]
+
+    /// 命令行无值标志与动作集合。
+    private static let flagOptions: Set<String> = [
+        "--capture", "--list-displays", "--list-desktops", "--list-windows",
+        "--ocr", "--elements", "--record", "--help", "-h",
+        "--switch-desktop", "--direct", "--via-app", "--coordinate-grid"
     ]
 
     /// 识别启动模式。
     ///
-    /// - Parameter arguments: 完整 `CommandLine.arguments`（含可执行文件路径）。
-    /// - Returns: 自动化模式；`nil` 表示按 GUI 正常启动。
-    /// - Throws: `AutomationError.invalidArgument` —— `--mcp` 与其它选项混用。
-    ///
-    /// ── 为什么混用必须在**这里**拒绝 ────────────────────────────
-    ///
-    /// 曾经的实现是「见到 `--mcp` 就进 MCP 模式」，于是 `--mcp --capture`
-    /// 被静默当成纯 MCP 启动，CLI 解析器里那条「--mcp 不能与其它选项同时使用」
-    /// 的检查**永远不可达**——测试测的是一个生产路径到不了的函数。
-    /// 调用方（或 AI）写下两个意图明确的参数却只得到一个的效果，
-    /// 是比报错更糟的失败方式。
+    /// 采用从左到右单遍游标扫描，遇到 `--option=value` 或带值选项后的值位置时
+    /// 自动跳过其值，避免 `--app -h` 或 `--app --mcp` 被误判为模式开关。
     public static func detect(from arguments: [String]) throws -> AutomationMode? {
         let rest = Array(arguments.dropFirst())
+        var wantsMCP = false
+        var cliHits: [String] = []
 
-        let wantsMCP = rest.contains("--mcp")
-        let wantsCLI = rest.contains(where: { cliOptions.contains($0) })
+        var index = 0
+        while index < rest.count {
+            let token = rest[index]
+            let optionName: String
+            let hasInlineValue: Bool
+            if token.hasPrefix("--"), let eqIndex = token.firstIndex(of: "=") {
+                optionName = String(token[..<eqIndex])
+                hasInlineValue = true
+            } else {
+                optionName = token
+                hasInlineValue = false
+            }
+
+            if optionName == "--mcp" && !hasInlineValue {
+                wantsMCP = true
+                index += 1
+                continue
+            }
+
+            if valueOptions.contains(optionName) {
+                cliHits.append(optionName)
+                if !hasInlineValue, index + 1 < rest.count {
+                    let next = rest[index + 1]
+                    if !next.hasPrefix("--") {
+                        index += 2
+                        continue
+                    }
+                }
+                index += 1
+                continue
+            }
+
+            if flagOptions.contains(optionName) {
+                cliHits.append(optionName)
+            }
+
+            index += 1
+        }
 
         if wantsMCP {
-            // `--help` 与 `--mcp` 并存时也一样拒绝：此时「用户想看的到底是
-            // 命令行帮助还是 MCP 服务」没有正确答案，不能让实现替调用方猜。
-            guard !wantsCLI else {
+            guard cliHits.isEmpty else {
                 throw AutomationError.invalidArgument(
                     "--mcp 不能与其它选项同时使用（同时收到："
-                    + rest.filter { cliOptions.contains($0) }.joined(separator: " ")
+                    + cliHits.joined(separator: " ")
                     + "）。--mcp 会以 stdio 服务端独占运行，不执行截图命令。"
                 )
             }
             return .mcp
         }
 
-        if wantsCLI {
+        if !cliHits.isEmpty {
             return .commandLine(arguments)
         }
 

@@ -1,14 +1,14 @@
-// swift-tools-version: 6.1
+// swift-tools-version: 6.0
 import PackageDescription
 
-// AnShotAutomation：把 anShot 的捕获能力暴露给外部 AI 工具/脚本。
+// AnShotAutomation：把 anShot 的捕获、识别、探测与录制能力暴露给外部 AI 工具/脚本。
 //
 // ── 为什么它是独立包而非直接写进 App ─────────────────────────
 //
-// 捕获逻辑必须能被单测（`AnShotUI` 没有测试 target），
-// 而 MCP/CLI 的协议细节又不该污染捕获模块（`AnShotCapture`）。
-// 本包夹在两者之间：只做「参数校验 → 调用捕获 → 编码/裁切 → 输出」，
-// 不重新实现任何捕获或编码算法。
+// 自动化协议与参数校验需要高频独立单测，而不应耦合界面层；
+// 同时 MCP/CLI 的协议细节也不该污染捕获模块（`AnShotCapture`）。
+// 本包夹在两者之间：只做「参数校验 → 调用捕获/识别/录制 → 编码/裁切 → 输出」，
+// 不重新实现任何捕获或编解码算法。
 //
 // ── 为什么依赖 MCP SDK 而不是自己拼 JSON-RPC ────────────────
 //
@@ -21,7 +21,7 @@ import PackageDescription
 //
 // 版本用 `exact` 而非 `from`：本包是**应用**的一部分而不是被广泛复用的库，
 // 构建应当可重现；`from` 会让同一个提交在不同时间解析出不同版本。
-// （升级时显式改这个数字，并重跑 `docs/automation/task.md` 里的验证命令。）
+// （升级时显式改这个数字，并执行 `swift test` 与 `tools/anshot-mcp-smoke.py` 验证。）
 let package = Package(
     name: "AnShotAutomation",
     platforms: [.macOS(.v13)],

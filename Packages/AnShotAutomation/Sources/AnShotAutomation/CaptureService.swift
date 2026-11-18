@@ -30,14 +30,47 @@ import CoreGraphics
 import Foundation
 import ImageIO
 
+/// 图像编码载荷，携带最终格式与自适应降级元信息。
+struct EncodedImagePayload: Sendable {
+    let data: Data
+    let format: CaptureImageFormat
+    let jpegQuality: Int?
+    let didAutoFallbackToJPEG: Bool
+    let originalPNGByteCount: Int?
+}
+
 /// 截图结果。
 public struct CaptureOutcome: Sendable {
 
-    /// 图像（可能已按 `maxLongEdge` 缩小）。
+    /// 图像（可能已按 `maxLongEdge` 缩小，并可能已绘制坐标网格）。
     public let image: CGImage
 
-    /// PNG 编码后的数据。
-    public let pngData: Data
+    /// 最终编码后的图像字节（PNG 或 JPEG）。
+    public let imageData: Data
+
+    /// 向后兼容别名：返回实际编码字节。
+    public var pngData: Data { imageData }
+
+    /// 实际输出格式（`png` 或 `jpeg`）。
+    public let imageFormat: CaptureImageFormat
+
+    /// 对应的 MIME 类型（`image/png` 或 `image/jpeg`）。
+    public var mimeType: String { imageFormat.mimeType }
+
+    /// JPEG 压缩质量（1...100）；PNG 时为 `nil`。
+    public let jpegQuality: Int?
+
+    /// 是否因未显式强制 PNG 且体积超 3.5 MiB 阈值而自动降级为 JPEG。
+    public let didAutoFallbackToJPEG: Bool
+
+    /// 自动降级前原始 PNG 的字节数；未降级时为 `nil`。
+    public let originalPNGByteCount: Int?
+
+    /// 是否绘制了逻辑点坐标网格。
+    public let coordinateGridEnabled: Bool
+
+    /// 坐标网格原点（逻辑点）。未开启网格时为 `nil`。
+    public let coordinateGridOrigin: CGPoint?
 
     /// 来源显示器。
     public let displayID: CGDirectDisplayID
@@ -69,6 +102,40 @@ public struct CaptureOutcome: Sendable {
     /// 原图像素尺寸（缩放**之前**）。
     public let sourcePixelSize: CGSize
 
+    public init(
+        image: CGImage,
+        imageData: Data,
+        imageFormat: CaptureImageFormat = .png,
+        jpegQuality: Int? = nil,
+        didAutoFallbackToJPEG: Bool = false,
+        originalPNGByteCount: Int? = nil,
+        coordinateGridEnabled: Bool = false,
+        coordinateGridOrigin: CGPoint? = nil,
+        displayID: CGDirectDisplayID,
+        scaleFactor: CGFloat,
+        region: CGRect?,
+        spaceID: UInt64?,
+        window: WindowCaptureInfo?,
+        savedURL: URL?,
+        sourcePixelSize: CGSize
+    ) {
+        self.image = image
+        self.imageData = imageData
+        self.imageFormat = imageFormat
+        self.jpegQuality = jpegQuality
+        self.didAutoFallbackToJPEG = didAutoFallbackToJPEG
+        self.originalPNGByteCount = originalPNGByteCount
+        self.coordinateGridEnabled = coordinateGridEnabled
+        self.coordinateGridOrigin = coordinateGridOrigin
+        self.displayID = displayID
+        self.scaleFactor = scaleFactor
+        self.region = region
+        self.spaceID = spaceID
+        self.window = window
+        self.savedURL = savedURL
+        self.sourcePixelSize = sourcePixelSize
+    }
+
     /// 返回仅替换 `savedURL` 的副本。
     ///
     /// 跨进程路径需要它：截图由子实例完成（所以当时没有落盘），落盘由父进程
@@ -76,7 +143,13 @@ public struct CaptureOutcome: Sendable {
     func withSavedURL(_ url: URL?) -> CaptureOutcome {
         CaptureOutcome(
             image: image,
-            pngData: pngData,
+            imageData: imageData,
+            imageFormat: imageFormat,
+            jpegQuality: jpegQuality,
+            didAutoFallbackToJPEG: didAutoFallbackToJPEG,
+            originalPNGByteCount: originalPNGByteCount,
+            coordinateGridEnabled: coordinateGridEnabled,
+            coordinateGridOrigin: coordinateGridOrigin,
             displayID: displayID,
             scaleFactor: scaleFactor,
             region: region,
@@ -115,7 +188,8 @@ public enum CaptureService {
     ///     → PNG 排他到 `shot-2.png` → 报告再覆盖掉它。
     public static func capture(
         _ parameters: CaptureParameters,
-        reservedOutputPaths: Set<String> = []
+        reservedOutputPaths: Set<String> = [],
+        lockTimeout: TimeInterval = 30
     ) async throws -> CaptureOutcome {
         let target = try parameters.resolveTarget()
 
@@ -128,7 +202,8 @@ public enum CaptureService {
             captured = try await DesktopCaptureCoordinator.capture(
                 spaceID: parameters.spaceID,
                 displayID: target.displayID,
-                allowSwitch: parameters.allowDesktopSwitch
+                allowSwitch: parameters.allowDesktopSwitch,
+                lockTimeout: lockTimeout
             ) {
                 let frame = try await CapturerFactory.makeDefault().captureFrame(scope: target.scope)
                 // ScreenCaptureKit 图像可能引用系统复用的表面；恢复桌面前先编码快照，
@@ -145,10 +220,67 @@ public enum CaptureService {
 
         // 文件写入在恢复完成后执行，避免恢复失败时留下看似成功的产物。
         guard let path = parameters.savePath, !path.isEmpty else { return captured }
-        return captured.withSavedURL(try save(captured.pngData, to: path, reservedPaths: reservedOutputPaths))
+        return captured.withSavedURL(try save(captured.imageData, to: path, reservedPaths: reservedOutputPaths))
     }
 
-    /// 在目标桌面仍处于活动状态时完成像素快照和编码。
+    /// 抓取单帧图像但不立即缩放到小图，供 OCR 等需要原始清晰度的场景直接复用。
+    static func captureRawFrame(
+        _ parameters: CaptureParameters,
+        lockTimeout: TimeInterval = 30
+    ) async throws -> (frame: CapturedFrame, target: ResolvedCaptureTarget) {
+        let target = try parameters.resolveTarget()
+        try requirePermission()
+
+        do {
+            return try await DesktopCaptureCoordinator.capture(
+                spaceID: parameters.spaceID,
+                displayID: target.displayID,
+                allowSwitch: parameters.allowDesktopSwitch,
+                lockTimeout: lockTimeout
+            ) {
+                let frame = try await CapturerFactory.makeDefault().captureFrame(scope: target.scope)
+                // 跨桌面时先在原位拷贝出独立位图，避免切回桌面后系统底层缓冲区失效。
+                if parameters.spaceID != nil,
+                   let copied = copyCGImage(frame.image) {
+                    let stable = CapturedFrame(
+                        image: copied,
+                        displayID: frame.displayID,
+                        scaleFactor: frame.scaleFactor,
+                        window: frame.window
+                    )
+                    return (stable, target)
+                }
+                return (frame, target)
+            }
+        } catch let error as AutomationError {
+            throw error
+        } catch let error as CaptureError {
+            throw mapCaptureError(error, displayID: target.displayID)
+        } catch {
+            throw AutomationError.captureFailed(String(describing: error))
+        }
+    }
+
+    /// 复制为独立的 sRGB CGImage 快照。
+    private static func copyCGImage(_ image: CGImage) -> CGImage? {
+        guard let colorSpace = image.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                  data: nil,
+                  width: image.width,
+                  height: image.height,
+                  bitsPerComponent: 8,
+                  bytesPerRow: 0,
+                  space: colorSpace,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                      | CGBitmapInfo.byteOrder32Little.rawValue
+              ) else {
+            return nil
+        }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return context.makeImage()
+    }
+
+    /// 在目标桌面仍处于活动状态时完成像素快照、网格叠加和编码。
     private static func prepareOutcome(
         frame: CapturedFrame,
         parameters: CaptureParameters,
@@ -157,7 +289,7 @@ public enum CaptureService {
         let sourcePixelSize = frame.pixelSize
 
         // 缩放失败会抛出，不回退到超限原图（理由见 ImageScaling 的文件头）。
-        let outputImage: CGImage
+        var outputImage: CGImage
         do {
             outputImage = try ImageScaling.downscale(
                 frame.image,
@@ -173,22 +305,31 @@ public enum CaptureService {
             throw AutomationError.invalidArgument(
                 "输出图像过大：\(outputImage.width)×\(outputImage.height) = "
                 + "\(outputPixels) 像素，超过上限 \(Self.maximumOutputPixels)。"
-                + "请缩小 region，或设置 max_size（如 2560）限制长边。"
+                + "请缩小 region，或设置 max_size（如 1568）限制长边。"
             )
         }
 
-        let pngData: Data
-        do {
-            pngData = try ImageEncoding.data(from: outputImage, format: .png)
-        } catch {
-            throw AutomationError.outputFailed(
-                "PNG 编码失败：\(error.localizedDescription)"
+        // 若启用坐标网格，在最终输出分辨率上绘制以保证刻度清晰可读。
+        var gridOrigin: CGPoint?
+        if parameters.coordinateGrid {
+            let logicalRect = logicalCoordinateRect(
+                target: target,
+                sourcePixelSize: sourcePixelSize,
+                scaleFactor: frame.scaleFactor
+            )
+            gridOrigin = logicalRect.origin
+            outputImage = CoordinateGridRenderer.render(
+                on: outputImage,
+                logicalOrigin: logicalRect.origin,
+                logicalSize: logicalRect.size
             )
         }
+
+        let encoded = try encodeImage(outputImage, parameters: parameters)
 
         let stableImage: CGImage
         if parameters.spaceID != nil {
-            guard let source = CGImageSourceCreateWithData(pngData as CFData, nil),
+            guard let source = CGImageSourceCreateWithData(encoded.data as CFData, nil),
                   let decoded = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
                 throw AutomationError.outputFailed("无法读取已编码的桌面截图。")
             }
@@ -199,7 +340,13 @@ public enum CaptureService {
 
         return CaptureOutcome(
             image: stableImage,
-            pngData: pngData,
+            imageData: encoded.data,
+            imageFormat: encoded.format,
+            jpegQuality: encoded.jpegQuality,
+            didAutoFallbackToJPEG: encoded.didAutoFallbackToJPEG,
+            originalPNGByteCount: encoded.originalPNGByteCount,
+            coordinateGridEnabled: parameters.coordinateGrid,
+            coordinateGridOrigin: gridOrigin,
             displayID: frame.displayID,
             scaleFactor: frame.scaleFactor,
             // 区域取自已校验的范围：窗口与整屏都为 nil，只有「显示器 + 区域」有值。
@@ -208,6 +355,90 @@ public enum CaptureService {
             window: frame.window,
             savedURL: nil,
             sourcePixelSize: sourcePixelSize
+        )
+    }
+
+    /// 推算捕获目标覆盖的逻辑点矩形范围，用于绘制坐标网格标尺。
+    private static func logicalCoordinateRect(
+        target: ResolvedCaptureTarget,
+        sourcePixelSize: CGSize,
+        scaleFactor: CGFloat
+    ) -> CGRect {
+        switch target {
+        case .display(let displayID):
+            let bounds = DisplayGeometry.bounds(for: displayID)
+            if bounds.width > 0, bounds.height > 0 {
+                return CGRect(origin: .zero, size: bounds.size)
+            }
+        case .region(_, let rect):
+            return rect
+        case .window(_, _, let frame, _, _):
+            return frame
+        }
+        let divisor = max(1, scaleFactor)
+        return CGRect(
+            origin: .zero,
+            size: CGSize(width: sourcePixelSize.width / divisor, height: sourcePixelSize.height / divisor)
+        )
+    }
+
+    /// 根据参数与自适应策略编码图像（internal 便于单测直接覆盖降级分支）。
+    static func encodeImage(
+        _ image: CGImage,
+        parameters: CaptureParameters
+    ) throws -> EncodedImagePayload {
+        if parameters.outputFormat == .jpeg {
+            let quality = parameters.jpegQuality ?? MCPPayloadLimits.autoJPEGQuality
+            let normalized = max(0.01, min(1.0, CGFloat(quality) / 100.0))
+            let data: Data
+            do {
+                data = try ImageEncoding.data(from: image, format: .jpeg(quality: normalized))
+            } catch {
+                throw AutomationError.outputFailed("JPEG 编码失败：\(error.localizedDescription)")
+            }
+            return EncodedImagePayload(
+                data: data,
+                format: .jpeg,
+                jpegQuality: quality,
+                didAutoFallbackToJPEG: false,
+                originalPNGByteCount: nil
+            )
+        }
+
+        let pngData: Data
+        do {
+            pngData = try ImageEncoding.data(from: image, format: .png)
+        } catch {
+            throw AutomationError.outputFailed("PNG 编码失败：\(error.localizedDescription)")
+        }
+
+        // 调用方未显式强制 PNG，且 PNG 字节数超过 3.5 MiB 阈值时，自动转为高质量 JPEG。
+        if parameters.autoFallbackToJPEG,
+           parameters.outputFormat == nil,
+           pngData.count > MCPPayloadLimits.autoJPEGThresholdBytes {
+            let quality = MCPPayloadLimits.autoJPEGQuality
+            let normalized = CGFloat(quality) / 100.0
+            let jpegData: Data
+            do {
+                jpegData = try ImageEncoding.data(from: image, format: .jpeg(quality: normalized))
+            } catch {
+                throw AutomationError.outputFailed("自动 JPEG 编码失败：\(error.localizedDescription)")
+            }
+            return EncodedImagePayload(
+                data: jpegData,
+                format: .jpeg,
+                jpegQuality: quality,
+                didAutoFallbackToJPEG: true,
+                originalPNGByteCount: pngData.count
+            )
+        }
+
+        return EncodedImagePayload(
+            data: pngData,
+            format: .png,
+            jpegQuality: nil,
+            didAutoFallbackToJPEG: false,
+            originalPNGByteCount: nil
         )
     }
 
@@ -323,13 +554,16 @@ public enum CaptureService {
             )
         }
 
+        // 将全部保留路径规范化为支持大小写折叠的比较键。
+        let reservedKeys = Set(reservedPaths.map { PathIdentity.comparisonKey($0) })
+
         // attempt 0 是原路径；其后依次追加 -2、-3…（命名规则统一由 OutputPath 给出）
         for attempt in 0...OutputPath.maximumAttempts {
             let candidate = OutputPath.candidate(for: desiredURL, attempt: attempt)
 
             // 保留路径视为「已占用」：不只看它是否真实存在——
             // 报告可能尚未写入，但把它的位置占了就会导致后续报告覆盖截图。
-            if reservedPaths.contains(PathIdentity.canonical(candidate)) {
+            if reservedKeys.contains(PathIdentity.comparisonKey(candidate)) {
                 continue
             }
 
@@ -348,7 +582,7 @@ public enum CaptureService {
         // 序号空间用尽：退化为 UUID，仍然保证不覆盖。
         var fallback = OutputPath.fallbackCandidate(for: desiredURL)
         // UUID 撞上保留路径的概率可忽略，但没必要靠概率——显式换一个。
-        while reservedPaths.contains(PathIdentity.canonical(fallback)) {
+        while reservedKeys.contains(PathIdentity.comparisonKey(fallback)) {
             fallback = OutputPath.fallbackCandidate(for: desiredURL)
         }
 

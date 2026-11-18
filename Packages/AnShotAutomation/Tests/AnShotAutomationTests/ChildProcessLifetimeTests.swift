@@ -56,6 +56,56 @@ struct ChildProcessLifetimeTests {
         #expect(!process.isRunning)
     }
 
+    @Test("超时或取消时读取 child.pid 发送 SIGTERM 回收真实子进程")
+    func timeoutTerminatesRealChildViaPIDFile() async throws {
+        let workspace = try OutOfProcessCapture.createPrivateWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        // 验证 IPC 临时目录权限严格收敛为 0o700。
+        let attrs = try FileManager.default.attributesOfItem(atPath: workspace.path)
+        let permissions = (attrs[.posixPermissions] as? NSNumber)?.intValue
+        #expect(permissions == 0o700)
+
+        // 模拟真实被 LaunchServices 派生的长驻子进程，并把它的 PID 写入 child.pid。
+        let realChild = Process()
+        realChild.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        realChild.arguments = ["30"]
+        try realChild.run()
+        defer { if realChild.isRunning { realChild.terminate() } }
+
+        let pidFile = workspace.appendingPathComponent("child.pid")
+        try IPCRequest.writePrivateFile(Data("\(realChild.processIdentifier)\n".utf8), to: pidFile)
+
+        // 验证私有文件权限严格为 0o600。
+        let pidAttrs = try FileManager.default.attributesOfItem(atPath: pidFile.path)
+        let pidPermissions = (pidAttrs[.posixPermissions] as? NSNumber)?.intValue
+        #expect(pidPermissions == 0o600)
+
+        let observer = Process()
+        observer.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        observer.arguments = ["30"]
+        let child = OutOfProcessCapture.LaunchedChild(process: observer)
+        try observer.run()
+        defer { child.stopWaiting() }
+
+        let missingReport = workspace.appendingPathComponent("report.json")
+        do {
+            _ = try await OutOfProcessCapture.waitForReport(
+                at: missingReport,
+                pidFileURL: pidFile,
+                child: child,
+                timeout: 0.1
+            )
+            Issue.record("超时后不应返回报告")
+        } catch {
+            #expect(error is AutomationError)
+        }
+
+        // 校验 realChild 被 SIGTERM 回收退出。
+        try await waitUntil { !realChild.isRunning }
+        #expect(!realChild.isRunning)
+    }
+
     private func waitUntil(_ condition: () -> Bool) async throws {
         let deadline = ContinuousClock.now + .seconds(5)
         while !condition() {

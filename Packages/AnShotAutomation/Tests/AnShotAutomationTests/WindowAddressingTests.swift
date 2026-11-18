@@ -150,49 +150,52 @@ struct WindowAddressingTests {
     }
 }
 
-// MARK: - 子实例参数
+// MARK: - 子实例 IPC 请求
 
 struct WindowChildArgumentTests {
 
-    private func arguments(_ parameters: CaptureParameters) -> [String] {
-        OutOfProcessCapture.childArguments(
-            parameters: parameters,
-            outputURL: URL(fileURLWithPath: "/tmp/transfer.png"),
-            reportURL: URL(fileURLWithPath: "/tmp/report.json")
-        )
+    private func roundTrip(_ parameters: CaptureParameters) throws -> CaptureParameters {
+        let workspace = try OutOfProcessCapture.createPrivateWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let requestURL = workspace.appendingPathComponent("request.json")
+        try IPCRequest(
+            action: .capture(parameters),
+            outputPath: workspace.appendingPathComponent("transfer.png").path,
+            reportPath: workspace.appendingPathComponent("report.json").path,
+            pidFilePath: workspace.appendingPathComponent("child.pid").path,
+            watchdogTimeoutSeconds: 30
+        ).write(to: requestURL)
+        let decoded = try IPCRequest.load(from: requestURL.path)
+        guard case .capture(let params) = decoded.action else {
+            throw AutomationError.invalidArgument("期望解码为 .capture")
+        }
+        return params
     }
 
     /// 窗口 ID 要透传给子实例。
     @Test
-    func windowIDIsForwarded() {
-        let result = arguments(CaptureParameters(windowID: 4321))
-        #expect(result.contains("--window"))
-        #expect(result.contains("4321"))
-        #expect(result.contains("--direct"))
+    func windowIDIsForwarded() throws {
+        let result = try roundTrip(CaptureParameters(windowID: 4321))
+        #expect(result.windowID == 4321)
+        #expect(result.displayID == nil)
+        #expect(result.region == nil)
     }
 
-    /// 应用名要**原样**透传，不在父进程解析成 ID。
-    ///
-    /// 理由：父进程（被宿主 spawn 的 MCP 进程）通常没有屏幕录制权限，
-    /// 就地解析只能看到「无权限视角下」的窗口列表——标题全空，
-    /// 选中的窗口因此可能与调用方期望的不一致。
+    /// 应用名要**原样**透传，包含含空格及 `--mcp` / `-h` 等特殊字符也能防注入安全传回。
     @Test
-    func applicationNameIsForwardedVerbatim() {
-        let result = arguments(CaptureParameters(applicationName: "Visual Studio Code"))
-        #expect(result.contains("--app"))
-        #expect(result.contains("Visual Studio Code"))
+    func applicationNameIsForwardedVerbatim() throws {
+        for name in ["Visual Studio Code", "-h", "--mcp", "--json-out"] {
+            let result = try roundTrip(CaptureParameters(applicationName: name))
+            #expect(result.applicationName == name)
+        }
     }
 
-    /// 只带窗口 ID 时，子参数里不应出现任何显示器侧参数。
-    ///
-    /// 反过来也成立：这条约束不是向子实例「隐瞒」什么，而是因为
-    /// `windowID` 与 `displayID` 的组合会在 `resolveTarget()` 被拒绝，
-    /// 根本走不到这里——本用例锁住的是「不额外附加参数」这件事本身。
+    /// 只带窗口 ID 时，请求里不应出现任何显示器侧参数。
     @Test
-    func windowOnlyRequestCarriesNoDisplayArguments() {
-        let result = arguments(CaptureParameters(windowID: 4321))
-        #expect(!result.contains("--display"))
-        #expect(!result.contains("--region"))
-        #expect(result.contains("--window"))
+    func windowOnlyRequestCarriesNoDisplayArguments() throws {
+        let result = try roundTrip(CaptureParameters(windowID: 4321))
+        #expect(result.displayID == nil)
+        #expect(result.region == nil)
+        #expect(result.windowID == 4321)
     }
 }

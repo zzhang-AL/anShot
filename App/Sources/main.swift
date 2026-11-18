@@ -90,6 +90,9 @@ private func isPlainGUILaunch(_ arguments: [String]) -> Bool {
             index += 2  // 连同它的值一起跳过
             continue
         }
+        #if DEBUG
+        // 与 AppDelegate.isDiagnosticRun 保持严格的 Debug 宏对齐：
+        // Release 包下不得放行这些参数绕过单实例锁，避免双进程互抢热键。
         if argument.hasPrefix("-diagnose")
             || argument.hasPrefix("-show")
             || argument == "-requestMicrophoneAccess"
@@ -97,6 +100,7 @@ private func isPlainGUILaunch(_ arguments: [String]) -> Bool {
             || argument == "-editImage" {
             return false
         }
+        #endif
         index += 1
     }
     return true

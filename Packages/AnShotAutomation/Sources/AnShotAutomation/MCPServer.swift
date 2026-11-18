@@ -2,27 +2,13 @@
 //  MCPServer.swift
 //  AnShotAutomation
 //
-//  MCP stdio 服务端。让 AI 客户端（Claude Code / Cursor / pi 等）能直接截图。
-//
-//  ── 传输选型：stdio ──────────────────────────────────────────
-//
-//  MCP 规范定义 stdio 与 streamable HTTP 两种传输。这里选 stdio，理由是
-//  使用场景本身决定的：截图是**本机能力**，调用方与本进程在同一台机器上，
-//  stdio 由客户端直接 spawn 子进程，不需要监听端口、不需要鉴权、
-//  也不存在「谁会连上这个端口」的问题。HTTP 传输的价值在跨网络共享，
-//  而这恰好是这里不需要的。
+//  MCP stdio 服务端。让 AI 客户端（Claude Code / Cursor / pi 等）直接调用截图、
+//  离线 OCR、UI 控件树探测与有界时长录屏能力。
 //
 //  ── stdout 是协议通道，不是日志通道 ──────────────────────────
 //
-//  stdio 传输把 stdout 当作 JSON-RPC 消息流（换行分隔）。
-//  任何一行非协议输出都会让客户端解析失败，且症状通常是
-//  「客户端连上了但一个工具都没有」——排查方向完全被误导。
-//
-//  因此本文件遵守一条硬规则：
 //      - 协议消息 → stdout（只由 StdioTransport 写）
 //      - 一切日志 → stderr
-//  这也是给 `StdioTransport` 显式传 logger 的原因：它的默认 logger
-//  是 NoOp（丢弃），显式传入既避免污染又保留可调试性。
 //
 
 import AnShotCapture
@@ -35,9 +21,6 @@ import MCP
 enum AnShotBuildInfo {
 
     /// 对外声明的版本号。取 app bundle 的 `CFBundleShortVersionString`。
-    ///
-    /// 取不到时返回 `"unknown"` 而非崩溃：版本号只用于诊断，
-    /// 不该成为截图能力可用的前提。
     static var version: String {
         (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)
             ?? "unknown"
@@ -48,16 +31,16 @@ enum AnShotBuildInfo {
 public enum AnShotMCP {
 
     /// 服务端在 `initialize` 时返回给客户端的用法说明。
-    ///
-    /// 这段文字会进入模型的上下文，因此写得**可操作**：
-    /// 说清坐标系单位、以及无权限时该做什么。少这两条，
-    /// 模型最常见的两个错误就是「坐标传成像素」和「无权限时反复重试」。
-    private static let instructions = """
-    anShot 的 macOS 屏幕捕获能力。三个工具配合使用：
+    static let instructions = """
+    anShot 的 macOS 屏幕捕获、离线 OCR、UI 控件树探测与有界录制能力。七个工具配合使用：
 
-    - list_displays  看有哪些屏幕（id / 逻辑尺寸 / 像素尺寸 / 缩放系数）
-    - list_windows   看有哪些可截图的窗口（应用名 / 标题 / window_id）
-    - capture_screenshot  截图
+    - list_displays             看有哪些屏幕（id / 逻辑尺寸 / 像素尺寸 / 缩放系数）
+    - list_desktops             看各显示器的桌面与全屏空间（space_id / isCurrent）
+    - list_windows              看有哪些可截图的窗口（应用名 / 标题 / window_id）
+    - capture_screenshot        捕获屏幕/区域/后台窗口截图（支持 JPEG 压缩与坐标标尺网格）
+    - ocr_screenshot            离线识别屏幕或本地图像中的文字，返回全文与逐行像素包围盒
+    - inspect_window_elements   探测目标窗口或应用的 AX 控件树（角色 / 标题 / 逻辑点坐标框）
+    - record_screen             有界时长（1...15 秒）录制为 GIF 或 MP4 文件，用于验收动画与交互
 
     截图的三种取景方式（互斥，按优先级排）：
     1. window_id 或 app —— 截指定窗口。**窗口被遮挡、不在最顶层时同样能截到
@@ -70,16 +53,17 @@ public enum AnShotMCP {
     此时用 appName 判断。app 参数接受应用名（如 "Safari"、"Xcode"），
     会选中该应用在屏且面积最大的窗口。
 
-    输出尺寸默认把长边压到 2560 像素以内以控制体积，用 max_size 覆盖
-    （传 0 表示保持原分辨率——做像素计数类判断时必须这样传）。
+    图像压缩与体积控制：
+    - 默认 max_size 为 1568 像素（传 0 表示保持原分辨率——做像素级核验时传 0）。
+    - 未显式指定 format: "png" 且 PNG 超过 3.5 MiB 时，自动降级为高质量 JPEG（quality=82）
+      以控制响应在 5 MB 红线以内并大幅节省视觉 Token。
+    - 可按需传入 format: "jpeg" / "png" 与 quality（1...100），或开启 coordinate_grid: true 辅助定位坐标。
 
     若无权限，工具会返回明确的处理步骤。授权对象是 **anShot.app 自身**，
     不是你的宿主进程；不要建议用户给终端或客户端授予屏幕录制权限。
     """
 
     /// 在 stdio 上运行服务端，直到 stdin 关闭。
-    ///
-    /// - Throws: 传输建立失败时抛出。
     public static func run() async throws {
         let logger = makeLogger()
 
@@ -89,8 +73,6 @@ public enum AnShotMCP {
             title: "anShot Screen Capture",
             instructions: instructions,
             capabilities: .init(
-                // listChanged 为 false：工具集是编译期固定的，
-                // 声明 true 却从不发通知属于虚假声明。
                 tools: .init(listChanged: false)
             )
         )
@@ -102,19 +84,12 @@ public enum AnShotMCP {
         try await server.start(transport: transport)
         logger.notice("anshot MCP server started; awaiting stdio")
 
-        // 阻塞到 stdin EOF（客户端关闭管道）或对端断开。
-        // 用 waitUntilCompleted 而非 `Task.sleep(for: .days(365*100))`：
-        // 后者在客户端异常退出时会让进程一直挂着，成为孤儿进程。
         await server.waitUntilCompleted()
         await server.stop()
         logger.notice("anshot MCP server stopped")
     }
 
     /// stderr 日志器。
-    ///
-    /// 级别由 `ANSHOT_MCP_LOG` 环境变量控制（trace/debug/info/notice/warning/error），
-    /// 默认 `notice`。默认不开 debug 是因为 MCP 客户端会把 stderr
-    /// 原样转给用户，逐条消息的 trace 日志会淹没真正重要的信息。
     private static func makeLogger() -> Logger {
         var logger = Logger(label: "com.anshot.mcp") { label in
             StreamLogHandler.standardError(label: label)
@@ -140,7 +115,15 @@ public enum AnShotMCP {
         logger: Logger
     ) async {
         await server.withMethodHandler(ListTools.self) { _ in
-            .init(tools: [listDisplaysTool, listDesktopsTool, listWindowsTool, captureScreenshotTool])
+            .init(tools: [
+                listDisplaysTool,
+                listDesktopsTool,
+                listWindowsTool,
+                captureScreenshotTool,
+                ocrScreenshotTool,
+                inspectWindowElementsTool,
+                recordScreenTool
+            ])
         }
     }
 
@@ -190,16 +173,10 @@ public enum AnShotMCP {
             每个窗口返回：id、应用名（appName）、标题（title）、
             窗口矩形（frame，全局逻辑点）、所在显示器、所属桌面 ID（spaceIDs）、是否在屏。
 
-            用其中的 id 作为 capture_screenshot 的 window_id，或把 appName
-            作为该工具的 app 参数。
+            用其中的 id 作为 capture_screenshot / inspect_window_elements / ocr_screenshot 的 window_id，
+            或把 appName 作为对应工具的 app 参数。
 
-            注意 title 可能为空：那表示该窗口本就没有标题（不少应用的主窗口
-            就是如此），此时按 appName 与 frame 判断即可，不要因此认为
-            列表不可用。
-
-            isOnScreen 为 false 可能表示窗口在其他桌面、已最小化或隐藏，
-            并不保证系统能捕获；后台窗口的内容也可能过期或为空。
-            用 list_desktops 把 spaceIDs 对应到桌面；spaceIDs 可能缺失，表示系统未提供归属。
+            注意 title 可能为空：那表示该窗口本就没有标题，此时按 appName 与 frame 判断即可。
             """,
             inputSchema: .object([
                 "type": .string("object"),
@@ -219,51 +196,32 @@ public enum AnShotMCP {
             **取景方式三选一（互斥）**：
 
             1. 窗口 —— 传 window_id（来自 list_windows）或 app（应用名）。
-               **窗口被遮挡、不在最顶层时同样能截到完整内容**：
-               这是「看一眼某个应用现在长什么样」的首选方式，
-               不需要知道窗口在哪，也不需要把它切到前台。
-               其他桌面的窗口也会尝试捕获；最小化、隐藏或后台窗口的内容
-               可能不可用、过期或为空。app 优先选当前在屏窗口，其次面积最大。
+               **窗口被遮挡、不在最顶层时同样能截到完整内容**。
                不要为了截图先调用 activate、设置 frontmost、执行 AXRaise 或其他窗口置前操作；
                截不到时应说明限制，不能擅自激活应用或切换桌面。
-               如果其他界面交互需要将窗口切到前台，应先取得用户明确同意。
-
-            2. 区域 —— 传 display_id + region。
-               region 是 **显示器内逻辑点**（不是像素、不是全局坐标），
-               原点在该显示器左上角，格式 [x, y, width, height]。
-
-            3. 整屏 —— 传 display_id，省略时为主显示器。
-               可传 space_id 指定桌面。默认不切换；只有用户明确同意后，才能传入
-               allow_switch: true 短暂切换并恢复原桌面，且需要辅助功能权限。
-               先用 list_desktops 获取 ID。
-               优先按窗口后台截图；需要其他桌面的完整画面时才使用切换模式。
-
-            window_id/app 不能与 display_id、space_id 或 region 同时使用。
+            2. 区域 —— 传 display_id + region（显示器内逻辑点 [x, y, width, height]，原点左上）。
+            3. 整屏 —— 传 display_id，省略时为主显示器。可传 space_id 指定桌面（默认不切换，
+               仅在用户明确同意后才能传 allow_switch: true）。
 
             其他参数：
-            - max_size：输出长边像素上限，默认 2560；传 0 表示不缩放。
-              做像素计数类判断（「这个按钮宽 400 像素吗」）必须传 0。
+            - max_size：输出长边像素上限，默认 1568；传 0 表示不缩放。
+            - format："png" 或 "jpeg"。省略时默认优先 PNG，若 PNG 超过 3.5 MiB 则自动降级为高质量 JPEG（quality=82）。
+            - quality：JPEG 压缩质量（1...100，默认 82，仅 JPEG 时生效）。
+            - coordinate_grid：可选布尔值，为 true 时在图像边缘绘制逻辑点坐标标尺网格，辅助精准定位点击坐标。
             - save_path：把截图另存到该路径（已存在时自动追加序号，不覆盖）。
 
-            截图由 anShot.app 自己完成，复用它已有的屏幕录制授权。因此**不需要**
-            给你的终端或 AI 客户端授予屏幕录制权限；若返回权限错误，
-            那是 anShot 自身未被授权，请把错误原文转达给用户。
+            截图由 anShot.app 自己完成，复用它已有的屏幕录制授权。
             """,
             inputSchema: .object([
                 "type": .string("object"),
                 "properties": .object([
                     "window_id": .object([
                         "type": .string("integer"),
-                        "description": .string(
-                            "目标窗口 ID，来自 list_windows 的 id。可尝试其他桌面的窗口。"
-                        )
+                        "description": .string("目标窗口 ID，来自 list_windows 的 id。")
                     ]),
                     "app": .object([
                         "type": .string("string"),
-                        "description": .string(
-                            "应用名（如 Safari、Xcode），优先当前在屏窗口，其次面积最大。"
-                            + "与 window_id 二选一。"
-                        )
+                        "description": .string("应用名（如 Safari、Xcode），与 window_id 二选一。")
                     ]),
                     "display_id": .object([
                         "type": .string("integer"),
@@ -280,17 +238,30 @@ public enum AnShotMCP {
                     ]),
                     "region": .object([
                         "type": .string("array"),
-                        "description": .string(
-                            "显示器内逻辑点区域 [x, y, width, height]，原点该显示器左上角。省略则整屏。"
-                        ),
+                        "description": .string("显示器内逻辑点区域 [x, y, width, height]，原点该显示器左上角。"),
                         "items": .object(["type": .string("number")]),
                         "minItems": .int(4),
                         "maxItems": .int(4)
                     ]),
                     "max_size": .object([
                         "type": .string("integer"),
-                        "description": .string("输出长边像素上限，默认 2560；0 表示不缩放。"),
+                        "description": .string("输出长边像素上限，默认 1568；0 表示不缩放。"),
                         "minimum": .int(0)
+                    ]),
+                    "format": .object([
+                        "type": .string("string"),
+                        "enum": .array([.string("png"), .string("jpeg")]),
+                        "description": .string("图像编码格式（png 或 jpeg）。省略时优先 PNG，超过 3.5 MiB 自动转 JPEG。")
+                    ]),
+                    "quality": .object([
+                        "type": .string("integer"),
+                        "description": .string("JPEG 压缩质量（1...100，默认 82；仅 JPEG 时有效）。"),
+                        "minimum": .int(1),
+                        "maximum": .int(100)
+                    ]),
+                    "coordinate_grid": .object([
+                        "type": .string("boolean"),
+                        "description": .string("是否在图像边缘绘制逻辑点坐标标尺网格辅助定位坐标，默认 false。")
                     ]),
                     "save_path": .object([
                         "type": .string("string"),
@@ -299,14 +270,174 @@ public enum AnShotMCP {
                 ]),
                 "additionalProperties": .bool(false)
             ]),
-            // readOnlyHint 必须为 false：本工具可经 `save_path` 写文件。
-            //
-            // 曾错误地声明为 true。按 MCP 规范，readOnlyHint 的含义是
-            // 「不修改其环境」；一个能写盘的工具声称自己只读，会让
-            // 客户端在只读会话里放行它——而调用方是靠这个字段做安全判断的。
-            // （schema 里 `additionalProperties: false` 只能约束入参形状，
-            // 不能表达「会写盘」这件事。）
             annotations: .init(title: "截取屏幕", readOnlyHint: false, openWorldHint: false)
+        )
+    }
+
+    private static var ocrScreenshotTool: Tool {
+        Tool(
+            name: "ocr_screenshot",
+            description: """
+            离线识别屏幕/窗口/区域截图或本地图片文件中的文字（基于 Apple Vision，100% 本地运行），
+            返回全文（fullText）与按阅读顺序排列的逐行结果（text、confidence、boundingBox 像素包围盒）。
+
+            输入来源二选一（互斥）：
+            1. image_path —— 读取本地图片文件进行识别（无需屏幕录制权限）。
+            2. 屏幕取景 —— 传 window_id / app 或 display_id + region / space_id + allow_switch，
+               自动以原始分辨率抓帧并识别。
+            """,
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "image_path": .object([
+                        "type": .string("string"),
+                        "description": .string("本地图片文件路径（与截屏参数互斥）。")
+                    ]),
+                    "window_id": .object([
+                        "type": .string("integer"),
+                        "description": .string("目标窗口 ID，来自 list_windows。")
+                    ]),
+                    "app": .object([
+                        "type": .string("string"),
+                        "description": .string("目标应用名。")
+                    ]),
+                    "display_id": .object([
+                        "type": .string("integer"),
+                        "description": .string("目标显示器 ID。")
+                    ]),
+                    "space_id": .object([
+                        "type": .string("integer"),
+                        "description": .string("目标桌面 ID。"),
+                        "minimum": .int(1)
+                    ]),
+                    "allow_switch": .object([
+                        "type": .string("boolean"),
+                        "description": .string("是否允许切换桌面并恢复，默认 false。")
+                    ]),
+                    "region": .object([
+                        "type": .string("array"),
+                        "description": .string("显示器内逻辑点区域 [x, y, width, height]。"),
+                        "items": .object(["type": .string("number")]),
+                        "minItems": .int(4),
+                        "maxItems": .int(4)
+                    ]),
+                    "languages": .object([
+                        "type": .string("array"),
+                        "description": .string("偏好识别语言代码列表（如 [\"zh-Hans\", \"en-US\"]）。"),
+                        "items": .object(["type": .string("string")])
+                    ])
+                ]),
+                "additionalProperties": .bool(false)
+            ]),
+            annotations: .init(title: "离线文字识别", readOnlyHint: true, openWorldHint: false)
+        )
+    }
+
+    private static var inspectWindowElementsTool: Tool {
+        Tool(
+            name: "inspect_window_elements",
+            description: """
+            探测目标窗口或应用内的辅助功能（AX）UI 控件树，返回各控件的角色（role）、标题（title）、
+            描述、值、启用状态与全局逻辑点坐标框（frame）。
+            需要辅助功能权限；若无权限则返回包含 hasAccessibilityPermission: false 与授权指引的结构化结果。
+            """,
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "window_id": .object([
+                        "type": .string("integer"),
+                        "description": .string("目标窗口 ID（与 app / pid 三选一）。")
+                    ]),
+                    "app": .object([
+                        "type": .string("string"),
+                        "description": .string("目标应用名（与 window_id / pid 三选一）。")
+                    ]),
+                    "pid": .object([
+                        "type": .string("integer"),
+                        "description": .string("目标进程 PID（与 window_id / app 三选一）。"),
+                        "minimum": .int(1)
+                    ]),
+                    "max_depth": .object([
+                        "type": .string("integer"),
+                        "description": .string("最大遍历深度（1...12，默认 4）。"),
+                        "minimum": .int(1),
+                        "maximum": .int(12)
+                    ]),
+                    "max_elements": .object([
+                        "type": .string("integer"),
+                        "description": .string("最大返回控件数量（1...1000，默认 200）。"),
+                        "minimum": .int(1),
+                        "maximum": .int(1000)
+                    ])
+                ]),
+                "additionalProperties": .bool(false)
+            ]),
+            annotations: .init(title: "探测窗口控件树", readOnlyHint: true, openWorldHint: false)
+        )
+    }
+
+    private static var recordScreenTool: Tool {
+        Tool(
+            name: "record_screen",
+            description: """
+            录制有界时长（强制 1...15 秒）的屏幕、区域或窗口视频，输出 GIF 或 MP4 文件路径，
+            供验收动画、过渡效果与交互时序。
+
+            取景参数与 capture_screenshot 一致（window_id / app 或 display_id + region，默认主显示器）。
+            """,
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "window_id": .object([
+                        "type": .string("integer"),
+                        "description": .string("目标窗口 ID。")
+                    ]),
+                    "app": .object([
+                        "type": .string("string"),
+                        "description": .string("目标应用名。")
+                    ]),
+                    "display_id": .object([
+                        "type": .string("integer"),
+                        "description": .string("目标显示器 ID。")
+                    ]),
+                    "region": .object([
+                        "type": .string("array"),
+                        "description": .string("显示器内逻辑点区域 [x, y, width, height]。"),
+                        "items": .object(["type": .string("number")]),
+                        "minItems": .int(4),
+                        "maxItems": .int(4)
+                    ]),
+                    "duration": .object([
+                        "type": .string("number"),
+                        "description": .string("录制时长（秒），强制限制在 1...15 秒之间，默认 3 秒。"),
+                        "minimum": .int(1),
+                        "maximum": .int(15)
+                    ]),
+                    "format": .object([
+                        "type": .string("string"),
+                        "enum": .array([.string("gif"), .string("mp4")]),
+                        "description": .string("输出格式：gif（默认）或 mp4。")
+                    ]),
+                    "fps": .object([
+                        "type": .string("integer"),
+                        "description": .string("帧率（GIF 默认 12，上限 30；MP4 默认 30，上限 60）。"),
+                        "minimum": .int(1),
+                        "maximum": .int(60)
+                    ]),
+                    "max_size": .object([
+                        "type": .string("integer"),
+                        "description": .string("GIF 长边像素上限（100...1600，默认 800；仅 gif 格式支持）。"),
+                        "minimum": .int(100),
+                        "maximum": .int(1600)
+                    ]),
+                    "save_path": .object([
+                        "type": .string("string"),
+                        "description": .string("另存路径（可选）。省略时保存至 ~/Pictures/anShot/；绝不覆盖已有文件。")
+                    ])
+                ]),
+                "additionalProperties": .bool(false)
+            ]),
+            annotations: .init(title: "录制屏幕", readOnlyHint: false, openWorldHint: false)
         )
     }
 
@@ -333,27 +464,40 @@ public enum AnShotMCP {
                     logger: logger
                 )
 
+            case "ocr_screenshot":
+                return await handleOCRScreenshot(
+                    arguments: params.arguments,
+                    logger: logger
+                )
+
+            case "inspect_window_elements":
+                return await handleInspectWindowElements(
+                    arguments: params.arguments,
+                    logger: logger
+                )
+
+            case "record_screen":
+                return await handleRecordScreen(
+                    arguments: params.arguments,
+                    logger: logger
+                )
+
             default:
                 return errorResult(
                     "未知工具：\(params.name)。"
-                    + "可用工具：list_displays、list_desktops、list_windows、capture_screenshot。"
+                    + "可用工具：list_displays、list_desktops、list_windows、capture_screenshot、"
+                    + "ocr_screenshot、inspect_window_elements、record_screen。"
                 )
             }
         }
     }
 
-    /// 枚举窗口。
-    ///
-    /// 走 app 内执行的理由见 `OutOfProcessCapture.listWindows`：窗口标题
-    /// 受屏幕录制权限管控，而 MCP 服务器是被宿主 spawn 的，自己没有这个身份。
-    /// 就地枚举会得到一列「有应用名、没标题」的窗口，调用方据此挑窗口只能靠猜。
     private static func handleListWindows(logger: Logger) async -> CallTool.Result {
         let windows: [WindowInfo]
         do {
             if let appURL = OutOfProcessCapture.currentAppURL {
                 windows = try await OutOfProcessCapture.listWindows(appURL: appURL)
             } else {
-                // 不在 .app 内（单测、裸二进制）：退回就地枚举，至少给出应用名。
                 logger.notice("list_windows: running outside an app bundle; titles may be unavailable")
                 windows = WindowCatalog.all()
             }
@@ -365,55 +509,18 @@ public enum AnShotMCP {
             return errorResult("枚举窗口失败：\(error.localizedDescription)")
         }
 
-        let payload = WindowsPayload(windows: windows)
-
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-
-        guard let data = try? encoder.encode(payload),
-              let json = String(data: data, encoding: .utf8) else {
-            return errorResult("窗口列表序列化失败。")
-        }
-
-        return CallTool.Result(
-            content: [.text(text: json, annotations: nil, _meta: nil)],
-            structuredContent: try? Value(payload),
-            isError: false
-        )
+        return structuredJSONResult(WindowsPayload(windows: windows), failureMessage: "窗口列表序列化失败。")
     }
 
     private static func handleListDisplays() -> CallTool.Result {
-        let displays = DisplayCatalog.all()
-        let payload = DisplaysPayload(displays: displays)
-
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-
-        guard let data = try? encoder.encode(payload),
-              let json = String(data: data, encoding: .utf8) else {
-            return errorResult("显示器列表序列化失败。")
-        }
-
-        return CallTool.Result(
-            content: [.text(text: json, annotations: nil, _meta: nil)],
-            structuredContent: try? Value(payload),
-            isError: false
-        )
+        structuredJSONResult(DisplaysPayload(displays: DisplayCatalog.all()), failureMessage: "显示器列表序列化失败。")
     }
 
     private static func handleListDesktops() -> CallTool.Result {
         do {
-            let payload = DesktopsPayload(desktops: try DesktopCatalog.all())
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-            let data = try encoder.encode(payload)
-            guard let json = String(data: data, encoding: .utf8) else {
-                return errorResult("桌面列表序列化失败。")
-            }
-            return CallTool.Result(
-                content: [.text(text: json, annotations: nil, _meta: nil)],
-                structuredContent: try? Value(payload),
-                isError: false
+            return structuredJSONResult(
+                DesktopsPayload(desktops: try DesktopCatalog.all()),
+                failureMessage: "桌面列表序列化失败。"
             )
         } catch {
             return errorResult("枚举桌面失败：\(error.localizedDescription)")
@@ -434,16 +541,6 @@ public enum AnShotMCP {
         }
 
         do {
-            // 恒走「让 anShot.app 自己截」，不复用宿主进程的授权。
-            //
-            // stdio MCP 服务器**总是**被宿主 spawn 的，因此永远没有自己的
-            // TCC 身份。就地截图会把授权要求推给宿主——用户得给终端或 AI 客户端
-            // 单独开一次录屏权限，而 anShot 已经有这个权限了。给终端录屏权限
-            // 比复用一个已知 app 的既有授权更危险，所以这里不提供开关。
-            //
-            // 落盘推迟到体量检查之后：先截图不落盘，过了检查再按 save_path 保存。
-            // 否则超限时文件已经写下，返回的却是一条不带路径的错误——
-            // 调用方既拿不到图，也不知道磁盘上多了一个文件。
             var captureOnly = parameters
             captureOnly.savePath = nil
             var outcome = try await CaptureRunner.run(
@@ -451,22 +548,23 @@ public enum AnShotMCP {
                 execution: .reuseApplicationAuthorization
             )
 
-            // 体量检查必须在**编码进响应之前**：同一条 JSON-RPC 消息
-            // 若大到让对端卡死，再好的错误信息也传不出去了。
-            try MCPPayloadLimits.validate(pngByteCount: outcome.pngData.count)
+            try MCPPayloadLimits.validate(
+                byteCount: outcome.imageData.count,
+                format: outcome.imageFormat
+            )
 
             if let savePath = parameters.savePath, !savePath.isEmpty {
                 outcome = outcome.withSavedURL(
-                    try CaptureService.save(outcome.pngData, to: savePath)
+                    try CaptureService.save(outcome.imageData, to: savePath)
                 )
             }
 
-            let base64 = outcome.pngData.base64EncodedString()
+            let base64 = outcome.imageData.base64EncodedString()
             return CallTool.Result(
                 content: [
                     .image(
                         data: base64,
-                        mimeType: "image/png",
+                        mimeType: outcome.mimeType,
                         annotations: nil,
                         _meta: nil
                     ),
@@ -479,8 +577,6 @@ public enum AnShotMCP {
                 isError: false
             )
         } catch let error as AutomationError {
-            // 工具级错误用 isError 返回而非抛 JSON-RPC 错误：
-            // 前者会把可读文案交给模型，后者在许多客户端只表现为「工具失败」。
             logger.warning("capture failed: \(error.localizedDescription)")
             return errorResult(error.localizedDescription)
         } catch {
@@ -489,30 +585,356 @@ public enum AnShotMCP {
         }
     }
 
-    // MARK: - 参数解析
+    private static func handleOCRScreenshot(
+        arguments: [String: Value]?,
+        logger: Logger
+    ) async -> CallTool.Result {
+        let parameters: OCRParameters
+        do {
+            parameters = try parseOCR(arguments: arguments)
+        } catch let error as AutomationError {
+            return errorResult(error.localizedDescription)
+        } catch {
+            return errorResult("参数解析失败：\(error.localizedDescription)")
+        }
 
-    /// 把 MCP 参数解析为共享的请求模型。
-    ///
-    /// ── 为何这里只做「形状」检查，不做值域检查 ─────────────────
-    ///
-    /// 值域（区域是否越界、`max_size` 是否非负、坐标是否有限）
-    /// **一律交给 `CaptureParameters.validate()`**。两侧入口共用同一套规则，
-    /// 才能避免「MCP 能过而 CLI 过不了」这类分歧。
-    ///
-    /// ── 为何要显式拒绝未知参数 ──────────────────────────────────
-    ///
-    /// schema 里的 `additionalProperties: false` 只是给客户端的**提示**，
-    /// 服务端不会因此自动拒绝。这里显式拦掉：一个拼错的参数名
-    /// （`maxsize`）若被静默忽略，调用方会得到一张默认尺寸的图，
-    /// 却以为自己的限制生效了。
-    private static func parse(
+        do {
+            let result = try await AutomationOCRService.recognize(
+                parameters,
+                execution: .reuseApplicationAuthorization
+            )
+            return structuredJSONResult(result, failureMessage: "OCR 结果序列化失败。")
+        } catch let error as AutomationError {
+            logger.warning("ocr_screenshot failed: \(error.localizedDescription)")
+            return errorResult(error.localizedDescription)
+        } catch {
+            logger.error("ocr_screenshot failed unexpectedly: \(String(describing: error))")
+            return errorResult("离线文字识别失败：\(error.localizedDescription)")
+        }
+    }
+
+    private static func handleInspectWindowElements(
+        arguments: [String: Value]?,
+        logger: Logger
+    ) async -> CallTool.Result {
+        let parameters: InspectElementsParameters
+        do {
+            parameters = try parseInspectElements(arguments: arguments)
+        } catch let error as AutomationError {
+            return errorResult(error.localizedDescription)
+        } catch {
+            return errorResult("参数解析失败：\(error.localizedDescription)")
+        }
+
+        do {
+            let result = try await AccessibilityInspector.inspect(
+                parameters,
+                execution: .reuseApplicationAuthorization
+            )
+            return structuredJSONResult(result, failureMessage: "控件树结果序列化失败。")
+        } catch let error as AutomationError {
+            logger.warning("inspect_window_elements failed: \(error.localizedDescription)")
+            return errorResult(error.localizedDescription)
+        } catch {
+            logger.error("inspect_window_elements failed unexpectedly: \(String(describing: error))")
+            return errorResult("探测控件树失败：\(error.localizedDescription)")
+        }
+    }
+
+    private static func handleRecordScreen(
+        arguments: [String: Value]?,
+        logger: Logger
+    ) async -> CallTool.Result {
+        let parameters: RecordingParameters
+        do {
+            parameters = try parseRecord(arguments: arguments)
+        } catch let error as AutomationError {
+            return errorResult(error.localizedDescription)
+        } catch {
+            return errorResult("参数解析失败：\(error.localizedDescription)")
+        }
+
+        do {
+            let result = try await RecordingService.record(
+                parameters,
+                execution: .reuseApplicationAuthorization
+            )
+            return structuredJSONResult(result, failureMessage: "录制结果序列化失败。")
+        } catch let error as AutomationError {
+            logger.warning("record_screen failed: \(error.localizedDescription)")
+            return errorResult(error.localizedDescription)
+        } catch {
+            logger.error("record_screen failed unexpectedly: \(String(describing: error))")
+            return errorResult("屏幕录制失败：\(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - 参数解析（internal 便于单元测试直接覆盖）
+
+    /// 把 `capture_screenshot` MCP 参数解析为共享请求模型。
+    static func parse(
         arguments: [String: Value]?
     ) throws -> CaptureParameters {
         let arguments = arguments ?? [:]
 
         let allowedKeys: Set<String> = [
-            "window_id", "app", "display_id", "space_id", "allow_switch", "region", "max_size", "save_path"
+            "window_id", "app", "display_id", "space_id", "allow_switch",
+            "region", "max_size", "format", "quality", "coordinate_grid", "save_path"
         ]
+        try rejectUnknownArguments(in: arguments, allowedKeys: allowedKeys)
+
+        var parameters = CaptureParameters(
+            maxLongEdge: MCPPayloadLimits.defaultMaxLongEdge,
+            autoFallbackToJPEG: true
+        )
+
+        if let raw = arguments["window_id"] {
+            parameters.windowID = try parseWindowID(raw)
+        }
+        if let raw = arguments["app"] {
+            parameters.applicationName = try parseString(raw, name: "app")
+        }
+        if let raw = arguments["display_id"] {
+            parameters.displayID = try parseDisplayID(raw)
+        }
+        if let raw = arguments["space_id"] {
+            parameters.spaceID = try parseSpaceID(raw)
+        }
+        if let raw = arguments["allow_switch"] {
+            parameters.allowDesktopSwitch = try parseBool(raw, name: "allow_switch")
+        }
+        if let raw = arguments["region"] {
+            parameters.region = try parseRegion(raw)
+        }
+        if let raw = arguments["max_size"] {
+            guard let value = raw.intValue else {
+                throw AutomationError.invalidArgument("max_size 必须是整数，收到 \(raw)。")
+            }
+            parameters.maxLongEdge = value
+        }
+        if let raw = arguments["format"] {
+            let rawString = try parseString(raw, name: "format").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard let format = CaptureImageFormat(rawValue: rawString) else {
+                throw AutomationError.invalidArgument("format 仅支持 \"png\" 或 \"jpeg\"，收到「\(rawString)」。")
+            }
+            parameters.outputFormat = format
+            parameters.autoFallbackToJPEG = (format != .png)
+        }
+        if let raw = arguments["quality"] {
+            guard let value = raw.intValue else {
+                throw AutomationError.invalidArgument("quality 必须是整数（1...100），收到 \(raw)。")
+            }
+            parameters.jpegQuality = value
+        }
+        if let raw = arguments["coordinate_grid"] {
+            parameters.coordinateGrid = try parseBool(raw, name: "coordinate_grid")
+        }
+        if let raw = arguments["save_path"] {
+            parameters.savePath = try parseString(raw, name: "save_path")
+        }
+
+        // 入口即做数值边界与格式互斥校验（如 quality 1...100、png+quality 冲突）。
+        if let quality = parameters.jpegQuality {
+            guard (1...100).contains(quality) else {
+                throw AutomationError.invalidArgument("quality 必须在 1 到 100 之间（收到 \(quality)）。")
+            }
+            if parameters.outputFormat == .png {
+                throw AutomationError.invalidArgument("quality 仅适用于 jpeg 格式，不能与 format: \"png\" 同时使用。")
+            }
+        }
+        if let maxSize = parameters.maxLongEdge {
+            guard maxSize >= 0 else {
+                throw AutomationError.invalidArgument("max_size 不能为负：\(maxSize)。")
+            }
+            guard maxSize <= CaptureParameters.maximumLongEdge else {
+                throw AutomationError.invalidArgument(
+                    "max_size 过大：\(maxSize)（上限 \(CaptureParameters.maximumLongEdge)）。"
+                )
+            }
+        }
+
+        return parameters
+    }
+
+    /// 解析 `ocr_screenshot` 参数。
+    static func parseOCR(arguments: [String: Value]?) throws -> OCRParameters {
+        let arguments = arguments ?? [:]
+        let allowedKeys: Set<String> = [
+            "image_path", "window_id", "app", "display_id", "space_id", "allow_switch", "region", "languages"
+        ]
+        try rejectUnknownArguments(in: arguments, allowedKeys: allowedKeys)
+
+        var parameters = OCRParameters()
+        if let raw = arguments["image_path"] {
+            parameters.imagePath = try parseString(raw, name: "image_path")
+        }
+        if let raw = arguments["window_id"] {
+            parameters.windowID = try parseWindowID(raw)
+        }
+        if let raw = arguments["app"] {
+            parameters.applicationName = try parseString(raw, name: "app")
+        }
+        if let raw = arguments["display_id"] {
+            parameters.displayID = try parseDisplayID(raw)
+        }
+        if let raw = arguments["space_id"] {
+            parameters.spaceID = try parseSpaceID(raw)
+        }
+        if let raw = arguments["allow_switch"] {
+            parameters.allowDesktopSwitch = try parseBool(raw, name: "allow_switch")
+        }
+        if let raw = arguments["region"] {
+            parameters.region = try parseRegion(raw)
+        }
+        if let raw = arguments["languages"] {
+            guard let items = raw.arrayValue else {
+                throw AutomationError.invalidArgument("languages 必须是字符串数组。")
+            }
+            parameters.languages = try items.map { item in
+                guard let s = item.stringValue else {
+                    throw AutomationError.invalidArgument("languages 的元素必须是字符串，收到 \(item)。")
+                }
+                return s
+            }
+        }
+
+        // 入口提前校验与 image_path 的互斥性。
+        if let imagePath = parameters.imagePath {
+            if imagePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                throw AutomationError.invalidArgument("image_path 不能为空字符串。")
+            }
+            if parameters.displayID != nil || parameters.spaceID != nil
+                || parameters.allowDesktopSwitch || parameters.region != nil
+                || parameters.windowID != nil || parameters.applicationName != nil {
+                throw AutomationError.invalidArgument(
+                    "image_path 与截屏目标参数（display_id / space_id / allow_switch / region / window_id / app）不能同时使用。"
+                )
+            }
+        }
+        return parameters
+    }
+
+    /// 解析 `inspect_window_elements` 参数。
+    static func parseInspectElements(arguments: [String: Value]?) throws -> InspectElementsParameters {
+        let arguments = arguments ?? [:]
+        let allowedKeys: Set<String> = ["window_id", "app", "pid", "max_depth", "max_elements"]
+        try rejectUnknownArguments(in: arguments, allowedKeys: allowedKeys)
+
+        var parameters = InspectElementsParameters()
+        if let raw = arguments["window_id"] {
+            parameters.windowID = try parseWindowID(raw)
+        }
+        if let raw = arguments["app"] {
+            parameters.applicationName = try parseString(raw, name: "app")
+        }
+        if let raw = arguments["pid"] {
+            guard let value = raw.intValue, value > 0, value <= Int(Int32.max) else {
+                throw AutomationError.invalidArgument("pid 必须是大于 0 的整数，收到 \(raw)。")
+            }
+            parameters.pid = Int32(value)
+        }
+        if let raw = arguments["max_depth"] {
+            guard let value = raw.intValue else {
+                throw AutomationError.invalidArgument("max_depth 必须是整数，收到 \(raw)。")
+            }
+            parameters.maxDepth = value
+        }
+        if let raw = arguments["max_elements"] {
+            guard let value = raw.intValue else {
+                throw AutomationError.invalidArgument("max_elements 必须是整数，收到 \(raw)。")
+            }
+            parameters.maxElements = value
+        }
+
+        try parameters.validate()
+        return parameters
+    }
+
+    /// 解析 `record_screen` 参数。
+    static func parseRecord(arguments: [String: Value]?) throws -> RecordingParameters {
+        let arguments = arguments ?? [:]
+        let allowedKeys: Set<String> = [
+            "window_id", "app", "display_id", "region", "duration", "format", "fps", "max_size", "save_path"
+        ]
+        try rejectUnknownArguments(in: arguments, allowedKeys: allowedKeys)
+
+        var parameters = RecordingParameters()
+        if let raw = arguments["window_id"] {
+            parameters.windowID = try parseWindowID(raw)
+        }
+        if let raw = arguments["app"] {
+            parameters.applicationName = try parseString(raw, name: "app")
+        }
+        if let raw = arguments["display_id"] {
+            parameters.displayID = try parseDisplayID(raw)
+        }
+        if let raw = arguments["region"] {
+            parameters.region = try parseRegion(raw)
+        }
+        if let raw = arguments["duration"] {
+            if let d = raw.doubleValue {
+                parameters.durationSeconds = d
+            } else if let i = raw.intValue {
+                parameters.durationSeconds = Double(i)
+            } else {
+                throw AutomationError.invalidArgument("duration 必须是数字（1...15 秒），收到 \(raw)。")
+            }
+        }
+        if let raw = arguments["format"] {
+            let rawString = try parseString(raw, name: "format").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard let format = RecordingOutputFormat(rawValue: rawString) else {
+                throw AutomationError.invalidArgument("record_screen 的 format 仅支持 \"gif\" 或 \"mp4\"，收到「\(rawString)」。")
+            }
+            parameters.format = format
+        }
+        if let raw = arguments["fps"] {
+            guard let value = raw.intValue else {
+                throw AutomationError.invalidArgument("fps 必须是整数，收到 \(raw)。")
+            }
+            parameters.fps = value
+        }
+        if let raw = arguments["max_size"] {
+            guard let value = raw.intValue else {
+                throw AutomationError.invalidArgument("max_size 必须是整数，收到 \(raw)。")
+            }
+            parameters.maxDimension = value
+        }
+        if let raw = arguments["save_path"] {
+            parameters.savePath = try parseString(raw, name: "save_path")
+        }
+
+        // 先做边界与格式组合校验，确保无效时长/fps/max_size 在 parse 阶段即拦截。
+        guard parameters.durationSeconds.isFinite,
+              parameters.durationSeconds >= RecordingParameters.minimumDurationSeconds,
+              parameters.durationSeconds <= RecordingParameters.maximumDurationSeconds else {
+            throw AutomationError.invalidArgument(
+                "duration 必须在 \(Int(RecordingParameters.minimumDurationSeconds)) 到 "
+                + "\(Int(RecordingParameters.maximumDurationSeconds)) 秒之间（收到 \(parameters.durationSeconds)）。"
+            )
+        }
+        if let fps = parameters.fps {
+            let maxFPS = parameters.format == .gif ? 30 : 60
+            guard (1...maxFPS).contains(fps) else {
+                throw AutomationError.invalidArgument("\(parameters.format.rawValue) 模式下 fps 必须在 1 到 \(maxFPS) 之间（收到 \(fps)）。")
+            }
+        }
+        if let maxDimension = parameters.maxDimension {
+            guard parameters.format == .gif else {
+                throw AutomationError.invalidArgument("max_size 仅在 format: \"gif\" 时支持（MP4 请勿传入 max_size）。")
+            }
+            guard (100...1600).contains(maxDimension) else {
+                throw AutomationError.invalidArgument("GIF max_size 必须在 100 到 1600 之间（收到 \(maxDimension)）。")
+            }
+        }
+        return parameters
+    }
+
+    // MARK: - 解析辅助
+
+    private static func rejectUnknownArguments(
+        in arguments: [String: Value],
+        allowedKeys: Set<String>
+    ) throws {
         let unknown = Set(arguments.keys).subtracting(allowedKeys)
         guard unknown.isEmpty else {
             throw AutomationError.invalidArgument(
@@ -520,75 +942,49 @@ public enum AnShotMCP {
                 + "可用参数：\(allowedKeys.sorted().joined(separator: "、"))。"
             )
         }
-
-        var parameters = CaptureParameters()
-
-        if let raw = arguments["window_id"] {
-            guard let value = raw.intValue else {
-                throw AutomationError.invalidArgument("window_id 必须是整数，收到 \(raw)。")
-            }
-            guard value >= 0, value <= Int(UInt32.max) else {
-                throw AutomationError.invalidArgument("window_id 超出有效范围：\(value)。")
-            }
-            parameters.windowID = CGWindowID(UInt32(value))
-        }
-
-        if let raw = arguments["app"] {
-            guard let value = raw.stringValue else {
-                throw AutomationError.invalidArgument("app 必须是字符串（应用名）。")
-            }
-            parameters.applicationName = value
-        }
-
-        if let raw = arguments["display_id"] {
-            guard let value = raw.intValue else {
-                throw AutomationError.invalidArgument("display_id 必须是整数，收到 \(raw)。")
-            }
-            guard value >= 0, value <= Int(UInt32.max) else {
-                throw AutomationError.invalidArgument("display_id 超出有效范围：\(value)。")
-            }
-            parameters.displayID = CGDirectDisplayID(UInt32(value))
-        }
-
-        if let raw = arguments["space_id"] {
-            guard let value = raw.intValue, value > 0 else {
-                throw AutomationError.invalidArgument("space_id 必须是大于 0 的整数。")
-            }
-            parameters.spaceID = UInt64(value)
-        }
-
-        if let raw = arguments["allow_switch"] {
-            guard let value = raw.boolValue else {
-                throw AutomationError.invalidArgument("allow_switch 必须是布尔值。")
-            }
-            parameters.allowDesktopSwitch = value
-        }
-
-        if let raw = arguments["region"] {
-            parameters.region = try parseRegion(raw)
-        }
-
-        if let raw = arguments["max_size"] {
-            guard let value = raw.intValue else {
-                throw AutomationError.invalidArgument("max_size 必须是整数，收到 \(raw)。")
-            }
-            parameters.maxLongEdge = value
-        }
-
-        if let raw = arguments["save_path"] {
-            guard let value = raw.stringValue else {
-                throw AutomationError.invalidArgument("save_path 必须是字符串。")
-            }
-            parameters.savePath = value
-        }
-
-        return parameters
     }
 
-    /// 解析 `[x, y, width, height]`。
-    ///
-    /// 同时接受整数与浮点：JSON 里 `600` 会被解成 `.int(600)`，
-    /// 而 `600.0` 是 `.double`，两者语义相同，不该一个能用一个报错。
+    private static func parseWindowID(_ raw: Value) throws -> CGWindowID {
+        guard let value = raw.intValue else {
+            throw AutomationError.invalidArgument("window_id 必须是整数，收到 \(raw)。")
+        }
+        guard value >= 0, value <= Int(UInt32.max) else {
+            throw AutomationError.invalidArgument("window_id 超出有效范围：\(value)。")
+        }
+        return CGWindowID(UInt32(value))
+    }
+
+    private static func parseDisplayID(_ raw: Value) throws -> CGDirectDisplayID {
+        guard let value = raw.intValue else {
+            throw AutomationError.invalidArgument("display_id 必须是整数，收到 \(raw)。")
+        }
+        guard value >= 0, value <= Int(UInt32.max) else {
+            throw AutomationError.invalidArgument("display_id 超出有效范围：\(value)。")
+        }
+        return CGDirectDisplayID(UInt32(value))
+    }
+
+    private static func parseSpaceID(_ raw: Value) throws -> UInt64 {
+        guard let value = raw.intValue, value > 0 else {
+            throw AutomationError.invalidArgument("space_id 必须是大于 0 的整数。")
+        }
+        return UInt64(value)
+    }
+
+    private static func parseString(_ raw: Value, name: String) throws -> String {
+        guard let value = raw.stringValue else {
+            throw AutomationError.invalidArgument("\(name) 必须是字符串。")
+        }
+        return value
+    }
+
+    private static func parseBool(_ raw: Value, name: String) throws -> Bool {
+        guard let value = raw.boolValue else {
+            throw AutomationError.invalidArgument("\(name) 必须是布尔值。")
+        }
+        return value
+    }
+
     private static func parseRegion(_ raw: Value) throws -> CGRect {
         guard let items = raw.arrayValue else {
             throw AutomationError.invalidArgument(
@@ -619,19 +1015,14 @@ public enum AnShotMCP {
 
     // MARK: - 结果构造
 
-    /// 附在图像之后的元数据。
-    ///
-    /// 之所以要它：模型看到图像后常需要知道「这是哪块屏、是不是被缩放过」，
-    /// 而缩放与否直接决定它数像素得出的结论是否可靠。
-    private static func metadataText(for outcome: CaptureOutcome) -> String {
+    /// 生成附在图像之后的文本元数据（internal 便于单测校验格式与尺寸透明说明）。
+    static func metadataText(for outcome: CaptureOutcome) -> String {
         let source = outcome.sourcePixelSize
         let output = outcome.pixelSize
         let scaled = source != output
 
         var lines: [String] = []
 
-        // 第一行必须说清「这张图是什么」：窗口截图与整屏截图的后续判断完全不同，
-        // 而模型只能靠这段文字区分二者。
         if let window = outcome.window {
             let name = window.title ?? window.applicationName ?? "未命名窗口"
             lines.append("已捕获窗口 #\(window.windowID)「\(name)」")
@@ -656,6 +1047,22 @@ public enum AnShotMCP {
 
         lines.append("输出尺寸：\(Int(output.width))×\(Int(output.height)) 像素")
 
+        let byteText = formattedByteCount(outcome.imageData.count)
+        switch outcome.imageFormat {
+        case .png:
+            lines.append("编码格式：PNG（\(byteText)）")
+        case .jpeg:
+            let quality = outcome.jpegQuality ?? MCPPayloadLimits.autoJPEGQuality
+            if outcome.didAutoFallbackToJPEG, let origBytes = outcome.originalPNGByteCount {
+                lines.append(
+                    "编码格式：JPEG（quality=\(quality)，\(byteText)；"
+                    + "原 PNG \(formattedByteCount(origBytes)) 超过 3.5 MiB 阈值已自动降级）"
+                )
+            } else {
+                lines.append("编码格式：JPEG（quality=\(quality)，\(byteText)）")
+            }
+        }
+
         if scaled {
             let percent = source.width > 0
                 ? Int((output.width / source.width * 100).rounded())
@@ -675,6 +1082,12 @@ public enum AnShotMCP {
             lines.append("采样区域：整块显示器")
         }
 
+        if outcome.coordinateGridEnabled, let origin = outcome.coordinateGridOrigin {
+            lines.append(
+                "坐标网格：已启用（标尺刻度单位为逻辑点，左上角原点=(\(Int(origin.x.rounded())), \(Int(origin.y.rounded())))）"
+            )
+        }
+
         lines.append("显示器缩放系数：\(outcome.scaleFactor)")
 
         if let saved = outcome.savedURL {
@@ -682,6 +1095,30 @@ public enum AnShotMCP {
         }
 
         return lines.joined(separator: "\n")
+    }
+
+    private static func formattedByteCount(_ bytes: Int) -> String {
+        if bytes >= 1024 * 1024 {
+            return String(format: "%.2f MiB", Double(bytes) / 1024.0 / 1024.0)
+        }
+        return String(format: "%.1f KiB", Double(bytes) / 1024.0)
+    }
+
+    private static func structuredJSONResult<T: Codable>(
+        _ payload: T,
+        failureMessage: String
+    ) -> CallTool.Result {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        guard let data = try? encoder.encode(payload),
+              let json = String(data: data, encoding: .utf8) else {
+            return errorResult(failureMessage)
+        }
+        return CallTool.Result(
+            content: [.text(text: json, annotations: nil, _meta: nil)],
+            structuredContent: try? Value(payload),
+            isError: false
+        )
     }
 
     private static func errorResult(_ message: String) -> CallTool.Result {

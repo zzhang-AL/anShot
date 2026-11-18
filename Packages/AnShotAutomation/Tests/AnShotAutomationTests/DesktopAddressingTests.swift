@@ -17,7 +17,7 @@ struct DesktopAddressingTests {
         #expect(try CommandLineInterface.parse(arguments: arguments).action == .listDesktops)
     }
 
-    @Test("桌面 ID 被解析并透传给截图子进程")
+    @Test("桌面 ID 被解析并经 IPC 请求透传给截图子进程")
     func desktopIDIsForwarded() throws {
         let outcome = try CommandLineInterface.parse(
             arguments: ["anShot", "--capture", "--space", "42", "--switch-desktop"]
@@ -28,13 +28,25 @@ struct DesktopAddressingTests {
         }
         #expect(parameters.spaceID == 42)
         #expect(parameters.allowDesktopSwitch)
-        let args = OutOfProcessCapture.childArguments(
-            parameters: parameters,
-            outputURL: URL(fileURLWithPath: "/tmp/transfer.png"),
-            reportURL: URL(fileURLWithPath: "/tmp/report.json")
+
+        let workspace = try OutOfProcessCapture.createPrivateWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let requestURL = workspace.appendingPathComponent("request.json")
+        let request = IPCRequest(
+            action: .capture(parameters),
+            outputPath: workspace.appendingPathComponent("transfer.png").path,
+            reportPath: workspace.appendingPathComponent("report.json").path,
+            pidFilePath: workspace.appendingPathComponent("child.pid").path,
+            watchdogTimeoutSeconds: 60
         )
-        #expect(args.firstIndex(of: "--space").map { args[$0 + 1] } == "42")
-        #expect(args.contains("--switch-desktop"))
+        try request.write(to: requestURL)
+        let decoded = try IPCRequest.load(from: requestURL.path)
+        guard case .capture(let forwarded) = decoded.action else {
+            Issue.record("期望解码为 .capture")
+            return
+        }
+        #expect(forwarded.spaceID == 42)
+        #expect(forwarded.allowDesktopSwitch)
     }
 
     @Test("无效桌面 ID 与窗口寻址混用被拒绝")

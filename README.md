@@ -89,19 +89,28 @@ ln -sfn "<path-to-anShot>/tools/anshot" ~/.local/bin/anshot
 
 常用命令：
 ```bash
-# 获取当前显示器与窗口列表
+# 获取当前显示器、桌面空间与窗口列表
 anshot list-displays
+anshot list-desktops
 anshot list-windows
 
-# 截取整个主屏并保存
+# 截取整个主屏并保存（支持 --format png|jpeg、--quality 1..100、--coordinate-grid）
 anshot capture --out /tmp/screen.png
+anshot capture --app "Safari" --format jpeg --quality 82 --out /tmp/safari.jpg
 
-# 截取指定应用窗口（即使被遮挡也无需切到前台）
-anshot capture --app "Safari" --out /tmp/safari.png
-
-# 截取特定窗口 ID 或指定逻辑点区域
-anshot capture --window 1234 --out /tmp/window.png
+# 截取特定窗口 ID 或指定逻辑点区域（叠加逻辑点坐标标尺网格）
+anshot capture --window 1234 --coordinate-grid --out /tmp/window.png
 anshot capture --region 0,0,800,600 --out /tmp/region.png
+
+# 离线 OCR 文字识别（截屏或本地图片）
+anshot ocr --app "Safari"
+anshot ocr --image /tmp/screen.png --lang zh-Hans,en-US
+
+# 探测目标窗口/应用内 AX 控件树
+anshot elements --app "Safari" --max-depth 4
+
+# 有界时长录制（1...15 秒）输出 GIF 或 MP4
+anshot record --app "Safari" --duration 4 --format gif --out /tmp/demo.gif
 ```
 
 ### 2. 在 AI 编辑器中接入 MCP (Cursor / Windsurf / Claude Desktop)
@@ -118,12 +127,28 @@ anshot capture --region 0,0,800,600 --out /tmp/region.png
   }
 }
 ```
-*(如果你是源码调试阶段，也可以将 command 换为 `<仓库路径>/tools/anshot`)*
 
-MCP 服务端提供以下三个标准工具：
-- `capture_screenshot`: 截取屏幕、区域或指定后台窗口
-- `list_windows`: 获取当前各桌面上的所有窗口 ID、所有者与标题
-- `list_displays`: 获取系统所有显示器的 ID、名称与分辨率
+源码调试阶段，使用仓库中的 `tools/anshot` 包装脚本（注意参数为 `"mcp"`，而非 `"--mcp"`），或者先执行 `tools/anshot path` 获取本地构建的二进制路径：
+
+```json
+{
+  "mcpServers": {
+    "anshot": {
+      "command": "<仓库路径>/tools/anshot",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+MCP 服务端提供以下七个标准工具：
+- `list_displays`: 获取系统所有显示器的 ID、逻辑尺寸、物理像素尺寸与缩放系数
+- `list_desktops`: 获取各显示器的桌面与全屏空间（`id`、`displayID`、`isCurrent`）
+- `list_windows`: 获取当前各桌面上的所有窗口 ID、应用名与标题
+- `capture_screenshot`: 截取屏幕、区域或指定后台窗口。支持 `format`（`png`/`jpeg`）、`quality`（`1...100`）、`coordinate_grid`（绘制逻辑点坐标标尺网格）；默认 `max_size` 为 `1568`（传 `0` 保留原分辨率），未显式强制 `format: "png"` 且 PNG 超过 `3.5 MiB` 时自动降级为高质量 JPEG（`quality=82`）控制响应体积
+- `ocr_screenshot`: 离线识别屏幕/窗口/区域或本地图片文件中的文字，返回全文与逐行精确像素包围盒
+- `inspect_window_elements`: 探测目标窗口或应用内的辅助功能（AX）控件树（角色、标题与逻辑点坐标框；无辅助功能权限时返回结构化指引）
+- `record_screen`: 录制有界时长（强制 `1...15` 秒）的屏幕/区域/窗口为 GIF 或 MP4 文件路径，供验收动画与交互时序
 
 ---
 
@@ -187,6 +212,11 @@ anShot/
   ```bash
   brew install xcodegen
   ```
+- 准备本地代码签名自签名证书 `"anShot Dev"`（避免每次重编译导致 macOS 屏幕录制 TCC 授权失效）：
+  ```bash
+  ./tools/setup-dev-cert.sh
+  ```
+  *若不需要本地签名仅需验证编译，可在 `xcodebuild` 时传入 `CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""`。*
 
 ### 2. 生成工程与运行
 ```bash
@@ -202,12 +232,13 @@ open anShot.xcodeproj
 ```
 
 ### 3. 运行完整测试套件
-项目各核心逻辑包具备高度覆盖的自动化测试（当前共 570+ 项测试用例）：
+项目各核心逻辑包具备高覆盖率的自动化测试（`AnShotCore`、`AnShotCapture`、`AnShotAutomation`、`AnShotUI` 合计 650+ 项测试用例）：
 ```bash
-# 并行测试所有 SPM 核心包
-for p in AnShotCore AnShotCapture AnShotAutomation AnShotUI; do
+# 依次运行四个 SPM 核心包测试（AnShotUI 需加 --no-parallel 防止 MainActor 定时测试争抢）
+for p in AnShotCore AnShotCapture AnShotAutomation; do
   (cd Packages/$p && swift test)
 done
+(cd Packages/AnShotUI && swift test --no-parallel)
 ```
 
 ### 4. 发布打包

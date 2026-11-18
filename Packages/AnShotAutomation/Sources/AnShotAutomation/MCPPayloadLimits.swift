@@ -30,21 +30,41 @@
 
 import Foundation
 
-/// MCP 响应体量限制。
+/// MCP 响应体量限制与自适应压缩策略。
 enum MCPPayloadLimits {
 
-    /// PNG 原始字节数上限（不含 base64 膨胀）。
-    static let maximumPNGBytes = 16 * 1024 * 1024
+    /// MCP 截图默认长边像素上限（在清晰度与视觉 Token 间取得平衡）。
+    static let defaultMaxLongEdge = 1568
+
+    /// 未显式指定 `format: "png"` 时，触发自动 JPEG 降级的原始 PNG 字节阈值（3.5 MiB）。
+    ///
+    /// 3.5 MiB 经 base64 编码后约为 4.67 MiB，可稳定控制在 Claude 5 MB 单消息红线之下。
+    static let autoJPEGThresholdBytes = 3_670_016
+
+    /// 自动降级为 JPEG 时使用的默认质量（1...100）。
+    static let autoJPEGQuality = 82
+
+    /// 图像原始字节数上限（不含 base64 膨胀）。
+    static let maximumPayloadBytes = 16 * 1024 * 1024
+
+    /// 向后兼容别名：PNG 原始字节数上限（不含 base64 膨胀）。
+    static let maximumPNGBytes = maximumPayloadBytes
 
     /// 校验图像体量。
     ///
-    /// - Parameter pngByteCount: 已编码 PNG 的字节数。
+    /// - Parameters:
+    ///   - byteCount: 已编码图像字节数。
+    ///   - format: 图像编码格式。
     /// - Throws: `AutomationError.invalidArgument` —— 附带上限、实际值与处置建议。
-    static func validate(pngByteCount: Int) throws {
-        guard pngByteCount > maximumPNGBytes else { return }
+    static func validate(byteCount: Int, format: CaptureImageFormat = .png) throws {
+        guard byteCount > maximumPayloadBytes else { return }
 
-        let actualMiB = Double(pngByteCount) / 1024 / 1024
-        let limitMiB = Double(maximumPNGBytes) / 1024 / 1024
+        let actualMiB = Double(byteCount) / 1024 / 1024
+        let limitMiB = Double(maximumPayloadBytes) / 1024 / 1024
+
+        let formatAdvice = format == .png
+            ? "或改用 format: \"jpeg\"（默认 quality=82），"
+            : "或降低 quality（如 75），"
 
         throw AutomationError.invalidArgument(
             String(
@@ -52,9 +72,14 @@ enum MCPPayloadLimits {
                 actualMiB,
                 limitMiB
             )
-            + "请设置 max_size（例如 2560）限制长边，或缩小 region 只截需要的部分。"
+            + "请设置 max_size（例如 1568）限制长边、\(formatAdvice)或缩小 region 只截需要的部分。"
             + "（需要原始分辨率的图请改用命令行 --capture --max-size 0 --out <路径>，"
             + "那条路径写磁盘，不受本节限制。）"
         )
+    }
+
+    /// 兼容原有单参数签名。
+    static func validate(pngByteCount: Int) throws {
+        try validate(byteCount: pngByteCount, format: .png)
     }
 }
