@@ -343,25 +343,90 @@ struct VerticalOverlapTests {
                 "回滚 \(shift) 的 matchRatio 只有 \(match.matchRatio)，答案缺乏依据"
             )
         }
-}
+    }
 
-/// 在图像右侧画一条「滚动条」（竖直亮条）。
-private func paintScrollbar(in image: ScrollshotImage, offset: Int) -> ScrollshotImage {
-    var buffer = image.data
-    let width = image.width
-    let barWidth = 12
-    for y in 0..<image.height {
-        let barTop = offset
-        let barBottom = offset + 120
-        let inside = y >= barTop && y < barBottom
-        for x in (width - barWidth)..<width {
-            let index = (y * width + x) * 4
-            let value: UInt8 = inside ? 90 : 235
-            buffer[index] = value
-            buffer[index + 1] = value
-            buffer[index + 2] = value
+    @Test("可注入二维配准器：同一帧对最多调用 1 次且透传裁剪参数")
+    func injectsTwoDimensionalRegistrarAndInvokesAtMostOnce() throws {
+        // 构造正向匹配不干净的周期+回滚干扰场景，触发二维配准仲裁。
+        let previous = makeFrame(width: 240, height: 320, viewOffset: 100, kind: .periodic(spacing: 24))
+        let next = makeFrame(width: 240, height: 320, viewOffset: 148, kind: .periodic(spacing: 24))
+
+        final class SpyRegistrar: @unchecked Sendable {
+            var calls: [(top: Int, bottom: Int, right: Int)] = []
+        }
+        let spy = SpyRegistrar()
+        let options = VerticalOverlap.Options(
+            ignoreTopRows: 30,
+            ignoreRightColumns: 22,
+            ignoreBottomRows: 18
+        )
+
+        let match = try VerticalOverlap.estimate(
+            previous: previous,
+            next: next,
+            options: options,
+            registrar: { _, _, top, bottom, right in
+                spy.calls.append((top, bottom, right))
+                return VisionRegistrar.Estimate(deltaY: 48)
+            }
+        )
+
+        #expect(match.deltaY == 48)
+        #expect(spy.calls.count <= 1, "同一帧对最多调用 1 次二维配准器，实测 \(spy.calls.count)")
+        if let call = spy.calls.first {
+            // 若首先在翻转分支触发，top/bottom 会按坐标系互换；若在正向触发则保持 (30, 18)。
+            #expect((call.top == 30 && call.bottom == 18) || (call.top == 18 && call.bottom == 30))
+            #expect(call.right == 22)
         }
     }
-    return ScrollshotImage(width: width, height: image.height, data: buffer)!
-}
+
+    @Test("稀疏内容页面（4~11 个高对齐低冲突特征）放行并保留置信度")
+    func sparseMovingContentRetainsConfidence() throws {
+        let width = 200
+        let height = 300
+        let shift = 40
+        // 构造纯白背景上的 3 条分散短线（提供约 6 个运动纹理采样点，少于常规 12 点门槛）。
+        func sparseFrame(offset: Int) -> ScrollshotImage {
+            let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+            let context = CGContext(
+                data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )!
+            context.setFillColor(CGColor(red: 0.98, green: 0.98, blue: 0.98, alpha: 1))
+            context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            context.setFillColor(CGColor(red: 0.1, green: 0.1, blue: 0.1, alpha: 1))
+            for worldY in [80, 140, 200] {
+                let screenY = worldY - offset
+                let y = CGFloat(height - screenY)
+                context.fill(CGRect(x: 30, y: y - 4, width: 80, height: 4))
+            }
+            return ScrollshotImage(context.makeImage()!)!
+        }
+
+        let previous = sparseFrame(offset: 0)
+        let next = sparseFrame(offset: shift)
+        let match = try VerticalOverlap.estimate(previous: previous, next: next)
+        #expect(match.deltaY == shift)
+        #expect(match.confidence > 0, "稀疏但高对齐低冲突帧不应被清零置信度")
     }
+
+    /// 在图像右侧画一条「滚动条」（竖直亮条）。
+    private func paintScrollbar(in image: ScrollshotImage, offset: Int) -> ScrollshotImage {
+        var buffer = image.data
+        let width = image.width
+        let barWidth = 12
+        for y in 0..<image.height {
+            let barTop = offset
+            let barBottom = offset + 120
+            let inside = y >= barTop && y < barBottom
+            for x in (width - barWidth)..<width {
+                let index = (y * width + x) * 4
+                let value: UInt8 = inside ? 90 : 235
+                buffer[index] = value
+                buffer[index + 1] = value
+                buffer[index + 2] = value
+            }
+        }
+        return ScrollshotImage(width: width, height: image.height, data: buffer)!
+    }
+}

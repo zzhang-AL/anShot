@@ -110,7 +110,7 @@ public struct ScrollshotPreview: Sendable {
 /// for frame in captured { _ = session.submit(frame) }
 /// let result = session.result()
 /// ```
-public struct ScrollshotSession {
+public struct ScrollshotSession: Sendable {
 
     // MARK: - 结论
 
@@ -195,7 +195,7 @@ public struct ScrollshotSession {
     /// 存的是 **`worldStart`（世界坐标）而不是图内行号**：图内行号还要减去
     /// `coveredWorldStart`，而后者在会话进行中会变（用户往上滚）。先存世界坐标，
     /// 收尾时再统一重映射，就不会出现「边拼边改行号」那类错位。
-    private struct Segment {
+    private struct Segment: Sendable {
         let frame: ScrollshotFrame
         /// 产生它的帧在提交序列里的下标（首帧为 0）。
         let inputIndex: Int
@@ -368,14 +368,15 @@ public struct ScrollshotSession {
 
     /// 自动检测出的吸顶行数。仅当调用方**未**指定 `stickyHeaderRows` 时有意义。
     public private(set) var detectedStickyRows = 0
+    /// 最近一次可信且具备运动纹理支持的正文对齐行区间，供静止补帧时兜底约束接缝位置。
+    private var lastValidAlignmentRows: Range<Int>?
 
     public init(options: ScrollStitcher.Options = ScrollStitcher.Options()) {
         self.options = options
         self.overlapOptions = options.overlap
-        // 配准也要忽略顶部的固定元素：它们不随滚动移动，混进评分会把位移估计
-        // 往「不动」的方向拉。这里取两者较大值——`stickyHeaderRows` 是页面顶栏，
-        // `unusableTopRows` 是屏幕固定元素，对配准而言都属于「不该看的行」。
+        // 配准也要忽略顶/底部固定元素：它们不随滚动移动，混进评分会把位移估计往「不动」的方向拉。
         self.overlapOptions.ignoreTopRows = max(0, options.stickyHeaderRows, options.unusableTopRows)
+        self.overlapOptions.ignoreBottomRows = max(0, options.unusableBottomRows)
     }
 
     // MARK: - 提交
@@ -411,6 +412,9 @@ public struct ScrollshotSession {
         var matchSource: VerticalOverlap.Match.Source?
         var alignmentRows: Range<Int>?
         if let previous = lastObserved {
+            // 每次配准前同步最新吸顶与底部忽略行数，确保自动检出的固定栏不污染后续配准。
+            overlapOptions.ignoreTopRows = max(0, effectiveStickyRows)
+            overlapOptions.ignoreBottomRows = max(0, options.unusableBottomRows)
             do {
                 let match = try VerticalOverlap.estimate(
                     previous: previous, next: image, options: overlapOptions
@@ -431,8 +435,8 @@ public struct ScrollshotSession {
         }
 
         // 吸顶行检测：用「相邻两帧之间位置不变」这一特征猜出帧顶部的固定行数。
-        // 必须在 `lastObserved` 被本帧覆盖**之前**做。
-        if matched, !options.joinsInsideOverlap, let previous = lastObserved {
+        // 必须在 `lastObserved` 被本帧覆盖**之前**做；`joinsInsideOverlap` 模式下也用作接缝安全边界参考。
+        if matched, let previous = lastObserved {
             detectStickyRows(previous: previous, next: image, delta: delta)
         }
 
@@ -463,6 +467,10 @@ public struct ScrollshotSession {
             && (confidence >= Self.minimumTrustedConfidence || effectivelyStill)
         let effectiveDelta = trusted ? delta : 0
         let candidateOffset = observedOffset + effectiveDelta
+        if trusted, let alignmentRows {
+            lastValidAlignmentRows = alignmentRows
+        }
+        let effectiveAlignment = alignmentRows ?? (effectivelyStill ? lastValidAlignmentRows : nil)
 
         // 本帧覆盖世界的 `[candidateOffset, candidateOffset + height)`；其中开头
         // `stickyRows` 行是固定顶栏（只在最终输出顶端出现一次，不重复计入），
@@ -478,8 +486,8 @@ public struct ScrollshotSession {
         let frameBottom = candidateOffset + image.height - bottomRows
         // 区间外的新帧不能扩张已覆盖边界：两段之间没有任何像素可供填充，
         // compose、预览和明细切片都会把这段空洞显示成黑色断层。
-        let alignmentStart = candidateOffset + (alignmentRows?.lowerBound ?? 0)
-        let alignmentEnd = candidateOffset + (alignmentRows?.upperBound ?? image.height)
+        let alignmentStart = candidateOffset + (effectiveAlignment?.lowerBound ?? 0)
+        let alignmentEnd = candidateOffset + (effectiveAlignment?.upperBound ?? image.height)
         let connectsToCoverage = frameTop <= coveredWorldEnd && frameBottom >= coveredWorldStart
             && (!options.joinsInsideOverlap
                 || max(coveredWorldStart, alignmentStart) < min(coveredWorldEnd, alignmentEnd))
@@ -598,8 +606,24 @@ public struct ScrollshotSession {
             // 向上扩展丢远端（更靠上的）。两端一致，用户看到的是「从当前进度往外接」
             // 的连续内容，而不是中间横插一段。
             if options.joinsInsideOverlap {
-                let overlapStart = max(coveredWorldStart, candidateOffset + (alignmentRows?.lowerBound ?? 0))
-                let overlapEnd = min(coveredWorldEnd, candidateOffset + (alignmentRows?.upperBound ?? image.height))
+                // 静止补帧或弱纹理帧下，结合最近有效正文区间与吸顶/底栏安全边界钳制接缝中点，避免渗入固定栏。
+                let safeTop = max(0, min(image.height - 1, max(effectiveStickyRows, options.unusableTopRows)))
+                let safeBottom = max(safeTop, image.height - max(0, options.unusableBottomRows))
+                let safeFrameRange: Range<Int>
+                if let active = effectiveAlignment {
+                    let clampedLower = max(active.lowerBound, safeTop)
+                    let clampedUpper = min(active.upperBound, safeBottom)
+                    safeFrameRange = clampedLower < clampedUpper ? (clampedLower..<clampedUpper) : active
+                } else {
+                    safeFrameRange = safeTop..<safeBottom
+                }
+                let rawOverlapStart = max(coveredWorldStart, candidateOffset + (effectiveAlignment?.lowerBound ?? 0))
+                let rawOverlapEnd = min(coveredWorldEnd, candidateOffset + (effectiveAlignment?.upperBound ?? image.height))
+                let safeOverlapStart = max(coveredWorldStart, candidateOffset + safeFrameRange.lowerBound)
+                let safeOverlapEnd = min(coveredWorldEnd, candidateOffset + safeFrameRange.upperBound)
+                let (overlapStart, overlapEnd) = safeOverlapStart < safeOverlapEnd
+                    ? (safeOverlapStart, safeOverlapEnd)
+                    : (rawOverlapStart, rawOverlapEnd)
                 let seam = overlapStart + max(0, overlapEnd - overlapStart) / 2
                 if sourceStart >= coveredWorldStart {
                     let end = coveredWorldEnd + acceptedRows
@@ -704,16 +728,16 @@ public struct ScrollshotSession {
         // 段按**世界坐标**排序 = 输出顺序。用户可能先往下拼、再往上扩展，
         // 采纳顺序与输出顺序因此不再一致，这里必须按坐标排。
         let ordered = segments.sorted { $0.worldStart < $1.worldStart }
-        let seamRows = ordered
-            .filter { $0.inputIndex != 0 }
-            .map { $0.worldStart - coveredWorldStart }
+        // 第一段从输出第 0 行起铺，后续每段的起始位置减去起点才是真正的段间接缝行号。
+        let seamRows = ordered.dropFirst().map { $0.worldStart - coveredWorldStart }
         let image = ScrollStitcher.compose(
             segments: ordered.map {
                 (source: $0.frame.image, sourceY: $0.sourceY - $0.imageRowOffset, rows: $0.rows,
                  outputY: $0.worldStart - coveredWorldStart)
             },
             width: first.width,
-            height: outputHeight
+            height: outputHeight,
+            colorSpace: first.colorSpace
         )
         // 尺寸不一致属逐帧告警，但它会让用户看到的长图缺一块，必须在整体告警里也有。
         var planWarnings = resultWarnings
@@ -869,7 +893,7 @@ public struct ScrollshotSession {
         let requestedRows = worldRows.count
         let sourceBytesPerRow = sourceWidth * 4
         let outputBytesPerRow = outputWidth * 4
-        var buffer = [UInt8](repeating: 0, count: outputWidth * outputHeight * 4)
+        var buffer = Data(count: outputWidth * outputHeight * 4)
 
         // 列映射预计算：用户在拖动定位框时本方法会被连续调用（每帧一次），
         // 把每次采样都要做的整数除法提到循环外是实打实的提速。
@@ -884,8 +908,8 @@ public struct ScrollshotSession {
         let ordered = segments.sorted { $0.worldStart < $1.worldStart }
         var segmentIndex = 0
 
-        buffer.withUnsafeMutableBufferPointer { out in
-            guard let outBase = out.baseAddress else { return }
+        buffer.withUnsafeMutableBytes { rawOut in
+            guard let outBase = rawOut.bindMemory(to: UInt8.self).baseAddress else { return }
             for outY in 0..<outputHeight {
                 // 输出行 → 世界行（`outY` 单调递增，所以世界行也单调，指针只需前进）。
                 let worldRow = start + outY * requestedRows / outputHeight
@@ -920,7 +944,12 @@ public struct ScrollshotSession {
             }
         }
 
-        return ScrollshotImage(width: outputWidth, height: outputHeight, data: buffer)
+        return ScrollshotImage(
+            width: outputWidth,
+            height: outputHeight,
+            data: buffer,
+            colorSpace: first.colorSpace
+        )
     }
 
     // MARK: - 吸顶行检测
@@ -989,7 +1018,7 @@ public struct ScrollshotSession {
         guard abs(delta) > options.duplicateDeltaThreshold else { return }
         guard next.width == previous.width, next.height == previous.height else { return }
 
-        let scanRows = min(next.height / 3, Self.stickyScanMaxRows)
+        let scanRows = min(next.height, max(Self.stickyScanMaxRows, next.height / 3))
         let shift = abs(delta)
         let height = next.height
         guard scanRows > 0, shift < height else { return }
@@ -1013,33 +1042,53 @@ public struct ScrollshotSession {
                     guard y + shift < height else { continue }
                     var sameSum = 0
                     var shiftedSum = 0
-                    // 行内亮度极值：用来判断这一行**有没有内容**（空白行的采样点几乎同值）。
-                    var rowMin = 255
-                    var rowMax = 0
+                    // 行内亮度与三通道极值：兼顾深底蓝/绿导航栏，避免仅读 Red 通道漏检。
+                    var lumaMin = 255
+                    var lumaMax = 0
+                    var rMin = 255
+                    var rMax = 0
+                    var gMin = 255
+                    var gMax = 0
+                    var bMin = 255
+                    var bMax = 0
                     for index in 0..<columns {
                         let x = min(width - 1, index * width / columns)
                         let baseOffset = (y * width + x) * 4
                         let sameOffset = (y * width + x) * 4
                         let shiftedOffset = ((y + shift) * width + x) * 4
-                        let luminance = Int(b[baseOffset])
-                        rowMin = min(rowMin, luminance)
-                        rowMax = max(rowMax, luminance)
-                        sameSum += abs(Int(b[baseOffset]) - Int(m[sameOffset]))
-                            + abs(Int(b[baseOffset + 1]) - Int(m[sameOffset + 1]))
-                            + abs(Int(b[baseOffset + 2]) - Int(m[sameOffset + 2]))
-                        shiftedSum += abs(Int(b[baseOffset]) - Int(m[shiftedOffset]))
-                            + abs(Int(b[baseOffset + 1]) - Int(m[shiftedOffset + 1]))
-                            + abs(Int(b[baseOffset + 2]) - Int(m[shiftedOffset + 2]))
+                        let r = Int(b[baseOffset])
+                        let g = Int(b[baseOffset + 1])
+                        let bl = Int(b[baseOffset + 2])
+                        let luminance = (77 * r + 150 * g + 29 * bl) >> 8
+                        lumaMin = min(lumaMin, luminance)
+                        lumaMax = max(lumaMax, luminance)
+                        rMin = min(rMin, r)
+                        rMax = max(rMax, r)
+                        gMin = min(gMin, g)
+                        gMax = max(gMax, g)
+                        bMin = min(bMin, bl)
+                        bMax = max(bMax, bl)
+                        sameSum += abs(r - Int(m[sameOffset]))
+                            + abs(g - Int(m[sameOffset + 1]))
+                            + abs(bl - Int(m[sameOffset + 2]))
+                        shiftedSum += abs(r - Int(m[shiftedOffset]))
+                            + abs(g - Int(m[shiftedOffset + 1]))
+                            + abs(bl - Int(m[shiftedOffset + 2]))
                     }
                     let sameAverage = Double(sameSum) / Double(columns) / 3
                     let shiftedAverage = Double(shiftedSum) / Double(columns) / 3
+                    let lumaSpan = lumaMax - lumaMin
+                    let rSpan = rMax - rMin
+                    let gSpan = gMax - gMin
+                    let bSpan = bMax - bMin
+                    let rowSpan = max(lumaSpan, max(rSpan, max(gSpan, bSpan)))
                     // 四个条件缺一不可：
                     //  1) 这一行**自己有内容**（空白行的「相同」不是「固定」，是「没东西」）；
                     //  2) 同位置足够像；
                     //  3) 滚动位置确实不一样（没有对比就没有判断依据）；
                     //  4) 同位置确实比滚动位置更像。
                     // 详见 stickyRowContent / stickyRowContrast 的说明。
-                    unchanged[y] = Double(rowMax - rowMin) >= Self.stickyRowContent
+                    unchanged[y] = Double(rowSpan) >= Self.stickyRowContent
                         && sameAverage <= Self.stickyRowTolerance
                         && shiftedAverage >= Self.stickyRowContrast
                         && sameAverage < shiftedAverage
@@ -1147,11 +1196,16 @@ public struct ScrollshotSession {
         )
         return decisions.map { decision -> ScrollStitcher.FrameDecision in
             guard let segment = byIndex[decision.inputIndex] else {
+                // 若先前曾被采纳但最终段已被后续帧的接缝完全替换覆盖，须保持审计状态自洽。
+                let effectiveVerdict: Verdict = decision.verdict == .accepted ? .alreadyCovered : decision.verdict
+                let effectiveWarnings = decision.verdict == .accepted
+                    ? decision.warnings + ["已被后续接缝完全覆盖"]
+                    : decision.warnings
                 return ScrollStitcher.FrameDecision(
                     inputIndex: decision.inputIndex, deltaY: decision.deltaY,
                     confidence: decision.confidence, worldOffset: decision.worldOffset,
-                    verdict: decision.verdict, outputY: nil, rows: 0,
-                    warnings: decision.warnings
+                    verdict: effectiveVerdict, outputY: nil, rows: 0,
+                    warnings: effectiveWarnings
                 )
             }
             return ScrollStitcher.FrameDecision(

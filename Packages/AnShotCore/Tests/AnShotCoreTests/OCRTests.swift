@@ -96,6 +96,45 @@ struct OCRTests {
         #expect(ordered == ["第一行左", "第一行右", "第二行左", "第二行右"])
     }
 
+    @Test("多栏阶梯框满足严格弱序且排序确定性")
+    func staggeredColumnsHaveDeterministicOrder() {
+        func line(_ text: String, x: Double, y: Double, width: Double = 40, height: Double = 10) -> OCRTextLine {
+            OCRTextLine(
+                text: text, candidates: [], confidence: 0.9,
+                boundingBox: PixelRect(
+                    origin: PixelPoint(x: x, y: y),
+                    size: PixelSize(width: width, height: height)
+                )
+            )
+        }
+        // 审查报告反例：A(y:0..10)、B(y:4..14)、C(y:8..18) 在旧比较器下会形成循环比较。
+        let a = line("A", x: 200, y: 0)
+        let b = line("B", x: 100, y: 4)
+        let c = line("C", x: 0, y: 8)
+        let expected = ["B", "A", "C"]
+
+        // 无论输入如何排列，输出必须完全确定。
+        let permutations = [
+            [a, b, c],
+            [c, b, a],
+            [b, c, a],
+            [a, c, b],
+        ]
+        for input in permutations {
+            #expect(OCRResult.readingOrder(input).map(\.text) == expected)
+        }
+
+        // 覆盖行带内多列与多行交错情形。
+        let multi = [
+            line("R2C3", x: 300, y: 40, height: 14),
+            line("R1C2", x: 150, y: 12, height: 14),
+            line("R2C1", x: 20, y: 42, height: 14),
+            line("R1C1", x: 20, y: 10, height: 14),
+            line("R2C2", x: 150, y: 39, height: 14),
+        ]
+        #expect(OCRResult.readingOrder(multi).map(\.text) == ["R1C1", "R1C2", "R2C1", "R2C2", "R2C3"])
+    }
+
     @Test("纯文本按行拼接")
     func plainText() {
         let result = OCRResult(

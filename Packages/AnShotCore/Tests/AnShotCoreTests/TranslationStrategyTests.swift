@@ -73,9 +73,15 @@ struct TranslationLanguageTests {
         #expect(TranslationLanguage.isSameLanguage("EN-us", "en"))
     }
 
-    @Test("脚本差异算不同语言（简繁转换是用户可能真想要的）")
+    @Test("脚本差异与无脚本中文简繁地区差异均能区分")
     func scriptMatters() {
         #expect(TranslationLanguage.isSameLanguage("zh-Hans", "zh-Hant") == false)
+        #expect(TranslationLanguage.isSameLanguage("zh-CN", "zh-TW") == false)
+        #expect(TranslationLanguage.isSameLanguage("zh-SG", "zh-HK") == false)
+        #expect(TranslationLanguage.isSameLanguage("zh-CN", "zh-Hans") == true)
+        #expect(TranslationLanguage.isSameLanguage("zh-TW", "zh-Hant") == true)
+        #expect(TranslationLanguage.isSameLanguage("zh-MO", "zh-Hant") == true)
+        #expect(TranslationLanguage.isSameLanguage("zh-MY", "zh-Hans") == true)
     }
 
     @Test("缺失或空标识不参与判定")
@@ -87,11 +93,19 @@ struct TranslationLanguageTests {
         #expect(TranslationLanguage.isSameLanguage("en-US", nil) == false)
     }
 
-    @Test("规范化丢掉区域与变体、保留脚本")
+    @Test("规范化丢掉区域与变体、保留脚本并推导中文简繁")
     func normalization() {
         #expect(TranslationLanguage.normalized("EN_us") == "en")
         #expect(TranslationLanguage.normalized("zh-Hant-TW") == "zh-hant")
         #expect(TranslationLanguage.normalized("zh-Hans-CN") == "zh-hans")
+        #expect(TranslationLanguage.normalized("zh-Hans-TW") == "zh-hans")
+        #expect(TranslationLanguage.normalized("zh-TW") == "zh-hant")
+        #expect(TranslationLanguage.normalized("zh_hk") == "zh-hant")
+        #expect(TranslationLanguage.normalized("zh-MO") == "zh-hant")
+        #expect(TranslationLanguage.normalized("zh-CN") == "zh-hans")
+        #expect(TranslationLanguage.normalized("zh_sg") == "zh-hans")
+        #expect(TranslationLanguage.normalized("zh-MY") == "zh-hans")
+        #expect(TranslationLanguage.normalized("zh") == "zh")
         #expect(TranslationLanguage.normalized("") == "")
         #expect(TranslationLanguage.normalized("  ") == "")
     }

@@ -39,8 +39,49 @@
 
 import Foundation
 
+/// 二维平移配准器协议，用于将 `VerticalOverlap` 与具体二维配准实现解耦。
+public protocol ScrollshotTwoDimensionalRegistering: Sendable {
+    func estimate(
+        previous: ScrollshotImage,
+        next: ScrollshotImage,
+        topCrop: Int,
+        bottomCrop: Int,
+        rightCrop: Int
+    ) -> VisionRegistrar.Estimate?
+}
+
+/// 默认基于 Apple Vision 的二维平移配准器。
+public struct VisionTwoDimensionalRegistrar: ScrollshotTwoDimensionalRegistering {
+    public init() {}
+
+    public func estimate(
+        previous: ScrollshotImage,
+        next: ScrollshotImage,
+        topCrop: Int,
+        bottomCrop: Int,
+        rightCrop: Int
+    ) -> VisionRegistrar.Estimate? {
+        VisionRegistrar.estimate(
+            previous: previous,
+            next: next,
+            topCrop: topCrop,
+            bottomCrop: bottomCrop,
+            rightCrop: rightCrop
+        )
+    }
+}
+
 /// 竖直平移配准。
 public enum VerticalOverlap {
+
+    /// 可注入的二维平移配准闭包类型。
+    public typealias TwoDimensionalRegistrar = @Sendable (
+        _ previous: ScrollshotImage,
+        _ next: ScrollshotImage,
+        _ topCrop: Int,
+        _ bottomCrop: Int,
+        _ rightCrop: Int
+    ) -> VisionRegistrar.Estimate?
 
     // MARK: - 参数
 
@@ -56,6 +97,8 @@ public enum VerticalOverlap {
         public var maxOverlapRatio: Double
         /// 忽略顶部若干行（**吸顶栏所在区域**）。
         public var ignoreTopRows: Int
+        /// 忽略底部若干行（**固定底栏/输入栏所在区域**）。
+        public var ignoreBottomRows: Int
         /// 忽略左侧列（例如固定侧栏）。
         public var ignoreLeftColumns: Int
         /// 忽略右侧列（**滚动条**通常在这里）。
@@ -72,11 +115,13 @@ public enum VerticalOverlap {
             ignoreLeftColumns: Int = 0,
             ignoreRightColumns: Int = 0,
             sampleColumns: Int = 48,
-            sampleRows: Int = 64
+            sampleRows: Int = 64,
+            ignoreBottomRows: Int = 0
         ) {
             self.minOverlapRatio = minOverlapRatio
             self.maxOverlapRatio = maxOverlapRatio
             self.ignoreTopRows = ignoreTopRows
+            self.ignoreBottomRows = ignoreBottomRows
             self.ignoreLeftColumns = ignoreLeftColumns
             self.ignoreRightColumns = ignoreRightColumns
             self.sampleColumns = sampleColumns
@@ -268,11 +313,66 @@ public enum VerticalOverlap {
     /// 正向路径必须保持原样。
     ///
     /// - Returns: 尺寸不一致时抛 `shapeMismatch`；搜索区间内没有任何候选时抛 `noCandidate`。
+    /// 默认使用 `VisionRegistrar` 求解 `previous` → `next` 的竖直位移。
     public static func estimate(
         previous: ScrollshotImage,
         next: ScrollshotImage,
         options: Options = Options()
     ) throws -> Match {
+        try estimate(
+            previous: previous,
+            next: next,
+            options: options,
+            registrar: { prev, nxt, topCrop, bottomCrop, rightCrop in
+                VisionRegistrar.estimate(
+                    previous: prev,
+                    next: nxt,
+                    topCrop: topCrop,
+                    bottomCrop: bottomCrop,
+                    rightCrop: rightCrop
+                )
+            }
+        )
+    }
+
+    /// 使用协议抽象的二维配准器求解 `previous` → `next` 的竖直位移。
+    public static func estimate(
+        previous: ScrollshotImage,
+        next: ScrollshotImage,
+        options: Options = Options(),
+        registrar: any ScrollshotTwoDimensionalRegistering
+    ) throws -> Match {
+        try estimate(
+            previous: previous,
+            next: next,
+            options: options,
+            registrar: { prev, nxt, topCrop, bottomCrop, rightCrop in
+                registrar.estimate(
+                    previous: prev,
+                    next: nxt,
+                    topCrop: topCrop,
+                    bottomCrop: bottomCrop,
+                    rightCrop: rightCrop
+                )
+            }
+        )
+    }
+
+    /// 估计 `previous` → `next` 的竖直位移（有符号，负值为回滚），支持注入二维配准器。
+    ///
+    /// - Returns: 尺寸不一致时抛 `shapeMismatch`；搜索区间内没有任何候选时抛 `noCandidate`。
+    public static func estimate(
+        previous: ScrollshotImage,
+        next: ScrollshotImage,
+        options: Options = Options(),
+        registrar: TwoDimensionalRegistrar
+    ) throws -> Match {
+        guard previous.width == next.width, previous.height == next.height else {
+            throw Failure.shapeMismatch(
+                previousWidth: previous.width, previousHeight: previous.height,
+                nextWidth: next.width, nextHeight: next.height
+            )
+        }
         if let translation = ScrollshotRowTranslation.estimate(previous: previous, next: next, options: options),
            let quality = evaluateCandidate(previous: previous, next: next, delta: translation.delta, options: options) {
             let candidate = Match(
@@ -297,24 +397,39 @@ public enum VerticalOverlap {
             let validated = validateMovingContent(candidate, previous: previous, next: next, options: options)
             if validated.confidence > 0 { return validated }
         }
-        let candidate = try estimate(previous: previous, next: next, options: options, allowFlip: true)
-        let validated = validateMovingContent(candidate, previous: previous, next: next, options: options)
-        if validated.confidence > 0 { return validated }
-        // 字体的相位变化会使两个方向的原始逐点评分不同。正向候选未通过
-        // 独立校验时，反向求解后仍在原图坐标内验证，不能只比较旧评分便放弃。
-        if let reverse = try? estimate(previous: next, next: previous, options: options, allowFlip: true) {
-            let alternate = Match(
-                deltaY: -reverse.deltaY, overlapRows: reverse.overlapRows,
-                confidence: reverse.confidence, score: reverse.score,
-                secondBestScore: reverse.secondBestScore, evidence: reverse.evidence,
-                matchRatio: reverse.matchRatio, reversed: true,
-                source: .reverseKernel, visionArbitrated: reverse.visionArbitrated
+
+        // 在单次配准调用生命周期内缓存定向内核与二维配准结果，杜绝重复穷举与多次 Vision 调用。
+        return try withoutActuallyEscaping(registrar) { escapingRegistrar in
+            let cache = RegistrationCache(
+                previous: previous,
+                next: next,
+                options: options,
+                registrar: escapingRegistrar
             )
-            let checked = validateMovingContent(alternate, previous: previous, next: next, options: options)
-            // 竞争方向须提供明确证据，不能用周期内容的低置信度别名替换原先验。
-            if checked.confidence >= 0.5 { return checked }
+            let candidate = try estimate(
+                reversed: false,
+                allowFlip: true,
+                cache: cache
+            )
+            let validated = validateMovingContent(candidate, previous: previous, next: next, options: options)
+            if validated.confidence > 0 { return validated }
+
+            // 字体的相位变化会使两个方向的原始逐点评分不同。正向候选未通过
+            // 独立校验时，复用缓存中的反向求解并在原图坐标内验证。
+            if let reverse = try? estimate(reversed: true, allowFlip: true, cache: cache) {
+                let alternate = Match(
+                    deltaY: -reverse.deltaY, overlapRows: reverse.overlapRows,
+                    confidence: reverse.confidence, score: reverse.score,
+                    secondBestScore: reverse.secondBestScore, evidence: reverse.evidence,
+                    matchRatio: reverse.matchRatio, reversed: true,
+                    source: .reverseKernel, visionArbitrated: reverse.visionArbitrated
+                )
+                let checked = validateMovingContent(alternate, previous: previous, next: next, options: options)
+                // 竞争方向须提供明确证据，不能用周期内容的低置信度别名替换原先验。
+                if checked.confidence >= 0.5 { return checked }
+            }
+            return validated
         }
-        return validated
     }
 
     /// 独立检查真正移动的纹理，不让共同背景或固定栏为错误位移背书。
@@ -398,7 +513,12 @@ public enum VerticalOverlap {
                 lastAlignedRow = resampled.lastRow
             }
         }
-        let valid = features >= 12 && supportedRows >= 3 && ratio >= 0.8
+        let conflicts = features - aligned
+        let isDenseValid = features >= 12 && supportedRows >= 3 && ratio >= 0.8
+        // 稀疏页面（如大量留白的设置页/空列表）只要对齐率高且冲突极少，也保留原有置信度。
+        let isSparseValid = features >= 4 && features < 12
+            && supportedRows >= 2 && ratio >= 0.9 && conflicts <= 1
+        let valid = isDenseValid || isSparseValid
         return Match(
             deltaY: candidate.deltaY, overlapRows: candidate.overlapRows,
             confidence: valid ? candidate.confidence : 0,
@@ -460,30 +580,112 @@ public enum VerticalOverlap {
                 firstRows[winner], lastRows[winner])
     }
 
-    /// `estimate` 的实现体。
-    ///
-    /// `allowFlip` 存在只是为了**防递归**：翻转分支会把翻转后的两帧再交给本函数
-    /// 走完整流程（内核正向 → Vision 仲裁 → 反向内核），若翻转世界里的正向也不
-    /// 干净，它会想再翻一次——翻回去正好是最初的两帧，就成了无限递归。
-    ///
-    /// 翻转世界是**一次性**的变换（翻两次回到原点），所以只需一层。
+    /// 单次配准过程的状态缓存，保证同一帧对最多只调用 1 次二维配准器且不重复跑定向穷举。
+    private final class RegistrationCache {
+        private struct PairKey: Hashable {
+            let reversed: Bool
+            let flipped: Bool
+        }
+
+        let originalPrevious: ScrollshotImage
+        let originalNext: ScrollshotImage
+        let options: Options
+        private let registrar: TwoDimensionalRegistrar
+
+        private var flippedPair: (previous: ScrollshotImage, next: ScrollshotImage)?
+        private var directedResults: [PairKey: Result<Match, Error>] = [:]
+        private var hasInvokedRegistrar = false
+        /// 归一化到 `(reversed: false, flipped: false)` 原图方向上的二维配准估计。
+        private var canonicalVisionEstimate: VisionRegistrar.Estimate?
+
+        init(
+            previous: ScrollshotImage,
+            next: ScrollshotImage,
+            options: Options,
+            registrar: @escaping TwoDimensionalRegistrar
+        ) {
+            self.originalPrevious = previous
+            self.originalNext = next
+            self.options = options
+            self.registrar = registrar
+        }
+
+        func pair(reversed: Bool, flipped: Bool) -> (previous: ScrollshotImage, next: ScrollshotImage)? {
+            if !flipped {
+                return reversed ? (originalNext, originalPrevious) : (originalPrevious, originalNext)
+            }
+            if flippedPair == nil {
+                guard let fp = flippedVertically(originalPrevious),
+                      let fn = flippedVertically(originalNext) else { return nil }
+                flippedPair = (fp, fn)
+            }
+            guard let pair = flippedPair else { return nil }
+            return reversed ? (pair.next, pair.previous) : (pair.previous, pair.next)
+        }
+
+        func directedMatch(reversed: Bool, flipped: Bool) throws -> Match {
+            let key = PairKey(reversed: reversed, flipped: flipped)
+            if let cached = directedResults[key] {
+                return try cached.get()
+            }
+            guard let images = pair(reversed: reversed, flipped: flipped) else {
+                throw Failure.noCandidate
+            }
+            do {
+                let match = try estimateDirected(
+                    previous: images.previous,
+                    next: images.next,
+                    options: options
+                )
+                directedResults[key] = .success(match)
+                return match
+            } catch {
+                directedResults[key] = .failure(error)
+                throw error
+            }
+        }
+
+        func visionEstimate(reversed: Bool, flipped: Bool) -> VisionRegistrar.Estimate? {
+            let sign = (reversed != flipped) ? -1 : 1
+            if hasInvokedRegistrar {
+                guard let canonical = canonicalVisionEstimate else { return nil }
+                return VisionRegistrar.Estimate(
+                    deltaY: canonical.deltaY * sign,
+                    rawShift: canonical.rawShift * Double(sign)
+                )
+            }
+            hasInvokedRegistrar = true
+            guard let images = pair(reversed: reversed, flipped: flipped) else {
+                canonicalVisionEstimate = nil
+                return nil
+            }
+            let topCrop = flipped ? max(0, options.ignoreBottomRows) : max(0, options.ignoreTopRows)
+            let bottomCrop = flipped ? max(0, options.ignoreTopRows) : max(0, options.ignoreBottomRows)
+            let width = min(images.previous.width, images.next.width)
+            let defaultScrollbarCrop = width >= 100 ? min(32, width / 20) : 0
+            let rightCrop = max(0, max(options.ignoreRightColumns, defaultScrollbarCrop))
+            let result = registrar(images.previous, images.next, topCrop, bottomCrop, rightCrop)
+            canonicalVisionEstimate = result.map {
+                VisionRegistrar.Estimate(
+                    deltaY: $0.deltaY * sign,
+                    rawShift: $0.rawShift * Double(sign)
+                )
+            }
+            return result
+        }
+    }
+
+    /// `estimate` 的内部实现体（基于缓存上下文执行）。
     private static func estimate(
-        previous: ScrollshotImage,
-        next: ScrollshotImage,
-        options: Options,
-        allowFlip: Bool
+        reversed: Bool,
+        allowFlip: Bool,
+        cache: RegistrationCache
     ) throws -> Match {
-        // 正向**连候选都找不到**时不能直接向外抛：向上回滚在正向假设（内容上移）
-        // 下本就无解，而回滚正是本函数的正常输入之一（见上文「为什么可能跑两次」）。
-        // 直接抛的后果不是「少接一帧」——编排层把它记成 `unresolved`，连续三帧
-        // 就判定跟丢、换基准，用户看到「内容跳变」。所以这里换反向重试。
-        //
-        // 反向也失败才把**正向的错误**抛出去：正向是主路径，它的失败原因更具代表性。
         let forward: Match
         do {
-            forward = try estimateDirected(previous: previous, next: next, options: options)
+            forward = try cache.directedMatch(reversed: reversed, flipped: false)
         } catch {
-            let reverse = try estimateDirected(previous: next, next: previous, options: options)
+            let reverse = try cache.directedMatch(reversed: !reversed, flipped: false)
             return Match(
                 deltaY: -reverse.deltaY,
                 overlapRows: reverse.overlapRows,
@@ -498,37 +700,10 @@ public enum VerticalOverlap {
             )
         }
 
-        // 快路径：正向匹配干净就直接返回，不付任何额外代价（来源即 `.kernel`）。
-        //
-        // **为什么不把「分离度低（疑似周期别名）」也算进触发条件**：试过，且实测
-        // 把严格周期内容判坏了。等距横线（内容完全重复）下，内核的先验偏置
-        // 「同分取更小的 delta」恰好给出正确答案（实测位移 5px、周期 28px 时给出 5），
-        // 而 Vision 给出 285 = 5 + 10×28 —— 纯别名。**严格周期内容单帧本就无解**，
-        // 此时内核「偏好重叠更多」的先验比二维配准的任意答案更安全。
-        // 真实内容（终端、代码、列表）都是「行距固定但每行不同」，属于另一种情形，
-        // 那时正向匹配本就不干净，会被下面的分支接住。
         guard forward.matchRatio < cleanMatchRatio else { return forward }
 
-        // ── 回滚优先走「翻转」，这一步比问 Vision 便宜得多 ──────────
-        //
-        // 正向不干净时最可能的解释是用户在往上回滚（见下）。而回滚在内核眼里
-        // 是「内容下移」，恰好与内核假设相反，所以过去只能请 Vision 兜底。
-        //
-        // 把两帧**各自上下翻转**（行序反转）后，内容下移在几何上就变成了内容
-        // 上移——不只是换了个说法，而是内核那套先验（同分取更小 delta）重新
-        // 成立。实测同一对真实帧（上滚 995px，视口 1406px）：
-        //
-        //   正向         d=-995  c=0.018  ratio=0.776  Vision 仲裁
-        //   翻转后       d=-994  c=0.900  ratio=0.793  内核与 Vision 一致
-        //
-        // 50 倍置信度差。这个差别不是锦上添花：编排层用 confidence 对 0.01 的
-        // 下限判「这一帧可不可信」，0.018 擦着线，稍有风吹草动就掉到 0.00x，
-        // 连判三帧就换基准、用户看到「内容跳变」。0.900 不擦线。
-        //
-        // 判据只用 `matchRatio`（同一把尺子），且要求**超过**正向一点点：
-        // 两个方向都脏时（周期内容、界面动效）不能随便取反，那会凭空造出回滚。
         if allowFlip,
-           let flipped = flippedEstimate(previous: previous, next: next, options: options),
+           let flipped = try? estimateFlipped(reversed: reversed, cache: cache),
            flipped.matchRatio > forward.matchRatio + flipAdvantage {
             return Match(
                 deltaY: -flipped.deltaY,
@@ -544,21 +719,18 @@ public enum VerticalOverlap {
             )
         }
 
-        // 正向不干净——要么是真的难配（动态内容、周期别名），要么是**用户在往上
-        // 回滚**：负位移在正向假设下只能匹配到另一段相似内容（实测回滚 150px
-        // 被报成 +430px），编排层据此会把已采集的内容再粘一遍。
-        //
-        // 这时请 Vision 做二维信号级求解。它不逐行独立打分，因此不会 snap 到
-        // 「局部合理、整体错误」的候选——终端、代码、聊天记录这类相邻行相似的
-        // 内容正是内核的弱项。
-        if let arbitrated = arbitrateWithVision(
-            previous: previous, next: next, forward: forward, options: options
-        ) {
+        if let images = cache.pair(reversed: reversed, flipped: false),
+           let arbitrated = arbitrateWithVision(
+               previous: images.previous,
+               next: images.next,
+               forward: forward,
+               options: cache.options,
+               vision: cache.visionEstimate(reversed: reversed, flipped: false)
+           ) {
             return arbitrated
         }
 
-        // Vision 不可用或没有结果：退回内核层面的反向匹配。
-        guard let reverse = try? estimateDirected(previous: next, next: previous, options: options) else {
+        guard let reverse = try? cache.directedMatch(reversed: !reversed, flipped: false) else {
             return forward
         }
         guard reverse.score < forward.score * reverseBetterRatio else { return forward }
@@ -576,82 +748,103 @@ public enum VerticalOverlap {
         )
     }
 
-    /// 两帧各自上下翻转后走**完整**流程（内核正向 → Vision 仲裁 → 反向内核）。
-    ///
-    /// ── 为什么不只跑内核正向 ──────────────────────────────
-    ///
-    /// 试过，实测差两个数量级：同一对真实帧只跑内核正向得 c=0.006，走完整流程得
-    /// c=0.900。原因是 0.900 来自「内核与 Vision 得出同一答案」这条路径——它是
-    /// 两个独立方法互相印证才有的高置信度，跳过 Vision 就永远拿不到。**翻转解决
-    /// 的是方向问题，不是「Vision 不再需要」**。
-    ///
-    /// 返回的是**翻转坐标系**里的结果：那里的「内容上移」等于原坐标系的
-    /// 「内容下移」即向上回滚，所以调用方要取负（见 `estimate`）。
-    private static func flippedEstimate(
-        previous: ScrollshotImage,
-        next: ScrollshotImage,
-        options: Options
-    ) -> Match? {
-        guard let flippedPrevious = flippedVertically(previous),
-              let flippedNext = flippedVertically(next)
-        else {
-            return nil
+    /// 翻转坐标系内的求解（禁用二次翻转，共享同一次会话的二维配准与缓存）。
+    private static func estimateFlipped(
+        reversed: Bool,
+        cache: RegistrationCache
+    ) throws -> Match {
+        let forward: Match
+        do {
+            forward = try cache.directedMatch(reversed: reversed, flipped: true)
+        } catch {
+            let reverse = try cache.directedMatch(reversed: !reversed, flipped: true)
+            return Match(
+                deltaY: -reverse.deltaY,
+                overlapRows: reverse.overlapRows,
+                confidence: reverse.confidence,
+                score: reverse.score,
+                secondBestScore: reverse.secondBestScore,
+                evidence: reverse.evidence,
+                matchRatio: reverse.matchRatio,
+                reversed: true,
+                source: .reverseKernel,
+                visionArbitrated: false
+            )
         }
-        return try? estimate(
-            previous: flippedPrevious, next: flippedNext, options: options, allowFlip: false
+
+        guard forward.matchRatio < cleanMatchRatio else { return forward }
+
+        if let images = cache.pair(reversed: reversed, flipped: true),
+           let arbitrated = arbitrateWithVision(
+               previous: images.previous,
+               next: images.next,
+               forward: forward,
+               options: cache.options,
+               vision: cache.visionEstimate(reversed: reversed, flipped: true)
+           ) {
+            return arbitrated
+        }
+
+        guard let reverse = try? cache.directedMatch(reversed: !reversed, flipped: true) else {
+            return forward
+        }
+        guard reverse.score < forward.score * reverseBetterRatio else { return forward }
+        return Match(
+            deltaY: -reverse.deltaY,
+            overlapRows: reverse.overlapRows,
+            confidence: reverse.confidence,
+            score: reverse.score,
+            secondBestScore: reverse.secondBestScore,
+            evidence: reverse.evidence,
+            matchRatio: reverse.matchRatio,
+            reversed: true,
+            source: .reverseKernel,
+            visionArbitrated: false
         )
     }
 
-    /// 垂直翻转：行序反转（第 0 行与最后一行互换）。
-    ///
-    /// 不用 `CGContext` 重绘，也不碰 `CGImage`：内核只认 `data` 这一份 RGBA8
-    /// 缓冲，逐行搬运就够，且不引入任何平台依赖。翻转是**上下对称**的，所以
-    /// 通道顺序、行填充都不受影响——这正是它比交换两帧更可靠的原因。
+    /// 垂直翻转：行序反转（第 0 行与最后一行互换），使用整行 `memcpy` 零开销搬运。
     private static func flippedVertically(_ image: ScrollshotImage) -> ScrollshotImage? {
         let bytesPerRow = image.bytesPerRow
-        var flipped = [UInt8](repeating: 0, count: image.data.count)
-        for row in 0..<image.height {
-            let source = (image.height - 1 - row) * bytesPerRow
-            let destination = row * bytesPerRow
-            flipped.replaceSubrange(
-                destination..<(destination + bytesPerRow),
-                with: image.data[source..<(source + bytesPerRow)]
-            )
+        var flipped = Data(count: image.data.count)
+        flipped.withUnsafeMutableBytes { rawOutput in
+            guard let out = rawOutput.bindMemory(to: UInt8.self).baseAddress else { return }
+            image.withPixels { source in
+                guard let src = source.baseAddress else { return }
+                for row in 0..<image.height {
+                    let sourceOffset = (image.height - 1 - row) * bytesPerRow
+                    let destinationOffset = row * bytesPerRow
+                    memcpy(out + destinationOffset, src + sourceOffset, bytesPerRow)
+                }
+            }
         }
-        return ScrollshotImage(width: image.width, height: image.height, data: flipped)
+        return ScrollshotImage(
+            width: image.width,
+            height: image.height,
+            data: flipped,
+            colorSpace: image.colorSpace
+        )
     }
 
-    /// 用 Vision 的二维信号配准，对**已经判定为不干净**的正向结果做仲裁。
-    ///
-    /// 关键分工：**Vision 只出候选，优劣由内核的评分函数判**。Vision 没有置信度，
-    /// 且实测在重叠很少时会给出完全错误的值（900 行高的帧、真值 880 解成 −380），
-    /// 所以「它给了一个答案」本身不能成为采用它的理由。
-    ///
-    /// - Returns: 采用 Vision 的答案（或两法一致值得提置信度）时返回新结果；
-    ///   Vision 不可用、没有结果、候选被内核评分否决、或超出可解范围时返回 nil，
-    ///   交给反向匹配。
+    /// 用二维信号配准结果，对**已经判定为不干净**的正向结果做仲裁。
     private static func arbitrateWithVision(
         previous: ScrollshotImage,
         next: ScrollshotImage,
         forward: Match,
-        options: Options
+        options: Options,
+        vision: VisionRegistrar.Estimate?
     ) -> Match? {
         // ⓪ 两帧没有对应关系（画面剧烈变化）：任何位移都是在猜。
-        //    Vision 对纯随机噪声帧同样会报出一个「看起来很正常」的 transform。
         guard forward.matchRatio >= noEvidenceMatchRatio else { return nil }
 
         let searchable = previous.height - max(0, options.ignoreTopRows)
 
-        // ① 范围闸门：Vision 的答案必须落在「两帧重叠充分」的可解区间内。
+        // ① 范围闸门：二维配准结果必须落在「两帧重叠充分」的可解区间内。
         let maxDelta = min(
             searchable - 2,
             Int((Double(searchable) * (1 - options.minOverlapRatio)).rounded())
         )
-        guard let vision = VisionRegistrar.estimate(
-            previous: previous,
-            next: next,
-            topCrop: max(0, options.ignoreTopRows)
-        ), abs(vision.deltaY) <= maxDelta else { return nil }
+        guard let vision, abs(vision.deltaY) <= maxDelta else { return nil }
 
         // ② 两法一致：两条独立路径给出同一答案，这本身就是强证据。
         if abs(vision.deltaY - forward.deltaY) <= visionAgreementTolerance {
@@ -716,12 +909,18 @@ public enum VerticalOverlap {
         let rowMotion = computeRowMotion(
             previous: from, next: to, columns: columns, options: options
         )
-        let rows = sampledRows(count: options.sampleRows, overlapRows: searchable - magnitude)
-        guard let result = score(
-            previous: from, next: to, delta: magnitude, columns: columns,
-            columnWeights: columnWeights, rowMotion: rowMotion, rows: rows,
-            useTexture: true, options: options
-        ) else { return nil }
+        var rowBuffer = [Int](repeating: 0, count: max(1, options.sampleRows))
+        let rowCount = fillSampledRows(into: &rowBuffer, count: options.sampleRows, overlapRows: searchable - magnitude)
+        guard rowCount > 0 else { return nil }
+        let result = rowBuffer.withUnsafeBufferPointer { buffer in
+            score(
+                previous: from, next: to, delta: magnitude, columns: columns,
+                columnWeights: columnWeights, rowMotion: rowMotion,
+                rows: UnsafeBufferPointer(start: buffer.baseAddress, count: rowCount),
+                useTexture: true, options: options
+            )
+        }
+        guard let result else { return nil }
         return (result.score, result.matchRatio, result.evidence)
     }
 
@@ -758,47 +957,93 @@ public enum VerticalOverlap {
             previous: previous, next: next, columns: columns, options: options
         )
 
-        // ── 第一遍：1 像素步进穷举，廉价采样、不算纹理 ──
-        //
-        // 为什么必须穷举而不是粗网格：周期内容（行距、行高）会让真实位移附近
-        // 出现一串分数接近的峰，粗网格会直接跨过真正的峰。
+        // ── 第一遍：1 像素步进穷举，廉价采样、不算纹理（复用采样缓冲避免堆分配） ──
         var candidates: [(delta: Int, score: Double, evidence: Double, matchRatio: Double)] = []
-        var weightsByDelta: [Int: Double] = [:]
+        candidates.reserveCapacity(maxDelta - minDelta + 1)
+        var pass1Buffer = [Int](repeating: 0, count: pass1Rows)
 
         for delta in minDelta...maxDelta {
-            let rows = sampledRows(count: pass1Rows, overlapRows: searchable - delta)
-            guard let result = score(
-                previous: previous, next: next, delta: delta, columns: columns,
-                columnWeights: columnWeights, rowMotion: rowMotion, rows: rows,
-                useTexture: false, options: options
-            ) else { continue }
+            let rowCount = fillSampledRows(into: &pass1Buffer, count: pass1Rows, overlapRows: searchable - delta)
+            guard rowCount > 0 else { continue }
+            let result = pass1Buffer.withUnsafeBufferPointer { buffer in
+                score(
+                    previous: previous, next: next, delta: delta, columns: columns,
+                    columnWeights: columnWeights, rowMotion: rowMotion,
+                    rows: UnsafeBufferPointer(start: buffer.baseAddress, count: rowCount),
+                    useTexture: false, options: options
+                )
+            }
+            guard let result else { continue }
             candidates.append((delta, result.score, result.evidence, result.matchRatio))
-            weightsByDelta[delta] = result.weightSum
         }
         guard !candidates.isEmpty else { throw Failure.noCandidate }
 
         // 分数相同时取更小的 delta（重叠更多）——这是先验偏置，不改变正确时的结果。
         candidates.sort { $0.score == $1.score ? $0.delta < $1.delta : $0.score < $1.score }
-        let shortlist = Array(candidates.prefix(pass2Candidates))
+
+        // 一维非极大值抑制（NMS）：每选入一个波峰，跳过 `±refinementRadius` 邻域，
+        // 确保有限名额覆盖互异的周期竞争峰而不是全耗在同一个波峰上。
+        var shortlist: [(delta: Int, score: Double, evidence: Double, matchRatio: Double)] = []
+        shortlist.reserveCapacity(pass2Candidates)
+        for candidate in candidates {
+            if shortlist.contains(where: { abs($0.delta - candidate.delta) <= refinementRadius }) {
+                continue
+            }
+            shortlist.append(candidate)
+            if shortlist.count >= pass2Candidates { break }
+        }
 
         // ── 第二遍：短名单用全分辨率 + 纹理复算 ──
-        var rescored: [(delta: Int, score: Double, evidence: Double, matchRatio: Double)] = []
-        for candidate in shortlist {
-            let rows = sampledRows(count: options.sampleRows, overlapRows: searchable - candidate.delta)
-            guard let result = score(
-                previous: previous, next: next, delta: candidate.delta, columns: columns,
-                columnWeights: columnWeights, rowMotion: rowMotion, rows: rows,
-                useTexture: true, options: options
-            ) else { continue }
-            rescored.append((candidate.delta, result.score, result.evidence, result.matchRatio))
+        var pass2Buffer = [Int](repeating: 0, count: max(1, options.sampleRows))
+        func rescoreDelta(_ delta: Int) -> (delta: Int, score: Double, evidence: Double, matchRatio: Double)? {
+            let rowCount = fillSampledRows(
+                into: &pass2Buffer,
+                count: options.sampleRows,
+                overlapRows: searchable - delta
+            )
+            guard rowCount > 0 else { return nil }
+            let result = pass2Buffer.withUnsafeBufferPointer { buffer in
+                score(
+                    previous: previous, next: next, delta: delta, columns: columns,
+                    columnWeights: columnWeights, rowMotion: rowMotion,
+                    rows: UnsafeBufferPointer(start: buffer.baseAddress, count: rowCount),
+                    useTexture: true, options: options
+                )
+            }
+            guard let result else { return nil }
+            return (delta, result.score, result.evidence, result.matchRatio)
         }
-        let finalists = rescored.isEmpty ? shortlist : rescored
-        guard let winner = finalists.min(by: { $0.score < $1.score }) else {
+
+        var rescored: [(delta: Int, score: Double, evidence: Double, matchRatio: Double)] = []
+        rescored.reserveCapacity(shortlist.count)
+        for candidate in shortlist {
+            if let evaluated = rescoreDelta(candidate.delta) {
+                rescored.append(evaluated)
+            }
+        }
+        let peakList = rescored.isEmpty ? shortlist : rescored
+        guard let initialPeak = peakList.min(by: {
+            $0.score == $1.score ? $0.delta < $1.delta : $0.score < $1.score
+        }) else {
             throw Failure.noCandidate
         }
 
+        // 对胜出波峰的 `±refinementRadius` 邻域做全分辨率细化，弥补粗筛可能产生的 1px 偏移。
+        var winner = initialPeak
+        if !rescored.isEmpty {
+            let localStart = max(minDelta, initialPeak.delta - refinementRadius)
+            let localEnd = min(maxDelta, initialPeak.delta + refinementRadius)
+            for delta in localStart...localEnd where delta != initialPeak.delta {
+                if let neighbor = rescoreDelta(delta) {
+                    if neighbor.score < winner.score || (neighbor.score == winner.score && neighbor.delta < winner.delta) {
+                        winner = neighbor
+                    }
+                }
+            }
+        }
+
         // ── 竞争假设与置信度 ──
-        let rival = finalists
+        let rival = peakList
             .filter { abs($0.delta - winner.delta) > refinementRadius }
             .min(by: { $0.score < $1.score })
 
@@ -838,6 +1083,25 @@ public enum VerticalOverlap {
             return [left + usable / 2]
         }
         return (0..<count).map { left + Int(round(Double($0) * Double(usable - 1) / Double(count - 1))) }
+    }
+
+    /// 在 `overlapRows` 内等距采样行号并复用到既有缓冲区，避免穷举循环中重复堆分配。
+    private static func fillSampledRows(into buffer: inout [Int], count: Int, overlapRows: Int) -> Int {
+        guard overlapRows > 0, count > 0 else { return 0 }
+        let n = max(1, min(count, overlapRows))
+        if buffer.count < n {
+            buffer = [Int](repeating: 0, count: n)
+        }
+        if n == 1 {
+            buffer[0] = overlapRows / 2
+            return 1
+        }
+        let denom = Double(n - 1)
+        let maxIndex = overlapRows - 1
+        for i in 0..<n {
+            buffer[i] = min(maxIndex, Int(round(Double(i) * Double(maxIndex) / denom)))
+        }
+        return n
     }
 
     /// 在 `overlapRows` 内等距采样行号（含 0 与最后一行附近）。
@@ -935,7 +1199,7 @@ public enum VerticalOverlap {
         columns: [Int],
         columnWeights: [Double],
         rowMotion: [Double],
-        rows: [Int],
+        rows: UnsafeBufferPointer<Int>,
         useTexture: Bool,
         options: Options
     ) -> ScoreResult? {

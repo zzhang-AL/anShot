@@ -394,4 +394,69 @@ struct CrashLogStoreTests {
             #expect(FileManager.default.fileExists(atPath: url.path))
         }
     }
+
+    @Test(".crash 仅匹配 Process 字段，不被 Path 目录名误匹配")
+    func crashFilterMatchesProcessOnlyNotPath() throws {
+        try withTempDirectory { directory in
+            let text = """
+            Process:               OtherHelper [567]
+            Path:                  /Users/dev/anShot-builds/OtherHelper.app/Contents/MacOS/OtherHelper
+            Date/Time:             2026-09-06 08:00:00.000 +0800
+            Exception Type:        EXC_CRASH
+            """
+            _ = try writeText(text, in: directory, name: "OtherHelper.crash")
+            #expect(CrashLogStore.reports(processName: "anShot", directories: [directory], limit: 10).isEmpty)
+            #expect(CrashLogStore.reportCount(processName: "anShot", directories: [directory], limit: 10) == 0)
+        }
+    }
+
+    @Test("reportCount 轻量统计并遵守 limit 截断")
+    func reportCountRespectsLimit() throws {
+        try withTempDirectory { directory in
+            _ = try writeIPS(in: directory, name: "anShot-1.ips")
+            _ = try writeIPS(in: directory, name: "anShot-2.ips")
+            _ = try writeCrash(in: directory, name: "anShot-3.crash")
+            _ = try writeIPS(in: directory, name: "Safari.ips", appName: "Safari")
+
+            #expect(CrashLogStore.reportCount(directories: [directory], limit: 10) == 3)
+            #expect(CrashLogStore.reportCount(directories: [directory], limit: 2) == 2)
+            #expect(CrashLogStore.reportCount(directories: [directory], limit: 0) == 0)
+        }
+    }
+
+    @Test("redactedDetails 替换本机家目录并掩码设备与事件标识符")
+    func redactedDetailsMasksHomeAndIdentifiers() throws {
+        try withTempDirectory { directory in
+            let homePath = FileManager.default.homeDirectoryForCurrentUser.path
+            let content = """
+            {"app_name":"anShot","timestamp":"2026-09-05 18:04:23.00 +0800","crashReporterKey":"secret-reporter-key-123","anonUUID":"anon-uuid-456","incident":"INCIDENT-789"}
+            {"userPath":"\(homePath)/Desktop/shot.png","Incident Identifier":"CRASH-ABC","Anonymous UUID":"ANON-DEF"}
+            """
+            let url = try writeText(content, in: directory, name: "anShot-redacted.ips")
+            let entries = CrashLogStore.reports(directories: [directory], limit: 10)
+            let entry = try #require(entries.first { $0.url.path == url.path })
+
+            let redacted = CrashLogStore.redactedDetails(for: entry)
+            #expect(!redacted.contains(homePath))
+            #expect(redacted.contains("~/Desktop/shot.png"))
+            #expect(!redacted.contains("secret-reporter-key-123"))
+            #expect(!redacted.contains("anon-uuid-456"))
+            #expect(!redacted.contains("INCIDENT-789"))
+            #expect(redacted.contains("<redacted>"))
+
+            let legacyText = """
+            Process:               anShot [123]
+            Path:                  \(homePath)/Applications/anShot.app/Contents/MacOS/anShot
+            Incident Identifier:   11111111-2222-3333-4444-555555555555
+            Anonymous UUID:        AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE
+            CrashReporter Key:     ZZZZZZZZ-1111-2222-3333-444444444444
+            """
+            let redactedLegacy = CrashLogStore.redactSensitiveContent(in: legacyText)
+            #expect(!redactedLegacy.contains(homePath))
+            #expect(redactedLegacy.contains("~/Applications/anShot.app"))
+            #expect(!redactedLegacy.contains("11111111-2222-3333-4444-555555555555"))
+            #expect(!redactedLegacy.contains("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"))
+            #expect(!redactedLegacy.contains("ZZZZZZZZ-1111-2222-3333-444444444444"))
+        }
+    }
 }

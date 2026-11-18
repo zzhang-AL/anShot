@@ -110,57 +110,68 @@ public enum CrashLogStore {
         guard limit > 0, !processName.isEmpty else { return [] }
 
         let roots = directories ?? defaultDirectories()
-        var entries: [CrashLogEntry] = []
+        var candidates: [CandidateReport] = []
 
         for url in candidateFiles(in: roots) {
-            let kind = url.pathExtension.lowercased()
-            guard kind == "ips" || kind == "crash" else { continue }
-
-            // 文件名命中时不必先读内容；文件名没命中才去报告正文里找进程名。
-            // 这样即使 DiagnosticReports 里有几百份其它 app 的报告，也只读
-            // 每份的头部而不是整份。
-            let nameMatches = matches(name: url.lastPathComponent, processName: processName)
-            guard nameMatches || contentMentions(
-                processName: processName,
-                in: url,
-                kind: kind
-            ) else {
+            guard let candidate = inspectCandidate(url: url, processName: processName) else {
                 continue
             }
-
-            guard let data = readData(at: url) else { continue }
-
-            let parsed: ParsedReport
-            switch kind {
-            case "ips":
-                parsed = parseIPS(data: data)
-            default:
-                parsed = parseCrash(data: data)
-            }
-
-            // 报告时间解析失败时用文件修改时间：排序仍能反映「新旧」，
-            // 也不会因为一份格式怪异的报告把它排到列表最末。
-            let fallbackDate = modificationDate(of: url) ?? Date(timeIntervalSince1970: 0)
-            entries.append(CrashLogEntry(
-                url: url,
-                date: parsed.date ?? fallbackDate,
-                appVersion: parsed.appVersion,
-                buildVersion: parsed.buildVersion,
-                kind: kind,
-                summary: parsed.summary
-            ))
+            candidates.append(candidate)
         }
 
-        entries.sort { lhs, rhs in
-            if lhs.date != rhs.date {
-                return lhs.date > rhs.date
+        // 先按头部时间戳倒序截断前 `limit` 条，再解析完整 `.ips` payload 摘要。
+        candidates.sort { lhs, rhs in
+            if lhs.sortDate != rhs.sortDate {
+                return lhs.sortDate > rhs.sortDate
             }
             // 同一秒内的报告没有内在顺序；用路径保证每次刷新结果稳定，
             // 避免列表在刷新时无谓地跳动。
             return lhs.url.path < rhs.url.path
         }
 
-        return Array(entries.prefix(limit))
+        var entries: [CrashLogEntry] = []
+        entries.reserveCapacity(min(limit, candidates.count))
+        for candidate in candidates.prefix(limit) {
+            guard let data = readData(at: candidate.url) else { continue }
+            let parsed: ParsedReport
+            switch candidate.kind {
+            case "ips":
+                parsed = parseIPS(data: data, preParsedHeader: candidate.ipsHeader)
+            default:
+                parsed = parseCrash(data: data)
+            }
+
+            entries.append(CrashLogEntry(
+                url: candidate.url,
+                date: parsed.date ?? candidate.sortDate,
+                appVersion: parsed.appVersion,
+                buildVersion: parsed.buildVersion,
+                kind: candidate.kind,
+                summary: parsed.summary
+            ))
+        }
+
+        return entries
+    }
+
+    /// 轻量统计匹配的崩溃报告数量（最多计数到 `limit` 即提前停止，不解析完整负载）。
+    public static func reportCount(
+        processName: String = "anShot",
+        directories: [URL]? = nil,
+        limit: Int = 50
+    ) -> Int {
+        guard limit > 0, !processName.isEmpty else { return 0 }
+        let roots = directories ?? defaultDirectories()
+        var count = 0
+        for url in candidateFiles(in: roots) {
+            if matchesCandidateProcess(url: url, processName: processName) != nil {
+                count += 1
+                if count >= limit {
+                    return limit
+                }
+            }
+        }
+        return count
     }
 
     // MARK: - 详情
@@ -200,6 +211,45 @@ public enum CrashLogStore {
             \(url.path)
             """
         }
+    }
+
+    /// 读取并脱敏报告原文：将本机家目录替换为 `~`，并掩码设备与事件标识符。
+    public static func redactedDetails(for entry: CrashLogEntry) -> String {
+        redactSensitiveContent(in: details(for: entry))
+    }
+
+    /// 对崩溃文本执行隐私脱敏。
+    static func redactSensitiveContent(in rawText: String) -> String {
+        var text = rawText
+
+        // 1. 替换本机家目录路径为 `~`（先长后短，避免前缀残留）。
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let homeCandidates = Set([
+            home.standardizedFileURL.path,
+            home.path,
+            NSHomeDirectory(),
+        ].filter { !$0.isEmpty && $0 != "/" })
+        for path in homeCandidates.sorted(by: { $0.count > $1.count }) {
+            let normalized = path.hasSuffix("/") ? String(path.dropLast()) : path
+            guard !normalized.isEmpty else { continue }
+            text = text.replacingOccurrences(of: normalized, with: "~")
+        }
+
+        // 2. 掩码 `.ips` JSON 中的 `crashReporterKey` / `anonUUID` / `incident`。
+        text = RedactionPatterns.jsonIdentifiers.stringByReplacingMatches(
+            in: text,
+            range: NSRange(text.startIndex..<text.endIndex, in: text),
+            withTemplate: "$1\"<redacted>\""
+        )
+
+        // 3. 掩码 `.crash` 纯文本键值行中的标识符。
+        text = RedactionPatterns.textIdentifiers.stringByReplacingMatches(
+            in: text,
+            range: NSRange(text.startIndex..<text.endIndex, in: text),
+            withTemplate: "$1$2<redacted>"
+        )
+
+        return text
     }
 
     // MARK: - 扫描辅助
@@ -256,7 +306,98 @@ public enum CrashLogStore {
             .contentModificationDate
     }
 
-    // MARK: - 进程名匹配
+    // MARK: - 进程名匹配与轻量头解析
+
+    private struct CandidateReport {
+        let url: URL
+        let kind: String
+        let sortDate: Date
+        let ipsHeader: [String: Any]?
+    }
+
+    /// 判断候选文件是否匹配目标进程，并返回轻量头部读取结果（仅 `reportCount` 使用）。
+    private static func matchesCandidateProcess(url: URL, processName: String) -> String? {
+        let kind = url.pathExtension.lowercased()
+        guard kind == "ips" || kind == "crash" else { return nil }
+        if matches(name: url.lastPathComponent, processName: processName) {
+            return kind
+        }
+        return contentMentions(processName: processName, in: url, kind: kind) ? kind : nil
+    }
+
+    /// 阶段 1 轻量读取：仅解析 `.ips` 首行 JSON header 或 `.crash` 前 16KB 头部，
+    /// 提取进程归属与时间戳，避免对超出 `limit` 的报告读取并解析完整 JSON payload。
+    private static func inspectCandidate(url: URL, processName: String) -> CandidateReport? {
+        let kind = url.pathExtension.lowercased()
+        guard kind == "ips" || kind == "crash" else { return nil }
+        let nameMatches = matches(name: url.lastPathComponent, processName: processName)
+        let fallbackDate = modificationDate(of: url) ?? Date(timeIntervalSince1970: 0)
+
+        switch kind {
+        case "ips":
+            guard let firstLine = readIPSHeaderLine(at: url) else {
+                return nameMatches ? CandidateReport(url: url, kind: kind, sortDate: fallbackDate, ipsHeader: nil) : nil
+            }
+            let header = jsonObject(from: Data(firstLine.utf8))
+            if !nameMatches {
+                guard ipsHeaderMentions(processName: processName, header: header, rawLine: firstLine) else {
+                    return nil
+                }
+            }
+            let date = stringValue(header?["timestamp"]).flatMap(parseDate) ?? fallbackDate
+            return CandidateReport(url: url, kind: kind, sortDate: date, ipsHeader: header)
+
+        default:
+            guard let prefix = readPrefix(at: url) else {
+                return nameMatches ? CandidateReport(url: url, kind: kind, sortDate: fallbackDate, ipsHeader: nil) : nil
+            }
+            let text = String(decoding: prefix, as: UTF8.self)
+            let lines = text.split(whereSeparator: \.isNewline)
+            if !nameMatches {
+                let processMatched = crashValue(for: "Process", in: lines).map {
+                    matches(name: $0, processName: processName)
+                } ?? false
+                guard processMatched else { return nil }
+            }
+            let rawDate = crashValue(for: "Date/Time", in: lines)
+            let date = rawDate.flatMap(parseDate) ?? rawDate.flatMap(parseLooseDate) ?? fallbackDate
+            return CandidateReport(url: url, kind: kind, sortDate: date, ipsHeader: nil)
+        }
+    }
+
+    private static func readIPSHeaderLine(at url: URL) -> String? {
+        guard let prefix = readPrefix(at: url) else { return nil }
+        let headerData: Data
+        if let newline = prefix.firstIndex(of: 0x0A) {
+            headerData = Data(prefix[..<newline])
+        } else {
+            headerData = prefix
+        }
+
+        var headerLine = String(decoding: headerData, as: UTF8.self)
+        if headerLine.hasPrefix("\u{FEFF}") {
+            headerLine.removeFirst()
+        }
+        return headerLine.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func ipsHeaderMentions(
+        processName: String,
+        header: [String: Any]?,
+        rawLine: String
+    ) -> Bool {
+        if let header {
+            let names = [
+                stringValue(header["app_name"]),
+                stringValue(header["name"]),
+                stringValue(header["bundleID"]),
+            ].compactMap { $0 }
+            if !names.isEmpty {
+                return names.contains { matches(name: $0, processName: processName) }
+            }
+        }
+        return matches(name: rawLine, processName: processName)
+    }
 
     private static func matches(name value: String, processName: String) -> Bool {
         value.range(
@@ -268,51 +409,24 @@ public enum CrashLogStore {
     /// 文件名未命中时的兜底：读取报告头部，找进程名。
     ///
     /// `.ips` 的 `app_name` / `name` / `bundleID` 都在首行 JSON 头里；
-    /// `.crash` 的 `Process:` / `Path:` 在文件开头几行。16 KB 足够覆盖
-    /// 这两种定位，又不会为了过滤去读几百 KB 的线程栈。
+    /// `.crash` 仅匹配 `Process:` 字段（避免 `Path:` 中的目录名误匹配其他进程）。
     private static func contentMentions(
         processName: String,
         in url: URL,
         kind: String
     ) -> Bool {
-        guard let prefix = readPrefix(at: url) else { return false }
-
         switch kind {
         case "ips":
-            let headerData: Data
-            if let newline = prefix.firstIndex(of: 0x0A) {
-                headerData = Data(prefix[..<newline])
-            } else {
-                headerData = prefix
-            }
-
-            var headerLine = String(decoding: headerData, as: UTF8.self)
-            if headerLine.hasPrefix("\u{FEFF}") {
-                headerLine.removeFirst()
-            }
-            headerLine = headerLine.trimmingCharacters(in: .whitespacesAndNewlines)
-
-            if let header = jsonObject(from: Data(headerLine.utf8)) {
-                let names = [
-                    stringValue(header["app_name"]),
-                    stringValue(header["name"]),
-                    stringValue(header["bundleID"]),
-                ].compactMap { $0 }
-                if !names.isEmpty {
-                    return names.contains { matches(name: $0, processName: processName) }
-                }
-            }
-            // 头部不是合法 JSON 时，至少用原始首行做一次包含判断；
-            // 解析失败的报告仍可能带着进程名。
-            return matches(name: headerLine, processName: processName)
+            guard let headerLine = readIPSHeaderLine(at: url) else { return false }
+            let header = jsonObject(from: Data(headerLine.utf8))
+            return ipsHeaderMentions(processName: processName, header: header, rawLine: headerLine)
 
         default:
+            guard let prefix = readPrefix(at: url) else { return false }
             let text = String(decoding: prefix, as: UTF8.self)
             let lines = text.split(whereSeparator: \.isNewline)
-            let values = ["Process", "Path"].compactMap {
-                crashValue(for: $0, in: lines)
-            }
-            return values.contains { matches(name: $0, processName: processName) }
+            guard let process = crashValue(for: "Process", in: lines) else { return false }
+            return matches(name: process, processName: processName)
         }
     }
 
@@ -329,7 +443,7 @@ public enum CrashLogStore {
     ///
     /// 头与负载分别解析：头部通常完好，即使负载被截断（写盘时崩溃、
     /// 第三方工具截取）也仍能拿到版本和时间。
-    private static func parseIPS(data: Data) -> ParsedReport {
+    private static func parseIPS(data: Data, preParsedHeader: [String: Any]? = nil) -> ParsedReport {
         let headerData: Data
         let payloadData: Data
         if let newline = data.firstIndex(of: 0x0A) {
@@ -346,7 +460,7 @@ public enum CrashLogStore {
         }
         headerLine = headerLine.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        let header = jsonObject(from: Data(headerLine.utf8))
+        let header = preParsedHeader ?? jsonObject(from: Data(headerLine.utf8))
         let payload = jsonObject(from: payloadData)
 
         let dateText = stringValue(header?["timestamp"])
@@ -554,53 +668,99 @@ public enum CrashLogStore {
         return result.joined(separator: " · ")
     }
 
-    // MARK: - 日期
+    // MARK: - 日期与脱敏静态缓存
+
+    private enum RedactionPatterns {
+        static let jsonIdentifiers = try! NSRegularExpression(
+            pattern: #"("(?:crashReporterKey|anonUUID|incident)"\s*:\s*)"([^"\\]*(?:\\.[^"\\]*)*)""#,
+            options: [.caseInsensitive]
+        )
+        static let textIdentifiers = try! NSRegularExpression(
+            pattern: #"(^|\n)([ \t]*(?:Incident Identifier|Anonymous UUID|CrashReporter Key|crashReporterKey|anonUUID|incident)[ \t]*:[ \t]*)([^\r\n]+)"#,
+            options: [.caseInsensitive]
+        )
+    }
+
+    /// 线程安全的静态日期解析器缓存，避免遍历报告时反复创建 `DateFormatter`。
+    private final class DateParserCache: @unchecked Sendable {
+        static let shared = DateParserCache()
+
+        private let lock = NSLock()
+        private let formatters: [DateFormatter]
+        private let looseFormatter: DateFormatter
+        private let isoWithFraction: ISO8601DateFormatter
+        private let isoBasic: ISO8601DateFormatter
+
+        private init() {
+            let posix = Locale(identifier: "en_US_POSIX")
+            let utc = TimeZone(secondsFromGMT: 0)
+            let patterns = [
+                "yyyy-MM-dd HH:mm:ss.SSSSSS Z",
+                "yyyy-MM-dd HH:mm:ss.SSS Z",
+                "yyyy-MM-dd HH:mm:ss.SS Z",
+                "yyyy-MM-dd HH:mm:ss.S Z",
+                "yyyy-MM-dd HH:mm:ss Z",
+                "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
+                "yyyy-MM-dd'T'HH:mm:ssZ",
+            ]
+            self.formatters = patterns.map { pattern in
+                let formatter = DateFormatter()
+                formatter.locale = posix
+                formatter.timeZone = utc
+                formatter.dateFormat = pattern
+                formatter.isLenient = false
+                return formatter
+            }
+            let loose = DateFormatter()
+            loose.locale = posix
+            loose.timeZone = utc
+            loose.dateFormat = "yyyy-MM-dd 'at' HH:mm:ss Z"
+            self.looseFormatter = loose
+
+            let frac = ISO8601DateFormatter()
+            frac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            self.isoWithFraction = frac
+
+            let basic = ISO8601DateFormatter()
+            basic.formatOptions = [.withInternetDateTime]
+            self.isoBasic = basic
+        }
+
+        func parseDate(_ value: String) -> Date? {
+            lock.lock()
+            defer { lock.unlock() }
+            for formatter in formatters {
+                if let date = formatter.date(from: value) {
+                    return date
+                }
+            }
+            if let date = isoWithFraction.date(from: value) {
+                return date
+            }
+            return isoBasic.date(from: value)
+        }
+
+        func parseLooseDate(_ value: String) -> Date? {
+            lock.lock()
+            defer { lock.unlock() }
+            return looseFormatter.date(from: value)
+        }
+    }
 
     /// 系统报告里的时间戳没有统一 ISO 格式：`.ips` 头用
     /// `2026-09-05 18:04:23.00 +0800`，`.crash` 的 `Date/Time` 也类似。
-    /// 按「带几分之一秒、带不带时区」逐级尝试。
+    /// 复用静态日期解析器按「带几分之一秒、带不带时区」逐级尝试。
     private static func parseDate(_ raw: String) -> Date? {
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return nil }
-
-        let patterns = [
-            "yyyy-MM-dd HH:mm:ss.SSSSSS Z",
-            "yyyy-MM-dd HH:mm:ss.SSS Z",
-            "yyyy-MM-dd HH:mm:ss.SS Z",
-            "yyyy-MM-dd HH:mm:ss.S Z",
-            "yyyy-MM-dd HH:mm:ss Z",
-            "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
-            "yyyy-MM-dd'T'HH:mm:ssZ",
-        ]
-        for pattern in patterns {
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: "en_US_POSIX")
-            // 所有 pattern 都带时区；这里设 UTC 只是避免 formatter 的默认值
-            // 影响解析（字符串里的 Z 会覆盖它）。
-            formatter.timeZone = TimeZone(secondsFromGMT: 0)
-            formatter.dateFormat = pattern
-            formatter.isLenient = false
-            if let date = formatter.date(from: value) {
-                return date
-            }
-        }
-
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = iso.date(from: value) {
-            return date
-        }
-        iso.formatOptions = [.withInternetDateTime]
-        return iso.date(from: value)
+        return DateParserCache.shared.parseDate(value)
     }
 
     /// 老式 `.crash` 的 `Date/Time` 可能写成
     /// `2026-09-06 at 08:00:00 +0800`。
     private static func parseLooseDate(_ raw: String) -> Date? {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "yyyy-MM-dd 'at' HH:mm:ss Z"
-        return formatter.date(from: raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        return DateParserCache.shared.parseLooseDate(value)
     }
 }
