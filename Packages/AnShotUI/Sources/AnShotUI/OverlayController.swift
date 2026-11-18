@@ -65,6 +65,9 @@ public final class OverlayController {
     /// 正在后台抓取一个窗口。防止连点菜单叠出多个会话。
     private var pendingWindowCapture = false
 
+    /// `teardown()` 重入守卫，防止系统关窗通知 `windowWillClose` 递归调用 `dismiss()`。
+    private var isTearingDown = false
+
     /// 标注编辑器状态（仅会话期间存在，随 `teardown` 释放）。
     ///
     /// 它是标注的唯一权威：工具、样式、已提交标注、草稿、撤销历史全在这里。
@@ -143,7 +146,7 @@ public final class OverlayController {
     /// 复用截图覆盖层的选区/标注/导出，只是窗口改成围着图片本身：
     /// 用户已经有一张图时，不该为了加一个箭头再截一次屏。
     /// 源文件只读载入，导出仍走保存/复制/钉住，绝不写回原文件。
-    public func present(image: CGImage, sourceURL: URL? = nil) {
+    public func present(image: CGImage, sourceURL: URL? = nil, scaleFactor: CGFloat? = nil) {
         guard !isPresenting else {
             logger.debug("present(image:) ignored: a session is already presenting")
             return
@@ -151,17 +154,21 @@ public final class OverlayController {
         guard let screen = NSScreen.main ?? NSScreen.screens.first,
               let displayID = screen.displayID else { return }
 
-        // 窗口尺寸：大图缩到屏幕 90% 内，小图放大到至少 600×400 点，
-        // 否则工具栏比图片还宽，会被窗口边缘裁掉。
+        // 先将像素尺寸按缩放比折算回逻辑点，避免 Retina 2x 图窗口面积膨胀 4 倍；
+        // 再限制大图不超过屏幕可见区 90%，小图不小于合适编辑窗口尺寸。
+        let effectiveScale = max(1, scaleFactor ?? screen.backingScaleFactor)
+        let logicalWidth = CGFloat(image.width) / effectiveScale
+        let logicalHeight = CGFloat(image.height) / effectiveScale
+
         let visible = screen.visibleFrame
         let maxWidth = max(320, visible.width * 0.9)
         let maxHeight = max(240, visible.height * 0.9)
-        let downScale = max(1, CGFloat(image.width) / maxWidth, CGFloat(image.height) / maxHeight)
-        let upScale = min(1, max(0.5, min(CGFloat(image.width) / 600, CGFloat(image.height) / 400)))
+        let downScale = max(1, logicalWidth / maxWidth, logicalHeight / maxHeight)
+        let upScale = min(1, max(0.5, min(logicalWidth / 600, logicalHeight / 400)))
         let scale = downScale > 1 ? downScale : upScale
         let size = CGSize(
-            width: CGFloat(image.width) / scale,
-            height: CGFloat(image.height) / scale
+            width: max(320, (logicalWidth / scale).rounded()),
+            height: max(200, (logicalHeight / scale).rounded())
         )
         let frame = CGRect(
             x: visible.midX - size.width / 2,
@@ -171,6 +178,9 @@ public final class OverlayController {
         )
 
         let window = OverlayWindow(imageFrame: frame, displayID: displayID)
+        window.onWindowWillClose = { [weak self] in
+            self?.dismiss()
+        }
         let pixel = PixelRect(
             origin: .zero,
             size: PixelSize(width: Double(image.width), height: Double(image.height))
@@ -250,7 +260,7 @@ public final class OverlayController {
             defer { self.pendingWindowCapture = false }
             do {
                 let frame = try await self.capturer.captureFrame(scope: .window(windowID))
-                self.present(image: frame.image)
+                self.present(image: frame.image, scaleFactor: frame.scaleFactor)
                 self.documentSource = HistorySource(
                     appName: appName,
                     windowTitle: windowTitle,
@@ -381,6 +391,8 @@ public final class OverlayController {
         )
         selection = pixel
         selectionDisplayID = displayID
+        // 多屏拖拽起点立即清理其余屏残留的旧选框与工具栏。
+        resetOverlaySelections(except: displayID)
         onSelectionChanged?(pixel)
     }
 
@@ -967,6 +979,8 @@ public final class OverlayController {
 
         for window in windows {
             window.orderOut(nil)
+            // 进入长截图后覆盖层不再重新展示，立即释放 5K 底图与合成缓存降低内存峰值。
+            window.overlayView.releaseBackdropMemory()
         }
 
         // 选区在屏幕上的位置（AppKit 坐标）：覆盖层窗口 frame + 视图内偏移。
@@ -1273,6 +1287,12 @@ public final class OverlayController {
         NSPasteboard.general.clearContents()
         let ok = NSPasteboard.general.setString(text, forType: .string)
         logger.notice("OCR 复制：\(text.count, privacy: .public) 字符 成功=\(ok, privacy: .public)")
+        if ok {
+            ToastPresenter.show("已复制到剪贴板")
+        } else {
+            NSSound.beep()
+            ToastPresenter.show("复制失败")
+        }
     }
 
     /// 用户点「完成」：拼接并交付。
@@ -1303,8 +1323,9 @@ public final class OverlayController {
             logger.error("滚动截图失败：\(outcome.failure ?? "未知", privacy: .public)")
             NSSound.beep()
             // 失败原因只写日志等于用户什么都没看到：覆盖层一消失，
-            // 用户只知道「响了一声」。必须把可读原因摆到屏幕上。
+            // 用户只知道「响了一声」。必须把可读原因摆到屏幕上，并完整收尾结束会话。
             presentScrollshotFailure(outcome.failure)
+            dismiss()
             return
         }
 
@@ -2025,7 +2046,15 @@ public final class OverlayController {
 
     /// 关闭全部窗口并释放底图。不做任何延迟回收。
     private func teardown() {
+        guard !isTearingDown else { return }
+        isTearingDown = true
+        defer { isTearingDown = false }
+
         sessionID = nil
+        // 显式取消未完成的 OCR/翻译和长截图任务，防止退出会话后弹出幽灵面板或后台空转。
+        cancelTextRequests()
+        scrollshot?.cancel()
+        scrollshot = nil
         ocrPanel.hide()
         // 准备面板与预览框是**跨会话**存在的实例（不是每个会话新建的），
         // 因此会话结束时必须显式收起：用户完全可能在正在选取录制目标时
@@ -2055,8 +2084,9 @@ public final class OverlayController {
         windows.first?.overlayView.dismissColorPanel()
 
         for window in windows {
+            window.onWindowWillClose = nil
             // 显式释放底图，不依赖 ARC 的释放时机。
-            window.overlayView.backdrop = nil
+            window.overlayView.releaseBackdropMemory()
             window.overlayView.editorState = nil
             window.overlayView.onCancel = nil
             window.orderOut(nil)

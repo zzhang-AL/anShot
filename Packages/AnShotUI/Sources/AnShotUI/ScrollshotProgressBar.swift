@@ -276,7 +276,9 @@ final class ScrollshotProgressBar {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         // 不抢焦点：用户会话期间还要继续滚下层应用。
         panel.becomesKeyOnlyIfNeeded = true
-        panel.isMovable = false
+        // 允许按住背景空白区拖动浮层，避免遮挡目标页面控件；定位框与按钮各自拦截鼠标。
+        panel.isMovable = true
+        panel.isMovableByWindowBackground = true
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true

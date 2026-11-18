@@ -55,6 +55,10 @@ struct SelectionDecoration {
     /// 中点手柄的不可见命中半径。
     let midpointHitRadius: CGFloat = 12
 
+    /// 选区四条边线的带状缩放命中半宽（逻辑点）。
+    /// 补齐除角点和中点之外整条边线的拖拽调整能力，避免微偏误废选区。
+    let edgeHitBand: CGFloat = 6
+
     /// 选区短边小于此值时只保留四角手柄：8 个控件在几十点见方的选区里
     /// 会互相叠压，既看不清也点不准。
     let compactHandleThreshold: CGFloat = 44
@@ -300,6 +304,66 @@ enum SelectionHandleLayout {
             best = (item.handle, distance)
         }
         return best?.handle
+    }
+
+    /// 完整选区命中测试：角手柄与中点手柄优先，其次命中所在线段的带状缩放热区。
+    static func hit(
+        at point: CGPoint,
+        for selection: CGRect,
+        viewBounds: CGRect,
+        displayID: CGDirectDisplayID,
+        decoration: SelectionDecoration = .standard,
+        activeHandle: SelectionHandle? = nil
+    ) -> SelectionHandle? {
+        let decorated = decoratedRect(for: selection)
+        let radii = cornerRadii(for: selection, viewBounds: viewBounds, displayID: displayID)
+        return hit(
+            at: point,
+            decoratedRect: decorated,
+            radii: radii,
+            decoration: decoration,
+            activeHandle: activeHandle
+        )
+    }
+
+    /// 完整选区命中测试（纯几何重载，不依赖真实显示器状态）。
+    static func hit(
+        at point: CGPoint,
+        decoratedRect: CGRect,
+        radii: CaptureFrameStyle.CornerRadii,
+        decoration: SelectionDecoration = .standard,
+        activeHandle: SelectionHandle? = nil
+    ) -> SelectionHandle? {
+        let layoutItems = items(
+            decoratedRect: decoratedRect,
+            radii: radii,
+            decoration: decoration,
+            activeHandle: activeHandle
+        )
+        if let handleHit = hit(at: point, in: layoutItems) {
+            return handleHit
+        }
+
+        // 紧凑选区仅留四角，避免小选区内边线热区与内部移动冲突。
+        guard !decoration.usesCompactHandles(for: decoratedRect.size) else {
+            return nil
+        }
+
+        let band = decoration.edgeHitBand
+        var candidates: [(handle: SelectionHandle, distance: CGFloat)] = []
+        if point.x >= decoratedRect.minX && point.x <= decoratedRect.maxX {
+            let topDist = abs(point.y - decoratedRect.minY)
+            if topDist <= band { candidates.append((.top, topDist)) }
+            let bottomDist = abs(point.y - decoratedRect.maxY)
+            if bottomDist <= band { candidates.append((.bottom, bottomDist)) }
+        }
+        if point.y >= decoratedRect.minY && point.y <= decoratedRect.maxY {
+            let leftDist = abs(point.x - decoratedRect.minX)
+            if leftDist <= band { candidates.append((.left, leftDist)) }
+            let rightDist = abs(point.x - decoratedRect.maxX)
+            if rightDist <= band { candidates.append((.right, rightDist)) }
+        }
+        return candidates.min(by: { $0.distance < $1.distance })?.handle
     }
 
     /// 手柄是否位于角上（同时推动水平与垂直两条边）。

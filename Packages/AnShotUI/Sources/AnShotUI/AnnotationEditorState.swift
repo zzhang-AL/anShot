@@ -289,6 +289,20 @@ struct AnnotationStyle: Equatable, Sendable {
     }
 }
 
+/// 指针选中标注的几何控制手柄。
+enum AnnotationControlHandle: Equatable, Hashable {
+    /// 矩形类（矩形 / 高亮 / 框选马赛克）的八点缩放手柄。
+    case rect(SelectionHandle)
+    /// 线段 / 箭头 / 测量 / 弯曲箭头的起点。
+    case start
+    /// 弯曲箭头的中间控制点。
+    case control
+    /// 线段 / 箭头 / 测量 / 弯曲箭头的终点。
+    case end
+    /// 圆类（放大镜 / 编号）的半径控制点。
+    case radius
+}
+
 /// 正在编辑的一段文字。
 ///
 /// 放在编辑器状态里而不是留在视图上：
@@ -303,6 +317,8 @@ struct TextEditDraft: Equatable {
     /// 字号（点，界面单位）。
     var fontSize: Double
     var color: RGBAColor
+    /// 自动折行最大宽度（底图像素）；nil 表示仅在显式换行符处换行。
+    var maxWidth: Double? = nil
 
     /// 该文字使用的字体描述（模型单位：像素）。
     func font(scaleFactor: CGFloat) -> FontDescriptor {
@@ -396,6 +412,59 @@ final class AnnotationEditorState {
 
     // MARK: - 私有
 
+    /// 连续手势事务起始快照（用于合并移动/缩放/滑块拖拽的撤销记录）。
+    private var transactionSnapshot: [Annotation]?
+    var isInEditTransaction: Bool { transactionSnapshot != nil }
+
+    /// 开始一次连续编辑事务，期间的变更实时预览而不写入撤销历史。
+    func beginEditTransaction() {
+        guard transactionSnapshot == nil else { return }
+        transactionSnapshot = annotations
+    }
+
+    /// 结束连续编辑事务：若标注相对事务开始时确有变化，合并为一条撤销记录。
+    func commitEditTransaction() {
+        guard let snapshot = transactionSnapshot else { return }
+        transactionSnapshot = nil
+        guard annotations != snapshot else { return }
+        history.commit(EditState(selection: selection, annotations: annotations))
+        notifyChange()
+    }
+
+    /// 选中标注的颜色（供工具栏色卡与取色器对齐高亮）。
+    var selectedAnnotationColor: RGBAColor? {
+        guard let kind = selectedAnnotation?.kind else { return nil }
+        switch kind {
+        case let .rectangle(_, stroke, _, _),
+             let .line(_, _, stroke),
+             let .arrow(_, _, stroke, _, _),
+             let .measure(_, _, stroke),
+             let .freehand(_, stroke),
+             let .curvedArrow(_, _, _, stroke, _, _):
+            return stroke.color
+        case let .text(_, _, _, color, _, _):
+            return color
+        case let .numbering(_, _, _, stroke, _, _):
+            return stroke.color
+        case let .highlight(_, color):
+            return color
+        case let .magnifier(_, _, _, border):
+            return border.color
+        case .mosaic, .mosaicStroke:
+            return nil
+        }
+    }
+
+    /// 若当前选中标注是文字，返回其逻辑点字号。
+    func selectedTextLogicalFontSize(scaleFactor: CGFloat) -> Double? {
+        guard let kind = selectedAnnotation?.kind,
+              case let .text(_, _, font, _, _, _) = kind else {
+            return nil
+        }
+        let safeScale = scaleFactor > 0 ? Double(scaleFactor) : 1
+        return font.size / safeScale
+    }
+
     private var history: EditHistory
     private var draftAnchor: PixelPoint?
     /// 涂抹草稿累积的路径点（底图像素）。
@@ -481,13 +550,37 @@ final class AnnotationEditorState {
         select(shape)
     }
 
+    /// 高亮颜色锁定半透明（防止从普通调色板或取色器传入不透明色块盖死文字）。
+    private static func normalizedHighlightColor(_ color: RGBAColor) -> RGBAColor {
+        if color.a > 0 && color.a < 0.99 {
+            return color
+        }
+        return RGBAColor(r: color.r, g: color.g, b: color.b, a: 0.35)
+    }
+
     func selectColor(_ color: RGBAColor) {
         // 按当前工具写入对应的颜色槽，避免「改文字颜色顺手改了箭头」。
         switch tool {
-        case .text: style.textColor = color
-        case .highlight: style.highlightColor = color
+        case .text:
+            style.textColor = color
+        case .highlight:
+            style.highlightColor = Self.normalizedHighlightColor(color)
+        case .pointer:
+            // 指针选中高亮或文字时，同步到对应颜色槽以便色卡高亮准确。
+            if let kind = selectedAnnotation?.kind {
+                switch kind {
+                case .highlight:
+                    style.highlightColor = Self.normalizedHighlightColor(color)
+                case .text:
+                    style.textColor = color
+                default:
+                    style.shapeColor = color
+                }
+            } else {
+                style.shapeColor = color
+            }
         // 放大镜与马赛克是像素处理，没有颜色槽（面板也不会显示颜色）。
-        case .pointer, .rectangle, .line, .arrow, .mosaic, .magnifier,
+        case .rectangle, .line, .arrow, .mosaic, .magnifier,
              .numbering, .measure, .freehand, .curvedArrow:
             style.shapeColor = color
         }
@@ -584,10 +677,10 @@ final class AnnotationEditorState {
         return scale
     }
 
-    func selectFontSize(_ size: Double) {
+    func selectFontSize(_ size: Double, scaleFactor: CGFloat = 1) {
         style.textFontSize = size
         // 同颜色/线宽：有选中文字时改的是那一段文字，而不只是「下一段」。
-        updateSelectedFontSize(size)
+        updateSelectedFontSize(size, scaleFactor: scaleFactor)
     }
 
     func selectMosaicMode(_ mode: MosaicToolMode) {
@@ -682,8 +775,68 @@ final class AnnotationEditorState {
         guard clamped != PixelPoint.zero else { return }
 
         annotations[index] = annotation.translated(by: clamped)
+        if !isInEditTransaction {
+            history.commit(EditState(selection: selection, annotations: annotations))
+        }
+        notifyChange()
+    }
+
+    /// 将选中的标注置于最顶层（数组末尾）。
+    @discardableResult
+    func bringSelectedToFront() -> Bool {
+        guard let index = selectedAnnotationIndex, index < annotations.count - 1 else {
+            return false
+        }
+        let item = annotations.remove(at: index)
+        annotations.append(item)
         history.commit(EditState(selection: selection, annotations: annotations))
         notifyChange()
+        return true
+    }
+
+    /// 将选中的标注置于最底层（数组开头）。
+    @discardableResult
+    func sendSelectedToBack() -> Bool {
+        guard let index = selectedAnnotationIndex, index > 0 else {
+            return false
+        }
+        let item = annotations.remove(at: index)
+        annotations.insert(item, at: 0)
+        history.commit(EditState(selection: selection, annotations: annotations))
+        notifyChange()
+        return true
+    }
+
+    /// 复制选中的标注并偏移摆放。
+    @discardableResult
+    func duplicateSelected(offset: PixelPoint = PixelPoint(x: 24, y: 24)) -> Bool {
+        guard let index = selectedAnnotationIndex else { return false }
+        let original = annotations[index]
+        let duplicatedKind: Annotation.Kind
+        if case let .numbering(center, radius, _, stroke, fill, textColor) = original.kind {
+            duplicatedKind = .numbering(
+                center: center,
+                radius: radius,
+                index: takeNextNumberingIndex(),
+                stroke: stroke,
+                fill: fill,
+                textColor: textColor
+            )
+        } else {
+            duplicatedKind = original.kind
+        }
+        let rawCopy = Annotation(id: UUID(), kind: duplicatedKind)
+        var delta = clampedDelta(for: rawCopy, delta: offset)
+        // 若正向平移被边界完全顶住，尝试向相反方向偏移以免与原标注完全重合。
+        if delta == .zero {
+            delta = clampedDelta(for: rawCopy, delta: PixelPoint(x: -offset.x, y: -offset.y))
+        }
+        let finalCopy = rawCopy.translated(by: delta)
+        annotations.append(finalCopy)
+        selectedAnnotationID = finalCopy.id
+        history.commit(EditState(selection: selection, annotations: annotations))
+        notifyChange()
+        return true
     }
 
     /// 删除选中标注。
@@ -721,20 +874,23 @@ final class AnnotationEditorState {
     }
 
     /// 修改选中文字的字号（点，界面单位；无选中或选中的不是文字时什么也不做）。
-    func updateSelectedFontSize(_ size: Double) {
+    func updateSelectedFontSize(_ size: Double, scaleFactor: CGFloat = 1) {
         guard let index = selectedAnnotationIndex else { return }
-        let updated = Self.restyled(annotations[index], fontSize: size)
+        let safeScale = scaleFactor > 0 ? Double(scaleFactor) : 1
+        let updated = Self.restyled(annotations[index], fontSize: size * safeScale)
         commitSelectedChange(updated, at: index)
     }
 
-    /// 把一条已重新构造的标注写回数组并记一步历史。
+    /// 把一条已重新构造的标注写回数组；若在编辑事务中则仅实时预览不写历史。
     ///
     /// 内容没变就不提交：`selectColor` 这类入口会在「点了一个已是当前颜色的色块」
     /// 时被触发，若照样压栈，⌘Z 会退到一个视觉上完全相同的状态。
     private func commitSelectedChange(_ updated: Annotation, at index: Int) {
         guard updated != annotations[index] else { return }
         annotations[index] = updated
-        history.commit(EditState(selection: selection, annotations: annotations))
+        if !isInEditTransaction {
+            history.commit(EditState(selection: selection, annotations: annotations))
+        }
         notifyChange()
     }
 
@@ -798,12 +954,16 @@ final class AnnotationEditorState {
             kind = .line(start: start, end: end, stroke: restroke(stroke))
 
         case let .arrow(start, end, stroke, headLength, headWidth):
+            let updatedStroke = restroke(stroke)
+            let widthRatio = (lineWidth != nil && stroke.width > 0)
+                ? updatedStroke.width / stroke.width
+                : 1
             kind = .arrow(
                 start: start,
                 end: end,
-                stroke: restroke(stroke),
-                headLength: headLength,
-                headWidth: headWidth
+                stroke: updatedStroke,
+                headLength: headLength * widthRatio,
+                headWidth: headWidth * widthRatio
             )
 
         case let .text(origin, text, font, textColor, background, maxWidth):
@@ -846,7 +1006,8 @@ final class AnnotationEditorState {
             )
 
         case let .highlight(rect, highlightColor):
-            kind = .highlight(rect: rect, color: color ?? highlightColor)
+            let resolved = color.map(Self.normalizedHighlightColor)
+            kind = .highlight(rect: rect, color: resolved ?? highlightColor)
 
         case let .measure(start, end, stroke):
             kind = .measure(start: start, end: end, stroke: restroke(stroke))
@@ -858,13 +1019,17 @@ final class AnnotationEditorState {
             kind = .freehand(points: points, stroke: restroke(stroke))
 
         case let .curvedArrow(start, control, end, stroke, headLength, headWidth):
+            let updatedStroke = restroke(stroke)
+            let widthRatio = (lineWidth != nil && stroke.width > 0)
+                ? updatedStroke.width / stroke.width
+                : 1
             kind = .curvedArrow(
                 start: start,
                 control: control,
                 end: end,
-                stroke: restroke(stroke),
-                headLength: headLength,
-                headWidth: headWidth
+                stroke: updatedStroke,
+                headLength: headLength * widthRatio,
+                headWidth: headWidth * widthRatio
             )
         }
         return Annotation(id: annotation.id, kind: kind)
@@ -899,8 +1064,14 @@ final class AnnotationEditorState {
     /// 上一版把累积写死在「马赛克 + 涂抹」这一个条件下，手绘因而永远拿到空点序列，
     /// 落到 `makeDraggedAnnotation` 的 `.freehand` 分支里只能退化成
     /// `[start, end]`——**拖出来的永远是直线**，鼠标轨迹整段被丢掉。
-    func updateDraft(to point: PixelPoint) {
+    func updateDraft(to rawPoint: PixelPoint, isShiftPressed: Bool = false) {
         guard let anchor = draftAnchor else { return }
+        let point = Self.constrainedEndPoint(
+            rawPoint,
+            from: anchor,
+            tool: tool,
+            isShiftPressed: isShiftPressed
+        )
 
         // 正常路径下 beginDraft 已经分配过序号；这里兜底一次，
         // 避免草稿被外部重置（如 `resetNumberingCounter`）后落下没有序号的标注。
@@ -925,6 +1096,37 @@ final class AnnotationEditorState {
             )
         }
         notifyChange()
+    }
+
+    /// Shift 正方形与 0°/45°/90° 正交约束。
+    static func constrainedEndPoint(
+        _ end: PixelPoint,
+        from start: PixelPoint,
+        tool: AnnotationTool,
+        isShiftPressed: Bool
+    ) -> PixelPoint {
+        guard isShiftPressed else { return end }
+        let dx = end.x - start.x
+        let dy = end.y - start.y
+        switch tool {
+        case .rectangle, .highlight, .mosaic:
+            let side = max(abs(dx), abs(dy))
+            return PixelPoint(
+                x: start.x + (dx >= 0 ? side : -side),
+                y: start.y + (dy >= 0 ? side : -side)
+            )
+        case .line, .arrow, .measure, .curvedArrow:
+            let length = (dx * dx + dy * dy).squareRoot()
+            guard length > 0 else { return end }
+            let angle = atan2(dy, dx)
+            let snapped = (angle / (.pi / 4)).rounded() * (.pi / 4)
+            return PixelPoint(
+                x: start.x + cos(snapped) * length,
+                y: start.y + sin(snapped) * length
+            )
+        default:
+            return end
+        }
     }
 
     /// 当前工具是否需要逐点累积轨迹。
@@ -1014,29 +1216,42 @@ final class AnnotationEditorState {
     // MARK: - 文字编辑
 
     /// 开始新建文字。`topLeft` 为文字左上角（底图像素）。
-    func beginTextEditing(at topLeft: PixelPoint) {
+    func beginTextEditing(at topLeft: PixelPoint, maxWidth: Double? = nil) {
         textDraft = TextEditDraft(
             annotationID: nil,
             topLeft: topLeft,
             text: "",
             fontSize: style.textFontSize,
-            color: style.textColor
+            color: style.textColor,
+            maxWidth: maxWidth
         )
         notifyChange()
     }
 
     /// 开始重新编辑一段已有文字（保留其 ID 与 z 序）。
-    func beginTextEditing(annotation: Annotation, topLeft: PixelPoint) {
-        guard case let .text(_, text, font, color, _, _) = annotation.kind else { return }
+    func beginTextEditing(
+        annotation: Annotation,
+        topLeft: PixelPoint,
+        scaleFactor: CGFloat = 1
+    ) {
+        guard case let .text(_, text, font, color, _, maxWidth) = annotation.kind else { return }
+        let safeScale = scaleFactor > 0 ? Double(scaleFactor) : 1
         textDraft = TextEditDraft(
             annotationID: annotation.id,
             topLeft: topLeft,
             text: text,
-            // 模型字号是像素，转回界面用的点。
-            fontSize: font.size,
-            color: color
+            // 模型字号是像素，除以 scaleFactor 转回界面用的点。
+            fontSize: font.size / safeScale,
+            color: color,
+            maxWidth: maxWidth
         )
         notifyChange()
+    }
+
+    /// 更新当前编辑文字的最大自动折行宽度（底图像素）。
+    func updateTextDraftMaxWidth(_ maxWidth: Double?) {
+        guard textDraft != nil, textDraft?.maxWidth != maxWidth else { return }
+        textDraft?.maxWidth = maxWidth
     }
 
     /// 记录输入框里的当前内容（每次按键都会调用）。
@@ -1143,7 +1358,7 @@ final class AnnotationEditorState {
                 font: font,
                 color: draft.color,
                 background: nil,
-                maxWidth: nil
+                maxWidth: draft.maxWidth
             )
         )
     }
@@ -1449,5 +1664,155 @@ final class AnnotationEditorState {
 
     private func notifyChange() {
         onChange?()
+    }
+
+    // MARK: - 选中标注几何控制手柄
+
+    /// 计算标注在底图像素坐标下的可交互几何控制手柄集合。
+    static func controlHandles(
+        for annotation: Annotation
+    ) -> [(handle: AnnotationControlHandle, point: PixelPoint)] {
+        switch annotation.kind {
+        case let .rectangle(rect, _, _, _),
+             let .highlight(rect, _),
+             let .mosaic(rect, _, _):
+            let cgRect = CGRect(
+                x: rect.origin.x,
+                y: rect.origin.y,
+                width: rect.size.width,
+                height: rect.size.height
+            )
+            return SelectionHandle.allCases.map { handle in
+                let pt = SelectionGeometry.center(of: handle, in: cgRect)
+                return (.rect(handle), PixelPoint(x: pt.x, y: pt.y))
+            }
+
+        case let .line(start, end, _),
+             let .arrow(start, end, _, _, _),
+             let .measure(start, end, _):
+            return [(.start, start), (.end, end)]
+
+        case let .curvedArrow(start, control, end, _, _, _):
+            return [(.start, start), (.control, control), (.end, end)]
+
+        case let .magnifier(center, radius, _, _),
+             let .numbering(center, radius, _, _, _, _):
+            return [(.radius, PixelPoint(x: center.x + radius, y: center.y))]
+
+        case .text, .freehand, .mosaicStroke:
+            return []
+        }
+    }
+
+    /// 拖动选中标注的几何控制手柄以更新其形状（在编辑事务内仅实时预览）。
+    func updateSelectedControlHandle(
+        _ handle: AnnotationControlHandle,
+        to rawPoint: PixelPoint,
+        isShiftPressed: Bool = false
+    ) {
+        guard let index = selectedAnnotationIndex else { return }
+        let annotation = annotations[index]
+        let clamped = clampPointToSelection(rawPoint)
+
+        let updatedKind: Annotation.Kind
+        switch (annotation.kind, handle) {
+        case let (.rectangle(rect, stroke, fill, cornerRadius), .rect(rectHandle)):
+            let resized = resizedPixelRect(rect, handle: rectHandle, to: clamped, keepSquare: isShiftPressed)
+            updatedKind = .rectangle(rect: resized, stroke: stroke, fill: fill, cornerRadius: cornerRadius)
+
+        case let (.highlight(rect, color), .rect(rectHandle)):
+            let resized = resizedPixelRect(rect, handle: rectHandle, to: clamped, keepSquare: isShiftPressed)
+            updatedKind = .highlight(rect: resized, color: color)
+
+        case let (.mosaic(rect, mode, intensity), .rect(rectHandle)):
+            let resized = resizedPixelRect(rect, handle: rectHandle, to: clamped, keepSquare: isShiftPressed)
+            updatedKind = .mosaic(rect: resized, mode: mode, intensity: intensity)
+
+        case let (.line(_, end, stroke), .start):
+            let pt = clampPointToSelection(Self.constrainedEndPoint(clamped, from: end, tool: .line, isShiftPressed: isShiftPressed))
+            updatedKind = .line(start: pt, end: end, stroke: stroke)
+
+        case let (.line(start, _, stroke), .end):
+            let pt = clampPointToSelection(Self.constrainedEndPoint(clamped, from: start, tool: .line, isShiftPressed: isShiftPressed))
+            updatedKind = .line(start: start, end: pt, stroke: stroke)
+
+        case let (.arrow(_, end, stroke, headLength, headWidth), .start):
+            let pt = clampPointToSelection(Self.constrainedEndPoint(clamped, from: end, tool: .arrow, isShiftPressed: isShiftPressed))
+            updatedKind = .arrow(start: pt, end: end, stroke: stroke, headLength: headLength, headWidth: headWidth)
+
+        case let (.arrow(start, _, stroke, headLength, headWidth), .end):
+            let pt = clampPointToSelection(Self.constrainedEndPoint(clamped, from: start, tool: .arrow, isShiftPressed: isShiftPressed))
+            updatedKind = .arrow(start: start, end: pt, stroke: stroke, headLength: headLength, headWidth: headWidth)
+
+        case let (.measure(_, end, stroke), .start):
+            let pt = clampPointToSelection(Self.constrainedEndPoint(clamped, from: end, tool: .measure, isShiftPressed: isShiftPressed))
+            updatedKind = .measure(start: pt, end: end, stroke: stroke)
+
+        case let (.measure(start, _, stroke), .end):
+            let pt = clampPointToSelection(Self.constrainedEndPoint(clamped, from: start, tool: .measure, isShiftPressed: isShiftPressed))
+            updatedKind = .measure(start: start, end: pt, stroke: stroke)
+
+        case let (.curvedArrow(_, control, end, stroke, headLength, headWidth), .start):
+            let pt = clampPointToSelection(Self.constrainedEndPoint(clamped, from: end, tool: .curvedArrow, isShiftPressed: isShiftPressed))
+            updatedKind = .curvedArrow(start: pt, control: control, end: end, stroke: stroke, headLength: headLength, headWidth: headWidth)
+
+        case let (.curvedArrow(start, _, end, stroke, headLength, headWidth), .control):
+            updatedKind = .curvedArrow(start: start, control: clamped, end: end, stroke: stroke, headLength: headLength, headWidth: headWidth)
+
+        case let (.curvedArrow(start, control, _, stroke, headLength, headWidth), .end):
+            let pt = clampPointToSelection(Self.constrainedEndPoint(clamped, from: start, tool: .curvedArrow, isShiftPressed: isShiftPressed))
+            updatedKind = .curvedArrow(start: start, control: control, end: pt, stroke: stroke, headLength: headLength, headWidth: headWidth)
+
+        case let (.magnifier(center, _, zoom, border), .radius):
+            let newRadius = min(max(16, Self.distance(center, clamped)), 400)
+            updatedKind = .magnifier(center: center, radius: newRadius, zoom: zoom, border: border)
+
+        case let (.numbering(center, _, number, stroke, fill, textColor), .radius):
+            let newRadius = min(max(10, Self.distance(center, clamped)), 80)
+            updatedKind = .numbering(center: center, radius: newRadius, index: number, stroke: stroke, fill: fill, textColor: textColor)
+
+        default:
+            return
+        }
+
+        commitSelectedChange(Annotation(id: annotation.id, kind: updatedKind), at: index)
+    }
+
+    private func clampPointToSelection(_ point: PixelPoint) -> PixelPoint {
+        guard selection.size.width > 0, selection.size.height > 0 else { return point }
+        return PixelPoint(
+            x: min(max(point.x, selection.origin.x), selection.origin.x + selection.size.width),
+            y: min(max(point.y, selection.origin.y), selection.origin.y + selection.size.height)
+        )
+    }
+
+    private func resizedPixelRect(
+        _ rect: PixelRect,
+        handle: SelectionHandle,
+        to point: PixelPoint,
+        keepSquare: Bool
+    ) -> PixelRect {
+        let base = CGRect(x: rect.origin.x, y: rect.origin.y, width: rect.size.width, height: rect.size.height)
+        var resized = SelectionGeometry.resizedRect(
+            base,
+            handle: handle,
+            to: CGPoint(x: point.x, y: point.y),
+            minimumSize: 6
+        )
+        if keepSquare, SelectionHandleLayout.isCorner(handle) {
+            let side = max(resized.width, resized.height)
+            let x = handle.movesLeftEdge ? base.maxX - side : base.minX
+            let y = handle.movesTopEdge ? base.maxY - side : base.minY
+            resized = CGRect(x: x, y: y, width: side, height: side)
+            let selBounds = CGRect(x: selection.origin.x, y: selection.origin.y, width: selection.size.width, height: selection.size.height)
+            if !selBounds.isEmpty {
+                resized = resized.intersection(selBounds)
+                if resized.isNull { resized = base }
+            }
+        }
+        return PixelRect(
+            origin: PixelPoint(x: resized.minX, y: resized.minY),
+            size: PixelSize(width: max(6, resized.width), height: max(6, resized.height))
+        )
     }
 }

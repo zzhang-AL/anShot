@@ -23,12 +23,30 @@ import AppKit
 @MainActor
 final class OCRResultPanel: NSObject, NSWindowDelegate {
 
+    /// 文本展示模式。
+    enum DisplayMode: Int, CaseIterable {
+        case original = 0
+        case translation = 1
+        case bilingual = 2
+    }
+
     private let panel: NSPanel
     private let textView: NSTextView
     private let statusLabel: NSTextField
+    private let modeControl = NSSegmentedControl(
+        labels: ["原文", "译文", "双语"],
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
     private let copyButton = NSButton(title: "复制全部", target: nil, action: nil)
     private let translateButton = NSButton(title: "翻译", target: nil, action: nil)
     private let languagePopUp = NSPopUpButton(frame: .zero, pullsDown: false)
+
+    /// 识别原文与最近一次翻译结果，支持在「原文 / 译文 / 双语」间无损切换。
+    private var originalText = ""
+    private var translationResult: TranslationResult?
+    private var displayMode: DisplayMode = .original
 
     /// 进行中／出错时的浮层，盖在文本区上。
     ///
@@ -141,6 +159,15 @@ final class OCRResultPanel: NSObject, NSWindowDelegate {
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(statusLabel)
 
+        modeControl.controlSize = .mini
+        modeControl.selectedSegment = DisplayMode.original.rawValue
+        modeControl.setEnabled(false, forSegment: DisplayMode.translation.rawValue)
+        modeControl.setEnabled(false, forSegment: DisplayMode.bilingual.rawValue)
+        modeControl.target = self
+        modeControl.action = #selector(handleDisplayModeChanged(_:))
+        modeControl.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(modeControl)
+
         // 浮层驾在文本区之上（同组视图里后加的在上层）。
         statusOverlay.wantsLayer = true
         statusOverlay.layer?.backgroundColor = Self.textBackground.cgColor
@@ -218,10 +245,13 @@ final class OCRResultPanel: NSObject, NSWindowDelegate {
 
             statusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: Self.margin),
             statusLabel.trailingAnchor.constraint(
-                lessThanOrEqualTo: content.trailingAnchor,
-                constant: -Self.margin
+                lessThanOrEqualTo: modeControl.leadingAnchor,
+                constant: -8
             ),
             statusLabel.bottomAnchor.constraint(equalTo: controlRow.topAnchor, constant: -6),
+
+            modeControl.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -Self.margin),
+            modeControl.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
 
             scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: Self.margin),
             scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -Self.margin),
@@ -253,6 +283,9 @@ final class OCRResultPanel: NSObject, NSWindowDelegate {
     /// 等结果回来再显示就失去作用了。
     func showLoading(near selectionScreenRect: CGRect) {
         isTranslating = false
+        originalText = ""
+        translationResult = nil
+        resetDisplayModeControl()
         textView.string = ""
         statusLabel.stringValue = ""
         setOverlay(message: "正在识别文字…", spinning: true)
@@ -266,6 +299,9 @@ final class OCRResultPanel: NSObject, NSWindowDelegate {
     /// 不直接关掉面板：面板本身就是「这里刚刚发生了什么」的载体，
     /// 关掉之后用户只能看到一个消散的窗口，反而要自己猜是不是没点到。
     func showError(_ message: String, near selectionScreenRect: CGRect) {
+        originalText = ""
+        translationResult = nil
+        resetDisplayModeControl()
         textView.string = ""
         statusLabel.stringValue = ""
         setOverlay(message: message, spinning: false)
@@ -278,7 +314,10 @@ final class OCRResultPanel: NSObject, NSWindowDelegate {
     func show(result: OCRResult, near selectionScreenRect: CGRect) {
         setOverlay(message: nil, spinning: false)
         let lines = result.lines
-        setText(lines.map(\.text).joined(separator: "\n"))
+        originalText = lines.map(\.text).joined(separator: "\n")
+        translationResult = nil
+        resetDisplayModeControl()
+        setText(originalText)
         statusLabel.stringValue = Self.statusText(for: result)
         copyButton.isEnabled = !lines.isEmpty
         refreshTranslationControls(hasLines: !lines.isEmpty)
@@ -349,7 +388,13 @@ final class OCRResultPanel: NSObject, NSWindowDelegate {
     /// 未翻译的行显示**原文**而不是留空：契约要求单行失败不影响整体，
     /// 界面上就该表现为「这段里夹着几句原文」，而不是凭空少了几行。
     func showTranslation(_ result: TranslationResult) {
-        setText(result.segments.map(\.displayText).joined(separator: "\n"))
+        translationResult = result
+        modeControl.setEnabled(true, forSegment: DisplayMode.translation.rawValue)
+        modeControl.setEnabled(true, forSegment: DisplayMode.bilingual.rawValue)
+        displayMode = .translation
+        modeControl.selectedSegment = DisplayMode.translation.rawValue
+        refreshDisplayedText()
+
         if result.isEntirelyUntranslated {
             statusLabel.stringValue = "翻译不可用，已保留原文"
         } else if result.isPartiallyTranslated {
@@ -358,6 +403,46 @@ final class OCRResultPanel: NSObject, NSWindowDelegate {
             statusLabel.stringValue = "已翻译 \(result.translatedCount) 行"
         }
         translateButton.isEnabled = true
+    }
+
+    private func resetDisplayModeControl() {
+        displayMode = .original
+        modeControl.selectedSegment = DisplayMode.original.rawValue
+        modeControl.setEnabled(false, forSegment: DisplayMode.translation.rawValue)
+        modeControl.setEnabled(false, forSegment: DisplayMode.bilingual.rawValue)
+    }
+
+    private func refreshDisplayedText() {
+        switch displayMode {
+        case .original:
+            setText(originalText)
+        case .translation:
+            guard let result = translationResult else {
+                setText(originalText)
+                return
+            }
+            setText(result.segments.map(\.displayText).joined(separator: "\n"))
+        case .bilingual:
+            guard let result = translationResult else {
+                setText(originalText)
+                return
+            }
+            let combined = result.segments.map { segment in
+                if let translated = segment.translatedText,
+                   !translated.isEmpty,
+                   translated != segment.sourceText {
+                    return "\(segment.sourceText)\n\(translated)"
+                }
+                return segment.sourceText
+            }.joined(separator: "\n\n")
+            setText(combined)
+        }
+    }
+
+    @objc private func handleDisplayModeChanged(_ sender: NSSegmentedControl) {
+        guard let mode = DisplayMode(rawValue: sender.selectedSegment) else { return }
+        displayMode = mode
+        refreshDisplayedText()
     }
 
     /// 翻译没有发生时的**可见**反馈。
@@ -417,7 +502,15 @@ final class OCRResultPanel: NSObject, NSWindowDelegate {
 
     var debugTranslateEnabledForDiagnostics: Bool { translateButton.isEnabled }
     var debugLanguagePopUpEnabledForDiagnostics: Bool { languagePopUp.isEnabled }
+    var debugDisplayModeForDiagnostics: DisplayMode { displayMode }
     var windowForDiagnostics: NSWindow { panel }
+
+    func selectDisplayModeForDiagnostics(_ mode: DisplayMode) {
+        guard mode == .original || translationResult != nil else { return }
+        displayMode = mode
+        modeControl.selectedSegment = mode.rawValue
+        refreshDisplayedText()
+    }
 
     private func refreshTranslationControls(hasLines: Bool) {
         // 用**外部注入**的可用性，不在这里重新判断：面板不知道当前选的是

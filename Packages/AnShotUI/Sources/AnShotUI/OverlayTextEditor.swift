@@ -2,59 +2,110 @@
 //  OverlayTextEditor.swift
 //  AnShotUI
 //
-//  文字输入的控件宿主：把编辑器状态里的文字草稿显示成一个输入框。
+//  文字输入的控件宿主：把编辑器状态里的文字草稿显示成一个多行自动折行输入框。
 //
-//  ── 为什么单独一个类型 ────────────────────────────────────
+//  ── 为什么使用 NSTextView ─────────────────────────────────
 //
-//  输入框有一串只在交互中才暴露的规则，它们与选区几何毫无关系：
-//  * 输入法组字过程中不能重写 `stringValue`，否则光标会被顶掉；
-//  * 回车在组字中是「确认候选词」，不是「提交」；
-//  * ESC 在输入框里是「放弃这笔文字」，而不是退出整个会话；
-//  * 移除输入框时必须把键盘焦点交还给宿主，否则回车与 ⌘C 会静默失效。
-//  留在覆盖层视图里，视图就要同时承担「几何与绘制」和「文本输入」两种职责，
-//  而这些规则又只在打字时才被触发，回归时最容易漏。
-//
-//  ── 状态归属 ──────────────────────────────────────────────
-//
-//  文字的权威副本在 `AnnotationEditorState`（草稿与已提交标注），
-//  这里只是它的一个视图：`sync` 单向把草稿推给控件，用户改动经回调送回状态。
-//  视图与控件**都不保存**文字，因此「输入中看到的」与「提交后写进模型的」
-//  不会各记一份而分叉。
+//  支持多行编辑（Return 提交、⇧Return 换行）以及按选区右边界自适应宽度折行，
+//  同时配合应用常驻 Edit 主菜单天然支持 ⌘C / ⌘V / ⌘X / ⌘A 文本编辑快捷键，
+//  并保留输入法组字（hasMarkedText）期间不误拦截回车的规则。
 //
 
 import AnShotCore
 import AppKit
 
-/// 文字输入控件。
+/// 支持 Return 提交、⇧Return 换行、ESC 取消与空态占位的自绘多行输入视图。
+private final class OverlayInputTextView: NSTextView {
+    var onCommitKey: (() -> Void)?
+    var onCancelKey: (() -> Void)?
+    var placeholderText: String = "输入文字后回车（⇧回车换行）"
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard string.isEmpty, !hasMarkedText(), let font else { return }
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.white.withAlphaComponent(0.42),
+        ]
+        let inset = textContainerInset
+        let padding = textContainer?.lineFragmentPadding ?? 0
+        (placeholderText as NSString).draw(
+            at: CGPoint(x: inset.width + padding, y: inset.height),
+            withAttributes: attrs
+        )
+    }
+
+    override func keyDown(with event: NSEvent) {
+        // 输入法正在组字时，回车与 ESC 交给输入法处理选词/消词。
+        if hasMarkedText() {
+            super.keyDown(with: event)
+            return
+        }
+        // 53 = Escape：放弃本次文字编辑
+        if event.keyCode == 53 {
+            onCancelKey?()
+            return
+        }
+        // 36 = 主键盘 Return，76 = 小键盘 Return
+        if event.keyCode == 36 || event.keyCode == 76 {
+            let flags = event.modifierFlags
+            if flags.contains(.shift) || flags.contains(.option) {
+                insertNewlineIgnoringFieldEditor(nil)
+                return
+            }
+            onCommitKey?()
+            return
+        }
+        super.keyDown(with: event)
+    }
+}
+
+/// 文字输入控件宿主。
 @MainActor
-final class OverlayTextEditor: NSObject, NSTextFieldDelegate {
+final class OverlayTextEditor: NSObject, NSTextViewDelegate {
 
     /// 用户改了内容（每次按键、输入法更新都会触发）。
     var onTextChange: ((String) -> Void)?
+    /// 输入框自适应折行最大宽度变化（底图像素），用于同步导出换行。
+    var onMaxWidthChange: ((Double?) -> Void)?
     /// 回车提交当前文字。
     var onCommit: (() -> Void)?
     /// ESC 放弃这笔文字。
     var onCancel: (() -> Void)?
 
-    private(set) var field: NSTextField?
+    private var editorView: OverlayInputTextView?
 
     /// 当前是否有输入控件存在。
-    var isActive: Bool { field != nil }
+    var isActive: Bool { editorView != nil }
 
     /// 输入控件在其父视图坐标系里的 frame（无控件时为 nil）。
-    var frame: CGRect? { field?.frame }
+    var frame: CGRect? { editorView?.frame }
+
+    /// 供诊断读取当前输入框状态。
+    var diagnosticStateString: String {
+        guard let tv = editorView else { return "none" }
+        let isEditing = tv.window?.firstResponder === tv
+        return "editable=\(tv.isEditable),selectable=\(tv.isSelectable),editing=\(isEditing)"
+    }
 
     /// 按草稿同步控件；`draft` 为 nil 时移除控件并把焦点交还宿主。
     ///
     /// - Parameters:
     ///   - scaleFactor: 逻辑点 → 像素的缩放。草稿坐标以**底图像素**为单位。
+    ///   - selectionBounds: 当前选区（宿主视图逻辑点），用于按选区右边界自适应折行。
     ///   - host: 控件挂载到哪个视图，同时是键盘焦点交还的对象。
-    func sync(draft: TextEditDraft?, scaleFactor: CGFloat, host: NSView) {
+    func sync(
+        draft: TextEditDraft?,
+        scaleFactor: CGFloat,
+        selectionBounds: CGRect? = nil,
+        host: NSView
+    ) {
         guard let draft else {
             remove(host: host)
             return
         }
 
+        let safeScale = scaleFactor > 0 ? scaleFactor : 1
         let font = NSFont.systemFont(ofSize: CGFloat(draft.fontSize))
         let color = NSColor(
             srgbRed: CGFloat(draft.color.r),
@@ -63,125 +114,105 @@ final class OverlayTextEditor: NSObject, NSTextFieldDelegate {
             alpha: 1
         )
 
-        let field: NSTextField
+        let textView: OverlayInputTextView
         let isNew: Bool
-        if let existing = self.field {
-            field = existing
+        if let existing = editorView {
+            textView = existing
             isNew = false
         } else {
-            field = NSTextField(frame: .zero)
-            let cell = TopAlignedTextFieldCell(textCell: "")
-            // 换 cell 会**丢掉** `NSTextField(frame:)` 默认给出的可编辑性。
-            //
-            // 可编辑/可选中其实是 cell 上的属性（`field.isEditable` 只是转发到 cell），
-            // 而 `NSTextFieldCell` 自身的默认是 not editable；
-            // `NSTextField(frame:)` 之所以可编辑，是因为它自带的 cell 被打开过。
-            // 丢掉之后的现象很有迷惑性：输入框会正常出现、也能聚焦、光标也在闪，
-            // 但**打不进任何字**——看起来像键盘事件被吞了，实际是控件拒绝编辑。
-            // 实测：替换前后 `isEditable` 由 true 变 false。
-            cell.isEditable = true
-            cell.isSelectable = true
-            field.cell = cell
-            field.isBordered = false
-            field.drawsBackground = true
-            field.backgroundColor = NSColor.black.withAlphaComponent(0.35)
-            field.focusRingType = .none
-            field.delegate = self
-            host.addSubview(field)
-            self.field = field
+            let tv = OverlayInputTextView(frame: .zero)
+            tv.isRichText = false
+            tv.importsGraphics = false
+            tv.allowsUndo = true
+            tv.isEditable = true
+            tv.isSelectable = true
+            tv.drawsBackground = true
+            tv.backgroundColor = NSColor.black.withAlphaComponent(0.35)
+            tv.insertionPointColor = .white
+            tv.isHorizontallyResizable = false
+            tv.isVerticallyResizable = false
+            tv.textContainerInset = NSSize(width: 0, height: 2)
+            tv.textContainer?.lineFragmentPadding = 0
+            tv.textContainer?.widthTracksTextView = true
+            tv.delegate = self
+            tv.onCommitKey = { [weak self] in self?.onCommit?() }
+            tv.onCancelKey = { [weak self] in self?.onCancel?() }
+            host.addSubview(tv)
+            self.editorView = tv
+            textView = tv
             isNew = true
         }
 
         // 只在内容不同时写回：输入法组字过程中无条件赋值会把光标顶掉。
-        if field.stringValue != draft.text {
-            field.stringValue = draft.text
+        if textView.string != draft.text && !textView.hasMarkedText() {
+            textView.string = draft.text
         }
-        field.font = font
-        field.textColor = color
-        field.placeholderAttributedString = NSAttributedString(
-            string: "输入文字后回车",
-            attributes: [
-                .font: font,
-                .foregroundColor: NSColor.white.withAlphaComponent(0.4),
-            ]
-        )
+        textView.font = font
+        textView.textColor = color
+        textView.typingAttributes = [
+            .font: font,
+            .foregroundColor: color,
+        ]
 
-        // 行高走与渲染同源的度量（CoreText），不靠 fontSize 乘系数去猜。
-        // 输入框高度因此等于该字号实际排版出来的高度。
+        // 根据选区右边界自适应最大输入宽度，防导出右侧裁切。
         let lineHeight = CGFloat(
-            TextMetrics.lineHeight(for: draft.font(scaleFactor: scaleFactor))
+            TextMetrics.lineHeight(for: draft.font(scaleFactor: safeScale))
         )
         let origin = CGPoint(
-            x: CGFloat(draft.topLeft.x) / scaleFactor,
-            y: CGFloat(draft.topLeft.y) / scaleFactor
+            x: CGFloat(draft.topLeft.x) / safeScale,
+            y: CGFloat(draft.topLeft.y) / safeScale
         )
-        let width = min(320, max(80, host.bounds.width - 16))
-        let maxX = max(8, host.bounds.width - 8 - width)
-        let maxY = max(8, host.bounds.height - 8 - lineHeight)
-        field.frame = CGRect(
-            x: min(max(8, origin.x), maxX),
-            y: min(max(8, origin.y), maxY),
-            width: width,
-            height: max(lineHeight, 12)
-        )
+        let boundary = selectionBounds ?? host.bounds
+        let maxContainerWidth = max(120, boundary.width - 16)
+        let clampedX = min(max(boundary.minX + 8, origin.x), max(boundary.minX + 8, boundary.maxX - 128))
+        let availableToRightEdge = max(120, boundary.maxX - 8 - clampedX)
+        let width = min(maxContainerWidth, availableToRightEdge)
+
+        // 将逻辑点宽度换算回底图像素写入模型 maxWidth，保持输入折行与 CoreText 导出一致。
+        let pixelMaxWidth = Double(width * safeScale)
+        if draft.maxWidth != pixelMaxWidth {
+            onMaxWidthChange?(pixelMaxWidth)
+        }
+
+        // 先按可用宽度排版一次，求出实际多行高度。
+        textView.frame = CGRect(x: clampedX, y: origin.y, width: width, height: max(lineHeight + 4, 20))
+        if let layoutManager = textView.layoutManager, let container = textView.textContainer {
+            container.containerSize = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+            layoutManager.ensureLayout(for: container)
+            let usedRect = layoutManager.usedRect(for: container)
+            let neededHeight = ceil(max(lineHeight, usedRect.height)) + textView.textContainerInset.height * 2
+            let maxHeight = max(lineHeight + 4, host.bounds.height - 8 - origin.y)
+            let finalHeight = min(neededHeight, maxHeight)
+            let maxY = max(8, host.bounds.height - 8 - finalHeight)
+            textView.frame = CGRect(
+                x: clampedX,
+                y: min(max(8, origin.y), maxY),
+                width: width,
+                height: max(finalHeight, 16)
+            )
+        }
 
         if isNew {
-            host.window?.makeFirstResponder(field)
+            host.window?.makeFirstResponder(textView)
         }
     }
 
     /// 移除输入控件。
     func remove(host: NSView) {
-        guard let field else { return }
-        field.removeFromSuperview()
-        self.field = nil
+        guard let tv = editorView else { return }
+        tv.removeFromSuperview()
+        self.editorView = nil
 
-        // 必须把键盘焦点交还给宿主。
-        //
-        // 注意不能拿 `field` 去比对 first responder：输入框处于编辑态时，
-        // 真正的 first responder 是共享的 field editor（一个 NSTextView），
-        // `firstResponder === field` 恒为假——于是焦点落回窗口本身，
-        // 之后回车、⌘C 这些依赖 keyDown 的快捷键**全部静默失效**
-        // （用户看到的现象是「按了没反应」，而不是报错）。
         if host.window?.firstResponder !== host {
             host.window?.makeFirstResponder(host)
         }
-
         host.needsDisplay = true
     }
 
-    // MARK: - NSTextFieldDelegate
+    // MARK: - NSTextViewDelegate
 
-    /// 输入内容变化时同步给状态（状态是权威副本，控件只是它的视图）。
-    func controlTextDidChange(_ notification: Notification) {
-        guard let field = notification.object as? NSTextField else { return }
-        onTextChange?(field.stringValue)
-    }
-
-    /// 拦截回车与 ESC。
-    ///
-    /// 不用 `target/action`（只能捕回车），也避免让编辑器吞掉 ESC——
-    /// ESC 在编辑器内应「放弃这笔文字」而不是退出会话。
-    func control(
-        _ control: NSControl,
-        textView: NSTextView,
-        doCommandBy commandSelector: Selector
-    ) -> Bool {
-        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-            // 输入法正在组字（marked text）时，回车是「确认候选词」，
-            // 不能当提交，否则中文输入永远选不了词。
-            if textView.hasMarkedText() {
-                return false
-            }
-            onCommit?()
-            return true
-        }
-
-        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
-            onCancel?()
-            return true
-        }
-
-        return false
+    func textDidChange(_ notification: Notification) {
+        guard let tv = editorView else { return }
+        onTextChange?(tv.string)
     }
 }

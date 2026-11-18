@@ -18,6 +18,7 @@
 //
 
 import AnShotCore
+import AppKit
 import CoreGraphics
 import Testing
 
@@ -212,6 +213,59 @@ struct AnnotationToolbarViewLayoutTests {
         #expect(track.lowerBound >= item.rect.minX)
         #expect(track.upperBound <= item.rect.maxX)
         #expect(track.lowerBound < track.upperBound)
+    }
+
+    @Test("工具栏渲染器对编号半径、放大镜倍率、曲线弯曲度给出选中高亮")
+    func rendererHighlightsEnhancementOptions() {
+        let renderer = AnnotationToolbarRenderer()
+        renderer.style = .default
+
+        renderer.tool = .numbering
+        #expect(renderer.isSelected(.numberingRadius(AnnotationStyle.default.numberingRadius)))
+
+        renderer.tool = .magnifier
+        #expect(renderer.isSelected(.magnifierZoom(AnnotationStyle.default.magnifierZoom)))
+
+        renderer.tool = .curvedArrow
+        #expect(renderer.isSelected(.curvedArrowBend(AnnotationStyle.default.curvedArrowBend)))
+    }
+
+    @Test("折叠/展开二级面板触发尺寸变更回调，且提供完整 Tooltip 与 VoiceOver 子元素")
+    func panelCollapseNotifiesAndAccessibilityExposesItems() throws {
+        let view = Self.makeToolbar(tool: .rectangle)
+        var sizeChanges = 0
+        view.onIntrinsicSizeChanged = { sizeChanges += 1 }
+
+        // 点击当前分组按钮（形状）触发收起
+        let shapeCenter = try #require(view.itemCenter(.family(.shape)))
+        let window = NSWindow(
+            contentRect: CGRect(origin: .zero, size: view.toolbarSize),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = view
+        let event = NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: view.convert(shapeCenter, to: nil),
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 1
+        )!
+        view.mouseDown(with: event)
+        #expect(sizeChanges == 1, "折叠二级面板必须通知更新 frame")
+        #expect(view.toolbarSize.height == AnnotationToolbarLayout.barHeight)
+
+        // 校验无障碍元素数量与文案
+        let children = try #require(view.accessibilityChildren() as? [NSAccessibilityElement])
+        #expect(children.count == view.visibleItemCenters().count)
+        #expect(children.allSatisfy { ($0.accessibilityLabel()?.isEmpty == false) })
+        #expect(AnnotationToolbarView.tooltipText(for: .longScreenshot).contains("⌥点击横向"))
+        #expect(AnnotationToolbarView.tooltipText(for: .pin).contains("⌘P"))
     }
 
     /// 构造与视图等价的布局输入（两者的状态在这里显式对齐）。
