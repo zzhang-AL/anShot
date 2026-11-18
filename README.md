@@ -155,7 +155,7 @@ MCP 服务端提供以下七个标准工具：
 ## 🚀 下载与安装
 
 ### 预编译 DMG 安装
-1. 前往 [Releases](https://github.com/zzhang-AL/anShot/releases) 页面下载最新版 `anShot-1.0.0.dmg`。
+1. 前往 [Releases](https://github.com/zzhang-AL/anShot/releases) 页面下载最新版 `anShot-1.1.0.dmg`。
 2. 打开 DMG，将 `anShot.app` 拖入 `/Applications`（应用程序目录）。
 3. 启动 anShot。首次启动请在屏幕右上角菜单栏寻找相机图标 📸。
 
