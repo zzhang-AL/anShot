@@ -65,12 +65,79 @@
 
 import AnShotCore
 import AppKit
+import UniformTypeIdentifiers
 
 private let logger = AnShotLog.pin
-/// 可拖动的图像视图。
-///
-/// 存在的唯一理由是让背景拖动重新生效，见文件头的根因说明。
+/// 贴图内容视图（保留 `PinImageView` 命名以兼容现有诊断，并提供 `PinContentView` 别名）。
+typealias PinContentView = PinImageView
+
+/// 可拖动的图像视图：承载自适应内外对比细描边与鼠标悬停追踪。
 final class PinImageView: NSImageView {
+
+    /// 鼠标移入/移出卡片区域回调（用于右上角按钮淡入淡出）。
+    var onHoverChanged: ((Bool) -> Void)?
+
+    private var hoverTrackingArea: NSTrackingArea?
+    private let innerBorderLayer = CALayer()
+    private var didInstallBorderLayers = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("不支持从 nib 构造")
+    }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        super.updateLayer()
+        ensureBorderLayers()
+        // 外层深色细描边 + 内层浅色细描边，确保贴图在纯白或纯黑背景下均能清晰辨识边界。
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.black.withAlphaComponent(0.28).cgColor
+        innerBorderLayer.borderWidth = 1
+        innerBorderLayer.borderColor = NSColor.white.withAlphaComponent(0.24).cgColor
+    }
+
+    override func layout() {
+        super.layout()
+        ensureBorderLayers()
+        innerBorderLayer.frame = bounds.insetBy(dx: 1, dy: 1)
+    }
+
+    private func ensureBorderLayers() {
+        guard !didInstallBorderLayers, let rootLayer = layer else { return }
+        didInstallBorderLayers = true
+        innerBorderLayer.cornerRadius = 3
+        innerBorderLayer.zPosition = 50
+        rootLayer.addSublayer(innerBorderLayer)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTrackingArea {
+            removeTrackingArea(hoverTrackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self
+        )
+        addTrackingArea(area)
+        hoverTrackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        onHoverChanged?(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onHoverChanged?(false)
+    }
 
     /// 接管左键：交给 AppKit 的官方拖拽。
     ///
@@ -213,6 +280,12 @@ final class PinWindow: NSWindow {
 
     /// 用户关闭了这个 Pin（真正释放）。隐藏不触发它。
     var onClose: (() -> Void)?
+    /// 请求对当前贴图进行重新标注编辑。
+    var onEdit: ((CGImage) -> Void)?
+    /// 请求对当前贴图执行文字识别（OCR）。
+    var onOCR: ((CGImage, CGRect) -> Void)?
+    /// 请求关闭全部贴图。
+    var onCloseAll: (() -> Void)?
 
     /// 当前缩放比例（1.0 = 原始像素 1:1，屏幕是 2x 时逻辑尺寸为像素的一半）。
     private(set) var scale: Double = 1
@@ -251,7 +324,7 @@ final class PinWindow: NSWindow {
     private(set) var closeButton = PinCardButton.make(
         symbol: "xmark",
         fallbackTitle: "关闭",
-        toolTip: closeButtonTipWhenPinned
+        toolTip: closeButtonTipDirect
     )
     private(set) var plusButton = PinCardButton.make(
         symbol: "plus",
@@ -306,7 +379,12 @@ final class PinWindow: NSWindow {
         imageView.wantsLayer = true
         imageView.layer?.cornerRadius = 4
         imageView.layer?.masksToBounds = true
+        imageView.onHoverChanged = { [weak self] hovered in
+            self?.setCardButtonsVisible(hovered, animated: true)
+        }
         installCardButtons()
+        // 常态淡出隐藏右上角控制按钮，避免遮挡小图文字；鼠标移入时淡入。
+        setCardButtonsVisible(false, animated: false)
 
         // 窗口移动结束后的防丢检查。
         //
@@ -373,22 +451,34 @@ final class PinWindow: NSWindow {
                 fallbackTitle: "重新固定",
                 toolTip: pinButtonTipWhenUnpinned
             )
-            closeButton.setSymbol(
-                "xmark",
-                fallbackTitle: "关闭",
-                toolTip: closeButtonTipWhenUnpinned
-            )
         } else {
             pinButton.setSymbol(
                 "pin.fill",
                 fallbackTitle: "取消固定",
                 toolTip: pinButtonTipWhenPinned
             )
-            closeButton.setSymbol(
-                "xmark",
-                fallbackTitle: "关闭",
-                toolTip: closeButtonTipWhenPinned
-            )
+        }
+        closeButton.setSymbol(
+            "xmark",
+            fallbackTitle: "关闭",
+            toolTip: closeButtonTipDirect
+        )
+    }
+
+    /// 控制右上角操作按钮的显隐淡入淡出，避免常态遮挡小图文字。
+    private func setCardButtonsVisible(_ visible: Bool, animated: Bool) {
+        let targetAlpha: CGFloat = visible ? 1 : 0
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.15
+                for button in cardButtons {
+                    button.animator().alphaValue = targetAlpha
+                }
+            }
+        } else {
+            for button in cardButtons {
+                button.alphaValue = targetAlpha
+            }
         }
     }
 
@@ -532,14 +622,13 @@ final class PinWindow: NSWindow {
         self.alphaValue = CGFloat(min(1, max(0.2, alpha)))
     }
 
-    /// 按比例缩放（以窗口中心为锚点，避免缩放时位置乱跑）。
-    ///
-    /// 缩放的下限由**最小卡片尺寸**决定，而不是写死 0.15：卡片小到放不下按钮时，
-    /// 超出的按钮会被 `masksToBounds` 剪掉，最坏情况是「＋」被剪掉——用户把图缩到
-    /// 很小，却再也点不到放大（实测旧下限 0.15 时，一张 200×150 的卡片只剩 30pt 宽，
-    /// 四个按钮都放不下）。基准尺寸本身比最小卡片还小时（铉的是一个小图标）
-    /// **不强制放大**，只是不能再缩小。
-    func applyScale(_ newScale: Double, pixelSize: CGSize, screenScale: CGFloat) {
+    /// 按比例缩放，支持指定归一化锚点（`(0.5, 0.5)` 为窗口中心，鼠标滚轮时取光标位置）。
+    func applyScale(
+        _ newScale: Double,
+        pixelSize: CGSize,
+        screenScale: CGFloat,
+        anchor: CGPoint = CGPoint(x: 0.5, y: 0.5)
+    ) {
         let lower = Self.minimumScale(pixelSize: pixelSize, screenScale: screenScale)
         let clamped = min(Self.maximumScale, max(lower, newScale))
         scale = clamped
@@ -547,20 +636,24 @@ final class PinWindow: NSWindow {
             width: pixelSize.width / screenScale * CGFloat(clamped),
             height: pixelSize.height / screenScale * CGFloat(clamped)
         )
-        let center = CGPoint(x: frame.midX, y: frame.midY)
+        let clampedAnchor = CGPoint(
+            x: min(max(0, anchor.x), 1),
+            y: min(max(0, anchor.y), 1)
+        )
+        let anchorScreen = CGPoint(
+            x: frame.minX + frame.width * clampedAnchor.x,
+            y: frame.minY + frame.height * clampedAnchor.y
+        )
         setFrame(
             CGRect(
-                x: center.x - logical.width / 2,
-                y: center.y - logical.height / 2,
+                x: anchorScreen.x - logical.width * clampedAnchor.x,
+                y: anchorScreen.y - logical.height * clampedAnchor.y,
                 width: logical.width,
                 height: logical.height
             ),
             display: true
         )
         imageView.frame = CGRect(origin: .zero, size: logical)
-        // 按钮自己不会跟着变大：它们是控件，位置贴右上角即可。
-        // autoresizing 也会算一次，这里显式再算一次是为了让结果与
-        // 「窗口刚创建」时的路径完全一致（同一段代码，不依赖 AppKit 的时机）。
         layoutCardButtons()
     }
 
@@ -590,12 +683,9 @@ final class PinWindow: NSWindow {
         return min(1, max(absoluteMinimumScale, toFitButtons))
     }
 
-    /// 按倍率缩放（等比）。按钮与滚轮共用，两条入口的手感因此同源。
-    ///
-    /// 用**乘性**而不是加性：0.15 + 0.1 是 +67%，3.0 + 0.1 只有 +3%——
-    /// 同一句加法在两端的手感差 20 倍。
-    func scaleBy(_ factor: Double) {
-        applyScale(scale * factor, pixelSize: pixelSize, screenScale: screenScale)
+    /// 按倍率缩放（等比），可指定归一化锚点。
+    func scaleBy(_ factor: Double, anchor: CGPoint = CGPoint(x: 0.5, y: 0.5)) {
+        applyScale(scale * factor, pixelSize: pixelSize, screenScale: screenScale, anchor: anchor)
     }
 
     // MARK: - 显示 / 隐藏 / 关闭
@@ -643,51 +733,41 @@ final class PinWindow: NSWindow {
         case pinch(amount: Double)
     }
 
-    /// 处理缩放/透明度输入。
-    ///
-    /// 修饰键的语义：**⌃（或 ⌥）→ 透明度，其余 → 缩放**。
-    /// ⌃ 是用户指定的（与多数看图应用的「⌃+滚轮」惯例一致），⌥ 保留为别名：
-    /// 两者都不需要额外记忆，且不会与系统手势冲突到不可用。
-    func applyCardInput(_ input: CardInput, transparency: Bool) {
+    /// 处理缩放/透明度输入，支持以鼠标光标归一化坐标作为缩放锚点。
+    func applyCardInput(
+        _ input: CardInput,
+        transparency: Bool,
+        anchor: CGPoint = CGPoint(x: 0.5, y: 0.5)
+    ) {
         switch input {
         case .scroll(let delta, let precise):
             guard delta != 0 else { return }
             if transparency {
                 setAlpha(Double(alphaValue) + delta * (precise ? 0.004 : 0.03))
             } else {
-                scaleBy(Self.zoomFactor(forScrollDelta: delta, precise: precise))
+                scaleBy(Self.zoomFactor(forScrollDelta: delta, precise: precise), anchor: anchor)
             }
         case .pinch(let amount):
             guard amount != 0 else { return }
             if transparency {
-                // 捏合的 amount 量级比滚动小得多（一次手势常累计 0.1～0.5），
-                // 所以系数比滚轮大：0.1 的手势 → 透明度 5%。
                 setAlpha(Double(alphaValue) + amount * 0.5)
             } else {
-                // 捏合是「倍率增量」，用**指数映射**而不是 `1 + amount`：
-                //
-                // * `1 + amount` 不可逆：捏出 0.2 再捏回 -0.2 得到 ×1.2 × 0.8 = ×0.96，
-                //   连捏几下就会莫名缩小（诊断里第一版就是这么写的，被断言当场抓住）；
-                // * `amount` 小于 -1 时 `1 + amount` 会变成负倍率，图上会直接翻转/归零。
-                //
-                // `exp(amount)` 天然可逆（+0.2 与 -0.2 互为倒数）、恒为正，
-                // 且「捏得越多、变得越多」连续成立。
-                scaleBy(Foundation.exp(amount))
+                scaleBy(Foundation.exp(amount), anchor: anchor)
             }
         }
     }
 
-    /// 滚轮缩放；按住 ⌃（或 ⌥）调透明度。
-    ///
-    /// 透明度是调整一次就完事的，缩放是高频操作，所以高频的那件不需要修饰键。
-    ///
-    /// 幅度必须**按设备区分**，否则总有一类手感是错的：触控板/妙控鼠标给的是精确像素
-    /// （一次滑动常有几十点），普通滚轮给的是行数（每格 ±1）。旧实现一律按「2% × delta」
-    /// 算——鼠标滚一格只变 2%，用户的结论是「滚轮根本不能缩放」。
+    /// 滚轮缩放（以当前鼠标光标归一化位置为锚点）；按住 ⌃（或 ⌥）调透明度。
     override func scrollWheel(with event: NSEvent) {
+        let location = event.locationInWindow
+        let anchor = CGPoint(
+            x: min(max(0, location.x / max(1, frame.width)), 1),
+            y: min(max(0, location.y / max(1, frame.height)), 1)
+        )
         applyCardInput(
             .scroll(delta: Double(event.scrollingDeltaY), precise: event.hasPreciseScrollingDeltas),
-            transparency: event.modifierFlags.contains(.control) || event.modifierFlags.contains(.option)
+            transparency: event.modifierFlags.contains(.control) || event.modifierFlags.contains(.option),
+            anchor: anchor
         )
     }
 
@@ -730,21 +810,54 @@ final class PinWindow: NSWindow {
 
     // MARK: - 键盘
 
-    /// 键盘：ESC = 关闭。
-    ///
-    /// 规则与 ✕ **完全相同**（`performClose`）：固定中只隐藏（位图保留），
-    /// 已取消固定才隐藏并释放。两个入口共用同一个方法，否则迟早会出现
-    /// 「按 ESC 丢了一张，点 ✕ 只是收起」这类不一致，而它只会以「我的图怎么没了」暴露。
-    ///
-    /// 前提是窗口能成为 key window（见 `canBecomeKey`）：本应用不活跃时，
-    /// ESC 属于当前活跃应用，我们无权截获（截获键盘需要辅助功能权限，本项目刻意不要）。
+    /// 支持贴图窗口常用快捷键：`⌘C` 复制、`⌘S` 另存为、`⌘E` 编辑、`⌘H` 隐藏、`⌘W` 关闭、`0`/`+`/`-` 缩放。
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let key = event.charactersIgnoringModifiers?.lowercased()
+        if flags == .command {
+            switch key {
+            case "c":
+                copyPinImage()
+                return true
+            case "s":
+                savePinImageAs()
+                return true
+            case "e":
+                editPinImage()
+                return true
+            case "h":
+                hidePinFromMenu()
+                return true
+            case "w":
+                performClose(from: "command-w")
+                return true
+            case "0":
+                resetScale()
+                return true
+            default:
+                break
+            }
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    /// 键盘：ESC 直接关闭贴图并释放配额；`+`/`-`/`0` 控制缩放。
     override func keyDown(with event: NSEvent) {
-        guard event.keyCode == Self.escapeKeyCode else {
-            super.keyDown(with: event)
+        if event.keyCode == Self.escapeKeyCode {
+            logger.notice("pin #\(self.pinID, privacy: .public) escape pressed")
+            performClose(from: "escape key")
             return
         }
-        logger.notice("pin #\(self.pinID, privacy: .public) escape pressed")
-        performClose(from: "escape key")
+        switch event.charactersIgnoringModifiers {
+        case "+", "=":
+            zoomInFromCard()
+        case "-":
+            zoomOutFromCard()
+        case "0":
+            resetScale()
+        default:
+            super.keyDown(with: event)
+        }
     }
 
     /// ESC 的键码。与覆盖层用的是同一个（`OverlayWindow.keyDown`）。
@@ -768,32 +881,75 @@ final class PinWindow: NSWindow {
         precise ? pow(1.003, delta) : pow(1.08, delta)
     }
 
-    /// 右键菜单：只剩调整项（原始大小、恢复不透明）。
-    ///
-    /// 「隐藏」与「关闭」**不再出现在这里**：它们是这张卡片的主出口，
-    /// 藏在只有试过才发现的右键菜单里等于没有入口，已移到卡片右上角的按钮
-    /// （契约 §6）。留下的两项是调整，随手可用即可，不必占据卡片上的位置。
+    /// 右键菜单：提供复制、另存为、再编辑、OCR、透明度、缩放与隐藏/关闭等完整交互入口。
     override func rightMouseDown(with event: NSEvent) {
         if let view = contentView {
             NSMenu.popUpContextMenu(cardAdjustmentMenu(), with: event, for: view)
         }
     }
 
-    /// 右键菜单的内容。
-    ///
-    /// 抽成方法是为了让诊断能直接断言「隐藏/关闭确实不在菜单里」——
-    /// 只靠人工右键确认的事，迟早会在某次重构里悄悄回退。
+    /// 构造贴图右键上下文菜单。
     func cardAdjustmentMenu() -> NSMenu {
         let menu = NSMenu()
-        menu.addItem(withTitle: "原始大小", action: #selector(resetScale), keyEquivalent: "")
+        menu.autoenablesItems = false
+
+        let copyItem = NSMenuItem(title: "复制图片", action: #selector(copyPinImage), keyEquivalent: "c")
+        let saveItem = NSMenuItem(title: "另存为…", action: #selector(savePinImageAs), keyEquivalent: "s")
+        let editItem = NSMenuItem(title: "重新标注编辑…", action: #selector(editPinImage), keyEquivalent: "e")
+        editItem.isEnabled = onEdit != nil
+        let ocrItem = NSMenuItem(title: "提取文字 (OCR)", action: #selector(ocrPinImage), keyEquivalent: "")
+        ocrItem.isEnabled = onOCR != nil
+
+        menu.addItem(copyItem)
+        menu.addItem(saveItem)
+        menu.addItem(editItem)
+        menu.addItem(ocrItem)
+        menu.addItem(.separator())
+
+        // 透明度子菜单
+        let alphaParent = NSMenuItem(title: "透明度", action: nil, keyEquivalent: "")
+        let alphaSubmenu = NSMenu()
+        let currentAlpha = Double(alphaValue)
+        let alphaPresets: [(title: String, value: Double)] = [
+            ("100%（不透明）", 1.0),
+            ("85%", 0.85),
+            ("70%", 0.70),
+            ("50%", 0.50),
+            ("30%", 0.30),
+        ]
+        for preset in alphaPresets {
+            let item = NSMenuItem(
+                title: preset.title,
+                action: #selector(selectAlphaPreset(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = NSNumber(value: preset.value)
+            item.state = abs(currentAlpha - preset.value) < 0.04 ? .on : .off
+            alphaSubmenu.addItem(item)
+        }
+        alphaParent.submenu = alphaSubmenu
+        menu.addItem(alphaParent)
+
+        menu.addItem(withTitle: "原始大小", action: #selector(resetScale), keyEquivalent: "0")
+        menu.addItem(withTitle: "放大 10%", action: #selector(zoomInFromCard), keyEquivalent: "+")
+        menu.addItem(withTitle: "缩小 10%", action: #selector(zoomOutFromCard), keyEquivalent: "-")
         menu.addItem(withTitle: "不透明", action: #selector(resetAlpha), keyEquivalent: "")
+        menu.addItem(.separator())
+
+        menu.addItem(withTitle: "隐藏贴图", action: #selector(hidePinFromMenu), keyEquivalent: "h")
+        menu.addItem(withTitle: "关闭贴图", action: #selector(closeFromCard), keyEquivalent: "w")
+        let closeAllItem = NSMenuItem(title: "全部关闭", action: #selector(closeAllFromMenu), keyEquivalent: "")
+        closeAllItem.isEnabled = onCloseAll != nil
+        menu.addItem(closeAllItem)
+
         for item in menu.items where item.action != nil {
             item.target = self
         }
         return menu
     }
 
-    /// 图钉：切换固定状态。**不动可见性**（用户要求「取消固定先不隐藏」）。
+    /// 图钉：切换固定状态。
     @objc private func togglePinFromCard() {
         isUnpinned.toggle()
         refreshCardButtons()
@@ -801,29 +957,67 @@ final class PinWindow: NSWindow {
         logger.notice("pin #\(self.pinID, privacy: .public) \(state, privacy: .public) from card")
     }
 
-    /// 关闭：固定中只隐藏（位图保留），已取消固定才隐藏并释放。
-    ///
-    /// 于是「关闭」永远不会悄悄丢掉用户要求保留的图：要销毁必须先按图钉
-    /// （用户给的规则）。
+    /// 右上角 `✕` 回归直觉语义：直接关闭并释放位图与配额。
     @objc private func closeFromCard() {
         performClose(from: "card button")
     }
 
-    /// 「关闭」的规则（✕ 与 ESC 共用）。
-    ///
-    /// - Parameter source: 触发来源，只用于日志——两个入口在日志里必须分得清。
+    /// 关闭贴图并释放配额（隐藏操作已移至右键菜单与 `⌘H`）。
     func performClose(from source: String) {
-        if isUnpinned {
-            logger.notice("""
-                pin #\(self.pinID, privacy: .public) closed from \(source, privacy: .public) (releasing bitmap)
-                """)
-            closeAndRelease()
-        } else {
-            hidePin()
-            logger.notice("""
-                pin #\(self.pinID, privacy: .public) hidden from \(source, privacy: .public) (bitmap kept)
-                """)
+        logger.notice("pin #\(self.pinID, privacy: .public) closed from \(source, privacy: .public) (releasing bitmap)")
+        closeAndRelease()
+    }
+
+    @objc private func copyPinImage() {
+        guard let image = contentImage else { return }
+        let ok = SessionExporter.copyToPasteboard(image)
+        ToastPresenter.show(ok ? "已复制到剪贴板" : "复制失败")
+    }
+
+    @objc private func savePinImageAs() {
+        guard let image = contentImage else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png]
+        panel.nameFieldStringValue = "anShot-pin-\(pinID).png"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let data = Exporter.pngData(from: image) else {
+            ToastPresenter.show("保存失败：无法编码图像")
+            return
         }
+        do {
+            try data.write(to: url, options: .atomic)
+            ToastPresenter.show("已保存：\(url.lastPathComponent)", actionTitle: "在访达中显示") {
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            }
+        } catch {
+            ToastPresenter.show("保存失败：\(error.localizedDescription)")
+        }
+    }
+
+    @objc private func editPinImage() {
+        guard let image = contentImage else { return }
+        onEdit?(image)
+    }
+
+    @objc private func ocrPinImage() {
+        guard let image = contentImage else { return }
+        onOCR?(image, frame)
+    }
+
+    @objc private func selectAlphaPreset(_ sender: NSMenuItem) {
+        guard let number = sender.representedObject as? NSNumber else { return }
+        setAlpha(number.doubleValue)
+    }
+
+    @objc private func hidePinFromMenu() {
+        hidePin()
+        ToastPresenter.show("已隐藏贴图（可在菜单栏恢复）")
+    }
+
+    @objc private func closeAllFromMenu() {
+        onCloseAll?()
     }
 
     /// 放大：每次 10%，等比。
@@ -867,21 +1061,14 @@ final class PinWindow: NSWindow {
 
 // MARK: - 卡片文案
 
-/// 图钉按钮在「固定中」的说明：写明它**不动可见性**，并预告关闭会怎样。
-///
-/// 两个按钮两种状态共四句，集中在这里：它们是用户唯一能读到「这次点击会不会
-/// 释放内存」的地方，初始状态与切换后的文案必须逐字一致——分开写迟早会出现
-/// 状态与文案互相矛盾，而那正是本功能最难排查的一类缺陷。
-private let pinButtonTipWhenPinned = "取消固定（卡片继续显示；取消后再点关闭才会释放内存）"
+/// 取消固定提示文案。
+private let pinButtonTipWhenPinned = "取消固定（切换固定标记）"
 
-/// 图钉按钮在「已取消固定」的说明。
-private let pinButtonTipWhenUnpinned = "重新固定（恢复为「关闭只隐藏、不释放」）"
+/// 重新固定提示文案。
+private let pinButtonTipWhenUnpinned = "重新固定"
 
-/// 关闭按钮在「固定中」的说明：这一次点击只隐藏。
-private let closeButtonTipWhenPinned = "关闭：隐藏但不释放（可从菜单栏恢复）"
-
-/// 关闭按钮在「已取消固定」的说明：这一次点击会释放内存。
-private let closeButtonTipWhenUnpinned = "关闭：隐藏并释放内存（不可恢复）"
+/// 直接关闭按钮提示文案：点击立即关闭贴图并释放配额。
+private let closeButtonTipDirect = "关闭贴图（释放内存与配额；右键可隐藏）"
 
 /// 放大按钮的说明。写明步长与「滚轮也能用」两条入口——
 /// 按钮是给「不知道有滚轮」的人准备的。
@@ -926,6 +1113,11 @@ final class PinManager {
     private(set) var pins: [PinWindow] = [] {
         didSet { updatePinchMonitor() }
     }
+
+    /// 请求对某张贴图重新标注编辑。
+    var onEditPin: ((CGImage) -> Void)?
+    /// 请求对某张贴图执行 OCR 文字识别。
+    var onOCRPin: ((CGImage, CGRect) -> Void)?
 
     /// Pin 序号的分配器。隐藏后重新显示不改变它，因此菜单项不会跳号。
     private var nextPinID = 1
@@ -1058,6 +1250,15 @@ final class PinManager {
         window.onClose = { [weak self, weak window] in
             guard let self, let window else { return }
             self.pins.removeAll { $0 === window }
+        }
+        window.onEdit = { [weak self] img in
+            self?.onEditPin?(img)
+        }
+        window.onOCR = { [weak self] img, rect in
+            self?.onOCRPin?(img, rect)
+        }
+        window.onCloseAll = { [weak self] in
+            self?.closeAll()
         }
         window.orderFrontRegardless()
         pins.append(window)

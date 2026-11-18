@@ -19,7 +19,7 @@ import AnShotCore
 import AppKit
 
 @MainActor
-final class ScrollshotLogWindowController: NSObject {
+final class ScrollshotLogWindowController: NSObject, NSWindowDelegate {
 
     private let panel: NSPanel
     private let textView = NSTextView()
@@ -29,7 +29,7 @@ final class ScrollshotLogWindowController: NSObject {
     override init() {
         panel = NSPanel(
             contentRect: CGRect(x: 0, y: 0, width: 900, height: 540),
-            styleMask: [.titled, .closable, .resizable, .nonactivatingPanel, .utilityWindow],
+            styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
         )
@@ -37,11 +37,13 @@ final class ScrollshotLogWindowController: NSObject {
 
         panel.isReleasedWhenClosed = false
         panel.title = "长截图日志"
-        panel.appearance = NSAppearance(named: .darkAqua)
+        panel.backgroundColor = SettingsTheme.windowBackground
+        panel.hidesOnDeactivate = false
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary]
         panel.isMovableByWindowBackground = false
         panel.minSize = CGSize(width: 680, height: 320)
+        panel.delegate = self
         panel.contentView = makeContentView()
     }
 
@@ -53,13 +55,20 @@ final class ScrollshotLogWindowController: NSObject {
     // MARK: - 显示
 
     func show() {
+        ForegroundPolicyCoordinator.acquire("scrollshotLog")
         refresh()
         repositionIfNeeded()
-        panel.orderFrontRegardless()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
     }
 
     func hide() {
         panel.orderOut(nil)
+        ForegroundPolicyCoordinator.release("scrollshotLog")
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        ForegroundPolicyCoordinator.release("scrollshotLog")
     }
 
     /// 重新读一次 store。窗口未打开时也刷新（打开时立刻是最新内容）。
@@ -86,62 +95,78 @@ final class ScrollshotLogWindowController: NSObject {
     // MARK: - 内容
 
     private func makeContentView() -> NSView {
-        let content = NSView(frame: CGRect(x: 0, y: 0, width: 900, height: 540))
+        let content = ScrollshotLogBackgroundView(frame: CGRect(x: 0, y: 0, width: 900, height: 540))
+        content.autoresizingMask = [.width, .height]
 
         summaryLabel.font = .systemFont(ofSize: 11)
         summaryLabel.textColor = .secondaryLabelColor
-        summaryLabel.frame = CGRect(x: 14, y: 508, width: 560, height: 18)
-        summaryLabel.autoresizingMask = [.width, .minYMargin]
-        content.addSubview(summaryLabel)
+        summaryLabel.lineBreakMode = .byTruncatingTail
+        summaryLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let refreshButton = makeButton("刷新", #selector(refreshTapped))
-        refreshButton.frame = CGRect(x: 588, y: 503, width: 68, height: 26)
-        refreshButton.autoresizingMask = [.minXMargin, .minYMargin]
-        content.addSubview(refreshButton)
+        let refreshButton = SettingsPushButton(title: "刷新", emphasis: .primary, target: self, action: #selector(refreshTapped))
+        let copyButton = SettingsPushButton(title: "复制全部", target: self, action: #selector(copyTapped))
+        let exportButton = SettingsPushButton(title: "导出…", target: self, action: #selector(exportTapped))
+        let clearButton = SettingsPushButton(title: "清空", target: self, action: #selector(clearTapped))
 
-        let copyButton = makeButton("复制全部", #selector(copyTapped))
-        copyButton.frame = CGRect(x: 662, y: 503, width: 76, height: 26)
-        copyButton.autoresizingMask = [.minXMargin, .minYMargin]
-        content.addSubview(copyButton)
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let exportButton = makeButton("导出…", #selector(exportTapped))
-        exportButton.frame = CGRect(x: 744, y: 503, width: 68, height: 26)
-        exportButton.autoresizingMask = [.minXMargin, .minYMargin]
-        content.addSubview(exportButton)
+        let toolbar = NSStackView(views: [summaryLabel, spacer, refreshButton, copyButton, exportButton, clearButton])
+        toolbar.orientation = .horizontal
+        toolbar.alignment = .centerY
+        toolbar.spacing = 8
+        toolbar.translatesAutoresizingMaskIntoConstraints = false
 
-        let clearButton = makeButton("清空", #selector(clearTapped))
-        clearButton.frame = CGRect(x: 818, y: 503, width: 68, height: 26)
-        clearButton.autoresizingMask = [.minXMargin, .minYMargin]
-        content.addSubview(clearButton)
-
-        // 等宽 + 不换行（横向可滚）：列对齐是这张表能被快速扫读的前提。
+        // 等宽 + 不换行（横向可滚）：在自适应亮暗卡片表面内呈现日志表格。
         textView.isEditable = false
         textView.isSelectable = true
         textView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        textView.textColor = .textColor
-        textView.drawsBackground = true
-        textView.backgroundColor = NSColor.black.withAlphaComponent(0.35)
-        textView.textContainerInset = NSSize(width: 10, height: 8)
+        textView.textColor = .labelColor
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 12, height: 10)
+        textView.frame = NSRect(x: 0, y: 0, width: 840, height: 460)
+        textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = true
+        textView.textContainer?.containerSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
         textView.textContainer?.widthTracksTextView = false
 
-        scrollView.frame = CGRect(x: 14, y: 14, width: 872, height: 482)
-        scrollView.autoresizingMask = [.width, .height]
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.drawsBackground = false
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
         scrollView.documentView = textView
-        content.addSubview(scrollView)
+
+        let card = HistorySurfaceView(style: .card)
+        card.addSubview(scrollView)
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: card.topAnchor, constant: 6),
+            scrollView.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 6),
+            scrollView.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -6),
+            scrollView.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -6),
+        ])
+
+        content.addSubview(toolbar)
+        content.addSubview(card)
+
+        let margin = SettingsTheme.margin
+        NSLayoutConstraint.activate([
+            toolbar.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            toolbar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: margin),
+            toolbar.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -margin),
+
+            card.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 12),
+            card.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: margin),
+            card.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -margin),
+            card.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -margin),
+        ])
 
         return content
-    }
-
-    private func makeButton(_ title: String, _ action: Selector) -> NSButton {
-        let button = NSButton(title: title, target: self, action: action)
-        button.bezelStyle = .rounded
-        button.controlSize = .small
-        return button
     }
 
     /// 首次显示时放到主屏中上部：菜单栏展开后用户的视线在屏幕上方，
@@ -165,10 +190,13 @@ final class ScrollshotLogWindowController: NSObject {
     @objc private func copyTapped() {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.setString(textView.string, forType: .string)
+        let ok = pasteboard.setString(textView.string, forType: .string)
+        ToastPresenter.show(ok ? "已复制长截图日志" : "复制失败")
     }
 
     @objc private func exportTapped() {
+        // 菜单栏应用在导出模态面板前必须显式激活，防止面板被其他窗口遮挡。
+        NSApp.activate(ignoringOtherApps: true)
         let savePanel = NSSavePanel()
         savePanel.allowedContentTypes = [.plainText]
         savePanel.nameFieldStringValue = "anshot-scrollshot-log.txt"
@@ -177,6 +205,7 @@ final class ScrollshotLogWindowController: NSObject {
             guard response == .OK, let url = savePanel.url, let self else { return }
             do {
                 try self.textView.string.write(to: url, atomically: true, encoding: .utf8)
+                ToastPresenter.show("已导出长截图日志")
             } catch {
                 let alert = NSAlert()
                 alert.messageText = "导出失败"
@@ -190,5 +219,24 @@ final class ScrollshotLogWindowController: NSObject {
     @objc private func clearTapped() {
         ScrollshotLogStore.shared.clear()
         refresh()
+    }
+}
+
+/// 长截图日志窗口自适应背景视图。
+private final class ScrollshotLogBackgroundView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("不支持从 nib 构造")
+    }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        layer?.backgroundColor = SettingsTheme.windowBackground.cgColor
     }
 }

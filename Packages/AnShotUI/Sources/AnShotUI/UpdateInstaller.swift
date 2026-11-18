@@ -32,8 +32,10 @@
 import AnShotCore
 import AppKit
 import CryptoKit
+import Darwin
 import Foundation
 import os
+import Security
 
 /// 下载 / 校验 / 安装的用户可读错误。
 ///
@@ -94,10 +96,26 @@ enum UpdateInstallError: LocalizedError, Sendable {
 final class UpdateInstaller {
 
     /// 安装包必须声明的 bundle id。与 `project.yml` 的 `PRODUCT_BUNDLE_IDENTIFIER` 一致。
-    static let expectedBundleIdentifier = "com.anshot.app"
+    nonisolated static let expectedBundleIdentifier = "com.anshot.app"
 
     /// 允许自安装的目录。
-    static let applicationsPath = "/Applications"
+    nonisolated static let applicationsPath = "/Applications"
+
+    /// 下载 zip 安装包体积安全上限（200 MiB）。
+    nonisolated static let maximumDownloadBytes: Int64 = 200 * 1024 * 1024
+
+    /// 解压后应用包总体积安全上限（500 MiB），防范压缩炸弹。
+    nonisolated static let maximumExtractedBytes: UInt64 = 500 * 1024 * 1024
+
+    /// 安装脚本等待旧进程退出的最大重试次数（150 * 0.2s = 30s）。
+    nonisolated static let processWaitMaxIterations = 150
+
+    /// 当前运行实例与更新包的签名者身份描述（用于同源校验）。
+    struct SigningIdentity: Equatable, Sendable {
+        let isAdhoc: Bool
+        let teamIdentifier: String?
+        let certificateDigests: [String]
+    }
 
     /// 安装阶段。窗口据此在「下载中 / 校验中」之间切换文案。
     enum Stage: Sendable {
@@ -169,7 +187,7 @@ final class UpdateInstaller {
         )
 
         onStageChange?(.validatingSignature)
-        try await validate(extracted, expecting: release.version)
+        try await validate(extracted, expecting: release)
         return extracted
     }
 
@@ -200,9 +218,11 @@ final class UpdateInstaller {
         request.setValue("anShot", forHTTPHeaderField: "User-Agent")
 
         // 代理只负责把字节数写进一个线程安全的盒子；进度由主线程上的
-        // ticker 读取。这样 `progress` 闭包永远在主 actor 上被调用，
-        // 调用方（窗口）不需要为线程切换做任何准备。
-        let probe = DownloadProbe(expectedBytes: Int64(expectedSize))
+        // ticker 读取。同时强制执行最大下载字节上限（200 MiB）。
+        let probe = DownloadProbe(
+            expectedBytes: Int64(expectedSize),
+            maximumBytes: Self.maximumDownloadBytes
+        )
         let ticker = Task { @MainActor in
             while !Task.isCancelled {
                 progress(probe.fraction)
@@ -222,6 +242,10 @@ final class UpdateInstaller {
         ticker.cancel()
         _ = await ticker.value
 
+        if probe.didExceedLimit {
+            throw UpdateInstallError.installFailed("安装包体积超过安全上限（200 MiB），已停止下载。")
+        }
+
         let downloaded: (URL, URLResponse)
         switch result {
         case .success(let payload):
@@ -234,6 +258,13 @@ final class UpdateInstaller {
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(status) else {
             throw UpdateInstallError.installFailed("下载安装包失败：HTTP \(status)。")
+        }
+
+        if let attributes = try? fileManager.attributesOfItem(atPath: temporaryURL.path),
+           let fileSize = (attributes[.size] as? NSNumber)?.int64Value,
+           fileSize > Self.maximumDownloadBytes {
+            try? fileManager.removeItem(at: temporaryURL)
+            throw UpdateInstallError.installFailed("安装包体积超过安全上限（200 MiB），已停止下载。")
         }
 
         do {
@@ -350,38 +381,101 @@ final class UpdateInstaller {
         do {
             contents = try FileManager.default.contentsOfDirectory(
                 at: directory,
-                includingPropertiesForKeys: [.isDirectoryKey],
+                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
                 options: [.skipsHiddenFiles]
             )
         } catch {
             throw UpdateInstallError.unzipFailed
         }
 
+        // 严格拒绝顶层 .app 为符号链接，防止目录遍历欺骗。
         let apps = contents.filter { candidate in
             guard candidate.pathExtension.lowercased() == "app" else { return false }
-            let values = try? candidate.resourceValues(forKeys: [.isDirectoryKey])
-            return values?.isDirectory == true
+            let values = try? candidate.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            return values?.isSymbolicLink != true && values?.isDirectory == true
         }
 
         // 先认名字，再退回到「唯一一个 .app」。
+        let selectedApp: URL
         if let named = apps.first(where: { $0.lastPathComponent == "anShot.app" }) {
-            return named
+            selectedApp = named
+        } else if apps.count == 1, let only = apps.first {
+            selectedApp = only
+        } else {
+            throw UpdateInstallError.unzipFailed
         }
-        if apps.count == 1, let only = apps.first {
-            return only
+
+        // 解压后全量巡检：拒绝任何指向包外的符号链接，并限制总解压大小防止压缩炸弹。
+        try validateExtractedBundle(at: selectedApp, maxBytes: maximumExtractedBytes)
+        return selectedApp
+    }
+
+    /// 巡检解压后的应用包：禁止顶层及内部符号链接逃逸到包外，并强制总字节上限。
+    nonisolated static func validateExtractedBundle(
+        at appURL: URL,
+        maxBytes: UInt64 = maximumExtractedBytes,
+        fileManager: FileManager = .default
+    ) throws {
+        let topValues = try? appURL.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey])
+        guard topValues?.isSymbolicLink != true, topValues?.isDirectory == true else {
+            throw UpdateInstallError.unzipFailed
         }
-        throw UpdateInstallError.unzipFailed
+
+        let resolvedRoot = appURL.standardizedFileURL.resolvingSymlinksInPath()
+        let rootPath = resolvedRoot.path
+        let rootPrefix = rootPath.hasSuffix("/") ? rootPath : (rootPath + "/")
+
+        guard let enumerator = fileManager.enumerator(
+            at: appURL,
+            includingPropertiesForKeys: [.isSymbolicLinkKey, .isRegularFileKey, .fileSizeKey],
+            options: []
+        ) else {
+            throw UpdateInstallError.unzipFailed
+        }
+
+        var totalBytes: UInt64 = 0
+        for case let itemURL as URL in enumerator {
+            let values = try? itemURL.resourceValues(
+                forKeys: [.isSymbolicLinkKey, .isRegularFileKey, .fileSizeKey]
+            )
+            if values?.isSymbolicLink == true {
+                // 逐条解析符号链接目标真实路径，必须严格落在解压包目录内。
+                let destinationPath: String
+                do {
+                    destinationPath = try fileManager.destinationOfSymbolicLink(atPath: itemURL.path)
+                } catch {
+                    throw UpdateInstallError.installFailed("安装包内包含无法读取的符号链接，已停止安装。")
+                }
+                let rawTargetURL: URL
+                if destinationPath.hasPrefix("/") {
+                    rawTargetURL = URL(fileURLWithPath: destinationPath)
+                } else {
+                    rawTargetURL = itemURL.deletingLastPathComponent()
+                        .appendingPathComponent(destinationPath)
+                }
+                let resolvedTarget = rawTargetURL.standardizedFileURL.resolvingSymlinksInPath().path
+                guard resolvedTarget == rootPath || resolvedTarget.hasPrefix(rootPrefix) else {
+                    throw UpdateInstallError.installFailed("安装包内包含越界符号链接，已停止安装。")
+                }
+                continue
+            }
+
+            if values?.isRegularFile == true, let size = values?.fileSize, size > 0 {
+                let (nextTotal, overflow) = totalBytes.addingReportingOverflow(UInt64(size))
+                if overflow || nextTotal > maxBytes {
+                    throw UpdateInstallError.installFailed("解压后的安装包体积超过安全上限，已停止安装。")
+                }
+                totalBytes = nextTotal
+            }
+        }
     }
 
     // MARK: - 签名与身份校验
 
-    private func validate(_ appURL: URL, expecting version: AppVersion) async throws {
-        let signature = try await Self.runToolInBackground(
-            "/usr/bin/codesign",
-            ["--verify", "--deep", "--strict", "--verbose=2", appURL.path]
-        )
-        guard signature.status == 0 else {
-            logger.error("codesign 失败：\(signature.output, privacy: .public)")
+    private func validate(_ appURL: URL, expecting release: UpdateRelease) async throws {
+        // 先用 Security 框架执行全架构严格签名验证并核对同源签名身份。
+        let signatureOK = await Self.verifySignatureInBackground(of: appURL, logger: logger)
+        guard signatureOK else {
             throw UpdateInstallError.signatureInvalid
         }
 
@@ -403,11 +497,134 @@ final class UpdateInstaller {
             throw UpdateInstallError.installFailed("安装包缺少可读的版本号，已停止安装。")
         }
         // 用语义相等而不是字符串相等：发布 tag 可能是 v1.2，而 Info.plist 写 1.2.0。
-        guard appVersion == version else {
+        guard appVersion == release.version else {
             throw UpdateInstallError.installFailed(
-                "安装包版本 \(appVersion) 与发布版本 \(version) 不一致，已停止安装。"
+                "安装包版本 \(appVersion) 与发布版本 \(release.version) 不一致，已停止安装。"
             )
         }
+        if let expectedBuild = release.buildNumber,
+           let rawBuild = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+           let actualBuild = Int(rawBuild.trimmingCharacters(in: .whitespacesAndNewlines)),
+           actualBuild != expectedBuild {
+            throw UpdateInstallError.installFailed(
+                "安装包构建号 \(actualBuild) 与发布构建号 \(expectedBuild) 不一致，已停止安装。"
+            )
+        }
+    }
+
+    private nonisolated static func verifySignatureInBackground(
+        of appURL: URL,
+        logger: Logger
+    ) async -> Bool {
+        await Task.detached(priority: .userInitiated) {
+            verifySignatureSynchronously(of: appURL, logger: logger)
+        }.value
+    }
+
+    /// 使用 Security 框架验证候选包签名有效性，并强制要求签名者身份与当前运行实例同源。
+    private nonisolated static func verifySignatureSynchronously(of appURL: URL, logger: Logger) -> Bool {
+        var candidateStaticCode: SecStaticCode?
+        let createStatus = SecStaticCodeCreateWithPath(appURL as CFURL, [], &candidateStaticCode)
+        guard createStatus == errSecSuccess, let candidateCode = candidateStaticCode else {
+            logger.error("创建候选包 SecStaticCode 失败：OSStatus \(createStatus, privacy: .public)")
+            return false
+        }
+
+        // 严格校验所有架构与嵌套代码资源签名。
+        let validationFlags = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSStrictValidate)
+        var validityError: Unmanaged<CFError>?
+        let validityStatus = SecStaticCodeCheckValidityWithErrors(
+            candidateCode,
+            validationFlags,
+            nil,
+            &validityError
+        )
+        guard validityStatus == errSecSuccess else {
+            let reason = (validityError?.takeRetainedValue() as Error?)?.localizedDescription ?? "OSStatus \(validityStatus)"
+            logger.error("SecStaticCode 签名校验失败：\(reason, privacy: .public)")
+            return false
+        }
+
+        // 获取候选包签名信息（Team ID 与证书链）。
+        var candidateInfoRef: CFDictionary?
+        let infoFlags = SecCSFlags(rawValue: kSecCSSigningInformation)
+        guard SecCodeCopySigningInformation(candidateCode, infoFlags, &candidateInfoRef) == errSecSuccess,
+              let candidateDict = candidateInfoRef as? [AnyHashable: Any] else {
+            logger.error("读取候选包签名信息失败")
+            return false
+        }
+        let candidateIdentity = extractSigningIdentity(from: candidateDict)
+
+        // 获取当前运行实例的签名信息（SecCodeCopySelf -> SecCodeCopySigningInformation）。
+        var selfCode: SecCode?
+        var selfStaticCode: SecStaticCode?
+        var selfInfoRef: CFDictionary?
+        guard SecCodeCopySelf([], &selfCode) == errSecSuccess,
+              let currentCode = selfCode,
+              SecCodeCopyStaticCode(currentCode, [], &selfStaticCode) == errSecSuccess,
+              let currentStaticCode = selfStaticCode,
+              SecCodeCopySigningInformation(currentStaticCode, infoFlags, &selfInfoRef) == errSecSuccess,
+              let selfDict = selfInfoRef as? [AnyHashable: Any] else {
+            logger.error("读取当前实例签名信息失败，拒绝替换")
+            return false
+        }
+        let currentIdentity = extractSigningIdentity(from: selfDict)
+
+        guard isSignerCompatible(current: currentIdentity, candidate: candidateIdentity) else {
+            logger.error("安装包签名者身份与当前实例不一致或为无锚点 Ad-hoc 构建，已拒绝")
+            return false
+        }
+        return true
+    }
+
+    /// 从 `SecCodeCopySigningInformation` 返回字典中提取签名者身份。
+    nonisolated static func extractSigningIdentity(from info: [AnyHashable: Any]) -> SigningIdentity {
+        let rawFlags = (info[kSecCodeInfoFlags] as? NSNumber)?.uint32Value ?? 0
+        let isAdhoc = (rawFlags & SecCodeSignatureFlags.adhoc.rawValue) != 0
+        let teamID = (info[kSecCodeInfoTeamIdentifier] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedTeam = (teamID?.isEmpty == false) ? teamID : nil
+
+        var digests: [String] = []
+        if let certificates = info[kSecCodeInfoCertificates] as? [SecCertificate] {
+            for cert in certificates {
+                let data = SecCertificateCopyData(cert) as Data
+                let digest = SHA256.hash(data: data).map { String(format: "%02x", Int($0)) }.joined()
+                digests.append(digest)
+            }
+        }
+        return SigningIdentity(
+            isAdhoc: isAdhoc,
+            teamIdentifier: normalizedTeam,
+            certificateDigests: digests
+        )
+    }
+
+    /// 校验当前运行实例与候选更新包的签名者是否严格同源，且均非无锚点 Ad-hoc 构建。
+    nonisolated static func isSignerCompatible(
+        current: SigningIdentity,
+        candidate: SigningIdentity
+    ) -> Bool {
+        // 禁止无锚点 Ad-hoc 构建绕过同源检查进行静默自动替换。
+        guard !current.isAdhoc, !candidate.isAdhoc else {
+            return false
+        }
+        if let currentTeam = current.teamIdentifier, let candidateTeam = candidate.teamIdentifier {
+            return currentTeam == candidateTeam
+        }
+        // 无 Team ID 时（如企业/自签锚点证书）要求双方证书链非空且叶证书或根证书指纹一致。
+        guard let currentLeaf = current.certificateDigests.first,
+              let candidateLeaf = candidate.certificateDigests.first else {
+            return false
+        }
+        if currentLeaf == candidateLeaf {
+            return true
+        }
+        if let currentRoot = current.certificateDigests.last,
+           let candidateRoot = candidate.certificateDigests.last {
+            return currentRoot == candidateRoot
+        }
+        return false
     }
 
     // MARK: - 安装
@@ -416,19 +633,27 @@ final class UpdateInstaller {
     ///
     /// 返回时脚本已经启动、新 bundle 已经复制到目标卷；调用方随后应当
     /// 调用 `NSApplication.shared.terminate(nil)` 让脚本继续。
+    /// 校验目标应用路径解析符号链接后是否真正位于 `/Applications` 目录下。
+    nonisolated static func isValidApplicationsTarget(_ targetURL: URL) -> Bool {
+        let resolvedTarget = targetURL.standardizedFileURL.resolvingSymlinksInPath()
+        guard resolvedTarget.pathExtension.lowercased() == "app" else {
+            return false
+        }
+        let parent = resolvedTarget.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
+        let applications = URL(fileURLWithPath: Self.applicationsPath, isDirectory: true)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        let appsPrefix = applications.path.hasSuffix("/") ? applications.path : (applications.path + "/")
+        return parent.path == applications.path || parent.path.hasPrefix(appsPrefix)
+    }
+
     func installAndRelaunch(appURL: URL) throws {
-        let target = Bundle.main.bundleURL.standardizedFileURL
-        guard target.pathExtension.lowercased() == "app" else {
+        let target = Bundle.main.bundleURL.standardizedFileURL.resolvingSymlinksInPath()
+        guard Self.isValidApplicationsTarget(target) else {
             throw UpdateInstallError.notInApplications
         }
 
-        let parent = target.deletingLastPathComponent().standardizedFileURL
-        let applications = URL(fileURLWithPath: Self.applicationsPath, isDirectory: true).standardizedFileURL
-        // 允许 /Applications 及其子目录（如 /Applications/Utilities），
-        // 但不允许符号链接以外的近似路径（/Applications2 之类）。
-        guard parent.path == applications.path || parent.path.hasPrefix(applications.path + "/") else {
-            throw UpdateInstallError.notInApplications
-        }
+        let parent = target.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
         guard fileManager.isWritableFile(atPath: parent.path) else {
             throw UpdateInstallError.notWritable
         }
@@ -538,8 +763,13 @@ final class UpdateInstaller {
             exit 1
         }
 
-        # 等旧进程真正退出：运行中的 bundle 被替换后，系统可能仍从旧 inode 读页。
+        # 等旧进程真正退出：加上最大等待次数上限（150 次 = 30s），避免死循环。
+        WAIT_COUNT=0
         while kill -0 "$APP_PID" 2>/dev/null; do
+            WAIT_COUNT=$((WAIT_COUNT + 1))
+            if [ "$WAIT_COUNT" -ge \(Self.processWaitMaxIterations) ]; then
+                rollback "等待旧版本进程退出超时"
+            fi
             sleep 0.2
         done
         sleep 0.3
@@ -551,8 +781,7 @@ final class UpdateInstaller {
 
         mv "$STAGED" "$TARGET" || rollback "无法替换应用"
 
-        # 网络下载的包可能带隔离属性，不清掉会在首次启动时弹出「已验证」提示。
-        xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null || true
+        # 遵循 Gatekeeper 安全边界：不再静默剥离 com.apple.quarantine 隔离属性。
 
         open "$TARGET" || rollback "无法重新启动 anShot"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 安装完成"
@@ -562,16 +791,26 @@ final class UpdateInstaller {
 
         let directory = fileManager.temporaryDirectory
         let scriptURL = directory.appendingPathComponent(
-            ".anshot-install-\(ProcessInfo.processInfo.processIdentifier)-\(Self.timestamp()).sh"
+            ".anshot-install-\(ProcessInfo.processInfo.processIdentifier)-\(Self.timestamp())-\(UUID().uuidString).sh"
         )
         do {
-            try script.write(to: scriptURL, atomically: true, encoding: .utf8)
-            // 只给当前用户执行权限：脚本内容包含安装路径，但仍是可执行文件。
-            try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: scriptURL.path)
+            try Self.writeExecutableScriptAtomically(script, to: scriptURL)
         } catch {
             throw UpdateInstallError.installFailed("无法写入安装脚本：\(error.localizedDescription)")
         }
         return scriptURL
+    }
+
+    /// 一步以 `0700` 权限原子创建安装脚本并写入内容，消除先写再改权的竞争窗口。
+    nonisolated static func writeExecutableScriptAtomically(_ script: String, to url: URL) throws {
+        let fd = Darwin.open(url.path, O_WRONLY | O_CREAT | O_EXCL, S_IRWXU)
+        guard fd >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        try handle.write(contentsOf: Data(script.utf8))
+        try handle.synchronize()
+        try handle.close()
     }
 
     // MARK: - 工具
@@ -668,11 +907,14 @@ struct ToolResult: Sendable {
 private final class DownloadProbe: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
 
     private let lock = NSLock()
+    private let maximumBytes: Int64
     private var expected: Int64
     private var written: Int64 = 0
+    private var exceededLimit = false
 
-    init(expectedBytes: Int64) {
+    init(expectedBytes: Int64, maximumBytes: Int64) {
         self.expected = expectedBytes
+        self.maximumBytes = maximumBytes
         super.init()
     }
 
@@ -681,6 +923,12 @@ private final class DownloadProbe: NSObject, URLSessionDownloadDelegate, @unchec
         defer { lock.unlock() }
         guard expected > 0 else { return 0 }
         return min(1, Double(written) / Double(expected))
+    }
+
+    var didExceedLimit: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return exceededLimit
     }
 
     /// 协议要求实现，但下载结果由 `URLSession.download(for:delegate:)` 的
@@ -698,12 +946,22 @@ private final class DownloadProbe: NSObject, URLSessionDownloadDelegate, @unchec
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
+        var shouldCancel = false
         lock.lock()
         // 服务器的 Content-Length 比资产元数据更准，有就以它为准。
         if totalBytesExpectedToWrite > 0 {
             expected = totalBytesExpectedToWrite
         }
         written = totalBytesWritten
+        if totalBytesWritten > maximumBytes
+            || (totalBytesExpectedToWrite > 0 && totalBytesExpectedToWrite > maximumBytes) {
+            exceededLimit = true
+            shouldCancel = true
+        }
         lock.unlock()
+
+        if shouldCancel {
+            downloadTask.cancel()
+        }
     }
 }

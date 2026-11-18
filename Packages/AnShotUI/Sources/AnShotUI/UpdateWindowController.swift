@@ -24,7 +24,7 @@ import AnShotCore
 import AppKit
 
 @MainActor
-final class UpdateWindowController: NSWindowController {
+final class UpdateWindowController: NSWindowController, NSWindowDelegate {
 
     /// 窗口阶段。与 `UpdateState`（检查结果）分开：一次「有新版本」之后
     /// 还有下载、校验、安装等若干步，把它们塞进全局状态会让设置页的
@@ -77,6 +77,7 @@ final class UpdateWindowController: NSWindowController {
         window.center()
 
         super.init(window: window)
+        window.delegate = self
 
         content.onPrimary = { [weak self] in self?.primaryTapped() }
         content.onOpenPage = { [weak self] in self?.onRequestOpenPage?() }
@@ -97,10 +98,16 @@ final class UpdateWindowController: NSWindowController {
     // MARK: - 显示
 
     func show() {
+        // 注册独立窗口前台策略，支持用户通过 ⌘Tab 切回更新窗口。
+        ForegroundPolicyCoordinator.acquire("update")
         // 菜单栏程序平时不是活跃应用；不主动激活，窗口会开在后台，
         // 用户点「查看」后什么都没看到。
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        ForegroundPolicyCoordinator.release("update")
     }
 
     /// 渲染一个阶段。窗口已关闭时仅记录，重新 `show()` 时仍是同一阶段。
@@ -431,8 +438,6 @@ private final class UpdateContentView: NSView {
     private func updateButtons(primary: (title: String, enabled: Bool), showsLater: Bool) {
         primaryButton.title = primary.title
         primaryButton.isEnabled = primary.enabled
-        // 自绘按钮不会自动变灰：不压暗的话「下载中…」看起来仍然可按。
-        primaryButton.alphaValue = primary.enabled ? 1 : 0.5
         // 自绘按钮的宽度来自 intrinsicContentSize；换标题后必须显式失效，
         // 否则「下载中…」会沿用上一个标题的宽度。
         primaryButton.invalidateIntrinsicContentSize()

@@ -109,12 +109,16 @@ public final class RecordingController {
     /// 合并进 `onUpdate` 会把「状态变化」与「导出期间一秒十几次的进度」压进同一根管子。
     public var onExportProgress: ((Double) -> Void)?
 
+    /// 录制前倒计时每秒回调（传剩余秒数，`nil` 表示倒计时结束或已进入实际录制）。
+    public var onCountdownTick: ((Int?) -> Void)?
+
     // MARK: 内部
 
     private var recorder: SCStreamRecorder?
     private var sessionTask: Task<Void, Never>?
     private var tickingTask: Task<Void, Never>?
     private var outputURL: URL?
+    private var isCancelling = false
 
     public init() {}
 
@@ -142,7 +146,8 @@ public final class RecordingController {
         audio: AudioSettings,
         output: RecordingOutputChoice,
         excludedWindowIDs: [CGWindowID] = [],
-        outputURL: URL
+        outputURL: URL,
+        countdownSeconds: Int = 0
     ) {
         guard !isActive else {
             recordingUILogger.error("已有会话在进行中，忽略重复开始")
@@ -150,6 +155,7 @@ public final class RecordingController {
         }
 
         self.outputURL = outputURL
+        self.isCancelling = false
         // 起步即标为 preparing：从此刻到首帧到达之间，界面上应显示「准备中」
         state = .preparing
         elapsed = 0
@@ -166,34 +172,60 @@ public final class RecordingController {
             output: output.output(at: outputURL),
             excludedWindowIDs: excludedWindowIDs
         )
-        let recorder = SCStreamRecorder()
-        self.recorder = recorder
-        // 进度回调来自导出线程，这里折到主 actor 再转发给界面。
-        // 量化已在 `GIFExporter` 内完成，所以这次转发就是「可见变化」的频率。
-        recorder.onExportProgress = { [weak self] value in
-            Task { @MainActor in
-                self?.onExportProgress?(value)
-            }
-        }
 
         sessionTask = Task { [weak self] in
+            guard let self else { return }
+            if countdownSeconds > 0 {
+                for remaining in stride(from: countdownSeconds, through: 1, by: -1) {
+                    guard !Task.isCancelled, !self.isCancelling else {
+                        self.onCountdownTick?(nil)
+                        self.finish(.cancelled)
+                        return
+                    }
+                    self.onCountdownTick?(remaining)
+                    try? await Task.sleep(for: .seconds(1))
+                }
+                self.onCountdownTick?(nil)
+                guard !Task.isCancelled, !self.isCancelling else {
+                    self.finish(.cancelled)
+                    return
+                }
+            }
+
+            let recorder = SCStreamRecorder()
+            self.recorder = recorder
+            // 进度回调来自导出线程，这里折到主 actor 再转发给界面。
+            recorder.onExportProgress = { [weak self] value in
+                Task { @MainActor in
+                    self?.onExportProgress?(value)
+                }
+            }
+            self.startTicking()
+
             do {
                 let result = try await recorder.record(configuration: configuration)
+                if self.isCancelling || Task.isCancelled {
+                    // 用户已要求取消并丢弃：安全删除已生成的文件并静默取消。
+                    try? FileManager.default.removeItem(at: result.url)
+                    self.finish(.cancelled)
+                    return
+                }
                 // 时长以结果为准：它是收尾时定格的权威值，
                 // 不依赖录制器后续的状态（见 SCStreamRecorder.statistics 的说明）。
-                self?.elapsed = result.duration
-                self?.finish(.finished(
+                self.elapsed = result.duration
+                self.finish(.finished(
                     result.url,
                     result.duration,
                     reachedLimit: recorder.didReachDurationLimit
                 ))
             } catch {
                 let recordingError = error as? RecordingError
-                // 取消不是失败：安静收尾，不记录故障也不弹窗。
-                // 判定必须依据错误类型，不能看界面状态——「准备中」时用户点停止
-                // 得到的也是 cancelled，而那正是他想要的结果。
-                if recordingError == .cancelled {
-                    self?.finish(.cancelled)
+                if self.isCancelling || Task.isCancelled || recordingError == .cancelled {
+                    if let keptURL = recorder.keptOutput?.url {
+                        try? FileManager.default.removeItem(at: keptURL)
+                    }
+                    try? FileManager.default.removeItem(at: outputURL)
+                    self.finish(.cancelled)
                     return
                 }
                 let message = recordingError?.errorDescription
@@ -208,20 +240,35 @@ public final class RecordingController {
                 } else {
                     missingPermission = nil
                 }
-                self?.finish(.failed(
+                self.finish(.failed(
                     message,
                     kept: keepable ? recorder.keptOutput : nil,
                     missingPermission: missingPermission
                 ))
             }
         }
-        startTicking()
     }
 
-    /// 请求停止。幂等。
+    /// 请求停止并保存。幂等。
     public func stop() async {
         guard isActive else { return }
+        if recorder == nil {
+            // 尚处于倒计时阶段，直接取消即可。
+            sessionTask?.cancel()
+            return
+        }
         await recorder?.stop()
+    }
+
+    /// 取消并丢弃当前录制（含倒计时阶段与正在录制阶段）。
+    public func cancel() async {
+        guard isActive, !isCancelling else { return }
+        isCancelling = true
+        onCountdownTick?(nil)
+        sessionTask?.cancel()
+        if let recorder {
+            await recorder.stop()
+        }
     }
 
     /// 暂停 / 继续。
@@ -298,6 +345,8 @@ public final class RecordingController {
         }
         recorder = nil
         sessionTask = nil
+        isCancelling = false
+        onCountdownTick?(nil)
         onUpdate?(state, elapsed)
         onFinish?(outcome)
     }

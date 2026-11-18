@@ -99,6 +99,7 @@ final class WelcomeWindowController: NSObject {
         // 必须显示最新状态，而不是创建时的旧快照。
         refreshStatuses()
 
+        ForegroundPolicyCoordinator.acquire("welcome")
         // 本应用平时不是活跃应用；不主动激活的话窗口会开在后台，
         // 用户看不到却以为「点了没反应」——与设置窗口同一理由。
         NSApp.activate(ignoringOtherApps: true)
@@ -154,6 +155,12 @@ final class WelcomeWindowController: NSObject {
     // MARK: - 系统设置
 
     private func openScreenRecordingSettings() {
+        // 若从未请求过屏幕录制权限，系统隐私列表里还没有 anShot 条目；
+        // 先发起一次请求让应用登记进系统设置，再跳转隐私面板。
+        if permission.current() == .notRequested {
+            _ = permission.requestAccess()
+            refreshStatuses()
+        }
         openPrivacyPane("Privacy_ScreenCapture")
     }
 
@@ -438,6 +445,7 @@ extension WelcomeWindowController: NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        ForegroundPolicyCoordinator.release("welcome")
         // 关闭即释放窗口与它的整棵视图树，维持「空闲期零窗口」。
         // 视图属性是弱引用，会随窗口一起自动变 nil，不需要手工拆。
         window = nil

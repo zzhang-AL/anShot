@@ -48,6 +48,8 @@ enum ImageSourceLauncher {
             .urls(for: .picturesDirectory, in: .userDomainMask)
             .first
 
+        // 菜单栏应用平时非活跃，打开文件面板前必须显式激活，防止面板藏在其他应用窗口后。
+        NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else {
             return nil
         }
@@ -97,6 +99,97 @@ enum ImageSourceLauncher {
             return decoded
         }
         return nil
+    }
+
+    /// 从剪贴板取贴图内容：优先解码图片，若无图片则将纯文本渲染为便签贴图。
+    static func pasteboardImageOrTextNote(scale: CGFloat = 2) -> (image: CGImage, isTextNote: Bool)? {
+        if let image = imageFromPasteboard() {
+            return (image, false)
+        }
+        guard let rawText = NSPasteboard.general.string(forType: .string) else {
+            return nil
+        }
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let noteImage = renderTextNoteImage(trimmed, scale: scale) else {
+            return nil
+        }
+        return (noteImage, true)
+    }
+
+    /// 将纯文本渲染成便签卡片位图（支持自动折行与长度保护）。
+    static func renderTextNoteImage(_ text: String, scale: CGFloat = 2) -> CGImage? {
+        let clampedScale = max(1, min(scale, 3))
+        let maxDisplayLength = 2000
+        let displayText = text.count > maxDisplayLength
+            ? String(text.prefix(maxDisplayLength)) + "\n…"
+            : text
+
+        let horizontalPadding: CGFloat = 20
+        let verticalPadding: CGFloat = 16
+        let minWidth: CGFloat = 180
+        let maxContentWidth: CGFloat = 420
+        let maxContentHeight: CGFloat = 520
+
+        let font = NSFont.systemFont(ofSize: 14, weight: .regular)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byWordWrapping
+        paragraph.lineSpacing = 4
+
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor(calibratedRed: 0.14, green: 0.14, blue: 0.12, alpha: 1),
+            .paragraphStyle: paragraph,
+        ]
+        let attributed = NSAttributedString(string: displayText, attributes: attributes)
+        let measured = attributed.boundingRect(
+            with: CGSize(width: maxContentWidth, height: maxContentHeight),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+
+        let logicalWidth = max(minWidth, min(maxContentWidth, ceil(measured.width)) + horizontalPadding * 2)
+        let logicalHeight = max(56, min(maxContentHeight, ceil(measured.height)) + verticalPadding * 2)
+        let pixelWidth = max(1, Int((logicalWidth * clampedScale).rounded()))
+        let pixelHeight = max(1, Int((logicalHeight * clampedScale).rounded()))
+
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                  data: nil,
+                  width: pixelWidth,
+                  height: pixelHeight,
+                  bitsPerComponent: 8,
+                  bytesPerRow: 0,
+                  space: colorSpace,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else {
+            return nil
+        }
+
+        // 浅暖纸张便签底色，保证深色字在任意桌面上都具备清晰对比度。
+        context.setFillColor(CGColor(red: 0.996, green: 0.976, blue: 0.890, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
+
+        // 顶部便签色条提示这是文本便签。
+        let barHeight = 4 * clampedScale
+        context.setFillColor(CGColor(red: 0.94, green: 0.78, blue: 0.30, alpha: 1))
+        context.fill(CGRect(x: 0, y: CGFloat(pixelHeight) - barHeight, width: CGFloat(pixelWidth), height: barHeight))
+
+        // 在缩放后的逻辑坐标系下使用 AppKit 绘制文本。
+        let graphicsContext = NSGraphicsContext(cgContext: context, flipped: false)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = graphicsContext
+        context.saveGState()
+        context.scaleBy(x: clampedScale, y: clampedScale)
+        let textRect = CGRect(
+            x: horizontalPadding,
+            y: verticalPadding - 2,
+            width: logicalWidth - horizontalPadding * 2,
+            height: logicalHeight - verticalPadding * 2
+        )
+        attributed.draw(with: textRect, options: [.usesLineFragmentOrigin, .usesFontLeading])
+        context.restoreGState()
+        NSGraphicsContext.restoreGraphicsState()
+
+        return context.makeImage()
     }
 
     /// 载入磁盘图片（不修改源文件）。

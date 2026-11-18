@@ -17,6 +17,7 @@
 //
 
 import AnShotCore
+import AppKit
 import CoreGraphics
 import Testing
 
@@ -78,5 +79,43 @@ struct PinClampTests {
             CGPoint(x: 123, y: 456), size: size, into: Self.visible
         )
         #expect(origin == CGPoint(x: Self.visible.minX, y: Self.visible.minY))
+    }
+
+    @Test("贴图按鼠标归一化锚点缩放时锚点屏幕坐标保持不变")
+    func anchorScalingPreservesAnchorPoint() throws {
+        _ = NSApplication.shared
+        let context = try #require(CGContext(
+            data: nil,
+            width: 400,
+            height: 200,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        let image = try #require(context.makeImage())
+        let manager = PinManager()
+        guard case .created(let window) = manager.pin(
+            image: image,
+            screenScale: 2,
+            topLeft: CGPoint(x: 300, y: 500)
+        ) else {
+            Issue.record("创建贴图失败")
+            return
+        }
+        defer { manager.closeAll() }
+
+        let anchor = CGPoint(x: 0.25, y: 0.75)
+        let beforeAnchorScreen = CGPoint(
+            x: window.frame.minX + window.frame.width * anchor.x,
+            y: window.frame.minY + window.frame.height * anchor.y
+        )
+        window.applyScale(2.0, pixelSize: CGSize(width: 400, height: 200), screenScale: 2, anchor: anchor)
+        let afterAnchorScreen = CGPoint(
+            x: window.frame.minX + window.frame.width * anchor.x,
+            y: window.frame.minY + window.frame.height * anchor.y
+        )
+        #expect(abs(beforeAnchorScreen.x - afterAnchorScreen.x) < 1)
+        #expect(abs(beforeAnchorScreen.y - afterAnchorScreen.y) < 1)
     }
 }

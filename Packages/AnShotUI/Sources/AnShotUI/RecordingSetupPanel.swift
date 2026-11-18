@@ -84,12 +84,27 @@ public final class RecordingSetupPanel: NSObject {
         public let kind: RecordingScopeKind
         public let audio: AudioSettings
         public let output: RecordingOutputChoice
+        public let countdownSeconds: Int
 
-        public init(kind: RecordingScopeKind, audio: AudioSettings, output: RecordingOutputChoice) {
+        public init(
+            kind: RecordingScopeKind,
+            audio: AudioSettings,
+            output: RecordingOutputChoice,
+            countdownSeconds: Int = 0
+        ) {
             self.kind = kind
             self.audio = audio
             self.output = output
+            self.countdownSeconds = countdownSeconds
         }
+    }
+
+    /// 准备倒计时偏好存储键（3 秒准备倒计时开关）。
+    private static let countdownPreferenceKey = "recording.countdown3sEnabled"
+
+    /// 当前是否开启 3 秒录制准备倒计时，供控制编排层统一读取。
+    public static var preferredCountdownSeconds: Int {
+        UserDefaults.standard.bool(forKey: countdownPreferenceKey) ? 3 : 0
     }
 
     /// 点击「开始录制」。
@@ -109,6 +124,7 @@ public final class RecordingSetupPanel: NSObject {
     private let gifNoSoundLabel: NSTextField
     private let systemAudioToggle: NSButton
     private let microphoneToggle: NSButton
+    private let countdownToggle: NSButton
     private let statusLabel: NSTextField
     private let pickButton: NSButton
     private let startButton: NSButton
@@ -172,6 +188,7 @@ public final class RecordingSetupPanel: NSObject {
         gifNoSoundLabel = NSTextField(labelWithString: "GIF 无声音")
         systemAudioToggle = NSButton(checkboxWithTitle: "系统声音", target: nil, action: nil)
         microphoneToggle = NSButton(checkboxWithTitle: "麦克风", target: nil, action: nil)
+        countdownToggle = NSButton(checkboxWithTitle: "开始前 3 秒准备倒计时", target: nil, action: nil)
         statusLabel = NSTextField(labelWithString: "")
         pickButton = NSButton(title: "选取目标", target: nil, action: nil)
         startButton = NSButton(title: "开始录制", target: nil, action: nil)
@@ -301,6 +318,10 @@ public final class RecordingSetupPanel: NSObject {
             toggle.target = self
             toggle.action = #selector(audioChanged)
         }
+        countdownToggle.font = .systemFont(ofSize: 12)
+        countdownToggle.state = UserDefaults.standard.bool(forKey: Self.countdownPreferenceKey) ? .on : .off
+        countdownToggle.target = self
+        countdownToggle.action = #selector(countdownChanged)
 
         scopeControl.target = self
         scopeControl.action = #selector(scopeChanged)
@@ -367,7 +388,7 @@ public final class RecordingSetupPanel: NSObject {
         let stack = NSStackView(views: [
             Self.sectionLabel("录制范围"), scopeControl, statusRow,
             Self.sectionLabel("输出格式"), outputControl, gifParameterRow,
-            Self.sectionLabel("音频"), audioRow, buttonRow
+            Self.sectionLabel("音频"), audioRow, countdownToggle, buttonRow
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -375,7 +396,8 @@ public final class RecordingSetupPanel: NSObject {
         stack.setCustomSpacing(6, after: scopeControl)
         stack.setCustomSpacing(14, after: statusRow)
         stack.setCustomSpacing(14, after: gifParameterRow)
-        stack.setCustomSpacing(14, after: audioRow)
+        stack.setCustomSpacing(10, after: audioRow)
+        stack.setCustomSpacing(14, after: countdownToggle)
         self.contentStack = stack
         stack.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(stack)
@@ -605,6 +627,7 @@ public final class RecordingSetupPanel: NSObject {
         }
         systemAudioToggle.state = preferences.systemAudio ? .on : .off
         microphoneToggle.state = preferences.microphone ? .on : .off
+        countdownToggle.state = UserDefaults.standard.bool(forKey: Self.countdownPreferenceKey) ? .on : .off
     }
 
     /// 刷新与输出格式相关的可用性。
@@ -722,6 +745,13 @@ public final class RecordingSetupPanel: NSObject {
         preferences.microphone = microphoneToggle.state == .on
     }
 
+    @objc private func countdownChanged() {
+        UserDefaults.standard.set(
+            countdownToggle.state == .on,
+            forKey: Self.countdownPreferenceKey
+        )
+    }
+
     @objc private func pickTapped() {
         guard let kind = selectedKind, kind.requiresTarget else { return }
         onPickRequested?(kind)
@@ -738,8 +768,14 @@ public final class RecordingSetupPanel: NSObject {
             systemAudio: systemAudioToggle.state == .on,
             microphone: microphoneToggle.state == .on
         )
+        let countdownSeconds = countdownToggle.state == .on ? 3 : 0
         panel.orderOut(nil)
-        onStart?(Outcome(kind: kind, audio: audio, output: selectedOutput))
+        onStart?(Outcome(
+            kind: kind,
+            audio: audio,
+            output: selectedOutput,
+            countdownSeconds: countdownSeconds
+        ))
     }
 
     @objc private func cancelTapped() {

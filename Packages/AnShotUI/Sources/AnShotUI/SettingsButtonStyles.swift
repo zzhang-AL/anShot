@@ -267,6 +267,7 @@ final class SettingsSidebarItem: NSButton {
         isBordered = false
         bezelStyle = .regularSquare
         setButtonType(.momentaryChange)
+        focusRingType = .default
         translatesAutoresizingMaskIntoConstraints = false
         self.target = target
         self.action = action
@@ -276,6 +277,13 @@ final class SettingsSidebarItem: NSButton {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("不支持从 nib 构造")
+    }
+
+    // 侧边栏项需要显式焦点环掩码，否则键盘导航切换至此项时无焦点高亮指示。
+    override var focusRingMaskBounds: NSRect { bounds }
+
+    override func drawFocusRingMask() {
+        NSBezierPath(roundedRect: bounds, xRadius: 7, yRadius: 7).fill()
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -357,6 +365,7 @@ final class SettingsPushButton: NSButton {
         isBordered = false
         bezelStyle = .regularSquare
         setButtonType(.momentaryChange)
+        focusRingType = .default
         translatesAutoresizingMaskIntoConstraints = false
         heightAnchor.constraint(equalToConstant: Self.height).isActive = true
     }
@@ -366,9 +375,22 @@ final class SettingsPushButton: NSButton {
         fatalError("不支持从 nib 构造")
     }
 
+    override var focusRingMaskBounds: NSRect { bounds }
+
+    override func drawFocusRingMask() {
+        NSBezierPath(roundedRect: bounds, xRadius: Self.radius, yRadius: Self.radius).fill()
+    }
+
     override var intrinsicContentSize: NSSize {
         let width = (title as NSString).size(withAttributes: titleAttributes).width
         return NSSize(width: ceil(width) + Self.horizontalPadding * 2, height: Self.height)
+    }
+
+    /// 启用/禁用态切换时触发重绘，统一呈现半透明禁用视觉反馈。
+    override var isEnabled: Bool {
+        didSet {
+            if oldValue != isEnabled { needsDisplay = true }
+        }
     }
 
     /// 按下态要重绘。
@@ -383,6 +405,9 @@ final class SettingsPushButton: NSButton {
 
     override func draw(_ dirtyRect: NSRect) {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
+
+        // 禁用态统一应用 0.45 透明度，避免各调用方重复手写 alphaValue 补丁。
+        let stateAlpha: CGFloat = isEnabled ? (isHighlighted ? 0.7 : 1) : 0.45
 
         let background: NSColor
         let border: NSColor?
@@ -400,20 +425,24 @@ final class SettingsPushButton: NSButton {
         SettingsTheme.fillRoundedRect(
             bounds,
             radius: Self.radius,
-            color: background.withAlphaComponent(isHighlighted ? 0.7 : 1),
+            color: background.withAlphaComponent(background.alphaComponent * stateAlpha),
             in: context
         )
         if let border {
             SettingsTheme.strokeRoundedRect(
                 bounds,
                 radius: Self.radius,
-                color: border,
+                color: border.withAlphaComponent(border.alphaComponent * (isEnabled ? 1 : 0.45)),
                 lineWidth: 1,
                 in: context
             )
         }
 
-        let attributed = NSAttributedString(string: title, attributes: titleAttributes)
+        var attributes = titleAttributes
+        if !isEnabled, let baseColor = attributes[.foregroundColor] as? NSColor {
+            attributes[.foregroundColor] = baseColor.withAlphaComponent(baseColor.alphaComponent * 0.45)
+        }
+        let attributed = NSAttributedString(string: title, attributes: attributes)
         let size = attributed.size()
         attributed.draw(at: CGPoint(
             x: bounds.midX - size.width / 2,

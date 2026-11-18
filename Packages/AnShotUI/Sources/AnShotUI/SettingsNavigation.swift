@@ -62,35 +62,27 @@ enum SettingsPage: String, CaseIterable {
 
 // MARK: - 表单控件外壳
 
-/// 设置窗口需要的最小主菜单。
+/// 应用级标准主菜单（含「编辑」菜单）。
 ///
-/// ── 一个「菜单栏辅助程序」为什么需要它 ─────────────────────
+/// ── 一个「菜单栏辅助程序」为什么需要常驻主菜单 ──────────────
 ///
-/// 本应用以 `.accessory` 策略运行，没有 Dock 图标，主菜单看起来多余。
-/// 但 macOS 的文本编辑快捷键（⌘C / ⌘V / ⌘X / ⌘A）**不是** field editor
-/// 自己处理的：它们以菜单项的 key equivalent 形式，经
-/// `NSApplication.sendAction(_:to:from:)` 分发到 `paste:` 这类标准 selector。
+/// 本应用默认以 `.accessory` 策略运行，没有 Dock 图标。
+/// macOS 的文本编辑快捷键（⌘C / ⌘V / ⌘X / ⌘A）是以菜单项 key equivalent
+/// 经 `NSApplication.sendAction(_:to:from:)` 分发到标准 selector 的。
+/// 若仅在设置窗口打开期间临时安装主菜单，其余窗口（OCR 面板、文字标注框、
+/// 历史/窗口搜索框、取色器 Hex 框、崩溃与长截图日志窗）的文本快捷键会集体失效。
 ///
-/// 没有主菜单 = 没有这些菜单项 = 设置窗口里的输入框**无法粘贴**，
-/// 而且不抛错、日志里什么都没有。代码上完全看不出问题，
-/// 只有真的按一次 ⌘V 才会发现——所以它值得一条诊断断言。
-///
-/// ── 为什么只在设置窗口打开时安装 ──────────────────────────
-///
-/// 截图覆盖层自己也用 ⌘Z / ⌘C（撤销、拷贝），语义与编辑菜单不同。
-/// 菜单的 key equivalent 先于窗口的第一响应者拿到事件：菜单项若可用，
-/// 事件就被它截走，覆盖层的快捷键会静默失效；若不可用则继续下发。
-/// 「恰好是 disabled」不是一个能依赖的前提，因此主菜单的存在
-/// 严格跟随设置窗口的生命周期。
+/// 因此在应用启动时全局常驻挂载本主菜单；截图覆盖层在非文本编辑态会在
+/// `performKeyEquivalent` 中优先拦截画布级 `⌘C / ⌘Z / ⇧⌘Z`，两者互不冲突。
 @MainActor
 enum SettingsMainMenu {
 
-    /// 安装。
+    /// 安装全局常驻主菜单。
     static func install() {
         NSApp.mainMenu = make()
     }
 
-    /// 移除，回到「无菜单」状态。
+    /// 移除主菜单（仅保留用于测试或显式清理场景）。
     static func remove() {
         NSApp.mainMenu = nil
     }
@@ -144,6 +136,47 @@ enum SettingsMainMenu {
         mainMenu.addItem(editMenuItem)
 
         return mainMenu
+    }
+}
+
+// MARK: - 前台激活策略协调器
+
+/// 独立窗口的前台激活策略协调器。
+///
+/// 本应用空闲期以 `.accessory`（无 Dock 图标）运行；当任意独立窗口（欢迎页、设置、
+/// 历史记录、预览、崩溃日志、长截图日志、更新窗）可见时，将其切换为 `.regular`，
+/// 让用户可以通过 `⌘Tab` 与 Dock 找回被切走的窗口；所有独立窗口关闭后再切回 `.accessory`。
+@MainActor
+enum ForegroundPolicyCoordinator {
+
+    /// 当前正处于可见状态的独立窗口标识集合。
+    private static var activeTokens: Set<String> = []
+
+    /// 测试或诊断可见的当前活跃窗口标识数量。
+    static var activeCount: Int { activeTokens.count }
+
+    /// 登记一个独立窗口进入可见态，并在需要时切换为 `.regular`。
+    static func acquire(_ token: String) {
+        activeTokens.insert(token)
+        if NSApp.activationPolicy() != .regular {
+            NSApp.setActivationPolicy(.regular)
+        }
+    }
+
+    /// 注销一个独立窗口；若已无其他独立窗口可见，则恢复为 `.accessory`。
+    static func release(_ token: String) {
+        activeTokens.remove(token)
+        if activeTokens.isEmpty, NSApp.activationPolicy() == .regular {
+            NSApp.setActivationPolicy(.accessory)
+        }
+    }
+
+    /// 清空全部登记状态（仅供测试复位使用）。
+    static func resetForTesting() {
+        activeTokens.removeAll()
+        if NSApp.activationPolicy() == .regular {
+            NSApp.setActivationPolicy(.accessory)
+        }
     }
 }
 

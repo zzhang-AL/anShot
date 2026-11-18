@@ -67,9 +67,6 @@ public final class ToastPresenter {
         let screenFrame = targetScreen?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
 
         let messageFont = NSFont.systemFont(ofSize: 13, weight: .medium)
-        let messageSize = (message as NSString).size(withAttributes: [.font: messageFont])
-        let messageHeight = ceil(messageSize.height)
-
         // 只有「标题 + 回调」齐全才显示按钮：只有标题的按钮点了什么也不会发生。
         let trimmedTitle = actionTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
         let usableTitle = (action != nil && trimmedTitle?.isEmpty == false) ? trimmedTitle : nil
@@ -84,10 +81,20 @@ public final class ToastPresenter {
         )
         let buttonAreaWidth = usableTitle == nil ? 0 : buttonGap + buttonSize.width
 
-        let capsuleHeight = max(minimumCapsuleHeight, messageHeight + verticalPadding * 2)
         let maxCapsuleWidth = max(minimumAvailableWidth, screenFrame.width - screenInset * 2)
         let maxTextWidth = max(1, min(maximumTextWidth, maxCapsuleWidth - horizontalPadding * 2 - buttonAreaWidth))
-        let textWidth = max(1, min(ceil(messageSize.width), maxTextWidth))
+        // 支持多行自适应测量，防止长提示（如「固定截图达上限」）被单行截断。
+        let boundingRect = (message as NSString).boundingRect(
+            with: CGSize(width: maxTextWidth, height: 140),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: messageFont]
+        )
+        let textWidth = max(1, min(ceil(boundingRect.width), maxTextWidth))
+        let singleLineHeight = ceil((("样本" as NSString).size(withAttributes: [.font: messageFont])).height)
+        let messageHeight = max(singleLineHeight, ceil(boundingRect.height))
+        let isMultiline = messageHeight > singleLineHeight * 1.4
+
+        let capsuleHeight = max(minimumCapsuleHeight, messageHeight + verticalPadding * 2)
         let capsuleWidth = horizontalPadding * 2 + textWidth + buttonAreaWidth
 
         let origin = CGPoint(
@@ -99,17 +106,18 @@ public final class ToastPresenter {
         capsule.wantsLayer = true
         // 深色胶囊：0.82 的黑既能压住浅色壁纸，又能透出一点背景，不致像一块黑板。
         capsule.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.82).cgColor
-        // 全圆角 = 胶囊形状；半径取高度一半。
-        capsule.layer?.cornerRadius = capsuleHeight / 2
+        // 单行维持全圆角胶囊造型，多行改用柔和圆角避免边缘裁切文字。
+        capsule.layer?.cornerRadius = isMultiline ? 12 : (capsuleHeight / 2)
         // 细白描边把胶囊从深色桌面上「抠」出来，否则暗背景下边界会糊掉。
         capsule.layer?.borderWidth = 1
         capsule.layer?.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
 
-        let label = NSTextField(labelWithString: message)
+        let label = NSTextField(wrappingLabelWithString: message)
         label.font = messageFont
         label.textColor = .white
-        label.lineBreakMode = .byTruncatingTail
-        label.maximumNumberOfLines = 1
+        label.lineBreakMode = .byWordWrapping
+        label.maximumNumberOfLines = 4
+        label.alignment = (isMultiline && usableTitle == nil) ? .center : .left
         label.isSelectable = false
         label.frame = CGRect(
             x: horizontalPadding,

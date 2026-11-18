@@ -21,18 +21,11 @@
 //  条目照常列出、只是标注「文件已移走」——用户整理自己的文件夹是正常
 //  操作，不该表现为列表报错。
 //
-//  ── 为什么用 StackView 而不是 NSTableView ────────────────
+//  ── 为什么用 NSTableView 虚拟化复用 ──────────────────────────
 //
-//  条目上限是 200，每行是「缩略图 + 三行文字 + 六个图标按钮」。
-//  为此实现一整套 dataSource/delegate 与自定义 cell 的复杂度远超收益。
-//
-//  ── 刷新为什么不是每次全量重建 ───────────────────────────
-//
-//  搜索是逐键触发的。200 条时若每敲一个字符都拆掉并重建 200 个行视图，
-//  峰值是上千个视图的创建与布局，输入会明显发涩。这里先比较「可见条目
-//  的 id 序列」：序列没变（例如又保存了一张但当前过滤结果不变）就原地
-//  更新已有行，序列变了才重建。每个条目的磁盘存在性只查一次，行操作
-//  用下标 O(1) 取条目，不在行里做 `firstIndex`——避免 200 条时退化成 O(n²)。
+//  条目上限 200 条，使用 NSTableView 仅实例化屏上可见单元格并按需异步
+//  解码缩略图，避免 200 个视图树一次创建；文件存在性检查也在后台并发
+//  缓存，彻底消除逐键搜索时主线程同步调用 200 次 fileExists 的卡顿。
 //
 
 import AnShotCore
@@ -425,11 +418,8 @@ private enum HistoryRowAction: Hashable {
     case favorite
 }
 
-/// 一行历史记录。
-///
-/// 单独成类为了三件事：整行可点（标签不该吃掉双击）、行内按键
-/// （空格预览 / 回车编辑）不依赖面板级快捷键，以及刷新时可以原地复用。
-private final class HistoryRowView: NSView {
+/// 一行历史记录单元格：保持卡片圆角视觉，配合 `NSTableView` 虚拟化复用。
+private final class HistoryRowView: NSTableCellView {
 
     /// 面板的闭包是否接上了。行只负责显示，不判断业务是否可用。
     struct Availability {
@@ -441,8 +431,8 @@ private final class HistoryRowView: NSView {
         var favorite = false
     }
 
-    private(set) var entryID: UUID
-    private(set) var rowIndex: Int
+    private(set) var entryID: UUID = UUID()
+    private(set) var rowIndex: Int = 0
 
     var availability = Availability() {
         didSet { updateActionAvailability() }
@@ -450,9 +440,6 @@ private final class HistoryRowView: NSView {
 
     var onClick: ((Int) -> Void)?
     var onDoubleClick: ((Int) -> Void)?
-    var onSpace: (() -> Void)?
-    var onReturn: (() -> Void)?
-    var onEscape: (() -> Void)?
     var onAction: ((HistoryRowAction, Int) -> Void)?
 
     private(set) var isSelected = false
@@ -462,21 +449,19 @@ private final class HistoryRowView: NSView {
     private var trackingArea: NSTrackingArea?
 
     private let thumbView = HistoryThumbnailView()
-    private let badge: HistoryKindBadge
+    private let badge = HistoryKindBadge(kind: .screenshot)
     private let sourceLabel = NSTextField(labelWithString: "")
     private let fileLabel = NSTextField(labelWithString: "")
     private let detailLabel = NSTextField(labelWithString: "")
     private let timeLabel = NSTextField(labelWithString: "")
     private var actionButtons: [HistoryRowAction: HistoryActionButton] = [:]
-    private static let rowHeight: CGFloat = 92
 
-    init(entry: HistoryEntry, rowIndex: Int) {
-        self.entryID = entry.id
-        self.rowIndex = rowIndex
-        self.badge = HistoryKindBadge(kind: entry.kind)
-        super.init(frame: .zero)
+    /// 卡片外侧留 5pt 垂直间距（整体表行高 102pt，卡片本身高 92pt）。
+    static let tableRowHeight: CGFloat = 102
+    private static let cardVerticalInset: CGFloat = 5
 
-        translatesAutoresizingMaskIntoConstraints = false
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
         thumbView.translatesAutoresizingMaskIntoConstraints = false
 
         configureLabels()
@@ -487,8 +472,6 @@ private final class HistoryRowView: NSView {
         }
 
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: Self.rowHeight),
-
             thumbView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
             thumbView.centerYAnchor.constraint(equalTo: centerYAnchor),
             thumbView.widthAnchor.constraint(equalToConstant: 96),
@@ -498,7 +481,7 @@ private final class HistoryRowView: NSView {
             actions.centerYAnchor.constraint(equalTo: centerYAnchor),
 
             badge.leadingAnchor.constraint(equalTo: thumbView.trailingAnchor, constant: 12),
-            badge.topAnchor.constraint(equalTo: topAnchor, constant: 15),
+            badge.topAnchor.constraint(equalTo: topAnchor, constant: Self.cardVerticalInset + 15),
 
             sourceLabel.leadingAnchor.constraint(equalTo: badge.trailingAnchor, constant: 8),
             sourceLabel.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
@@ -607,6 +590,18 @@ private final class HistoryRowView: NSView {
         needsDisplay = true
     }
 
+    func updateThumbnail(_ thumbnail: NSImage?) {
+        thumbView.image = thumbnail
+    }
+
+    func updatePresence(_ isPresent: Bool, for entry: HistoryEntry) {
+        self.isPresent = isPresent
+        detailLabel.stringValue = HistoryText.detail(for: entry, isPresent: isPresent)
+        detailLabel.textColor = isPresent ? .secondaryLabelColor : .systemOrange
+        updateActionAvailability()
+        updateToolTips(for: entry)
+    }
+
     func setSelected(_ selected: Bool) {
         guard isSelected != selected else { return }
         isSelected = selected
@@ -660,12 +655,13 @@ private final class HistoryRowView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
+        let cardRect = bounds.insetBy(dx: 0, dy: Self.cardVerticalInset)
 
         // 选中态是契约指定的 accentSoft + accent 描边：整页不出现系统蓝，
         // 与设置窗口的「无彩色」体系一致。
         if isSelected {
             SettingsTheme.fillRoundedRect(
-                bounds,
+                cardRect,
                 radius: SettingsTheme.cardRadius,
                 color: SettingsTheme.accentSoft,
                 in: context
@@ -673,7 +669,7 @@ private final class HistoryRowView: NSView {
             // 选中行也接受悬停/按下的反馈：底不变，叠一层极淡的前景色。
             if isHovered || isPressed {
                 SettingsTheme.fillRoundedRect(
-                    bounds,
+                    cardRect,
                     radius: SettingsTheme.cardRadius,
                     color: NSColor.labelColor.withAlphaComponent(isPressed ? 0.06 : 0.03),
                     in: context
@@ -681,21 +677,21 @@ private final class HistoryRowView: NSView {
             }
         } else if isPressed {
             SettingsTheme.fillRoundedRect(
-                bounds,
+                cardRect,
                 radius: SettingsTheme.cardRadius,
                 color: NSColor.labelColor.withAlphaComponent(0.10),
                 in: context
             )
         } else if isHovered {
             SettingsTheme.fillRoundedRect(
-                bounds,
+                cardRect,
                 radius: SettingsTheme.cardRadius,
                 color: NSColor.labelColor.withAlphaComponent(0.045),
                 in: context
             )
         } else {
             SettingsTheme.fillRoundedRect(
-                bounds,
+                cardRect,
                 radius: SettingsTheme.cardRadius,
                 color: SettingsTheme.cardBackground,
                 in: context
@@ -703,7 +699,7 @@ private final class HistoryRowView: NSView {
         }
 
         SettingsTheme.strokeRoundedRect(
-            bounds,
+            cardRect,
             radius: SettingsTheme.cardRadius,
             color: isSelected ? SettingsTheme.accent : SettingsTheme.cardBorder,
             lineWidth: 1,
@@ -749,7 +745,7 @@ private final class HistoryRowView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        window?.makeFirstResponder(self)
+        window?.makeFirstResponder(window)
         isPressed = true
         needsDisplay = true
         onClick?(rowIndex)
@@ -763,15 +759,6 @@ private final class HistoryRowView: NSView {
         needsDisplay = true
     }
 
-    override func keyDown(with event: NSEvent) {
-        switch event.keyCode {
-        case 49: onSpace?()
-        case 36, 76: onReturn?()
-        case 53: onEscape?()
-        default: super.keyDown(with: event)
-        }
-    }
-
     override func resetCursorRects() {
         addCursorRect(bounds, cursor: .pointingHand)
     }
@@ -782,30 +769,50 @@ private final class HistoryRowView: NSView {
     }
 }
 
-/// 历史窗口：把「空格预览 / ESC 关闭」放在窗口层处理。
-///
-/// 行与搜索框成为第一响应者时会先消费自己的按键；只有事件冒泡到窗口
-/// 才走这里。这样在搜索框里按空格仍然是输入空格，不会误触预览。
+/// 透明表行视图：禁用系统蓝选中底色，由内嵌卡片视图自绘选中框。
+private final class HistoryPlainTableRowView: NSTableRowView {
+    override var interiorBackgroundStyle: NSView.BackgroundStyle { .normal }
+    override func drawBackground(in dirtyRect: NSRect) {}
+    override func drawSelection(in dirtyRect: NSRect) {}
+}
+
+/// 历史窗口：在窗口层统一拦截列表键盘导航与快捷键操作。
 private final class HistoryPanelWindow: NSWindow {
 
     var onSpace: (() -> Void)?
     var onEscape: (() -> Void)?
+    var onReturn: (() -> Void)?
+    var onMoveSelection: ((Int) -> Void)?
+    var onCopy: (() -> Void)?
+    var onDelete: (() -> Void)?
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let key = event.charactersIgnoringModifiers?.lowercased()
+        if flags == .command {
+            if key == "c", !(firstResponder is NSTextView) {
+                onCopy?()
+                return true
+            }
+            if key == "w" {
+                onEscape?()
+                return true
+            }
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 
     override func keyDown(with event: NSEvent) {
         switch event.keyCode {
         case 49: onSpace?()
         case 53: onEscape?()
+        case 36, 76: onReturn?()
+        case 126: onMoveSelection?(-1)
+        case 125: onMoveSelection?(1)
+        case 51, 117: onDelete?()
         default: super.keyDown(with: event)
         }
     }
-}
-
-/// 列表滚动视图的文档视图。
-///
-/// `NSScrollView` 的文档视图默认非 flipped：条目少、文档比视口矮时
-/// 内容会贴着底部显示。这里翻转让列表始终从顶部开始。
-private final class HistoryDocumentView: NSView {
-    override var isFlipped: Bool { true }
 }
 
 // MARK: - 文案
@@ -885,9 +892,16 @@ private enum HistoryText {
 
 // MARK: - 面板
 
+/// 历史记录筛选条件。
+private enum HistoryFilter: Equatable {
+    case all
+    case favorites
+    case kind(HistoryEntryKind)
+}
+
 /// 历史记录窗口。
 @MainActor
-final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
+final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
 
     // MARK: - 对外回调
 
@@ -932,7 +946,7 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
 
     private let window: HistoryPanelWindow
     private let scrollView = NSScrollView()
-    private let listStack = NSStackView()
+    private let tableView = NSTableView()
     private let countLabel = NSTextField(labelWithString: "")
     private let hintLabel = NSTextField(labelWithString: "")
     private let emptyCard = HistorySurfaceView()
@@ -952,8 +966,13 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
     /// 过滤后的行 → `entries` 下标。行操作靠它 O(1) 取条目。
     private var visibleEntryIndices: [Int] = []
 
-    /// 与 `visibleEntryIndices` 一一对应的行视图。
-    private var rows: [HistoryRowView] = []
+    /// 文件存在性后台缓存（避免逐键搜索在主线程同步调用 200 次 fileExists）。
+    private var presenceCache: [UUID: Bool] = [:]
+    private var presenceGeneration = 0
+    private var presenceTask: Task<Void, Never>?
+
+    /// 正在异步解码中的缩略图条目集合，防止滚动快速触发重复读取。
+    private var loadingThumbnailIDs: Set<UUID> = []
 
     /// 用 id 而不是下标记住选中项：过滤/刷新会改变下标，id 不会。
     private var selectedEntryID: UUID?
@@ -1008,6 +1027,10 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
         window.minSize = CGSize(width: 560, height: 460)
         window.onSpace = { [weak self] in self?.togglePreview() }
         window.onEscape = { [weak self] in self?.escapePressed() }
+        window.onReturn = { [weak self] in self?.editSelected() }
+        window.onMoveSelection = { [weak self] delta in self?.moveSelection(by: delta) }
+        window.onCopy = { [weak self] in self?.copySelected() }
+        window.onDelete = { [weak self] in self?.deleteSelected() }
         window.delegate = self
 
         thumbnailCache.countLimit = 200
@@ -1024,9 +1047,13 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
 
     // MARK: - 诊断
 
-    var debugRowCountForDiagnostics: Int { rows.count }
-    var debugPresentCountForDiagnostics: Int { entries.filter(\.isFilePresent).count }
-    var debugMissingCountForDiagnostics: Int { entries.filter { !$0.isFilePresent }.count }
+    var debugRowCountForDiagnostics: Int { visibleEntryIndices.count }
+    var debugPresentCountForDiagnostics: Int {
+        entries.filter { presenceCache[$0.id] ?? $0.isFilePresent }.count
+    }
+    var debugMissingCountForDiagnostics: Int {
+        entries.filter { !(presenceCache[$0.id] ?? $0.isFilePresent) }.count
+    }
     var debugSummaryForDiagnostics: String { countLabel.stringValue }
 
     // MARK: - 显示
@@ -1040,20 +1067,23 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
         selectedEntryID = nil
         searchField.stringValue = ""
         kindFilter.selectItem(at: 0)
+        schedulePresenceRefresh()
         rebuildRows()
 
         repositionIfNeeded()
+        ForegroundPolicyCoordinator.acquire("history")
         // 标准窗口要成为 key 才能接收搜索输入与空格预览；菜单栏程序在被
         // 打开窗口时需要显式激活一次，否则窗口只是「浮上来」但没有焦点。
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
-        makeSelectedRowFirstResponder()
+        window.makeFirstResponder(window)
     }
 
     /// 刷新内容（条目变化后调用；窗口未打开时只更新数据）。
     func refresh(_ entries: [HistoryEntry]) {
         self.entries = entries
         guard window.isVisible else { return }
+        schedulePresenceRefresh()
         rebuildRows()
         updateFirstResponderAfterRebuild()
     }
@@ -1063,6 +1093,7 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
         // 那时窗口已经不可见，回调自然变成空操作。
         window.orderOut(nil)
         preview.close()
+        ForegroundPolicyCoordinator.release("history")
     }
 
     // MARK: - 页头与工具条
@@ -1084,9 +1115,11 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
         kindFilter.controlSize = .regular
         kindFilter.addItem(withTitle: "全部")
         kindFilter.lastItem?.tag = 0
+        kindFilter.addItem(withTitle: "★ 已收藏")
+        kindFilter.lastItem?.tag = 1
         for (offset, kind) in HistoryEntryKind.allCases.enumerated() {
             kindFilter.addItem(withTitle: kind.displayName)
-            kindFilter.lastItem?.tag = offset + 1
+            kindFilter.lastItem?.tag = offset + 2
         }
         // 与设置页的下拉一致：关掉系统外观，交给外壳统一高度与底色。
         kindFilter.isBordered = false
@@ -1097,11 +1130,12 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
         kindFilter.setContentHuggingPriority(.required, for: .horizontal)
     }
 
-    private var selectedKind: HistoryEntryKind? {
-        guard let tag = kindFilter.selectedItem?.tag, tag > 0 else { return nil }
-        let offset = tag - 1
-        guard HistoryEntryKind.allCases.indices.contains(offset) else { return nil }
-        return HistoryEntryKind.allCases[offset]
+    private var selectedFilter: HistoryFilter {
+        guard let tag = kindFilter.selectedItem?.tag, tag > 0 else { return .all }
+        if tag == 1 { return .favorites }
+        let offset = tag - 2
+        guard HistoryEntryKind.allCases.indices.contains(offset) else { return .all }
+        return .kind(HistoryEntryKind.allCases[offset])
     }
 
     private func makeContentView() -> NSView {
@@ -1111,21 +1145,30 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
         let header = SettingsHeaderView(
             symbolName: "clock",
             title: "历史记录",
-            subtitle: "最近的截图、长截图与录屏。单击复制，双击重新编辑。"
+            subtitle: "最近的截图、长截图与录屏。空格预览，双击编辑，⌘C 复制。"
         )
 
         let toolbar = makeToolbarCard()
 
-        listStack.orientation = .vertical
-        listStack.alignment = .leading
-        listStack.spacing = 10
-        listStack.translatesAutoresizingMaskIntoConstraints = false
+        // 采用虚拟化 NSTableView，仅渲染当前可见行，支持千百条记录流畅滚动。
+        tableView.headerView = nil
+        tableView.backgroundColor = .clear
+        tableView.rowHeight = HistoryRowView.tableRowHeight
+        tableView.intercellSpacing = .zero
+        tableView.selectionHighlightStyle = .none
+        tableView.style = .plain
+        tableView.allowsEmptySelection = true
+        tableView.allowsMultipleSelection = false
+        tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        tableView.gridStyleMask = []
+        tableView.dataSource = self
+        tableView.delegate = self
 
-        let documentView = HistoryDocumentView()
-        documentView.translatesAutoresizingMaskIntoConstraints = false
-        documentView.addSubview(listStack)
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("history"))
+        column.resizingMask = .autoresizingMask
+        tableView.addTableColumn(column)
 
-        scrollView.documentView = documentView
+        scrollView.documentView = tableView
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.scrollerStyle = .overlay
@@ -1142,13 +1185,6 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
         }
 
         let margin = SettingsTheme.margin
-        // 空列表时文档视图没有任何子视图撑高；给一个低优先级的「填满视口」，
-        // 避免 Auto Layout 在 0 高度上欠定（有行时会被行的必需高度打断）。
-        let fillHeight = documentView.heightAnchor.constraint(
-            equalTo: scrollView.contentView.heightAnchor
-        )
-        fillHeight.priority = .defaultLow
-        fillHeight.isActive = true
 
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: content.topAnchor, constant: Self.topInset),
@@ -1166,14 +1202,6 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
             scrollView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -margin),
             scrollView.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -margin),
 
-            documentView.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
-            documentView.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
-            documentView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
-
-            listStack.topAnchor.constraint(equalTo: documentView.topAnchor),
-            listStack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
-            listStack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
-            listStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor),
             emptyCard.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
             emptyCard.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
             emptyCard.widthAnchor.constraint(equalToConstant: 360),
@@ -1271,19 +1299,71 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
 
     // MARK: - 列表刷新
 
-    private func rebuildRows() {
+    // MARK: - 列表刷新与后台存在性缓存
+
+    /// 在后台并发线程批量校验历史条目源文件存在性，彻底消除主线程搜索卡顿。
+    private func schedulePresenceRefresh() {
+        presenceGeneration += 1
+        let generation = presenceGeneration
+        presenceTask?.cancel()
+        let items = entries.map { ($0.id, $0.filePath) }
+        guard !items.isEmpty else {
+            presenceCache.removeAll()
+            return
+        }
+
+        presenceTask = Task { @MainActor [weak self] in
+            let computed = await Task.detached(priority: .utility) {
+                var map: [UUID: Bool] = [:]
+                map.reserveCapacity(items.count)
+                let fm = FileManager.default
+                for (id, path) in items {
+                    if Task.isCancelled { break }
+                    map[id] = fm.fileExists(atPath: path)
+                }
+                return map
+            }.value
+
+            guard let self, self.presenceGeneration == generation, !Task.isCancelled else { return }
+            self.presenceCache = computed
+            self.applyPresenceUpdatesToVisibleRows()
+            self.updateSummary()
+        }
+    }
+
+    private func isEntryPresent(_ entry: HistoryEntry) -> Bool {
+        presenceCache[entry.id] ?? true
+    }
+
+    private func applyPresenceUpdatesToVisibleRows() {
+        let visibleRange = tableView.rows(in: tableView.visibleRect)
+        let start = max(0, visibleRange.location)
+        let end = min(visibleEntryIndices.count, visibleRange.location + visibleRange.length)
+        for rowIndex in start..<end {
+            guard let rowView = tableView.view(atColumn: 0, row: rowIndex, makeIfNecessary: false) as? HistoryRowView else {
+                continue
+            }
+            let entry = entries[visibleEntryIndices[rowIndex]]
+            rowView.updatePresence(isEntryPresent(entry), for: entry)
+        }
+    }
+
+    private func rebuildRows(scrollToTop: Bool = true) {
         let query = searchField.stringValue
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        let kind = selectedKind
+        let filter = selectedFilter
 
-        // 每条只查一次磁盘：摘要、行禁用状态、预览都复用同一份结论。
-        var presence = [Bool](repeating: false, count: entries.count)
         visibleEntryIndices.removeAll(keepingCapacity: true)
         for (index, entry) in entries.enumerated() {
-            let isPresent = entry.isFilePresent
-            presence[index] = isPresent
-            guard kind == nil || entry.kind == kind else { continue }
+            switch filter {
+            case .all:
+                break
+            case .favorites:
+                guard entry.isFavorite else { continue }
+            case .kind(let targetKind):
+                guard entry.kind == targetKind else { continue }
+            }
             guard query.isEmpty || HistoryText.search(for: entry).contains(query) else { continue }
             visibleEntryIndices.append(index)
         }
@@ -1297,56 +1377,36 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
             selectedEntryID = entries[first].id
         }
 
-        let desiredIDs = visibleEntryIndices.map { entries[$0].id }
-        // 用显式的 tuple 参数：`Zip2Sequence` 的元素是一个二元组，
-        // 闭包只有一个参数，不能写成 `$0 == $1`。
-        let canReuse = rows.count == desiredIDs.count
-            && zip(rows, desiredIDs).allSatisfy { pair in pair.0.entryID == pair.1 }
-
-        if canReuse {
-            // 序列没变：原地更新。搜索逐键触发时这条路径避免拆掉 200 个行视图。
-            for (rowIndex, entryIndex) in visibleEntryIndices.enumerated() {
-                let entry = entries[entryIndex]
-                rows[rowIndex].configure(
-                    entry: entry,
-                    rowIndex: rowIndex,
-                    isPresent: presence[entryIndex],
-                    thumbnail: thumbnailImage(for: entry),
-                    isSelected: entry.id == selectedEntryID
-                )
-            }
-        } else {
-            for view in listStack.arrangedSubviews {
-                listStack.removeArrangedSubview(view)
-                view.removeFromSuperview()
-            }
-            rows.removeAll(keepingCapacity: true)
-
-            for (rowIndex, entryIndex) in visibleEntryIndices.enumerated() {
-                let entry = entries[entryIndex]
-                let row = makeRow(entry: entry, rowIndex: rowIndex, isPresent: presence[entryIndex])
-                rows.append(row)
-                listStack.addArrangedSubview(row)
-                row.widthAnchor.constraint(equalTo: listStack.widthAnchor).isActive = true
-            }
-
-            // 序列变化（筛选、新增、删除）后回到顶部：用户刚改了条件，
-            // 停在半截既看不到第一条，也看不出结果变少了。
-            scrollView.contentView.scroll(to: .zero)
-            scrollView.reflectScrolledClipView(scrollView.contentView)
+        tableView.reloadData()
+        if scrollToTop, !visibleEntryIndices.isEmpty {
+            tableView.scrollRowToVisible(0)
         }
 
-        updateSummary(presence: presence)
+        updateSummary()
         updateHint()
         updateEmptyState()
-        // `SettingsPushButton` 自绘并且不处理禁用态，光设 `isEnabled` 会让人
-        // 看到一个「亮着但点不动」的按钮；补一层透明度作为视觉禁用。
+        // 禁用态外观由 SettingsPushButton.draw 统一绘制。
         clearButton.isEnabled = !entries.isEmpty
-        clearButton.alphaValue = entries.isEmpty ? 0.45 : 1
     }
 
-    private func makeRow(entry: HistoryEntry, rowIndex: Int, isPresent: Bool) -> HistoryRowView {
-        let row = HistoryRowView(entry: entry, rowIndex: rowIndex)
+    // MARK: - NSTableViewDataSource / NSTableViewDelegate
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        visibleEntryIndices.count
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard row >= 0, row < visibleEntryIndices.count else { return nil }
+        let identifier = NSUserInterfaceItemIdentifier("HistoryRowCell")
+        let rowView: HistoryRowView
+        if let reused = tableView.makeView(withIdentifier: identifier, owner: self) as? HistoryRowView {
+            rowView = reused
+        } else {
+            rowView = HistoryRowView(frame: .zero)
+            rowView.identifier = identifier
+        }
+
+        let entry = entries[visibleEntryIndices[row]]
         var availability = HistoryRowView.Availability()
         availability.copy = onCopy != nil
         availability.edit = onEdit != nil
@@ -1354,31 +1414,33 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
         availability.reveal = onReveal != nil
         availability.delete = onDelete != nil
         availability.favorite = onFavorite != nil
-        row.availability = availability
-        row.configure(
+        rowView.availability = availability
+
+        rowView.configure(
             entry: entry,
-            rowIndex: rowIndex,
-            isPresent: isPresent,
-            thumbnail: thumbnailImage(for: entry),
+            rowIndex: row,
+            isPresent: isEntryPresent(entry),
+            thumbnail: cachedOrLoadThumbnailAsync(for: entry, rowIndex: row),
             isSelected: entry.id == selectedEntryID
         )
-        row.onClick = { [weak self] index in self?.selectRow(index) }
-        row.onDoubleClick = { [weak self] index in self?.editRow(index) }
-        row.onSpace = { [weak self] in self?.togglePreview() }
-        row.onReturn = { [weak self] in self?.editSelected() }
-        row.onEscape = { [weak self] in self?.escapePressed() }
-        row.onAction = { [weak self] action, index in self?.perform(action, rowIndex: index) }
-        return row
+        rowView.onClick = { [weak self] index in self?.selectRow(index) }
+        rowView.onDoubleClick = { [weak self] index in self?.editRow(index) }
+        rowView.onAction = { [weak self] action, index in self?.perform(action, rowIndex: index) }
+        return rowView
     }
 
-    private func updateSummary(presence: [Bool]) {
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        HistoryPlainTableRowView()
+    }
+
+    private func updateSummary() {
         guard !entries.isEmpty else {
             countLabel.stringValue = "共 0 条"
             return
         }
         let total = entries.count
         let shown = visibleEntryIndices.count
-        let present = presence.lazy.filter { $0 }.count
+        let present = entries.lazy.filter { self.isEntryPresent($0) }.count
         var text = shown == total ? "共 \(total) 条" : "显示 \(shown) / 共 \(total) 条"
         text += " · 可打开 \(present) 条"
         let missing = total - present
@@ -1389,10 +1451,11 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
     }
 
     private func updateHint() {
-        var parts = ["空格预览"]
+        var parts = ["↑↓ 选择", "空格预览"]
         if onEdit != nil {
             parts.append("双击编辑")
         }
+        parts.append("⌘C 复制")
         hintLabel.stringValue = parts.joined(separator: " · ")
     }
 
@@ -1406,48 +1469,65 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
             emptySubtitleLabel.stringValue = "截图、长截图或录屏完成后会自动出现在这里。"
         } else {
             emptyTitleLabel.stringValue = "没有匹配的记录"
-            emptySubtitleLabel.stringValue = "换个关键词，或把类型筛选切回「全部」。"
+            emptySubtitleLabel.stringValue = "换个关键词，或把筛选条件切回「全部」。"
         }
     }
 
-    private func thumbnailImage(for entry: HistoryEntry) -> NSImage? {
+    /// 优先从内存缓存取缩略图；未命中时异步从磁盘解码并自动迁移旧版大图缩略图。
+    private func cachedOrLoadThumbnailAsync(for entry: HistoryEntry, rowIndex: Int) -> NSImage? {
         let key = entry.id.uuidString as NSString
-        if let cached = thumbnailCache.object(forKey: key) { return cached }
-        guard let url = store.thumbnailURL(for: entry),
-              let image = NSImage(contentsOf: url) else { return nil }
-        // 成本必须按**实际像素**算：旧版本生成的长截图缩略图可能是 360×4013，
-        // 用固定的 192×128 成本会低估几十倍，24 MiB 的总上限就形同虚设。
-        let representation = image.representations.first
-        let pixelWidth = representation?.pixelsWide ?? 0
-        let pixelHeight = representation?.pixelsHigh ?? 0
-
-        // 旧版本按原始比例生成缩略图，长截图可能是 360×4013。这里在**读取时**
-        // 一次性迁移到新的 192×128 裁切尺寸：只保留迁移后的小图，并把新文件
-        // 异步写回；否则 200 条旧记录仍会让历史页常驻数百 MB。
-        if pixelWidth > Self.thumbnailPixelWidth || pixelHeight > Self.thumbnailPixelHeight {
-            var proposed = CGRect(origin: .zero, size: image.size)
-            if let cgImage = image.cgImage(forProposedRect: &proposed, context: nil, hints: nil),
-               let data = HistoryThumbnail.makePNG(from: cgImage),
-               let migrated = NSImage(data: data) {
-                DispatchQueue.global(qos: .utility).async {
-                    try? data.write(to: url, options: .atomic)
-                }
-                thumbnailCache.setObject(
-                    migrated,
-                    forKey: key,
-                    cost: Self.thumbnailCacheItemCost
-                )
-                return migrated
-            }
+        if let cached = thumbnailCache.object(forKey: key) {
+            return cached
+        }
+        guard !loadingThumbnailIDs.contains(entry.id),
+              let url = store.thumbnailURL(for: entry) else {
+            return nil
         }
 
-        let pixelCost = pixelWidth * pixelHeight * 4
-        thumbnailCache.setObject(
-            image,
-            forKey: key,
-            cost: max(pixelCost, Self.thumbnailCacheItemCost)
-        )
-        return image
+        let entryID = entry.id
+        let maxW = Self.thumbnailPixelWidth
+        let maxH = Self.thumbnailPixelHeight
+        let itemCost = Self.thumbnailCacheItemCost
+        loadingThumbnailIDs.insert(entryID)
+
+        Task { @MainActor [weak self] in
+            // 后台仅返回 Sendable 的 CGImage 与像素成本，再回到主线程封装 NSImage，兼容 macOS 13 并发检查。
+            let loaded: (cgImage: CGImage, cost: Int)? = await Task.detached(priority: .utility) {
+                guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                      let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                    return nil
+                }
+                let pixelWidth = cgImage.width
+                let pixelHeight = cgImage.height
+
+                // 旧版本长截图缩略图体积过大时，在后台一次性降采样并写回。
+                if pixelWidth > maxW || pixelHeight > maxH {
+                    if let data = HistoryThumbnail.makePNG(from: cgImage),
+                       let migratedSource = CGImageSourceCreateWithData(data as CFData, nil),
+                       let migratedCG = CGImageSourceCreateImageAtIndex(migratedSource, 0, nil) {
+                        try? data.write(to: url, options: .atomic)
+                        return (migratedCG, itemCost)
+                    }
+                }
+                let cost = max(pixelWidth * pixelHeight * 4, itemCost)
+                return (cgImage, cost)
+            }.value
+
+            guard let self else { return }
+            self.loadingThumbnailIDs.remove(entryID)
+            guard let loaded else { return }
+
+            let image = NSImage(
+                cgImage: loaded.cgImage,
+                size: NSSize(width: loaded.cgImage.width, height: loaded.cgImage.height)
+            )
+            self.thumbnailCache.setObject(image, forKey: key, cost: loaded.cost)
+            if let currentVisibleIndex = self.visibleEntryIndices.firstIndex(where: { self.entries[$0].id == entryID }),
+               let cell = self.tableView.view(atColumn: 0, row: currentVisibleIndex, makeIfNecessary: false) as? HistoryRowView {
+                cell.updateThumbnail(image)
+            }
+        }
+        return nil
     }
 
     // MARK: - 选择与定位
@@ -1471,23 +1551,51 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
         guard let entry = entry(forRow: rowIndex) else { return }
         selectedEntryID = entry.id
         updateSelectionHighlight()
+        if preview.isVisible {
+            showPreview(for: entry, makeKey: false)
+        }
     }
 
     private func updateSelectionHighlight() {
-        for row in rows {
-            row.setSelected(row.entryID == selectedEntryID)
+        let visibleRange = tableView.rows(in: tableView.visibleRect)
+        let start = max(0, visibleRange.location)
+        let end = min(visibleEntryIndices.count, visibleRange.location + visibleRange.length)
+        for rowIndex in start..<end {
+            if let rowView = tableView.view(atColumn: 0, row: rowIndex, makeIfNecessary: false) as? HistoryRowView {
+                rowView.setSelected(rowView.entryID == selectedEntryID)
+            }
+        }
+    }
+
+    private func moveSelection(by delta: Int) {
+        guard !visibleEntryIndices.isEmpty else { return }
+        let currentVisibleIndex = selectedEntryID.flatMap { id in
+            visibleEntryIndices.firstIndex { entries[$0].id == id }
+        }
+        let targetIndex: Int
+        if let current = currentVisibleIndex {
+            targetIndex = min(max(0, current + delta), visibleEntryIndices.count - 1)
+        } else {
+            targetIndex = delta >= 0 ? 0 : visibleEntryIndices.count - 1
+        }
+        guard targetIndex != currentVisibleIndex || selectedEntryID == nil else { return }
+        let entry = entries[visibleEntryIndices[targetIndex]]
+        selectedEntryID = entry.id
+        tableView.scrollRowToVisible(targetIndex)
+        updateSelectionHighlight()
+        if preview.isVisible {
+            showPreview(for: entry, makeKey: false)
         }
     }
 
     private func focusSelectedRow() {
         guard window.isVisible, window.isKeyWindow else { return }
-        makeSelectedRowFirstResponder()
+        window.makeFirstResponder(window)
     }
 
     private func makeSelectedRowFirstResponder() {
-        guard window.isVisible, let selectedEntryID,
-              let row = rows.first(where: { $0.entryID == selectedEntryID }) else { return }
-        window.makeFirstResponder(row)
+        guard window.isVisible else { return }
+        window.makeFirstResponder(window)
     }
 
     /// 预览关闭后把键盘交回历史窗口。
@@ -1500,26 +1608,49 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
         makeSelectedRowFirstResponder()
     }
 
-    /// 重建后如果焦点原本在行上，把焦点接到新的选中行；
-    /// 焦点在搜索框时不动（否则打字会中断）。
+    /// 重建后如果焦点原本不在搜索框，保持窗口层接收方向键/空格快捷键。
     private func updateFirstResponderAfterRebuild() {
         let responder = window.firstResponder
-        guard responder is HistoryRowView || responder === window else { return }
+        guard !(responder is NSTextView) else { return }
         focusSelectedRow()
     }
 
     // MARK: - 键盘
 
+    private func copySelected() {
+        guard let entry = selectedEntry, isEntryPresent(entry) else { return }
+        onCopy?(entry)
+    }
+
+    private func deleteSelected() {
+        guard let entry = selectedEntry else { return }
+        // 先选定相邻行再通知删除，保证连续按 Delete 时焦点平滑顺延。
+        if let currentVisible = visibleEntryIndices.firstIndex(where: { entries[$0].id == entry.id }) {
+            let nextVisible = currentVisible + 1 < visibleEntryIndices.count
+                ? currentVisible + 1
+                : (currentVisible - 1 >= 0 ? currentVisible - 1 : nil)
+            selectedEntryID = nextVisible.map { entries[visibleEntryIndices[$0]].id }
+        }
+        onDelete?(entry)
+        if preview.isVisible {
+            if let next = selectedEntry {
+                showPreview(for: next, makeKey: false)
+            } else {
+                preview.close()
+            }
+        }
+    }
+
     private func editSelected() {
         guard let entry = selectedEntry else { return }
-        guard onEdit != nil, entry.isFilePresent else { return }
+        guard onEdit != nil, isEntryPresent(entry) else { return }
         onEdit?(entry)
     }
 
     private func editRow(_ rowIndex: Int) {
         guard let entry = entry(forRow: rowIndex) else { return }
         selectRow(rowIndex)
-        guard onEdit != nil, entry.isFilePresent else { return }
+        guard onEdit != nil, isEntryPresent(entry) else { return }
         onEdit?(entry)
     }
 
@@ -1534,8 +1665,12 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
             updateSelectionHighlight()
         }
         guard let entry = selectedEntry else { return }
+        showPreview(for: entry, makeKey: true)
+    }
+
+    private func showPreview(for entry: HistoryEntry, makeKey: Bool) {
         let thumbnail = thumbnailCache.object(forKey: entry.id.uuidString as NSString)
-        preview.show(entry, thumbnail: thumbnail, relativeTo: window)
+        preview.show(entry, thumbnail: thumbnail, relativeTo: window, makeKey: makeKey)
     }
 
     private func escapePressed() {
@@ -1590,13 +1725,14 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
     }
 
     private func toggleFavorite(rowIndex: Int, entry: HistoryEntry) {
-        guard validRowIndex(rowIndex), rowIndex < rows.count else { return }
+        guard validRowIndex(rowIndex) else { return }
         var updated = entry
         updated.isFavorite.toggle()
         // 本地数组先改：收藏是即时反馈，不该等集成方 refresh 回填。
-        // 排序不变——与 store 一致，用户按时间找图时位置跳动比高亮更烦。
         entries[visibleEntryIndices[rowIndex]] = updated
-        rows[rowIndex].setFavorite(updated.isFavorite)
+        if let rowView = tableView.view(atColumn: 0, row: rowIndex, makeIfNecessary: false) as? HistoryRowView {
+            rowView.setFavorite(updated.isFavorite)
+        }
         onFavorite?(updated, updated.isFavorite)
     }
 
@@ -1610,6 +1746,20 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
               field === searchField else { return }
         rebuildRows()
         updateFirstResponderAfterRebuild()
+    }
+
+    /// 搜索框获得焦点时仍允许使用 `↑ / ↓` 在列表里切行与联动预览。
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        guard control === searchField else { return false }
+        if commandSelector == #selector(NSResponder.moveUp(_:)) {
+            moveSelection(by: -1)
+            return true
+        }
+        if commandSelector == #selector(NSResponder.moveDown(_:)) {
+            moveSelection(by: 1)
+            return true
+        }
+        return false
     }
 
     @objc private func filterChanged() {
@@ -1636,18 +1786,13 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
         // 预览的 `onClose` 会尝试归还焦点；`isClosing` 让那次回交成为空操作。
         preview.close()
         isClosing = false
+        presenceTask?.cancel()
+        presenceTask = nil
+        loadingThumbnailIDs.removeAll()
 
-        // 关窗即释放行视图与缩略图：它们只服务屏上显示。窗口不销毁
-        // （`isReleasedWhenClosed = false`），若不主动清空，最多 200 行
-        // 视图和 24 MiB 缩略图会被一个隐藏窗口长期持有。
-        // `entries` 只是元数据，留着让下次 `show(_:)` 的刷新更平滑；
-        // `rebuildRows()` 见 `rows` 为空会整批重建，重开照常显示缩略图。
-        for view in listStack.arrangedSubviews {
-            listStack.removeArrangedSubview(view)
-            view.removeFromSuperview()
-        }
-        rows.removeAll()
         visibleEntryIndices.removeAll()
+        tableView.reloadData()
         thumbnailCache.removeAllObjects()
+        ForegroundPolicyCoordinator.release("history")
     }
 }

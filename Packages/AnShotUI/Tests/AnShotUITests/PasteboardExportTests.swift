@@ -69,4 +69,15 @@ struct PasteboardExportTests {
         // 历史缓存直接复用这份 Data，不能再编码一次；这里钉住「同一份字节」。
         #expect(pasteboard.data(forType: .png) == result.pngData)
     }
+
+    @Test("纯文本生成剪贴板便签贴图支持多行与长度保护")
+    func textNoteImageRendering() throws {
+        let shortImage = try #require(ImageSourceLauncher.renderTextNoteImage("剪贴板便签内容\n第二行测试", scale: 2))
+        #expect(shortImage.width >= 360)
+        #expect(shortImage.height >= 100)
+
+        let hugeText = String(repeating: "便签内容", count: 1200)
+        let hugeImage = try #require(ImageSourceLauncher.renderTextNoteImage(hugeText, scale: 2))
+        #expect(hugeImage.width > 0 && hugeImage.height > 0 && hugeImage.height <= 1200)
+    }
 }

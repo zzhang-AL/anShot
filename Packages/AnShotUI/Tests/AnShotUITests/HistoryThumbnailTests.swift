@@ -57,4 +57,19 @@ struct HistoryThumbnailTests {
         #expect(HistoryThumbnail.makePNG(from: image, maxWidth: 0) == nil)
         #expect(HistoryThumbnail.makePNG(from: image, maxHeight: 0) == nil)
     }
+
+    @Test("崩溃详情复制脱敏用户名目录与设备 UUID")
+    func crashDetailsRedaction() {
+        let raw = """
+        Path: /Users/alice/Applications/anShot.app/Contents/MacOS/anShot
+        Hardware UUID: 12345678-90AB-CDEF-1234-567890ABCDEF
+        Home: /Users/bob_dev/Library/Logs/DiagnosticReports/anShot.ips
+        """
+        let redacted = CrashLogWindowController.redactSensitiveDetails(raw)
+        #expect(!redacted.contains("/Users/alice"))
+        #expect(!redacted.contains("/Users/bob_dev"))
+        #expect(!redacted.contains("12345678-90AB-CDEF-1234-567890ABCDEF"))
+        #expect(redacted.contains("~/Applications/anShot.app"))
+        #expect(redacted.contains("<REDACTED-UUID>"))
+    }
 }

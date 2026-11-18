@@ -28,6 +28,8 @@ public final class RecordingControlBar {
     public var onTogglePause: (() -> Void)?
     /// 点击停止。
     public var onStop: (() -> Void)?
+    /// 点击取消并丢弃当前录制。
+    public var onCancel: (() -> Void)?
 
     private let panel: NSPanel
     private let statusDot = NSView()
@@ -35,6 +37,7 @@ public final class RecordingControlBar {
     private let hintLabel = NSTextField(labelWithString: "")
     private let pauseButton = NSButton()
     private let stopButton = NSButton()
+    private let cancelButton = NSButton()
 
     /// 当前状态与已录时长。`refreshHint` 依赖它们现算文案。
     private var state: RecordingState = .idle
@@ -46,7 +49,10 @@ public final class RecordingControlBar {
     /// GIF 导出进度（0…1）。nil 表示尚未进入导出。
     private var exportProgress: Double?
 
-    private static let barSize = CGSize(width: 232, height: 46)
+    /// 准备倒计时剩余秒数（>0 时处于开拍前倒计时）。
+    private var countdownRemaining: Int?
+
+    private static let barSize = CGSize(width: 266, height: 46)
 
     public init() {
         panel = NSPanel(
@@ -63,6 +69,11 @@ public final class RecordingControlBar {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
+        // 允许背景拖动，避免控制条遮挡目标窗口顶栏或按钮时无法挪开。
+        panel.isMovable = true
+        panel.isMovableByWindowBackground = true
+        // 防止被第三方会议或屏幕共享软件拍到控制条。
+        panel.sharingType = .none
         // 出现在所有空间，包括全屏应用之上
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.ignoresMouseEvents = false
@@ -73,7 +84,7 @@ public final class RecordingControlBar {
     // MARK: - 内容
 
     private func configureContent() {
-        let container = NSView(frame: CGRect(origin: .zero, size: Self.barSize))
+        let container = RecordingControlBarContainerView(frame: CGRect(origin: .zero, size: Self.barSize))
         container.wantsLayer = true
         container.layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 0.92).cgColor
         container.layer?.cornerRadius = 10
@@ -94,44 +105,52 @@ public final class RecordingControlBar {
         timeLabel.alignment = .left
         container.addSubview(timeLabel)
 
-        // 状态提示（准备中 / 已暂停 / 剩余时间 / GIF 进度）
-        //
-        // 宽度 60 是**用字长反推的上限**：它恰好在计时标签与暂停按钮之间。
-        // 因此这里只放短文案（「剩 15s」「GIF 42%」）——把「生成 GIF 42%」
-        // 这样的长句塞进来会挤压按钮位置，而按钮的可点性比文字完整更重要。
+        // 状态提示（准备中 / 倒计时 / 已暂停 / 剩余时间 / GIF 进度）
         hintLabel.frame = CGRect(x: 104, y: Self.barSize.height / 2 - 9, width: 60, height: 18)
         hintLabel.font = .systemFont(ofSize: 11)
         hintLabel.textColor = NSColor(calibratedWhite: 1, alpha: 0.65)
         container.addSubview(hintLabel)
 
         // 暂停 / 继续
-        styleButton(pauseButton, symbol: "pause.fill", action: #selector(handlePause))
-        pauseButton.frame = CGRect(x: 164, y: Self.barSize.height / 2 - 13, width: 26, height: 26)
+        styleButton(pauseButton, symbol: "pause.fill", toolTip: "暂停 / 继续录制", action: #selector(handlePause))
+        pauseButton.frame = CGRect(x: 166, y: Self.barSize.height / 2 - 13, width: 26, height: 26)
         container.addSubview(pauseButton)
 
-        // 停止
-        styleButton(stopButton, symbol: "stop.fill", action: #selector(handleStop))
-        stopButton.frame = CGRect(x: 196, y: Self.barSize.height / 2 - 13, width: 26, height: 26)
+        // 停止并保存
+        styleButton(stopButton, symbol: "stop.fill", toolTip: "停止并保存录制", action: #selector(handleStop))
+        stopButton.frame = CGRect(x: 198, y: Self.barSize.height / 2 - 13, width: 26, height: 26)
         container.addSubview(stopButton)
+
+        // 取消并丢弃当前录制
+        styleButton(cancelButton, symbol: "xmark", toolTip: "取消并丢弃当前录制", action: #selector(handleCancel))
+        cancelButton.frame = CGRect(x: 230, y: Self.barSize.height / 2 - 13, width: 26, height: 26)
+        container.addSubview(cancelButton)
 
         panel.contentView = container
     }
 
-    private func styleButton(_ button: NSButton, symbol: String, action: Selector) {
+    private func styleButton(_ button: NSButton, symbol: String, toolTip: String, action: Selector) {
         button.bezelStyle = .regularSquare
         button.isBordered = false
         button.imagePosition = .imageOnly
         button.contentTintColor = .white
+        button.toolTip = toolTip
         button.target = self
         button.action = action
         button.wantsLayer = true
         button.layer?.backgroundColor = NSColor(calibratedWhite: 1, alpha: 0.14).cgColor
         button.layer?.cornerRadius = 6
-        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
+        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: toolTip) {
             button.image = image
         } else {
             // 系统符号不可用时的文字回退（macOS 13 起 SF Symbols 应可用）
-            button.title = symbol == "stop.fill" ? "■" : "II"
+            if symbol == "stop.fill" {
+                button.title = "■"
+            } else if symbol == "xmark" {
+                button.title = "✕"
+            } else {
+                button.title = "II"
+            }
             button.imagePosition = .noImage
         }
     }
@@ -234,6 +253,9 @@ public final class RecordingControlBar {
     public func update(state: RecordingState, elapsed: TimeInterval) {
         self.state = state
         self.elapsed = elapsed
+        if state != .preparing {
+            countdownRemaining = nil
+        }
         timeLabel.stringValue = Self.format(elapsed)
 
         switch state {
@@ -254,11 +276,25 @@ public final class RecordingControlBar {
             break
         }
 
-        // 收尾期间两个按钮一律置灰：流已停、转码不可暂停，
-        // 它们此刻点下去没有任何效果。可点却无反应比置灰更难理解。
+        // 收尾期间三个按钮一律置灰：流已停、转码不可暂停也不可丢弃。
         pauseButton.isEnabled = (state == .recording || state == .paused)
-        stopButton.isEnabled = (state != .finishing)
+        stopButton.isEnabled = (state != .finishing && countdownRemaining == nil)
+        cancelButton.isEnabled = (state == .preparing || state == .recording || state == .paused)
 
+        refreshHint()
+    }
+
+    /// 刷新录制前准备倒计时（如 3 → 2 → 1 秒）。
+    public func updateCountdown(_ secondsRemaining: Int?) {
+        countdownRemaining = secondsRemaining
+        if let secondsRemaining, secondsRemaining > 0 {
+            state = .preparing
+            statusDot.layer?.backgroundColor = NSColor.systemOrange.cgColor
+            timeLabel.stringValue = String(format: "00:%02d", secondsRemaining)
+            pauseButton.isEnabled = false
+            stopButton.isEnabled = false
+            cancelButton.isEnabled = true
+        }
         refreshHint()
     }
 
@@ -280,7 +316,11 @@ public final class RecordingControlBar {
         let text: String
         switch state {
         case .preparing:
-            text = "准备中"
+            if let countdownRemaining, countdownRemaining > 0 {
+                text = "倒计时 \(countdownRemaining)s"
+            } else {
+                text = "准备中"
+            }
         case .paused:
             text = "已暂停"
         case .recording:
@@ -332,6 +372,10 @@ public final class RecordingControlBar {
         onStop?()
     }
 
+    @objc private func handleCancel() {
+        onCancel?()
+    }
+
     #if DEBUG
     // MARK: - 诊断
 
@@ -346,5 +390,13 @@ public final class RecordingControlBar {
 
     /// 诊断用：停止按钮此刻是否可点。
     public var stopEnabledForDiagnostics: Bool { stopButton.isEnabled }
+
+    /// 诊断用：取消按钮此刻是否可点。
+    public var cancelEnabledForDiagnostics: Bool { cancelButton.isEnabled }
     #endif
+}
+
+/// 控制条背景容器视图：明确允许通过背景拖拽移动控制条位置。
+private final class RecordingControlBarContainerView: NSView {
+    override var mouseDownCanMoveWindow: Bool { true }
 }

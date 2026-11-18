@@ -293,17 +293,8 @@ final class SettingsWindowController: NSWindowController {
     func show() {
         guard let window else { return }
 
-        // 打开设置期间**临时切到 `.regular`**。
-        //
-        // 本应用平时以 `.accessory` 运行（菜单栏常驻、无 Dock 图标），代价是
-        // ⌘Tab 的切换器里**看不到它**——用户切到别的 app 之后就再也切不回
-        // 设置窗口，表现就是「设置窗口失焦就不见了」。
-        //
-        // 设置是要停一会儿、来回改的地方，必须能切回来。关闭时在
-        // `windowWillClose` 里切回 `.accessory`，菜单栏程序的形态不变。
-        if NSApp.activationPolicy() != .regular {
-            NSApp.setActivationPolicy(.regular)
-        }
+        // 通过前台激活策略协调器保持 `.regular`，支持多窗口并存时 `⌘Tab` 切回。
+        ForegroundPolicyCoordinator.acquire("settings")
 
         // 默认不是活跃应用，不主动激活的话窗口会出现在后台，
         // 用户看不到却以为「点了没反应」。
@@ -312,19 +303,20 @@ final class SettingsWindowController: NSWindowController {
         window.makeKeyAndOrderFront(nil)
     }
 
-    /// 恢复菜单栏程序形态（去掉 Dock 图标与 ⌘Tab 条目）。
-    ///
-    /// 只在当前确实是 `.regular` 时切换：`activationPolicy` 的切换会让 AppKit
-    /// 重建菜单栏，无谓地多切一次会引发一次可见的闪动。
+    /// 恢复菜单栏程序形态（由协调器在所有独立窗口关闭后统一切换）。
     func restoreAccessoryPolicy() {
-        guard NSApp.activationPolicy() == .regular else { return }
-        NSApp.setActivationPolicy(.accessory)
+        ForegroundPolicyCoordinator.release("settings")
     }
 }
 
 // MARK: - 窗口代理
 
 extension SettingsWindowController: NSWindowDelegate {
+
+    public func windowDidBecomeKey(_ notification: Notification) {
+        // 从系统设置修改登录项后切回窗口，立即同步 SMAppService 最新状态。
+        contentController.refreshLaunchAtLoginStateFromSystem()
+    }
 
     public func windowDidResignKey(_ notification: Notification) {
         // 窗口失去键盘焦点时，若还在录制快捷键就必须收尾。
@@ -337,8 +329,7 @@ extension SettingsWindowController: NSWindowDelegate {
         // 取消更新状态订阅：coordinator 是进程级单例，设置窗口却会被释放；
         // 不清空的话它会一直持有一个指向已关闭页面的 weak 回调。
         contentController.detachUpdateObserver()
-        // 先恢复菜单栏程序形态，再通知外部：`onClose` 里会把 controller
-        // 置空，那时再切策略就晚了（对象可能已释放）。
+        // 先归还前台策略计数，再通知外部销毁控制器。
         restoreAccessoryPolicy()
         onClose?()
     }
@@ -370,7 +361,8 @@ private final class SettingsViewController: NSViewController {
 
     // MARK: 分页结构
 
-    /// 右侧内容容器：切页时只替换它的子视图。
+    /// 右侧滚动容器与文档内容容器：切页时只替换文档容器的子视图。
+    private var contentScrollView: NSScrollView!
     private var contentContainer: NSView!
     private var sidebarItems: [SettingsSidebarItem] = []
 
@@ -474,13 +466,26 @@ private final class SettingsViewController: NSViewController {
         itemStack.translatesAutoresizingMaskIntoConstraints = false
         sidebar.addSubview(itemStack)
 
-        // 右侧内容容器：切页时只替换这里的子视图。
-        let content = NSView()
+        // 右侧内容滚动容器：防止提示语展开后超出固定 580pt 高度而被裁切。
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        contentScrollView = scrollView
+
+        let content = SettingsScrollDocumentView()
         content.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = content
         contentContainer = content
 
         root.addSubview(sidebar)
-        root.addSubview(content)
+        root.addSubview(scrollView)
+
+        let minDocHeight = content.heightAnchor.constraint(equalTo: scrollView.contentView.heightAnchor)
+        minDocHeight.priority = .defaultLow
 
         NSLayoutConstraint.activate([
             root.widthAnchor.constraint(equalToConstant: SettingsTheme.windowWidth),
@@ -490,10 +495,15 @@ private final class SettingsViewController: NSViewController {
             sidebar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
             sidebar.widthAnchor.constraint(equalToConstant: SettingsTheme.sidebarWidth),
 
-            content.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
-            content.topAnchor.constraint(equalTo: root.topAnchor),
-            content.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            content.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: root.topAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+
+            content.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+            content.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
+            content.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+            minDocHeight,
 
             // 侧边栏项左右各缩进一小段，左边距与内容区的 margin 形成节奏。
             itemStack.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 16),
@@ -530,6 +540,9 @@ private final class SettingsViewController: NSViewController {
     }
 
     private func showPage(_ page: SettingsPage) {
+        // 切页前先取消仍在进行的快捷键录制并恢复热键，避免录制框离开可视区后热键悬空。
+        cancelRecordingIfNeeded()
+
         currentPage = page
         for item in sidebarItems {
             item.isCurrent = (item.page == page)
@@ -545,9 +558,11 @@ private final class SettingsViewController: NSViewController {
             pageView.topAnchor.constraint(equalTo: contentContainer.topAnchor, constant: margin),
             pageView.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor, constant: margin),
             pageView.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor, constant: -margin),
-            // 不约束 bottom：内容高度由卡片决定，不足时留白而不是拉伸卡片。
+            // 内容超出视口时撑开文档视图以允许滚动，未超出时由低优先级等高约束保持顶部对齐与留白。
             pageView.bottomAnchor.constraint(lessThanOrEqualTo: contentContainer.bottomAnchor, constant: -margin),
         ])
+        contentScrollView?.contentView.scroll(to: .zero)
+        contentScrollView?.reflectScrolledClipView(contentScrollView.contentView)
 
         resizeWindowToFitCurrentPage()
 
@@ -1887,11 +1902,9 @@ private final class SettingsViewController: NSViewController {
         }
         aboutUpdateStatusLabel?.stringValue = text
         aboutUpdateStatusLabel?.textColor = color
-        // 自绘按钮不会自动变灰，必须显式压暗：否则检查中看起来仍然可按，
-        // 用户会反复点击并以为界面卡住。0.5 与其它“不可用”控件保持同一观感。
+        // 禁用态外观由 SettingsPushButton.draw 统一绘制，无需外部手调 alphaValue。
         let canCheck = state != .checking
         aboutUpdateCheckButton?.isEnabled = canCheck
-        aboutUpdateCheckButton?.alphaValue = canCheck ? 1 : 0.5
     }
 
     /// 读取最近崩溃报告数量。
@@ -2091,8 +2104,14 @@ private final class SettingsViewController: NSViewController {
 
     /// 把开关与提示同步到系统当前的真实状态。
     private func refreshLaunchAtLoginState() {
+        guard launchAtLoginRow != nil else { return }
         launchAtLoginRow.isOn = LaunchAtLogin.isEnabled
         launchAtLoginRow.setNotice(LaunchAtLogin.notice)
+    }
+
+    /// 供窗口激活时同步系统登录项状态。
+    func refreshLaunchAtLoginStateFromSystem() {
+        refreshLaunchAtLoginState()
     }
 
     @objc private func saveModeChanged(_ sender: NSButton) {
@@ -2144,14 +2163,31 @@ private final class SettingsViewController: NSViewController {
 
     // MARK: 键盘
 
+    /// 汇总当前页面全部 5 个快捷键录制器，确保取消、失焦、切页、关窗时统一恢复系统热键。
+    private var allRecorders: [ShortcutRecorderView] {
+        var result: [ShortcutRecorderView] = []
+        if let recorder {
+            result.append(recorder)
+        }
+        if let pinToggleRecorder {
+            result.append(pinToggleRecorder)
+        }
+        for action in Self.intentShortcutActions {
+            if let intentRecorder = intentRecorders[action] {
+                result.append(intentRecorder)
+            }
+        }
+        return result
+    }
+
     /// Escape 先取消录制，没有录制时才关窗。
     ///
     /// `cancelOperation(_:)` 是 `NSResponder` 的隐式动作，AppKit 在按 Esc 时
     /// 沿响应链派发。不实现它，HIG 要求的「设置窗口可按 Esc 关闭」就是空的。
     override func cancelOperation(_ sender: Any?) {
-        // 与失焦/关闭走同一条收尾路径：两个热键录制控件都可能正开着，
-        // 各自让出了不同的热键，只处理其中一个会让另一个静默失效。
-        if recorder?.isRecording == true || pinToggleRecorder?.isRecording == true {
+        // 与失焦/关闭/切页走同一条收尾路径：所有 5 个热键录制控件都纳入检查，
+        // 避免直达入口热键录制期间按 Esc 导致热键静默丢失。
+        if allRecorders.contains(where: \.isRecording) {
             cancelRecordingIfNeeded()
             return
         }
@@ -2228,22 +2264,19 @@ private final class SettingsViewController: NSViewController {
         showPage(page)
     }
 
-    /// 取消进行中的快捷键录制并恢复热键。窗口失焦、关闭或按 Esc 时调用。
+    /// 取消进行中的快捷键录制并恢复热键。窗口失焦、关闭、切页或按 Esc 时调用。
     ///
-    /// **两个录制控件都必须收尾**：它们各自让出的是不同的全局热键
-    /// （截图 / 收起固定截图）。漏掉任何一个，该控件的 `didEndRecording`
-    /// 就不会触发，热键停在「已让出」状态；而窗口一关控制器随即释放，
-    /// 用户再也拿不回来，菜单里也不会出现任何告警。
+    /// **全部 5 个录制控件都必须收尾**：包含主截图热键、贴图开关热键及全部直达入口热键。
     func cancelRecordingIfNeeded() {
-        // 控件是懒构建的（没打开过那一页时不存在），用可选链而非强解包。
-        if recorder?.isRecording == true {
-            // 让控件走它自己的取消路径，避免在这里重复实现「恢复原值 + 恢复热键」。
-            recorder.cancelRecordingExternally()
-        }
-        if pinToggleRecorder?.isRecording == true {
-            pinToggleRecorder.cancelRecordingExternally()
+        for item in allRecorders where item.isRecording {
+            item.cancelRecordingExternally()
         }
     }
+}
+
+/// 滚动区文档视图：采用从上向下的翻转坐标系，确保不足一屏时内容顶部对齐。
+private final class SettingsScrollDocumentView: NSView {
+    override var isFlipped: Bool { true }
 }
 
 // MARK: - 窗口背景

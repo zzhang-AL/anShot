@@ -127,6 +127,12 @@ final class UpdateCoordinator {
         return AppVersion("0")!
     }
 
+    /// 当前运行实例的构建号，用于在语义版本相同时比对热修版本。
+    private var installedBuildNumber: Int? {
+        guard let raw = bundleString("CFBundleVersion") else { return nil }
+        return Int(raw)
+    }
+
     private func bundleString(_ key: String) -> String? {
         (Bundle.main.object(forInfoDictionaryKey: key) as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -169,7 +175,10 @@ final class UpdateCoordinator {
         }
 
         do {
-            let result = try await service.check(currentVersion: installedVersion)
+            let result = try await service.check(
+                currentVersion: installedVersion,
+                currentBuild: installedBuildNumber
+            )
             // 只有成功完成才算「检查过」，失败不应把下一次自动检查推迟 24 小时。
             preferences.lastCheckAt = Date()
 
@@ -207,9 +216,10 @@ final class UpdateCoordinator {
     /// 用户点过「稍后」的版本不再打扰；手动检查不受此限制
     ///（用户主动问“有没有新版本”时不回答才是错的）。
     private func notifyAutomatically(about release: UpdateRelease) {
-        guard preferences.skippedVersion != release.version.description else { return }
+        let skipped = preferences.skippedVersion
+        guard skipped != release.displayVersion, skipped != release.version.description else { return }
         ToastPresenter.show(
-            "发现新版本 \(release.version)",
+            "发现新版本 \(release.displayVersion)",
             actionTitle: "查看"
         ) { [weak self] in
             self?.presentAvailableUpdate()
@@ -352,7 +362,7 @@ final class UpdateCoordinator {
     /// 用户点「稍后」：记住版本，自动检查不再提示同一个版本。
     private func postpone() {
         if let release = pendingRelease {
-            preferences.skippedVersion = release.version.description
+            preferences.skippedVersion = release.displayVersion
         }
         windowController?.close()
     }
