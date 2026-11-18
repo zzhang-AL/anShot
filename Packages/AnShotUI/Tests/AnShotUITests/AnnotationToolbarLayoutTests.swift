@@ -24,6 +24,7 @@
 //
 
 import AnShotCore
+import AppKit
 import CoreGraphics
 import Testing
 
@@ -347,5 +348,37 @@ struct AnnotationToolbarPointerPanelTests {
         #expect(before.size == after.size)
         #expect(before.items.map(\.kind) == after.items.map(\.kind))
         #expect(before.items.map(\.rect) == after.items.map(\.rect))
+    }
+
+    @Test("放大镜倍率文案与高亮半透明色板符合预期")
+    func magnifierLabelsAndHighlightPalette() {
+        #expect(AnnotationToolbarLayout.formatZoomLabel(1.5) == "1.5x")
+        #expect(AnnotationToolbarLayout.formatZoomLabel(2.0) == "2x")
+        #expect(AnnotationToolbarLayout.formatZoomLabel(3.0) == "3x")
+
+        var highlightLayout = AnnotationToolbarLayout()
+        highlightLayout.tool = .highlight
+        let swatches = highlightLayout.layoutPanel().items.compactMap { item -> RGBAColor? in
+            if case let .color(color) = item.kind { return color }
+            return nil
+        }
+        #expect(swatches == AnnotationStyle.highlightColors)
+        #expect(swatches.allSatisfy { $0.a < 0.99 })
+    }
+
+    @Test("工具栏定位避开 safeInsets 顶部刘海与菜单栏")
+    func toolbarOriginAvoidsTopSafeArea() {
+        let viewBounds = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let fullSelection = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let safeInsets = NSEdgeInsets(top: 38, left: 0, bottom: 0, right: 0)
+        let origin = AnnotationToolbarLayout.toolbarOrigin(
+            selection: fullSelection,
+            toolbarSize: CGSize(width: 500, height: 70),
+            labelReserve: 33,
+            viewBounds: viewBounds,
+            gap: 8,
+            safeInsets: safeInsets
+        )
+        #expect(origin.y >= 38 + 8, "整屏选区工具栏顶部必须避开 38pt 刘海区域")
     }
 }

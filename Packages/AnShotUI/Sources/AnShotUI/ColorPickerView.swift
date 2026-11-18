@@ -138,6 +138,9 @@ final class ColorPickerView: NSView {
         // 用自定义 cell 保证单行文字在框内严格垂直居中：
         // 默认 cell 会给文字留出自己的内边距，在自绘的底块里看起来偏上。
         field.cell = CenteredHexFieldCell(textCell: "")
+        // 替换 cell 会重置可编辑标志为 false，必须显式恢复。
+        field.isEditable = true
+        field.isSelectable = true
         field.isBordered = false
         // 不让 AppKit 自己画底：处于编辑态时 field editor 会用系统浅色样式接管绘制，
         // 与深色面板撞成「浅底深字」。底色统一由本视图的 draw 负责。
@@ -508,7 +511,7 @@ extension ColorPickerView: NSTextFieldDelegate {
         }
         if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
             syncHexField()
-            window?.makeFirstResponder(nil)
+            window?.makeFirstResponder(self)
             return true
         }
         return false

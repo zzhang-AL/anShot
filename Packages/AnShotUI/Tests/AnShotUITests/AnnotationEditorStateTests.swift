@@ -907,3 +907,211 @@ struct AnnotationEditorRestyleTests {
         #expect(editor.annotations[0] == before, "马赛克的颜色/线宽不参与渲染，改动应是空操作")
     }
 }
+
+// MARK: - 2x 字号对齐、手势事务、控制手柄与层级操作
+
+@MainActor
+@Suite("标注编辑器 · 字号对齐与高级编辑能力")
+struct AnnotationEditorEnhancementTests {
+
+    @Test("2x 屏下文字重编辑字号除以 scaleFactor 不翻倍，指针改字号乘以 scaleFactor 不缩水")
+    func textFontSizeAlignsBetweenPointsAndPixels() {
+        let editor = AnnotationEditorState(selection: makeRect(0, 0, 400, 400))
+        editor.select(.text)
+        editor.selectFontSize(28, scaleFactor: 2)
+        editor.beginTextEditing(at: PixelPoint(x: 20, y: 20))
+        editor.updateTextDraft("Retina 文字")
+        #expect(editor.commitTextDraft(scaleFactor: 2))
+
+        guard case let .text(origin, _, createdFont, _, _, _) = editor.annotations.first?.kind else {
+            Issue.record("应存在一条文字标注")
+            return
+        }
+        #expect(createdFont.size == 56, "28pt 在 2x 屏模型字号应为 56px")
+
+        // 双击重编辑：传入 scaleFactor: 2 应还原为 28pt，提交后保持 56px 不翻倍
+        let topLeft = PixelPoint(x: origin.x, y: origin.y - TextMetrics.ascent(for: createdFont))
+        editor.beginTextEditing(annotation: editor.annotations[0], topLeft: topLeft, scaleFactor: 2)
+        #expect(editor.textDraft?.fontSize == 28, "重编辑字号应还原为逻辑点 28")
+        #expect(editor.commitTextDraft(scaleFactor: 2))
+
+        guard case let .text(_, _, reEditedFont, _, _, _) = editor.annotations[0].kind else {
+            Issue.record("应仍存在文字标注")
+            return
+        }
+        #expect(reEditedFont.size == 56, "重编辑提交后字号不得翻倍成 112px")
+
+        // 指针选中改字号：选 40pt 写入 80px
+        editor.select(.pointer)
+        let box = editor.annotations[0].hitBoundingRect
+        #expect(editor.selectAnnotation(at: PixelPoint(x: box.origin.x + 4, y: box.origin.y + 4), tolerance: 2))
+        editor.updateSelectedFontSize(40, scaleFactor: 2)
+        guard case let .text(_, _, resizedFont, _, _, _) = editor.annotations[0].kind else {
+            Issue.record("应仍存在文字标注")
+            return
+        }
+        #expect(resizedFont.size == 80, "指针改字号 40pt 在 2x 屏下应存为 80px")
+        #expect(editor.selectedTextLogicalFontSize(scaleFactor: 2) == 40)
+    }
+
+    @Test("手势起止事务把连续移动和线宽拖动合并为单条撤销记录")
+    func editTransactionCoalescesHistoryIntoSingleStep() {
+        let editor = AnnotationEditorState(selection: makeRect(0, 0, 300, 300))
+        drawRectangle(editor, from: PixelPoint(x: 20, y: 20), to: PixelPoint(x: 80, y: 60))
+        let original = editor.annotations[0]
+        editor.select(.pointer)
+        #expect(editor.selectAnnotation(at: PixelPoint(x: 50, y: 20), tolerance: 2))
+
+        // 连续移动 20 次仅压入 1 步撤销
+        editor.beginEditTransaction()
+        for _ in 0 ..< 20 {
+            editor.moveSelected(by: PixelPoint(x: 2, y: 1))
+        }
+        editor.commitEditTransaction()
+
+        #expect(editor.annotations[0].hitBoundingRect.origin == PixelPoint(x: 60, y: 40))
+        #expect(editor.undo())
+        #expect(editor.annotations[0] == original, "撤销 1 次即完整回到拖拽前原位")
+
+        // 连续拖动线宽滑块仅压入 1 步撤销
+        editor.beginEditTransaction()
+        for width in stride(from: 2.0, through: 12.0, by: 1.0) {
+            editor.selectLineWidth(width)
+        }
+        editor.commitEditTransaction()
+
+        guard case let .rectangle(_, updatedStroke, _, _) = editor.annotations[0].kind else {
+            Issue.record("应为矩形标注")
+            return
+        }
+        #expect(updatedStroke.width == 12.0)
+        #expect(editor.undo())
+        #expect(editor.annotations[0] == original, "撤销 1 次即完整退回滑块拖动前线宽")
+    }
+
+    @Test("调粗已有箭头和弯曲箭头线宽时按比例同步放大头部尺寸")
+    func restylingArrowLineWidthScalesHeadDimensions() {
+        let editor = AnnotationEditorState(selection: makeRect(0, 0, 300, 300))
+        editor.selectLineWidth(4)
+        editor.select(.arrow)
+        editor.beginDraft(at: PixelPoint(x: 20, y: 20))
+        editor.updateDraft(to: PixelPoint(x: 120, y: 20))
+        #expect(editor.commitDraft())
+
+        guard case let .arrow(_, _, oldStroke, oldLen, oldWidth) = editor.annotations[0].kind else {
+            Issue.record("应为箭头标注")
+            return
+        }
+        #expect(oldStroke.width == 4)
+
+        editor.select(.pointer)
+        #expect(editor.selectAnnotation(at: PixelPoint(x: 70, y: 20), tolerance: 2))
+        editor.updateSelectedLineWidth(12)
+
+        guard case let .arrow(_, _, newStroke, newLen, newWidth) = editor.annotations[0].kind else {
+            Issue.record("应为箭头标注")
+            return
+        }
+        #expect(newStroke.width == 12)
+        #expect(abs(newLen - oldLen * 3) < 0.001)
+        #expect(abs(newWidth - oldWidth * 3) < 0.001)
+    }
+
+    @Test("荧光笔高亮工具拒绝不透明色值，自动锁定 alpha = 0.35")
+    func highlightToolLocksTranslucentAlpha() {
+        let editor = AnnotationEditorState(selection: makeRect(0, 0, 200, 200))
+        editor.select(.highlight)
+        // 模拟从取色器传入全不透明黑色 (a = 1.0)
+        editor.selectColor(RGBAColor(r: 0, g: 0, b: 0, a: 1.0))
+        #expect(abs(editor.style.highlightColor.a - 0.35) < 0.001, "不透明色必须被锁定回半透明 0.35")
+
+        editor.beginDraft(at: PixelPoint(x: 10, y: 10))
+        editor.updateDraft(to: PixelPoint(x: 80, y: 40))
+        #expect(editor.commitDraft())
+
+        editor.select(.pointer)
+        #expect(editor.selectAnnotation(at: PixelPoint(x: 40, y: 25), tolerance: 2))
+        editor.updateSelectedColor(RGBAColor(r: 1, g: 0, b: 0, a: 1.0))
+        guard case let .highlight(_, updatedColor) = editor.annotations[0].kind else {
+            Issue.record("应为高亮标注")
+            return
+        }
+        #expect(abs(updatedColor.a - 0.35) < 0.001, "选中高亮改色也不得变成实心块")
+    }
+
+    @Test("指针控制手柄支持矩形缩放、弯曲箭头调弯、放大镜改半径，以及置顶置底和复制")
+    func controlHandlesZOrderAndDuplicateWork() {
+        let editor = AnnotationEditorState(selection: makeRect(0, 0, 400, 400))
+        drawRectangle(editor, from: PixelPoint(x: 20, y: 20), to: PixelPoint(x: 100, y: 80))
+
+        editor.select(.curvedArrow)
+        editor.beginDraft(at: PixelPoint(x: 40, y: 120))
+        editor.updateDraft(to: PixelPoint(x: 200, y: 120))
+        #expect(editor.commitDraft())
+
+        editor.select(.magnifier)
+        editor.beginDraft(at: PixelPoint(x: 250, y: 250))
+        editor.updateDraft(to: PixelPoint(x: 290, y: 250))
+        #expect(editor.commitDraft())
+
+        editor.select(.pointer)
+        // 1. 缩放矩形右下角
+        #expect(editor.selectAnnotation(at: PixelPoint(x: 20, y: 50), tolerance: 3))
+        let rectHandles = AnnotationEditorState.controlHandles(for: editor.selectedAnnotation!)
+        #expect(rectHandles.count == 8)
+        editor.updateSelectedControlHandle(.rect(.bottomRight), to: PixelPoint(x: 150, y: 100))
+        guard case let .rectangle(resized, _, _, _) = editor.selectedAnnotation?.kind else {
+            Issue.record("应为矩形")
+            return
+        }
+        #expect(resized.size == PixelSize(width: 130, height: 80))
+
+        // 2. 置顶与置底
+        let firstID = editor.annotations[0].id
+        #expect(editor.bringSelectedToFront())
+        #expect(editor.annotations.last?.id == firstID)
+        #expect(editor.sendSelectedToBack())
+        #expect(editor.annotations.first?.id == firstID)
+
+        // 3. 复制
+        let countBefore = editor.annotations.count
+        #expect(editor.duplicateSelected(offset: PixelPoint(x: 10, y: 10)))
+        #expect(editor.annotations.count == countBefore + 1)
+        #expect(editor.selectedAnnotationID != firstID)
+
+        // 4. 弯曲箭头控制点
+        let curved = editor.annotations.first {
+            if case .curvedArrow = $0.kind { return true }
+            return false
+        }!
+        let curvedHandles = AnnotationEditorState.controlHandles(for: curved)
+        #expect(curvedHandles.map(\.handle) == [.start, .control, .end])
+
+        // 5. 放大镜半径控制点
+        let mag = editor.annotations.first {
+            if case .magnifier = $0.kind { return true }
+            return false
+        }!
+        let magHandles = AnnotationEditorState.controlHandles(for: mag)
+        #expect(magHandles.map(\.handle) == [.radius])
+    }
+
+    @Test("Shift 约束矩形为正方形、直线与箭头对齐 45° 增量")
+    func shiftConstrainsGeometry() {
+        let square = AnnotationEditorState.constrainedEndPoint(
+            PixelPoint(x: 150, y: 120),
+            from: PixelPoint(x: 100, y: 100),
+            tool: .rectangle,
+            isShiftPressed: true
+        )
+        #expect(square == PixelPoint(x: 150, y: 150))
+
+        let horizontal = AnnotationEditorState.constrainedEndPoint(
+            PixelPoint(x: 200, y: 105),
+            from: PixelPoint(x: 100, y: 100),
+            tool: .line,
+            isShiftPressed: true
+        )
+        #expect(abs(horizontal.y - 100) < 0.001, "接近水平应吸附到 0°")
+    }
+}

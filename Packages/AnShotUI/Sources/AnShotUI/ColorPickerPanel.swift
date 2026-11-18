@@ -54,6 +54,9 @@ final class ColorPickerPanel: NSPanel {
 
     let pickerView: ColorPickerView
 
+    /// 按下 ESC 请求关闭面板时的回调。
+    var onCancel: (() -> Void)?
+
     /// 内容四周留给背板圆角的留白。
     static let padding: CGFloat = 10
 
@@ -103,4 +106,16 @@ final class ColorPickerPanel: NSPanel {
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+
+    override func cancelOperation(_ sender: Any?) {
+        onCancel?()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 {
+            onCancel?()
+            return
+        }
+        super.keyDown(with: event)
+    }
 }

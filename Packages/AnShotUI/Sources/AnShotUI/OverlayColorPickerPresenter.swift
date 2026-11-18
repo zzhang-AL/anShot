@@ -37,6 +37,27 @@ final class OverlayColorPickerPresenter {
     /// 是否已经展示。
     var isPresented: Bool { panel?.isVisible ?? false }
 
+    /// 切换取色器显隐（已展开时收起，未展开时展示）。
+    func toggle(
+        anchorInView: CGPoint,
+        toolbarFrame: CGRect,
+        selection: CGRect?,
+        in host: NSView,
+        state: AnnotationEditorState
+    ) {
+        if isPresented {
+            dismiss()
+            return
+        }
+        present(
+            anchorInView: anchorInView,
+            toolbarFrame: toolbarFrame,
+            selection: selection,
+            in: host,
+            state: state
+        )
+    }
+
     /// 打开取色器（已在展示时重新定位并同步颜色）。
     ///
     /// - Parameters:
@@ -71,12 +92,20 @@ final class OverlayColorPickerPresenter {
         panel.makeFirstResponder(panel.pickerView)
     }
 
-    /// 收起取色器并释放面板。会话结束必须调用。
+    /// 收起取色器并释放面板。会话结束必须调用，并在需要时把焦点归还父覆盖层。
     func dismiss() {
         guard let panel else { return }
-        panel.parent?.removeChildWindow(panel)
+        let parentWindow = panel.parent
+        let wasKey = panel.isKeyWindow
+        parentWindow?.removeChildWindow(panel)
         panel.orderOut(nil)
         self.panel = nil
+        if wasKey, let parentWindow, parentWindow.isVisible {
+            parentWindow.makeKey()
+            if let overlay = (parentWindow as? OverlayWindow)?.overlayView {
+                parentWindow.makeFirstResponder(overlay)
+            }
+        }
     }
 
     // MARK: - 内部
@@ -93,6 +122,9 @@ final class OverlayColorPickerPresenter {
         // 只弱引用编辑器：会话结束后它随会话释放，闭包不该把它留住。
         panel.pickerView.onChange = { [weak state] color in
             state?.selectColor(color)
+        }
+        panel.onCancel = { [weak self] in
+            self?.dismiss()
         }
         // 挂成覆盖层的子窗口：跟随覆盖层显示/隐藏，也不会跑到它后面。
         window.addChildWindow(panel, ordered: .above)

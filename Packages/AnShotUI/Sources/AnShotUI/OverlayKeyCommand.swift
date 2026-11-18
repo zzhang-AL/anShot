@@ -33,6 +33,12 @@ enum OverlayKeyCommand: Equatable {
     case copy
     case undo
     case redo
+    /// ⌘P：把当前截图钉在屏幕上。
+    case pin
+    /// ⌘D：复制当前选中的标注。
+    case duplicate
+    /// 方向键微调（1px；按住 Shift 为 10px）。
+    case nudge(dx: Int, dy: Int)
     /// 字母键：切换工具。
     case selectTool(AnnotationTool)
 
@@ -46,10 +52,12 @@ enum OverlayKeyCommand: Equatable {
             return .cancel
         }
 
-        if flags.contains(.command) {
+        if flags.contains(.command), !flags.contains(.control), !flags.contains(.option) {
             switch characters {
             case "s": return .save
             case "c": return .copy
+            case "p": return .pin
+            case "d": return .duplicate
             // ⌘Z 撤销、⇧⌘Z 重做
             case "z": return flags.contains(.shift) ? .redo : .undo
             default: break
@@ -61,11 +69,24 @@ enum OverlayKeyCommand: Equatable {
             return .copy
         }
 
-        // 工具快捷键：只在没有 ⌘/⌃/⌥ 时生效，
-        // 以免抢占系统快捷键与已注册的全局热键（⌃1）。
         let hasCommandLike = flags.contains(.command)
             || flags.contains(.control)
             || flags.contains(.option)
+
+        // 方向键微调（仅在不按 ⌘/⌃/⌥ 时生效；Shift 放大步长为 10）。
+        if !hasCommandLike {
+            let step = flags.contains(.shift) ? 10 : 1
+            switch event.keyCode {
+            case 123: return .nudge(dx: -step, dy: 0)
+            case 124: return .nudge(dx: step, dy: 0)
+            case 125: return .nudge(dx: 0, dy: step)
+            case 126: return .nudge(dx: 0, dy: -step)
+            default: break
+            }
+        }
+
+        // 工具快捷键：只在没有 ⌘/⌃/⌥ 时生效，
+        // 以免抢占系统快捷键与已注册的全局热键（⌃1）。
         if !hasCommandLike,
            let character = characters?.first,
            let tool = AnnotationTool.allCases.first(where: { $0.keyCharacter == character }) {

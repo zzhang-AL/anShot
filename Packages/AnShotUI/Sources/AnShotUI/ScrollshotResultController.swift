@@ -37,6 +37,14 @@ import AppKit
 @MainActor
 final class ScrollshotResultController: NSObject, NSWindowDelegate {
 
+    /// 长截图预览区的展示模式。
+    enum PreviewMode: Int {
+        /// 适应视口宽度并支持纵向滚动检视 1:1 细节与接缝。
+        case fitWidth = 0
+        /// 整幅等比缩进视口全览。
+        case fitAll = 1
+    }
+
     /// 结果窗口上的出口。
     ///
     /// 每个回调都带 `CGImage`：控制器不复用调用方的图，调用方不必再去别处取。
@@ -70,7 +78,12 @@ final class ScrollshotResultController: NSObject, NSWindowDelegate {
     /// 置空后按钮不会再回调，避免窗口已关还在触发保存。
     private var actions: Actions?
     private var panel: NSPanel?
+    private let previewScrollView = NSScrollView()
+    private let previewDocumentView = FlippedDocumentView()
     private let previewView = NSImageView()
+    private var previewModeControl: NSSegmentedControl?
+    private var previewMode: PreviewMode = .fitWidth
+    private var previewViewportSize: CGSize = .zero
     /// `onClose` 的幂等闸门。
     private var didNotifyClose = false
 
@@ -126,8 +139,9 @@ final class ScrollshotResultController: NSObject, NSWindowDelegate {
     // MARK: - 窗口
 
     private func configurePanel(image: CGImage, warnings: [String]) {
-        let previewSize = Self.previewSize(for: image)
-        let contentWidth = max(Layout.minimumWidth, previewSize.width + Layout.margin * 2)
+        let viewportSize = Self.viewportSize(for: image)
+        previewViewportSize = viewportSize
+        let contentWidth = max(Layout.minimumWidth, viewportSize.width + Layout.margin * 2)
 
         let panel = NSPanel(
             contentRect: CGRect(x: 0, y: 0, width: contentWidth, height: 240),
@@ -181,20 +195,46 @@ final class ScrollshotResultController: NSObject, NSWindowDelegate {
         previewContainer.translatesAutoresizingMaskIntoConstraints = false
         body.addSubview(previewContainer)
 
-        // size 传缩略尺寸：AppKit 按这个尺寸排版，而不是按整幅像素尺寸。
-        previewView.image = NSImage(cgImage: image, size: previewSize)
+        previewScrollView.hasVerticalScroller = true
+        previewScrollView.hasHorizontalScroller = false
+        previewScrollView.autohidesScrollers = true
+        previewScrollView.drawsBackground = false
+        previewScrollView.automaticallyAdjustsContentInsets = false
+        previewScrollView.contentInsets = NSEdgeInsetsZero
+        previewScrollView.translatesAutoresizingMaskIntoConstraints = false
+        previewContainer.addSubview(previewScrollView)
+
         previewView.imageScaling = .scaleProportionallyUpOrDown
         previewView.imageFrameStyle = .none
-        previewView.translatesAutoresizingMaskIntoConstraints = false
-        previewContainer.addSubview(previewView)
+        previewDocumentView.addSubview(previewView)
+        previewScrollView.documentView = previewDocumentView
 
-        // ── 像素尺寸 ────────────────────────────────────────
+        // 判断长图是否高度超出视口：若需要滚动检视，默认进入「适应宽度」并展示模式切换。
+        let needsScrollableInspection = Self.fitWidthDisplaySize(for: image, viewportWidth: viewportSize.width).height > viewportSize.height + 1
+        previewMode = needsScrollableInspection ? .fitWidth : .fitAll
+
+        // ── 像素尺寸与检视模式切换 ───────────────────────────
         let pixelLabel = NSTextField(labelWithString: "\(image.width) × \(image.height) px")
         pixelLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         pixelLabel.textColor = .secondaryLabelColor
         pixelLabel.alignment = .center
         pixelLabel.translatesAutoresizingMaskIntoConstraints = false
         body.addSubview(pixelLabel)
+
+        let modeControl = NSSegmentedControl(
+            labels: ["适应宽度", "全览"],
+            trackingMode: .selectOne,
+            target: self,
+            action: #selector(handlePreviewModeChanged(_:))
+        )
+        modeControl.controlSize = .small
+        modeControl.selectedSegment = previewMode.rawValue
+        modeControl.isHidden = !needsScrollableInspection
+        modeControl.translatesAutoresizingMaskIntoConstraints = false
+        body.addSubview(modeControl)
+        previewModeControl = modeControl
+
+        applyPreviewLayout(for: image)
 
         // ── 告警（有才显示）────────────────────────────────
         // 空告警不占一行：否则成功时窗口里会留下一块说不出理由的空白。
@@ -249,26 +289,30 @@ final class ScrollshotResultController: NSObject, NSWindowDelegate {
         var constraints: [NSLayoutConstraint] = [
             previewContainer.topAnchor.constraint(equalTo: body.topAnchor, constant: Layout.margin),
             previewContainer.centerXAnchor.constraint(equalTo: body.centerXAnchor),
-            previewContainer.widthAnchor.constraint(equalToConstant: previewSize.width),
-            previewContainer.heightAnchor.constraint(equalToConstant: previewSize.height),
+            previewContainer.widthAnchor.constraint(equalToConstant: viewportSize.width),
+            previewContainer.heightAnchor.constraint(equalToConstant: viewportSize.height),
 
-            previewView.leadingAnchor.constraint(equalTo: previewContainer.leadingAnchor),
-            previewView.trailingAnchor.constraint(equalTo: previewContainer.trailingAnchor),
-            previewView.topAnchor.constraint(equalTo: previewContainer.topAnchor),
-            previewView.bottomAnchor.constraint(equalTo: previewContainer.bottomAnchor),
+            previewScrollView.leadingAnchor.constraint(equalTo: previewContainer.leadingAnchor),
+            previewScrollView.trailingAnchor.constraint(equalTo: previewContainer.trailingAnchor),
+            previewScrollView.topAnchor.constraint(equalTo: previewContainer.topAnchor),
+            previewScrollView.bottomAnchor.constraint(equalTo: previewContainer.bottomAnchor),
 
             pixelLabel.topAnchor.constraint(
                 equalTo: previewContainer.bottomAnchor,
                 constant: Layout.sectionSpacing
             ),
-            pixelLabel.centerXAnchor.constraint(equalTo: body.centerXAnchor),
             pixelLabel.leadingAnchor.constraint(
-                greaterThanOrEqualTo: body.leadingAnchor,
+                equalTo: body.leadingAnchor,
                 constant: Layout.margin
             ),
-            pixelLabel.trailingAnchor.constraint(
-                lessThanOrEqualTo: body.trailingAnchor,
+            modeControl.centerYAnchor.constraint(equalTo: pixelLabel.centerYAnchor),
+            modeControl.trailingAnchor.constraint(
+                equalTo: body.trailingAnchor,
                 constant: -Layout.margin
+            ),
+            pixelLabel.trailingAnchor.constraint(
+                lessThanOrEqualTo: modeControl.leadingAnchor,
+                constant: -8
             ),
         ]
 
@@ -328,6 +372,65 @@ final class ScrollshotResultController: NSObject, NSWindowDelegate {
         return button
     }
 
+    /// 预览视口尺寸：长图按宽度展开（不缩成极窄细丝），高度封顶为 `maximumPreviewHeight`。
+    private static func viewportSize(for image: CGImage) -> CGSize {
+        let pixelWidth = CGFloat(image.width)
+        let pixelHeight = CGFloat(image.height)
+        guard pixelWidth > 0, pixelHeight > 0 else { return CGSize(width: 1, height: 1) }
+
+        let fitWidth = min(Layout.maximumPreviewWidth, pixelWidth)
+        let fitWidthHeight = (fitWidth * pixelHeight / pixelWidth).rounded(.down)
+        if fitWidthHeight <= Layout.maximumPreviewHeight {
+            return CGSize(width: max(1, fitWidth), height: max(1, fitWidthHeight))
+        }
+        return CGSize(
+            width: max(324, fitWidth),
+            height: Layout.maximumPreviewHeight
+        )
+    }
+
+    /// 适应宽度时的显示尺寸（用于纵向滚动 1:1 检视）。
+    private static func fitWidthDisplaySize(for image: CGImage, viewportWidth: CGFloat) -> CGSize {
+        let pixelWidth = CGFloat(image.width)
+        let pixelHeight = CGFloat(image.height)
+        guard pixelWidth > 0, pixelHeight > 0 else { return CGSize(width: 1, height: 1) }
+        let width = min(viewportWidth, pixelWidth)
+        let height = (width * pixelHeight / pixelWidth).rounded(.down)
+        return CGSize(width: max(1, width), height: max(1, height))
+    }
+
+    /// 根据当前模式更新可滚动文档视图与图像显示尺寸。
+    private func applyPreviewLayout(for image: CGImage) {
+        let viewport = previewViewportSize
+        let displaySize: CGSize
+        switch previewMode {
+        case .fitWidth:
+            displaySize = Self.fitWidthDisplaySize(for: image, viewportWidth: viewport.width)
+        case .fitAll:
+            displaySize = Self.previewSize(for: image)
+        }
+
+        let docWidth = max(viewport.width, displaySize.width)
+        let docHeight = max(viewport.height, displaySize.height)
+        previewDocumentView.frame = CGRect(x: 0, y: 0, width: docWidth, height: docHeight)
+        previewView.frame = CGRect(
+            x: (docWidth - displaySize.width) / 2,
+            y: displaySize.height > viewport.height ? 0 : (docHeight - displaySize.height) / 2,
+            width: displaySize.width,
+            height: displaySize.height
+        )
+        previewView.image = NSImage(cgImage: image, size: displaySize)
+        // 默认滚回顶部，让用户从长图开头往下检视接缝。
+        previewScrollView.contentView.scroll(to: .zero)
+        previewScrollView.reflectScrolledClipView(previewScrollView.contentView)
+    }
+
+    @objc private func handlePreviewModeChanged(_ sender: NSSegmentedControl) {
+        guard let image, let mode = PreviewMode(rawValue: sender.selectedSegment) else { return }
+        previewMode = mode
+        applyPreviewLayout(for: image)
+    }
+
     /// 等比缩放，且只缩不放：小图放大只会变糊，还会让窗口尺寸失去参照。
     private static func previewSize(for image: CGImage) -> CGSize {
         let pixelWidth = CGFloat(image.width)
@@ -358,6 +461,7 @@ final class ScrollshotResultController: NSObject, NSWindowDelegate {
     private func releaseImage() {
         image = nil
         previewView.image = nil
+        previewScrollView.documentView = nil
     }
 
     private func notifyCloseOnce() {
@@ -395,4 +499,9 @@ final class ScrollshotResultController: NSObject, NSWindowDelegate {
     @objc private func handleClose() {
         close()
     }
+}
+
+/// 顶边对齐的滚动文档容器，保证长图从顶部开始往下滚。
+private final class FlippedDocumentView: NSView {
+    override var isFlipped: Bool { true }
 }

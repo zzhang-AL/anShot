@@ -108,6 +108,30 @@ final class AnnotationToolbarView: NSView {
         }
     }
 
+    /// 选中的标注是否是高亮荧光笔（面板改用半透明荧光色板）。
+    var selectedAnnotationIsHighlight = false {
+        didSet {
+            guard selectedAnnotationIsHighlight != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    /// 选中的标注颜色（指针选中态高亮色卡使用）。
+    var selectedAnnotationColor: RGBAColor? {
+        didSet {
+            guard selectedAnnotationColor != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    /// 当前匹配字体档位高亮的逻辑点字号。
+    var activeFontSizeForToolbar: Double? {
+        didSet {
+            guard activeFontSizeForToolbar != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
     /// 选中的标注是否有可改的颜色槽（马赛克没有）。
     var selectedAnnotationSupportsColor = true {
         didSet {
@@ -160,6 +184,16 @@ final class AnnotationToolbarView: NSView {
     /// 正是「预设色卡 + 拖动色图 + 手动输入」这三种取色方式。
     var onOpenColorPanel: (() -> Void)?
 
+    /// 二级面板折叠/展开导致工具栏固有尺寸变化时回调。
+    var onIntrinsicSizeChanged: (() -> Void)?
+
+    /// 滑块拖动起止手势事务回调（用于在拖动结束时合并提交一次撤销历史）。
+    var onSliderGestureBegan: (() -> Void)?
+    var onSliderGestureEnded: (() -> Void)?
+
+    /// 按住工具栏空白背景拖动时回调（参数为视图坐标下的位移增量）。
+    var onDragMove: ((CGSize) -> Void)?
+
     // MARK: - 布局常量
 
 
@@ -183,6 +217,10 @@ final class AnnotationToolbarView: NSView {
     /// 面板只有 26pt 高，拖动时指针纵向抖出滑块条是必然的，
     /// 若每次拖动都重新命中，手一抖滑块就「脱手」，表现为拖到一半就不动了。
     private var draggingSliderKind: Kind?
+
+    /// 是否正在按住工具栏空白区域整体拖动位置。
+    private var isDraggingToolbar = false
+    private var lastDragScreenPoint: CGPoint = .zero
 
     override var isFlipped: Bool { true }
 
@@ -218,6 +256,7 @@ final class AnnotationToolbarView: NSView {
         input.allowsCaptureActions = allowsCaptureActions
         input.hasSelectedAnnotation = hasSelectedAnnotation
         input.selectedAnnotationIsText = selectedAnnotationIsText
+        input.selectedAnnotationIsHighlight = selectedAnnotationIsHighlight
         input.selectedAnnotationSupportsColor = selectedAnnotationSupportsColor
         input.selectedAnnotationSupportsLineWidth = selectedAnnotationSupportsLineWidth
         return input
@@ -277,6 +316,9 @@ final class AnnotationToolbarView: NSView {
         renderer.allowsCaptureActions = allowsCaptureActions
         renderer.hasSelectedAnnotation = hasSelectedAnnotation
         renderer.selectedAnnotationIsText = selectedAnnotationIsText
+        renderer.selectedAnnotationIsHighlight = selectedAnnotationIsHighlight
+        renderer.selectedAnnotationColor = selectedAnnotationColor
+        renderer.activeFontSizeForToolbar = activeFontSizeForToolbar
         renderer.selectedAnnotationSupportsColor = selectedAnnotationSupportsColor
         renderer.selectedAnnotationSupportsLineWidth = selectedAnnotationSupportsLineWidth
         renderer.hoveredKind = hoveredKind
@@ -297,6 +339,7 @@ final class AnnotationToolbarView: NSView {
             // 而看到的是一个半径 5pt 的手柄——点中手柄反而没反应。
             if isSlider(item.kind), item.isEnabled {
                 draggingSliderKind = item.kind
+                onSliderGestureBegan?()
                 updateSlider(item.kind, in: item.rect, at: point)
                 return
             }
@@ -308,9 +351,27 @@ final class AnnotationToolbarView: NSView {
             handle(item)
             return
         }
+
+        // 未命中任何条目：按住工具栏空白背景可自由拖拽移动工具栏位置。
+        isDraggingToolbar = true
+        lastDragScreenPoint = NSEvent.mouseLocation
+        NSCursor.closedHand.set()
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if isDraggingToolbar {
+            let current = NSEvent.mouseLocation
+            // AppKit 屏幕坐标 y 向上，而覆盖层宿主视图 isFlipped = true（y 向下）。
+            let delta = CGSize(
+                width: current.x - lastDragScreenPoint.x,
+                height: -(current.y - lastDragScreenPoint.y)
+            )
+            lastDragScreenPoint = current
+            if delta.width != 0 || delta.height != 0 {
+                onDragMove?(delta)
+            }
+            return
+        }
         guard let kind = draggingSliderKind else {
             super.mouseDragged(with: event)
             return
@@ -323,11 +384,17 @@ final class AnnotationToolbarView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if isDraggingToolbar {
+            isDraggingToolbar = false
+            NSCursor.arrow.set()
+            return
+        }
         guard draggingSliderKind != nil else {
             super.mouseUp(with: event)
             return
         }
         draggingSliderKind = nil
+        onSliderGestureEnded?()
     }
 
     /// 是否是滑块类条目。
@@ -384,10 +451,12 @@ final class AnnotationToolbarView: NSView {
         let kind = itemKind(at: point)
         guard kind != hoveredKind else { return }
         hoveredKind = kind
+        toolTip = kind.map { Self.tooltipText(for: $0) }
         needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) {
+        toolTip = nil
         guard hoveredKind != nil else { return }
         hoveredKind = nil
         needsDisplay = true
@@ -432,9 +501,11 @@ final class AnnotationToolbarView: NSView {
             if tool.family == family {
                 isPanelExpanded.toggle()
                 needsDisplay = true
+                onIntrinsicSizeChanged?()
                 return
             }
             isPanelExpanded = true
+            onIntrinsicSizeChanged?()
             // 分组记住上一次用的具体工具，不必每次重新挑。
             if let last = lastTool(in: family) {
                 onSelectTool?(last)
@@ -518,6 +589,100 @@ final class AnnotationToolbarView: NSView {
         case .shape: return lastToolByFamily[family]
         case .text: return .text
         case .mosaic: return .mosaic
+        }
+    }
+
+    // MARK: - 悬浮提示与无障碍支持
+
+    /// 工具栏条目对应的 Tooltip 与无障碍标签文案。
+    static func tooltipText(for kind: Kind) -> String {
+        switch kind {
+        case let .family(family):
+            switch family {
+            case .pointer: return "指针 (V)"
+            case .shape: return "形状标注"
+            case .text: return "文字 (T)"
+            case .mosaic: return "马赛克与放大镜 (M)"
+            }
+        case let .tool(tool):
+            return "\(tool.displayName) (\(String(tool.keyCharacter).uppercased()))"
+        case let .color(color):
+            return "颜色 \(color.hexString)"
+        case .lineWidthSlider:
+            return "线宽"
+        case .arrowHeadScaleSlider:
+            return "箭头大小"
+        case let .fontSize(size):
+            return "字号 \(Int(size))pt"
+        case let .mosaicMode(mode):
+            return "马赛克模式：\(mode.displayName)"
+        case let .mosaicBlockSize(size):
+            return "马赛克块大小 \(Int(size))"
+        case .mosaicBrushDiameterSlider:
+            return "涂抹笔刷直径"
+        case let .numberingRadius(radius):
+            return "编号半径 \(Int(radius))"
+        case let .magnifierZoom(zoom):
+            return "放大倍率 \(AnnotationToolbarLayout.formatZoomLabel(zoom))"
+        case let .curvedArrowBend(bend):
+            return "曲线弯曲度 \(Int((bend * 100).rounded()))%"
+        case .colorButton:
+            return "当前颜色"
+        case .colorPicker:
+            return "自定义取色器"
+        case .undo:
+            return "撤销 (⌘Z)"
+        case .redo:
+            return "重做 (⇧⌘Z)"
+        case .copy:
+            return "复制截图 (⌘C / Enter)"
+        case .save:
+            return "保存截图 (⌘S)"
+        case .record:
+            return "录制选区"
+        case .longScreenshot:
+            return "滚动长截图（⌥点击横向）"
+        case .recognizeText:
+            return "识别文字 (OCR)"
+        case .pin:
+            return "钉在屏幕上 (⌘P)"
+        case .deleteSelected:
+            return "删除选中标注 (Delete)"
+        }
+    }
+
+    override func isAccessibilityElement() -> Bool { false }
+
+    override func accessibilityRole() -> NSAccessibility.Role? { .toolbar }
+
+    override func accessibilityLabel() -> String? { "标注工具栏" }
+
+    override func accessibilityChildren() -> [Any]? {
+        let items = layoutBar().items + layoutPanel().items
+        return items.map { item in
+            let element = NSAccessibilityElement()
+            element.setAccessibilityParent(self)
+            element.setAccessibilityRole(accessibilityRole(for: item.kind))
+            element.setAccessibilityLabel(Self.tooltipText(for: item.kind))
+            element.setAccessibilityEnabled(item.isEnabled)
+            if let window {
+                let rectInWindow = convert(item.rect, to: nil)
+                element.setAccessibilityFrame(window.convertToScreen(rectInWindow))
+            } else {
+                element.setAccessibilityFrame(item.rect)
+            }
+            return element
+        }
+    }
+
+    private func accessibilityRole(for kind: Kind) -> NSAccessibility.Role {
+        switch kind {
+        case .lineWidthSlider, .arrowHeadScaleSlider, .mosaicBrushDiameterSlider:
+            return .slider
+        case .color, .colorButton, .colorPicker:
+            return .colorWell
+        default:
+            return .button
         }
     }
 

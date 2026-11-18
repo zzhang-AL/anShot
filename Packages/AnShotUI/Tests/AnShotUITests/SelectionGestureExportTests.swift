@@ -251,4 +251,90 @@ struct SelectionGestureExportTests {
         #expect(!fixture.view.settleSelectionGestureForExport(), "过小的手势不应放行导出")
         #expect(fixture.view.effectiveSelection == nil, "过小的矩形应被清掉，不留细线选区")
     }
+
+    @Test("快捷键解析支持 ⌘P 贴图、⌘D 复制标注与方向键 1px/10px 微调")
+    func keyCommandParsesPinDuplicateAndNudge() throws {
+        let pinEvent = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0,
+            windowNumber: 0, context: nil, characters: "p", charactersIgnoringModifiers: "p",
+            isARepeat: false, keyCode: 35
+        ))
+        #expect(OverlayKeyCommand.parse(pinEvent) == .pin)
+
+        let dupEvent = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0,
+            windowNumber: 0, context: nil, characters: "d", charactersIgnoringModifiers: "d",
+            isARepeat: false, keyCode: 2
+        ))
+        #expect(OverlayKeyCommand.parse(dupEvent) == .duplicate)
+
+        let right1 = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "",
+            isARepeat: false, keyCode: 124
+        ))
+        #expect(OverlayKeyCommand.parse(right1) == .nudge(dx: 1, dy: 0))
+
+        let up10 = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: .shift, timestamp: 0,
+            windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "",
+            isARepeat: false, keyCode: 126
+        ))
+        #expect(OverlayKeyCommand.parse(up10) == .nudge(dx: 0, dy: -10))
+    }
+
+    @Test("候选态按单键切换工具时自动确认当前候选选区")
+    func selectingToolInCandidateStateConfirmsSelection() throws {
+        let candidate = makeRect(100, 100, 400, 300)
+        let fixture = Fixture(initialSelection: candidate)
+        fixture.view.setSelection(CGRect(x: 50, y: 50, width: 200, height: 150))
+        #expect(!fixture.editor.isSelectionConfirmed)
+
+        let rKey = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: fixture.window.windowNumber, context: nil,
+            characters: "r", charactersIgnoringModifiers: "r",
+            isARepeat: false, keyCode: 15
+        ))
+        fixture.view.keyDown(with: rKey)
+        #expect(fixture.editor.isSelectionConfirmed, "候选态按 R 切工具必须自动锁定选区")
+        #expect(fixture.editor.tool == .rectangle)
+    }
+
+    @Test("指针模式双击文字进入重编辑并同步多行 maxWidth 折行")
+    func pointerDoubleClickReEditsTextAndSyncsMaxWidth() throws {
+        let candidate = makeRect(0, 0, 800, 600)
+        let fixture = Fixture(scale: 2, initialSelection: candidate)
+        fixture.view.setSelection(CGRect(x: 50, y: 50, width: 400, height: 300))
+        fixture.editor.confirmSelection()
+
+        fixture.editor.select(.text)
+        fixture.editor.beginTextEditing(at: PixelPoint(x: 200, y: 200))
+        fixture.editor.updateTextDraft("第一行\n第二行")
+        fixture.view.syncTextEditorFromState()
+        #expect(fixture.editor.textDraft?.maxWidth != nil, "多行编辑器应根据选区右边界同步 maxWidth")
+        #expect(fixture.editor.commitTextDraft(scaleFactor: 2))
+
+        // 切回指针模式，双击刚提交的文字应直接进入重编辑态
+        fixture.editor.select(.pointer)
+        let box = fixture.editor.annotations[0].hitBoundingRect
+        let clickPoint = CGPoint(
+            x: (box.origin.x + box.size.width / 2) / 2,
+            y: (box.origin.y + box.size.height / 2) / 2
+        )
+        let doubleClick = try #require(NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: fixture.view.convert(clickPoint, to: nil),
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: fixture.window.windowNumber,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 2,
+            pressure: 1
+        ))
+        fixture.view.mouseDown(with: doubleClick)
+        #expect(fixture.editor.isEditingText, "指针模式下双击已有文字必须进入编辑态")
+        #expect(fixture.editor.textDraft?.fontSize == AnnotationStyle.default.textFontSize)
+    }
 }

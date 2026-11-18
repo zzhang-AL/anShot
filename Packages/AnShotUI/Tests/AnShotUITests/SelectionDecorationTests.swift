@@ -348,3 +348,89 @@ struct SelectionDecorationArmLengthTests {
         #expect(decoration.armLength(for: CGSize(width: 0, height: 100), cornerRadius: 0) == 0)
     }
 }
+
+@MainActor
+@Suite("选区装饰 · 整边带状热区与像素放大镜")
+struct SelectionEdgeBandAndLoupeTests {
+
+    @Test("远离角点与中点的整条边线在容差内都可命中对应边手柄")
+    func edgeBandHitsFullBorder() {
+        let selection = makeRect(100, 100, 400, 300)
+        let decorated = SelectionHandleLayout.decoratedRect(for: selection)
+
+        // 顶边 x = 180（避开左上角 x=100..120 与中点 x=288..312）
+        let topHit = SelectionHandleLayout.hit(
+            at: CGPoint(x: 180, y: decorated.minY + 3),
+            decoratedRect: decorated,
+            radii: .uniform(0),
+            decoration: decoration
+        )
+        #expect(topHit == .top)
+
+        let bottomHit = SelectionHandleLayout.hit(
+            at: CGPoint(x: 420, y: decorated.maxY - 2),
+            decoratedRect: decorated,
+            radii: .uniform(0),
+            decoration: decoration
+        )
+        #expect(bottomHit == .bottom)
+
+        let leftHit = SelectionHandleLayout.hit(
+            at: CGPoint(x: decorated.minX - 2, y: 170),
+            decoratedRect: decorated,
+            radii: .uniform(0),
+            decoration: decoration
+        )
+        #expect(leftHit == .left)
+
+        let rightHit = SelectionHandleLayout.hit(
+            at: CGPoint(x: decorated.maxX + 4, y: 330),
+            decoratedRect: decorated,
+            radii: .uniform(0),
+            decoration: decoration
+        )
+        #expect(rightHit == .right)
+
+        // 选区内部远离开边线的点不得命中
+        let interiorMiss = SelectionHandleLayout.hit(
+            at: CGPoint(x: 200, y: 200),
+            decoratedRect: decorated,
+            radii: .uniform(0),
+            decoration: decoration
+        )
+        #expect(interiorMiss == nil)
+    }
+
+    @Test("像素放大镜采样读取精确 HEX/RGB，且在屏幕边缘自动翻转避让")
+    func loupeSamplerReadsColorAndAvoidsScreenEdges() {
+        let context = CGContext(
+            data: nil,
+            width: 40,
+            height: 40,
+            bitsPerComponent: 8,
+            bytesPerRow: 160,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        )!
+        context.setFillColor(CGColor(srgbRed: 1, green: 0, blue: 0, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 40, height: 40))
+        let image = context.makeImage()!
+
+        let sample = OverlayLoupeSampler.sample(from: image, at: CGPoint(x: 10, y: 10), scaleFactor: 2)
+        #expect(sample?.pixelX == 20)
+        #expect(sample?.pixelY == 20)
+        #expect(sample?.hexString == "#FF0000")
+        #expect(sample?.rgbText == "RGB(255, 0, 0)")
+
+        // 光标贴近右下角时，放大镜自动向左上方避让并落在视图边界内
+        let viewBounds = CGRect(x: 0, y: 0, width: 800, height: 600)
+        let panelFrame = OverlayLoupeSampler.panelFrame(
+            forCursor: CGPoint(x: 780, y: 580),
+            panelSize: OverlayLoupeView.panelSize,
+            in: viewBounds
+        )
+        #expect(viewBounds.contains(panelFrame))
+        #expect(panelFrame.maxX < 780)
+        #expect(panelFrame.maxY < 580)
+    }
+}

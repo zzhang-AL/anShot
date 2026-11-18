@@ -61,6 +61,34 @@ struct OCRResultPanelTests {
         #expect(panel.debugLanguagePopUpEnabledForDiagnostics)
     }
 
+    @Test("翻译后保留原文，支持 原文 / 译文 / 双语 三种模式无损切换")
+    func displayModesPreserveOriginalAndShowBilingual() {
+        _ = NSApplication.shared
+        let panel = OCRResultPanel()
+        defer { panel.hide() }
+        let lines = ["hello", "world"].map {
+            OCRTextLine(text: $0, candidates: [], confidence: 1, boundingBox: .zero)
+        }
+        panel.show(result: OCRResult(lines: lines, imagePixelSize: .zero), near: .zero)
+        #expect(panel.debugDisplayModeForDiagnostics == .original)
+        #expect(panel.text == "hello\nworld")
+
+        panel.showTranslation(TranslationAligner.align(
+            lines: lines,
+            translations: ["你好", "世界"],
+            sourceLanguage: "en",
+            targetLanguage: "zh-Hans"
+        ))
+        #expect(panel.debugDisplayModeForDiagnostics == .translation)
+        #expect(panel.text == "你好\n世界")
+
+        panel.selectDisplayModeForDiagnostics(.bilingual)
+        #expect(panel.text == "hello\n你好\n\nworld\n世界")
+
+        panel.selectDisplayModeForDiagnostics(.original)
+        #expect(panel.text == "hello\nworld")
+    }
+
     private func button(title: String, in view: NSView?) -> NSButton? {
         guard let view else { return nil }
         if let button = view as? NSButton, button.title == title { return button }

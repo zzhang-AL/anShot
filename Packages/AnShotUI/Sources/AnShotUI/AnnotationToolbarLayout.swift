@@ -62,6 +62,14 @@ struct AnnotationToolbarLayout {
     /// 轨道高度。
     static let sliderTrackHeight: CGFloat = 3
 
+    /// 放大镜倍率展示文案（如 1.5x / 2x / 3x）。
+    static func formatZoomLabel(_ zoom: Double) -> String {
+        if abs(zoom - zoom.rounded()) < 0.001 {
+            return "\(Int(zoom.rounded()))x"
+        }
+        return String(format: "%.1fx", zoom)
+    }
+
     /// 滑块轨道在条目矩形内的位置。
     ///
     /// 绘制、命中、诊断三处必须读这一份几何。滑块是工具栏上唯一
@@ -161,6 +169,8 @@ struct AnnotationToolbarLayout {
     /// 文字的样式槽是字号而不是线宽，面板据此换掉那一组控件。
     /// 只在 `hasSelectedAnnotation` 为真时有意义。
     var selectedAnnotationIsText = false
+    /// 选中的标注是否是高亮荧光笔（面板改用半透明荧光色板）。
+    var selectedAnnotationIsHighlight = false
     /// 选中的标注是否有可改的颜色槽（马赛克是像素处理，没有颜色）。
     var selectedAnnotationSupportsColor = true
     /// 选中的标注是否有可改的线宽（高亮与文字没有线宽；文字改用字号）。
@@ -233,27 +243,33 @@ struct AnnotationToolbarLayout {
         toolbarSize: CGSize,
         labelReserve: CGFloat,
         viewBounds: CGRect,
-        gap: CGFloat
+        gap: CGFloat,
+        safeInsets: NSEdgeInsets = NSEdgeInsetsZero
     ) -> CGPoint {
+        let topMargin = max(gap, safeInsets.top + gap)
+        let bottomMargin = max(gap, safeInsets.bottom + gap)
+        let leftMargin = max(gap, safeInsets.left + gap)
+        let rightMargin = max(gap, safeInsets.right + gap)
+
         // 优先贴在标签下方；放不下就翻到选区上方（标签之上）；
-        // 两边都不够时落在视图内，宁可紧贴也不越界。
+        // 两边都不够时落在视图安全区内，避开 MacBook 顶部刘海与菜单栏。
         let below = selection.maxY + labelReserve + gap
         let above = selection.minY - labelReserve - gap - toolbarSize.height
 
         let y: CGFloat
-        if below + toolbarSize.height <= viewBounds.height - gap {
+        if below + toolbarSize.height <= viewBounds.height - bottomMargin {
             y = below
-        } else if above >= gap {
+        } else if above >= topMargin {
             y = above
         } else {
             // 选区几乎占满整个视图（整屏截图、图片编辑）：上下都放不下。
-            // 放顶部而不是底部——尺寸标签在下方，放底部会正好压住读数。
-            y = gap
+            // 放顶部安全区下方而不是底部——尺寸标签在下方，放底部会压住读数，且需避开刘海。
+            y = topMargin
         }
 
-        // 水平方向与选区左对齐，并钳制在视图内。
-        let maxX = max(gap, viewBounds.width - gap - toolbarSize.width)
-        let x = min(max(gap, selection.minX), maxX)
+        // 水平方向与选区左对齐，并钳制在视图安全区内。
+        let maxX = max(leftMargin, viewBounds.width - rightMargin - toolbarSize.width)
+        let x = min(max(leftMargin, selection.minX), maxX)
         return CGPoint(x: x, y: y)
     }
 
@@ -405,9 +421,12 @@ struct AnnotationToolbarLayout {
         let buttonY: CGFloat = 3
         let buttonHeight = Self.panelHeight - buttonY * 2
 
-        // 颜色（马赛克没有颜色槽，不摆色卡）
+        // 颜色（马赛克没有颜色槽，不摆色卡；高亮使用半透明荧光色板）
         if selectedAnnotationSupportsColor {
-            for (index, color) in AnnotationStyle.palette.enumerated() {
+            let swatches = selectedAnnotationIsHighlight
+                ? AnnotationStyle.highlightColors
+                : AnnotationStyle.palette
+            for (index, color) in swatches.enumerated() {
                 if index > 0 {
                     x += Self.swatchSpacing
                 }
@@ -500,8 +519,11 @@ struct AnnotationToolbarLayout {
             )
         }
 
-        // 颜色
-        for (index, color) in AnnotationStyle.palette.enumerated() {
+        // 颜色（荧光笔高亮工具展示半透明荧光色板，防止误选不透明黑色块遮死底图文字）
+        let swatches = tool == .highlight
+            ? AnnotationStyle.highlightColors
+            : AnnotationStyle.palette
+        for (index, color) in swatches.enumerated() {
             cursor.append(
                 .color(color),
                 leading: index == 0 ? Self.groupSpacing : Self.swatchSpacing,
@@ -654,7 +676,7 @@ struct AnnotationToolbarLayout {
         if tool == .magnifier {
             for (index, zoom) in AnnotationStyle.magnifierZooms.enumerated() {
                 if index > 0 { x += Self.itemSpacing }
-                let width = textButtonWidth(for: "\(Int(zoom * 10))x")
+                let width = textButtonWidth(for: Self.formatZoomLabel(zoom))
                 items.append(Item(
                     kind: .magnifierZoom(zoom),
                     rect: CGRect(x: x, y: buttonY, width: width, height: buttonHeight),

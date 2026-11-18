@@ -44,6 +44,12 @@ final class AnnotationToolbarRenderer {
     var hasSelectedAnnotation = false
     /// 选中的标注是否是文字（面板用字号档位代替线宽滑块）。
     var selectedAnnotationIsText = false
+    /// 选中的标注是否是高亮荧光笔（面板改用半透明荧光色板）。
+    var selectedAnnotationIsHighlight = false
+    /// 选中的标注颜色（指针模式有选中时，优先用于色卡选中态对齐）。
+    var selectedAnnotationColor: RGBAColor?
+    /// 当前在面板高亮匹配的逻辑点字号（来自选中文字或正在编辑的草稿）。
+    var activeFontSizeForToolbar: Double?
     /// 选中的标注是否有颜色 / 线宽可改（决定面板条目的存在与否）。
     var selectedAnnotationSupportsColor = true
     var selectedAnnotationSupportsLineWidth = true
@@ -61,6 +67,7 @@ final class AnnotationToolbarRenderer {
         input.allowsCaptureActions = allowsCaptureActions
         input.hasSelectedAnnotation = hasSelectedAnnotation
         input.selectedAnnotationIsText = selectedAnnotationIsText
+        input.selectedAnnotationIsHighlight = selectedAnnotationIsHighlight
         input.selectedAnnotationSupportsColor = selectedAnnotationSupportsColor
         input.selectedAnnotationSupportsLineWidth = selectedAnnotationSupportsLineWidth
         return input
@@ -246,7 +253,7 @@ final class AnnotationToolbarRenderer {
 
         case let .magnifierZoom(zoom):
             drawTextButton(
-                "\(Int(zoom * 10))x",
+                AnnotationToolbarLayout.formatZoomLabel(zoom),
                 rect: rect,
                 isSelected: selected,
                 isHovered: hover,
@@ -340,7 +347,7 @@ final class AnnotationToolbarRenderer {
         fillRoundedRect(rect, radius: radius, color: color, in: context)
     }
 
-    private func isSelected(_ kind: Kind) -> Bool {
+    func isSelected(_ kind: Kind) -> Bool {
         // 候选阶段不显示「哪个工具生效」（理由见 `showsToolSelection`）。
         if !showsToolSelection {
             switch kind {
@@ -355,8 +362,9 @@ final class AnnotationToolbarRenderer {
         case let .tool(candidate):
             return tool == candidate
         case let .color(color):
-            // 指针 + 选中时面板改的是**选中标注**的颜色，样式槽也会被同步
-            //（见 `OverlayView` 的工具栏回调），因此当前值取形状色。
+            if tool == .pointer, let selectedAnnotationColor {
+                return selectedAnnotationColor == color
+            }
             if tool == .pointer {
                 return style.shapeColor == color
             }
@@ -366,17 +374,23 @@ final class AnnotationToolbarRenderer {
             // 不属于「多选一」的选中态。
             return false
         case let .fontSize(size):
-            return style.textFontSize == size
+            let activeSize = activeFontSizeForToolbar ?? style.textFontSize
+            return abs(activeSize - size) < 0.01
         case let .mosaicMode(mode):
             return style.mosaicMode == mode
         case let .mosaicBlockSize(size):
             return style.mosaicBlockSize == size
+        case let .numberingRadius(radius):
+            return abs(style.numberingRadius - radius) < 0.01
+        case let .magnifierZoom(zoom):
+            return abs(style.magnifierZoom - zoom) < 0.01
+        case let .curvedArrowBend(bend):
+            return abs(style.curvedArrowBend - bend) < 0.01
         case .mosaicBrushDiameterSlider:
             // 与其余滑块同理：连续值没有「选中档位」这回事。
             return false
         case .colorButton, .colorPicker, .undo, .redo, .copy, .save, .record, .longScreenshot,
-             .recognizeText, .numberingRadius, .magnifierZoom, .curvedArrowBend, .pin,
-             .deleteSelected:
+             .recognizeText, .pin, .deleteSelected:
             return false
         }
     }
@@ -624,11 +638,16 @@ final class AnnotationToolbarRenderer {
         let box = iconBox(in: rect, size: 16)
 
         context.saveGState()
+        if color.a < 0.99 {
+            // 半透明荧光色入口先垫浅灰底，体现半透明质感。
+            context.setFillColor(NSColor.white.withAlphaComponent(0.25 * alpha).cgColor)
+            context.fillEllipse(in: box)
+        }
         context.setFillColor(NSColor(
             srgbRed: CGFloat(color.r),
             green: CGFloat(color.g),
             blue: CGFloat(color.b),
-            alpha: alpha
+            alpha: alpha * CGFloat(color.a)
         ).cgColor)
         context.fillEllipse(in: box)
         // 深色（尤其纯黑）在深色浮层上看不出来，统一描一圈浅边。
@@ -686,10 +705,14 @@ final class AnnotationToolbarRenderer {
             srgbRed: CGFloat(color.r),
             green: CGFloat(color.g),
             blue: CGFloat(color.b),
-            alpha: alpha
+            alpha: alpha * CGFloat(color.a)
         )
 
         context.saveGState()
+        if color.a < 0.99 {
+            context.setFillColor(NSColor.white.withAlphaComponent(0.22 * alpha).cgColor)
+            context.fillEllipse(in: rect)
+        }
         context.setFillColor(fill.cgColor)
         context.fillEllipse(in: rect)
         context.restoreGState()
