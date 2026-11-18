@@ -30,7 +30,7 @@ import AnShotCore
 import AppKit
 
 @MainActor
-final class CrashLogWindowController: NSObject {
+final class CrashLogWindowController: NSObject, NSWindowDelegate {
 
     /// 单例：窗口关闭后再次从菜单打开时，复用同一个控制器，避免
     /// 每次点击都新建一个 NSWindow 和整棵视图树（本应用「空闲期零窗口」，
@@ -39,7 +39,7 @@ final class CrashLogWindowController: NSObject {
 
     /// 列表最多展示多少份。50 份足够覆盖「最近几次崩溃」，又不会让
     /// 一次刷新去读上百个文件。
-    private static let limit = 50
+    private nonisolated static let limit = 50
 
     private static let emptyMessage =
         "没有找到崩溃日志。anShot 运行正常，或者系统尚未生成报告。"
@@ -64,6 +64,9 @@ final class CrashLogWindowController: NSObject {
     )
 
     private var entries: [CrashLogEntry] = []
+    /// 并发刷新序号：后发起的扫描结果覆盖旧任务，避免异步乱序回写。
+    private var refreshGeneration = 0
+    private var refreshTask: Task<Void, Never>?
 
     /// 列表时间统一到秒：崩溃报告的时间点本身就是证据的一部分，
     /// 用相对时间（「3 天前」）反而让人无法与报告原文对照。
@@ -89,6 +92,7 @@ final class CrashLogWindowController: NSObject {
         window.hidesOnDeactivate = false
         window.minSize = NSSize(width: 720, height: 480)
         window.backgroundColor = SettingsTheme.windowBackground
+        window.delegate = self
         window.contentView = makeContentView()
         window.center()
 
@@ -104,8 +108,8 @@ final class CrashLogWindowController: NSObject {
     // MARK: - 显示
 
     func show() {
-        // 每次打开都重新扫描：用户可能刚复现了一次崩溃，或者在别的
-        // 诊断工具里把报告移进了 Retired。
+        ForegroundPolicyCoordinator.acquire("crashLogs")
+        // 每次打开都在后台异步扫描：避免同步枚举系统诊断目录阻塞主线程。
         refresh()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -117,11 +121,32 @@ final class CrashLogWindowController: NSObject {
         window.close()
     }
 
+    func windowWillClose(_ notification: Notification) {
+        refreshTask?.cancel()
+        refreshTask = nil
+        ForegroundPolicyCoordinator.release("crashLogs")
+    }
+
     // MARK: - 刷新
 
     private func refresh() {
         let previousID = selectedEntry?.id
-        entries = CrashLogStore.reports(limit: Self.limit)
+        refreshGeneration += 1
+        let generation = refreshGeneration
+        refreshTask?.cancel()
+        statusLabel.stringValue = "正在扫描崩溃日志…"
+
+        refreshTask = Task { @MainActor [weak self] in
+            let loaded = await Task.detached(priority: .utility) {
+                CrashLogStore.reports(limit: Self.limit)
+            }.value
+            guard let self, self.refreshGeneration == generation, !Task.isCancelled else { return }
+            self.applyLoadedEntries(loaded, preservingSelectionID: previousID)
+        }
+    }
+
+    private func applyLoadedEntries(_ loaded: [CrashLogEntry], preservingSelectionID previousID: String?) {
+        entries = loaded
         tableView.reloadData()
 
         if entries.isEmpty {
@@ -184,10 +209,6 @@ final class CrashLogWindowController: NSObject {
         let hasSelection = selectedEntry != nil
         revealButton.isEnabled = hasSelection
         copyButton.isEnabled = hasSelection && !detailTextView.string.isEmpty
-        // 自绘按钮不读 `isEnabled` 改变文字颜色；用透明度给出「不可按」
-        // 的反馈，否则用户会以为按钮坏了。
-        revealButton.alphaValue = revealButton.isEnabled ? 1 : 0.45
-        copyButton.alphaValue = copyButton.isEnabled ? 1 : 0.45
     }
 
     // MARK: - 布局
@@ -422,9 +443,31 @@ final class CrashLogWindowController: NSObject {
     @objc private func copySelectedDetails() {
         let text = detailTextView.string
         guard !text.isEmpty else { return }
+        let redacted = Self.redactSensitiveDetails(text)
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+        let ok = pasteboard.setString(redacted, forType: .string)
+        ToastPresenter.show(ok ? "已复制脱敏后的崩溃详情" : "复制失败")
+    }
+
+    /// 默认脱敏崩溃详情中的本机用户目录名与设备 UUID，降低直接分享日志时的隐私泄露风险。
+    nonisolated static func redactSensitiveDetails(_ raw: String) -> String {
+        var result = raw
+        if let userPathRegex = try? NSRegularExpression(pattern: #"/Users/[^/\s"':)]+"#) {
+            let range = NSRange(result.startIndex..., in: result)
+            result = userPathRegex.stringByReplacingMatches(in: result, range: range, withTemplate: "~")
+        }
+        if let uuidRegex = try? NSRegularExpression(
+            pattern: #"\b[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\b"#
+        ) {
+            let range = NSRange(result.startIndex..., in: result)
+            result = uuidRegex.stringByReplacingMatches(
+                in: result,
+                range: range,
+                withTemplate: "<REDACTED-UUID>"
+            )
+        }
+        return result
     }
 
     @objc private func closeTapped() {

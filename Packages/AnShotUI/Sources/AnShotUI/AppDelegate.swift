@@ -12,6 +12,7 @@
 import AppKit
 import AnShotCapture
 import AnShotCore
+import AVFoundation
 import ImageIO
 
 /// 结构化日志。subsystem 固定为 bundle ID，便于用 log show 过滤：
@@ -211,6 +212,22 @@ private let recordingFrame = RecordingRegionFrame()
         overlayController.onBackdropUnavailable = { [weak self] in
             self?.handleBackdropUnavailable()
         }
+
+        // 贴图右键/快捷键「重新标注编辑」与「提取文字 (OCR)」接线。
+        overlayController.pinManager.onEditPin = { [weak self] image in
+            guard let self else { return }
+            guard !self.overlayController.isPresenting else {
+                ToastPresenter.show("请先完成或关闭当前标注窗口")
+                return
+            }
+            self.overlayController.present(image: image)
+        }
+        overlayController.pinManager.onOCRPin = { [weak self] image, _ in
+            self?.recognizePinText(image)
+        }
+
+        // 全局常驻安装标准 Edit 主菜单，确保 7 个独立窗口与输入框均可使用 ⌘C/⌘V/⌘X/⌘A。
+        SettingsMainMenu.install()
 
         // 覆盖层的录制请求经由通知送达（见 observeRecordingRequests）
         #if DEBUG
@@ -458,6 +475,9 @@ private let recordingFrame = RecordingRegionFrame()
         append(makeHistorySection(), to: menu)
         append(makeScrollshotLogSection(), to: menu)
         append(makePermissionGuideSection(permission), to: menu)
+        if permission == .granted || recordingController.isActive {
+            append(makeRecordingSection() + [.separator()], to: menu)
+        }
         append(makeAccessibilitySection(), to: menu)
         #if DEBUG
         append(makeDiagnosticSection(), to: menu)
@@ -566,32 +586,29 @@ private let recordingFrame = RecordingRegionFrame()
         switch permission {
         case .notRequested:
             // 从未请求过：可以触发系统授权对话框
-            return [makeAction("请求屏幕录制权限…", #selector(requestPermission))]
+            return [makeAction("请求屏幕录制权限…", #selector(requestPermission)), .separator()]
 
         case .notGranted:
             // 已请求过：系统不会再弹窗，只能引导到系统设置
-            return [makeAction("打开系统设置检查权限…", #selector(openScreenRecordingSettings))]
+            return [makeAction("打开系统设置检查权限…", #selector(openScreenRecordingSettings)), .separator()]
 
         case .granted:
             return makeCaptureSection()
         }
     }
 
-    /// 已授权时的功能入口：截图、固定截图、热键故障提示、录制。
-    ///
-    /// 热键不可用**不**影响手动截图：菜单入口与热键是两条独立路径。
-    /// 早期版本在热键失败时把「截图」项也藏了起来，于是一个故障同时废掉了
-    /// 两个入口——用户只剩「重启」可选。
+    /// 已授权时的功能入口：截图、剪贴板贴图、固定截图、热键故障提示、录制。
     private func makeCaptureSection() -> [NSMenuItem] {
         // 本应用无 Dock 图标也无应用菜单，菜单栏是唯一能常驻的管理入口。
         var items: [NSMenuItem] = [
             makeAction("截图", #selector(startCapture)),
             makeAction("选择窗口…", #selector(chooseWindow)),
             makeAction("打开图片…", #selector(openImageFile)),
+            makeAction("从剪贴板贴图", #selector(pinFromPasteboard)),
             makeAction("滚动长截图…", #selector(startLongScreenshotFlow)),
             makeAction("识别文字…", #selector(startOCRCaptureFlow)),
             makeAction("开始录制…", #selector(startRecordingFlow)),
-            makePinMenuItem()
+            makePinMenuItem(),
         ]
 
         if let globalHotKeyError {
@@ -631,7 +648,8 @@ private let recordingFrame = RecordingRegionFrame()
         let pauseTitle = recordingController.state == .paused ? "继续录制" : "暂停录制"
         return [
             makeAction("停止录制（\(elapsed)）", #selector(stopRecording)),
-            makeAction(pauseTitle, #selector(toggleRecordingPause))
+            makeAction(pauseTitle, #selector(toggleRecordingPause)),
+            makeAction("取消并丢弃录制", #selector(cancelRecording)),
         ]
     }
 
@@ -795,6 +813,10 @@ private let recordingFrame = RecordingRegionFrame()
             guard let self else { return }
             switch action {
             case .recording:
+                guard !self.recordingController.isActive else {
+                    ToastPresenter.show("正在录制中，请先停止当前录制")
+                    return
+                }
                 self.overlayController.present(intent: .recording)
             case .longScreenshot:
                 self.overlayController.present(intent: .longScreenshot)
@@ -821,22 +843,70 @@ private let recordingFrame = RecordingRegionFrame()
         }
     }
 
+    /// 统一判定本次启动是否为诊断或人工验收模式（仅供 `#if DEBUG` 生效，Release 恒为 `false`）。
+    ///
+    /// 提供给 `AppDelegate` 自身及 `App/Sources/main.swift` 的单实例锁共同调用，
+    /// 确保诊断标记判定只维护一份单一事实来源。
+    public static func isDiagnosticLaunch(arguments: [String] = CommandLine.arguments) -> Bool {
+        #if DEBUG
+        let diagnosticArguments: Set<String> = [
+            "-diagnoseCapture",
+            "-diagnoseRegion",
+            "-diagnoseBoth",
+            "-diagnoseBenchmark",
+            "-diagnoseOverlay",
+            "-diagnoseSelection",
+            "-diagnoseSelectionPhase",
+            "-diagnoseAnnotation",
+            "-diagnoseAnnotationInput",
+            "-diagnoseColorPanel",
+            "-diagnoseExport",
+            "-diagnoseMemory",
+            "-diagnoseWindows",
+            "-diagnoseDetection",
+            "-diagnoseSettings",
+            "-diagnoseSettingsWindow",
+            "-diagnoseRecording",
+            "-diagnoseGIF",
+            "-requestMicrophoneAccess",
+            "-diagnoseRecordingUI",
+            "-diagnoseRecordingFrame",
+            "-diagnoseRecordFlow",
+            "-diagnoseWindowFollow",
+            "-diagnoseScrollshot",
+            "-diagnoseScrollshotLive",
+            "-diagnoseScrollshotEntry",
+            "-diagnoseScrollshotOverlay",
+            "-diagnoseScrollshotPanel",
+            "-diagnoseOCR",
+            "-diagnoseOCRProvider",
+            "-diagnoseM3Annotation",
+            "-diagnosePin",
+            "-diagnoseHistory",
+            "-diagnoseTranslation",
+            "-diagnoseLaunchAtLogin",
+            "-showSettings",
+            "-showWelcome",
+            "-editImage",
+            "-showHistory",
+            "-showCrashLogs",
+            "-checkUpdates",
+            "-showAbout",
+        ]
+        if arguments.contains(where: { diagnosticArguments.contains($0) }) {
+            return true
+        }
+        return arguments == CommandLine.arguments && CaptureDiagnostics.hasDiagnosticRequest()
+        #else
+        return false
+        #endif
+    }
+
     /// 本次启动是不是诊断（或仅用于人工验收的）运行。
     ///
     /// 用途只有一个：这些进程不得注册全局热键（见 `applicationDidFinishLaunching`）。
     private var isDiagnosticRun: Bool {
-        #if DEBUG
-        return CaptureDiagnostics.hasDiagnosticRequest()
-            || CommandLine.arguments.contains("-showSettings")
-            || CommandLine.arguments.contains("-showWelcome")
-            || CommandLine.arguments.contains("-editImage")
-            || CommandLine.arguments.contains("-showHistory")
-            || CommandLine.arguments.contains("-showCrashLogs")
-            || CommandLine.arguments.contains("-checkUpdates")
-            || CommandLine.arguments.contains("-showAbout")
-        #else
-        return false
-        #endif
+        Self.isDiagnosticLaunch()
     }
 
     /// 按给定组合构造 Pin 切换热键。构造成功即已完成系统级注册。
@@ -917,14 +987,8 @@ private let recordingFrame = RecordingRegionFrame()
             // 传闭包而不是管理器：设置窗口只需要一个数字。
             pinCountProvider: { [weak self] in self?.overlayController.pinManager.pins.count ?? 0 }
         )
-        // 设置窗口里的输入框需要主菜单才能粘贴（理由见 SettingsMainMenu）。
-        SettingsMainMenu.install()
-        // 关闭后释放控制器与窗口，而不是永久持着。
-        // 本应用是常驻菜单栏的辅助程序，「空闲期零窗口」是既定约束
-        //（见 m1-capture/plan.md §2.1）；窗口位置由 autosave 记住，
-        // 不依赖对象存活。
+        // 关闭后释放控制器与窗口，同时保留全局常驻主菜单，不影响其他独立窗口快捷键。
         controller.onClose = { [weak self] in
-            SettingsMainMenu.remove()
             self?.settingsWindowController = nil
         }
         settingsWindowController = controller
@@ -986,6 +1050,10 @@ private let recordingFrame = RecordingRegionFrame()
     /// 若在这里就能一键录 GIF，用户既看不到时长上限、也无法选档位，
     /// 而到达上限会自动停录——参数必须在开始前可见（GIF 只能从面板发起）。
     @objc private func startFullScreenRecording() {
+        guard !recordingController.isActive else {
+            ToastPresenter.show("正在录制中，请先停止当前录制")
+            return
+        }
         startRecording(scope: .display(DisplayGeometry.mainDisplay()), output: .movie)
     }
 
@@ -1003,7 +1071,10 @@ private let recordingFrame = RecordingRegionFrame()
         output: RecordingOutputChoice,
         controlBarRect: CGRect? = nil
     ) {
-        guard !recordingController.isActive else { return }
+        guard !recordingController.isActive else {
+            ToastPresenter.show("正在录制中，请先停止当前录制")
+            return
+        }
         let outputURL = RecordingController.defaultOutputURL(for: settings, output: output)
         logger.notice("开始录制：\(outputURL.path, privacy: .public)")
 
@@ -1012,6 +1083,9 @@ private let recordingFrame = RecordingRegionFrame()
             // 暂停时边框换色：边框位置不变，颜色是唯一能区分「在录」与「暂停」的手段
             self?.recordingFrame.update(appearance: state == .paused ? .paused : .recording)
             self?.refreshMenuTitle()
+        }
+        recordingController.onCountdownTick = { [weak self] remaining in
+            self?.recordingBar.updateCountdown(remaining)
         }
         // 进度单独一根管子（见 `RecordingController.onExportProgress`）。
         // 同时缓存一份：菜单是在 `menuWillOpen` 时现建的，没有回调可跟。
@@ -1036,11 +1110,19 @@ private let recordingFrame = RecordingRegionFrame()
             guard let self else { return }
             Task { await self.recordingController.stop() }
         }
+        recordingBar.onCancel = { [weak self] in
+            guard let self else { return }
+            Task { await self.recordingController.cancel() }
+        }
 
         // 顺序要紧：**先摆好录制 UI，再启动捕获**。
         // 排除窗口需要窗口号，而 windowNumber 只在 orderFront 之后才有值；
         // 先启动的话拿到的是空列表，范围框与控制条就会被录进成片。
+        let countdownSeconds = RecordingSetupPanel.preferredCountdownSeconds
         recordingBar.update(state: .preparing, elapsed: 0)
+        if countdownSeconds > 0 {
+            recordingBar.updateCountdown(countdownSeconds)
+        }
         // GIF 时把上限交给控制条：录制中它要显示倒计时，因为到达上限会**自动停止**。
         let gifLimit: TimeInterval?
         if case .gif(let gifSettings) = output {
@@ -1072,7 +1154,8 @@ private let recordingFrame = RecordingRegionFrame()
             audio: audio,
             output: output,
             excludedWindowIDs: excludedWindowIDs,
-            outputURL: outputURL
+            outputURL: outputURL,
+            countdownSeconds: countdownSeconds
         )
         // 菜单在 `menuWillOpen` 时自动重建，此处无需手动刷新
     }
@@ -1121,6 +1204,10 @@ private let recordingFrame = RecordingRegionFrame()
         Task { await recordingController.togglePause() }
     }
 
+    @objc private func cancelRecording() {
+        Task { await recordingController.cancel() }
+    }
+
     /// 会话结束后的反馈。
     ///
     /// 失败时必须让用户看到原因（磁盘满、流中断、权限不足），
@@ -1129,18 +1216,23 @@ private let recordingFrame = RecordingRegionFrame()
         switch outcome {
         case .finished(let url, let duration, let reachedLimit):
             logger.notice("录制完成：\(url.path, privacy: .public) 时长=\(duration, privacy: .public)s")
-            // 录屏产物也进历史：历史若只收截图，用户想找回刚录的片段
-            // 只能去访达里翻，而访达未必记得住保存目录。
-            historyStore.add(
-                fileURL: url,
-                thumbnailPNG: nil,
-                pixelWidth: 0,
-                pixelHeight: 0,
-                kind: .recording,
-                source: HistorySource(mode: "recording"),
-                cached: false
-            )
-            refreshHistoryPanel()
+            // 异步提取首帧缩略图与真实像素宽高并写回历史记录，避免在历史列表全显 0 × 0 空白图标。
+            Task { @MainActor [weak self] in
+                let metadata = await Task.detached(priority: .utility) {
+                    await Self.extractRecordingThumbnailAndSize(at: url)
+                }.value
+                guard let self else { return }
+                self.historyStore.add(
+                    fileURL: url,
+                    thumbnailPNG: metadata.thumbnailPNG,
+                    pixelWidth: metadata.width,
+                    pixelHeight: metadata.height,
+                    kind: .recording,
+                    source: HistorySource(mode: "recording"),
+                    cached: false
+                )
+                self.refreshHistoryPanel()
+            }
             // 非阻塞提示：录制结束后用户往往马上要回到刚才的应用，
             // 一个模态弹窗会把焦点和节奏一起打断。
             let message = reachedLimit
@@ -1273,9 +1365,91 @@ private let recordingFrame = RecordingRegionFrame()
         overlayController.present(intent: .ocr)
     }
 
-    /// 菜单入口：直接进入录制准备，选区确定即弹面板。
+    /// 菜单入口：直接进入录制准备，选区确定即弹面板（录制进行中则前置拦截提示）。
     @objc private func startRecordingFlow() {
+        guard !recordingController.isActive else {
+            ToastPresenter.show("正在录制中，请先停止当前录制")
+            return
+        }
         overlayController.present(intent: .recording)
+    }
+
+    /// 菜单入口：从剪贴板贴图（支持图片位图及纯文本生成便签图）。
+    @objc private func pinFromPasteboard() {
+        let scale = DisplayGeometry.scaleFactor(for: DisplayGeometry.mainDisplay())
+        guard let item = ImageSourceLauncher.pasteboardImageOrTextNote(scale: scale) else {
+            NSSound.beep()
+            ToastPresenter.show("剪贴板中没有可贴图的图片或文字")
+            return
+        }
+        switch overlayController.pinManager.pin(image: item.image, screenScale: scale) {
+        case .created:
+            ToastPresenter.show(item.isTextNote ? "已将剪贴板文字固定为便签" : "已固定剪贴板图片")
+        case .limitReached(let limit):
+            NSSound.beep()
+            showPinLimitNotice(limit: limit)
+        }
+    }
+
+    /// 贴图浮窗触发的文字识别（OCR）：识别完成后自动复制到剪贴板并弹轻提示。
+    private func recognizePinText(_ image: CGImage) {
+        ToastPresenter.show("正在识别贴图文字…", duration: 10)
+        Task { @MainActor in
+            do {
+                let result = try await OCRService().recognize(in: image)
+                let text = result.lines.map(\.text).joined(separator: "\n")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else {
+                    ToastPresenter.show("贴图中未识别到文字")
+                    return
+                }
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString(text, forType: .string)
+                ToastPresenter.show("已识别并复制 \(result.lines.count) 行文字")
+            } catch {
+                ToastPresenter.show("识别失败：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// 后台提取录屏/GIF 文件的首帧缩略图与真实像素宽高。
+    private nonisolated static func extractRecordingThumbnailAndSize(
+        at url: URL
+    ) async -> (thumbnailPNG: Data?, width: Int, height: Int) {
+        if url.pathExtension.lowercased() == "gif" {
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                return (nil, 0, 0)
+            }
+            return (HistoryThumbnail.makePNG(from: image), image.width, image.height)
+        }
+
+        let asset = AVURLAsset(url: url)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 1920, height: 1920)
+        let trackSize = await Self.videoNaturalPixelSize(for: asset)
+        if let cgImage = try? await generator.image(at: .zero).image {
+            // 优先使用视频轨道的真实像素宽高（经 transform 校正），防止 maximumSize 缩小时记错像素。
+            let width = trackSize?.width ?? cgImage.width
+            let height = trackSize?.height ?? cgImage.height
+            return (HistoryThumbnail.makePNG(from: cgImage), width, height)
+        }
+        return (nil, trackSize?.width ?? 0, trackSize?.height ?? 0)
+    }
+
+    private nonisolated static func videoNaturalPixelSize(for asset: AVAsset) async -> (width: Int, height: Int)? {
+        guard let track = (try? await asset.loadTracks(withMediaType: .video))?.first,
+              let naturalSize = try? await track.load(.naturalSize),
+              let preferredTransform = try? await track.load(.preferredTransform) else {
+            return nil
+        }
+        let transformed = naturalSize.applying(preferredTransform)
+        let width = Int(abs(transformed.width).rounded())
+        let height = Int(abs(transformed.height).rounded())
+        guard width > 0, height > 0 else { return nil }
+        return (width, height)
     }
 
     // MARK: - 固定截图
@@ -1379,8 +1553,7 @@ private let recordingFrame = RecordingRegionFrame()
         let count = manager.pins.count
         guard count > 0 else { return }
         // 「全部关闭」会**释放全部位图**且不可撤销，因此必须确认。
-        //（单个关闭不确认：固定中它只是隐藏（可恢复），已取消固定时才释放——
-        //  而那是用户刚按下图钉明确表达过的意图。）
+        NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "关闭全部固定截图？"
         alert.informativeText = "共 \(count) 张。关闭会释放它们占用的内存，此操作不可撤销。"
@@ -1570,7 +1743,23 @@ extension AppDelegate: NSMenuDelegate {
 /// 用户会以「快捷键突然没了」的形式受到伤害，而这正是最难归因的故障类型。
 extension AppDelegate: ShortcutHosting {
 
+    /// 检测候选组合键是否与本应用其余 4 个全局热键槽位发生内部互撞。
+    func internalConflictMessage(
+        for candidate: Shortcut,
+        excluding currentAction: GlobalShortcutAction
+    ) -> String? {
+        for other in GlobalShortcutAction.allCases where other != currentAction {
+            if settings.shortcut(for: other) == candidate {
+                return "与本应用「\(other.displayName)」快捷键冲突"
+            }
+        }
+        return nil
+    }
+
     func applyCaptureShortcut(_ shortcut: Shortcut) -> String? {
+        if let conflict = internalConflictMessage(for: shortcut, excluding: .capture) {
+            return conflict
+        }
         // 组合没变**且该注册确实处于活跃状态** → 无需重新注册。
         //（Carbon 对同一组合的二次注册返回 -9878）
         //
@@ -1647,6 +1836,9 @@ extension AppDelegate: ShortcutHosting {
     /// **不参与录制的让出/恢复**：录制期间按它隐藏/显示 Pin 是有用的行为
     /// （Pin 是浮窗，会被录进画面），而没有哪条录制交互在抢这个组合。
     func applyPinToggleShortcut(_ shortcut: Shortcut) -> String? {
+        if let conflict = internalConflictMessage(for: shortcut, excluding: .pinToggle) {
+            return conflict
+        }
         // 组合未变且注册确实活跃 → 无需重新注册（Carbon 二次注册返回 -9878）。
         if shortcut == settings.pinToggleShortcut, pinToggleHotKey != nil {
             return nil
@@ -1707,6 +1899,9 @@ extension AppDelegate: ShortcutHosting {
         case .pinToggle:
             return applyPinToggleShortcut(shortcut)
         case .recording, .longScreenshot, .ocr:
+            if let conflict = internalConflictMessage(for: shortcut, excluding: action) {
+                return conflict
+            }
             // 组合未变且注册活跃：Carbon 二次注册返回 -9878，不能重试。
             if shortcut == settings.shortcut(for: action), intentHotKeys[action] != nil {
                 return nil

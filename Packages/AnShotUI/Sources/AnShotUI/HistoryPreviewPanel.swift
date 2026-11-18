@@ -25,6 +25,8 @@
 
 import AnShotCore
 import AppKit
+import AVFoundation
+import AVKit
 import ImageIO
 
 /// 预览窗口：空格或 ESC 关闭。
@@ -65,6 +67,7 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
     private let imageSurface = HistorySurfaceView(style: .inset)
     private let infoSurface = HistorySurfaceView(style: .card)
     private let imageView = NSImageView()
+    private let playerView = AVPlayerView()
     private let placeholderSymbol = NSImageView()
     private let placeholderLabel = NSTextField(labelWithString: "")
     private let placeholderStack = NSStackView()
@@ -107,33 +110,63 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
 
     // MARK: - 显示
 
-    /// 显示一条历史记录的预览。
+    /// 显示一条历史记录的预览（支持图片、GIF 动画与 MP4/MOV 视频播放）。
     ///
     /// - Parameters:
     ///   - entry: 要预览的条目。
     ///   - thumbnail: 列表里已有的缩略图；原图读不出来时用它兜底。
     ///   - anchor: 历史窗口，用于把预览放在它左侧；不传则居中。
-    func show(_ entry: HistoryEntry, thumbnail: NSImage?, relativeTo anchor: NSWindow?) {
+    ///   - makeKey: 首次空格打开时抢占焦点；方向键联动切换时设为 `false` 保持列表焦点。
+    func show(
+        _ entry: HistoryEntry,
+        thumbnail: NSImage?,
+        relativeTo anchor: NSWindow?,
+        makeKey: Bool = true
+    ) {
         let isPresent = entry.isFilePresent
         let isRecording = entry.kind == .recording
+        let wasOpen = isOpen
 
         // 缓存条目的文件名是 UUID，显示出来没有信息量；用「缓存副本」代替。
         nameLabel.stringValue = entry.isCached ? "缓存副本" : entry.fileURL.lastPathComponent
         window.title = "预览 · \(entry.kind.displayName)"
 
-        imageView.image = nil
+        releaseContent()
         imageView.isHidden = true
+        playerView.isHidden = true
         placeholderSymbol.image = nil
         placeholderLabel.stringValue = ""
         placeholderStack.isHidden = false
 
         if isRecording {
-            // 录屏没有静态画面；给出明确标识，其余信息由底部信息卡片承担。
-            placeholderSymbol.image = NSImage(
-                systemSymbolName: "video.fill",
-                accessibilityDescription: "录屏"
-            )
-            placeholderLabel.stringValue = isPresent ? "录屏文件" : "录屏文件已移走"
+            if !isPresent {
+                placeholderSymbol.image = NSImage(
+                    systemSymbolName: "video.fill",
+                    accessibilityDescription: "录屏"
+                )
+                placeholderLabel.stringValue = "录屏文件已移走"
+            } else if entry.fileURL.pathExtension.lowercased() == "gif" {
+                // GIF 支持逐帧动画预览。
+                if let gifImage = NSImage(contentsOf: entry.fileURL) {
+                    imageView.animates = true
+                    imageView.image = gifImage
+                    imageView.isHidden = false
+                    placeholderStack.isHidden = true
+                } else {
+                    placeholderSymbol.image = NSImage(
+                        systemSymbolName: "video.fill",
+                        accessibilityDescription: "GIF"
+                    )
+                    placeholderLabel.stringValue = "无法读取 GIF 文件"
+                }
+            } else {
+                // 视频文件内嵌 AVPlayerView 播放，供用户快速核对录制片段。
+                let player = AVPlayer(url: entry.fileURL)
+                playerView.player = player
+                playerView.isHidden = false
+                placeholderStack.isHidden = true
+                player.play()
+            }
         } else if let image = Self.loadPreviewImage(at: entry.fileURL, maxPixelSize: 2000) {
             imageView.image = image
             imageView.isHidden = false
@@ -155,8 +188,15 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
         infoLabel.textColor = isPresent ? .secondaryLabelColor : .systemOrange
 
         isOpen = true
-        position(relativeTo: anchor)
-        window.makeKeyAndOrderFront(nil)
+        ForegroundPolicyCoordinator.acquire("historyPreview")
+        if !wasOpen {
+            position(relativeTo: anchor)
+        }
+        if makeKey {
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            window.orderFront(nil)
+        }
     }
 
     func close() {
@@ -164,11 +204,15 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
         isOpen = false
         window.orderOut(nil)
         releaseContent()
+        ForegroundPolicyCoordinator.release("historyPreview")
         onClose?()
     }
 
     private func releaseContent() {
-        // 大图预览可能是几十 MB；关闭即释放，不留给下一次打开当缓存。
+        // 大图与视频解码器占用高内存；关闭或切换即立即释放。
+        playerView.player?.pause()
+        playerView.player = nil
+        imageView.animates = false
         imageView.image = nil
         placeholderSymbol.image = nil
     }
@@ -185,6 +229,11 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
         imageView.translatesAutoresizingMaskIntoConstraints = false
         imageView.isHidden = true
         imageSurface.addSubview(imageView)
+
+        playerView.controlsStyle = .inline
+        playerView.translatesAutoresizingMaskIntoConstraints = false
+        playerView.isHidden = true
+        imageSurface.addSubview(playerView)
 
         placeholderSymbol.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 44, weight: .light)
         placeholderSymbol.contentTintColor = .secondaryLabelColor
@@ -207,6 +256,11 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
             imageView.leadingAnchor.constraint(equalTo: imageSurface.leadingAnchor, constant: 12),
             imageView.trailingAnchor.constraint(equalTo: imageSurface.trailingAnchor, constant: -12),
             imageView.bottomAnchor.constraint(equalTo: imageSurface.bottomAnchor, constant: -12),
+
+            playerView.topAnchor.constraint(equalTo: imageSurface.topAnchor, constant: 12),
+            playerView.leadingAnchor.constraint(equalTo: imageSurface.leadingAnchor, constant: 12),
+            playerView.trailingAnchor.constraint(equalTo: imageSurface.trailingAnchor, constant: -12),
+            playerView.bottomAnchor.constraint(equalTo: imageSurface.bottomAnchor, constant: -12),
 
             placeholderStack.centerXAnchor.constraint(equalTo: imageSurface.centerXAnchor),
             placeholderStack.centerYAnchor.constraint(equalTo: imageSurface.centerYAnchor),
@@ -380,6 +434,7 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
         guard isOpen else { return }
         isOpen = false
         releaseContent()
+        ForegroundPolicyCoordinator.release("historyPreview")
         onClose?()
     }
 }

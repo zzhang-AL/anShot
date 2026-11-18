@@ -39,6 +39,8 @@ import Foundation
 struct UpdateRelease: Equatable, Sendable {
     /// 从 tag 解析出的版本号。
     let version: AppVersion
+    /// 可选的构建号（解析自 `+build` 后缀或标题），用于在语义版本相同时识别热修。
+    let buildNumber: Int?
     /// 原始 tag（可能带 v 前缀），用于向用户展示与排查。
     let tag: String
     /// release 标题；为空时退回 tag。
@@ -56,6 +58,40 @@ struct UpdateRelease: Equatable, Sendable {
     /// zip 资产大小（字节）；未知为 0。
     let size: Int
     let publishedAt: Date?
+
+    init(
+        version: AppVersion,
+        buildNumber: Int? = nil,
+        tag: String,
+        title: String,
+        notes: String,
+        pageURL: URL,
+        zipURL: URL?,
+        checksumURL: URL?,
+        expectedSHA256: String?,
+        size: Int,
+        publishedAt: Date?
+    ) {
+        self.version = version
+        self.buildNumber = buildNumber
+        self.tag = tag
+        self.title = title
+        self.notes = notes
+        self.pageURL = pageURL
+        self.zipURL = zipURL
+        self.checksumURL = checksumURL
+        self.expectedSHA256 = expectedSHA256
+        self.size = size
+        self.publishedAt = publishedAt
+    }
+
+    /// 包含构建号的版本展示文本，供热修更新日志与忽略版本号区分使用。
+    var displayVersion: String {
+        if let buildNumber {
+            return "\(version) (\(buildNumber))"
+        }
+        return version.description
+    }
 }
 
 /// 一次检查的结论。
@@ -140,17 +176,22 @@ final class UpdateService {
         self.defaults = defaults
     }
 
-    /// 查询最新版本并与 `currentVersion` 比较。
+    /// 查询最新版本并与 `currentVersion` / `currentBuild` 比较。
     ///
     /// 网络与 JSON 错误统一抛 `UpdateCheckError`；404 返回 `.noRelease`。
-    func check(currentVersion: AppVersion) async throws -> UpdateCheckResult {
-        try await fetch(currentVersion: currentVersion, sendingConditionalRequest: true)
+    func check(currentVersion: AppVersion, currentBuild: Int? = nil) async throws -> UpdateCheckResult {
+        try await fetch(
+            currentVersion: currentVersion,
+            currentBuild: currentBuild,
+            sendingConditionalRequest: true
+        )
     }
 
     // MARK: - 请求
 
     private func fetch(
         currentVersion: AppVersion,
+        currentBuild: Int?,
         sendingConditionalRequest: Bool
     ) async throws -> UpdateCheckResult {
         var request = URLRequest(url: Self.latestReleaseEndpoint)
@@ -189,7 +230,11 @@ final class UpdateService {
                 defaults.removeObject(forKey: CacheKey.etag)
             }
             defaults.set(data, forKey: CacheKey.body)
-            return result(from: try makeRelease(from: payload), currentVersion: currentVersion)
+            return result(
+                from: try makeRelease(from: payload),
+                currentVersion: currentVersion,
+                currentBuild: currentBuild
+            )
 
         case 304:
             // 与上次相同的 release。缓存缺失或损坏时不能当成「无更新」，
@@ -199,9 +244,17 @@ final class UpdateService {
             else {
                 defaults.removeObject(forKey: CacheKey.etag)
                 defaults.removeObject(forKey: CacheKey.body)
-                return try await fetch(currentVersion: currentVersion, sendingConditionalRequest: false)
+                return try await fetch(
+                    currentVersion: currentVersion,
+                    currentBuild: currentBuild,
+                    sendingConditionalRequest: false
+                )
             }
-            return result(from: try makeRelease(from: payload), currentVersion: currentVersion)
+            return result(
+                from: try makeRelease(from: payload),
+                currentVersion: currentVersion,
+                currentBuild: currentBuild
+            )
 
         case 404:
             return .noRelease
@@ -230,6 +283,8 @@ final class UpdateService {
         guard let version = AppVersion(payload.tagName) ?? AppVersion(payload.name ?? "") else {
             throw UpdateCheckError.unparsableVersion(payload.tagName)
         }
+        let buildNumber = Self.extractBuildNumber(from: payload.tagName)
+            ?? Self.extractBuildNumber(from: payload.name)
 
         let zipAsset = Self.pickZip(from: payload.assets)
         let checksumAsset = Self.pickChecksum(from: payload.assets)
@@ -237,6 +292,7 @@ final class UpdateService {
 
         return UpdateRelease(
             version: version,
+            buildNumber: buildNumber,
             tag: payload.tagName,
             title: title,
             notes: payload.body ?? "",
@@ -251,14 +307,65 @@ final class UpdateService {
 
     private func result(
         from release: UpdateRelease,
-        currentVersion: AppVersion
+        currentVersion: AppVersion,
+        currentBuild: Int?
     ) -> UpdateCheckResult {
-        // 只有严格更高才算更新：本地构建版本比 release 新时（开发机常见）
-        // 不能被提示「降级」。
-        guard release.version > currentVersion else {
+        // 只有严格更高才算更新：支持语义版本相同时通过 build 号或构建后缀识别热修。
+        guard Self.isNewer(
+            releaseVersion: release.version,
+            releaseBuild: release.buildNumber,
+            currentVersion: currentVersion,
+            currentBuild: currentBuild
+        ) else {
             return .upToDate(current: currentVersion)
         }
         return .available(release)
+    }
+
+    /// 判断远端版本是否严格高于本地版本（支持同语义版本下比较构建号）。
+    static func isNewer(
+        releaseVersion: AppVersion,
+        releaseBuild: Int?,
+        currentVersion: AppVersion,
+        currentBuild: Int?
+    ) -> Bool {
+        if releaseVersion != currentVersion {
+            return releaseVersion > currentVersion
+        }
+        guard let releaseBuild, let currentBuild else {
+            return false
+        }
+        return releaseBuild > currentBuild
+    }
+
+    /// 从 tag 或版本号字符串提取构建号（支持 `+42`、`+build.42`、`(42)` 等后缀写法）。
+    static func extractBuildNumber(from raw: String?) -> Int? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        // 优先提取 `+build...` 构建元数据段中的正整数。
+        if let plusIndex = trimmed.firstIndex(of: "+") {
+            let suffix = trimmed[trimmed.index(after: plusIndex)...]
+            if let value = trailingInteger(in: suffix) {
+                return value
+            }
+        }
+        // 兼容在标题或描述中附带 `build 42` 或 `(42)` 的格式。
+        let pattern = #"(?:\(\s*|\bbuild[\s.:_-]*)(\d+)\b"#
+        if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+           let match = regex.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)),
+           let range = Range(match.range(at: 1), in: trimmed),
+           let value = Int(trimmed[range]) {
+            return value
+        }
+        return nil
+    }
+
+    private static func trailingInteger(in text: Substring) -> Int? {
+        let components = text.split(whereSeparator: { !$0.isNumber })
+        guard let last = components.last, let value = Int(last) else { return nil }
+        return value
     }
 
     // MARK: - 字段选择

@@ -15,10 +15,8 @@ let package = Package(
     ],
     targets: [
         .target(name: "AnShotUI", dependencies: ["AnShotCapture", "AnShotCore"]),
-        // 本 target 存在的理由：AnShotUI 长期没有测试 target，导致其中
-        // **不依赖 AppKit 的纯逻辑**（AnnotationEditorState 的撤销/重做与
-        // 选区快照、SelectionDecoration 的手柄命中）无法被单元测试锁定，
-        // 只能靠 -diagnoseXxx 诊断做截图式比对。详见 docs/refactor/plan.md。
+        // 本 target 覆盖 AnShotUI 中不依赖屏幕捕获权限的核心逻辑与视图状态机测试
+        // （如标注编辑器撤销/重做、选区手势与几何、贴图边界、设置窗口、历史缩略图、自动更新安全校验等）。
         .testTarget(
             name: "AnShotUITests",
             dependencies: ["AnShotUI", "AnShotCore", "AnShotCapture"]

@@ -32,6 +32,66 @@ struct SettingsWindowTests {
             window.close()
         }
     }
+
+    @Test("诊断启动参数判定统一入口与主菜单编辑通道校验")
+    func diagnosticLaunchAndMainMenu() {
+        _ = NSApplication.shared
+        #expect(AppDelegate.isDiagnosticLaunch(arguments: ["anShot", "-checkUpdates"]))
+        #expect(AppDelegate.isDiagnosticLaunch(arguments: ["anShot", "-diagnosePin"]))
+        #expect(!AppDelegate.isDiagnosticLaunch(arguments: ["anShot"]))
+
+        let menu = SettingsMainMenu.make()
+        let editMenu = menu.item(withTitle: "编辑")?.submenu
+        #expect(editMenu != nil)
+        #expect(editMenu?.items.contains { $0.keyEquivalent == "c" } == true)
+        #expect(editMenu?.items.contains { $0.keyEquivalent == "v" } == true)
+        #expect(editMenu?.items.contains { $0.keyEquivalent == "a" } == true)
+    }
+
+    @Test("前台窗口激活策略协调器多窗口计数不提前退回 accessory")
+    func foregroundPolicyCoordinatorReferenceCounting() {
+        _ = NSApplication.shared
+        ForegroundPolicyCoordinator.resetForTesting()
+        defer { ForegroundPolicyCoordinator.resetForTesting() }
+
+        ForegroundPolicyCoordinator.acquire("settings")
+        #expect(ForegroundPolicyCoordinator.activeCount == 1)
+        #expect(NSApp.activationPolicy() == .regular)
+
+        ForegroundPolicyCoordinator.acquire("welcome")
+        #expect(ForegroundPolicyCoordinator.activeCount == 2)
+
+        ForegroundPolicyCoordinator.release("settings")
+        #expect(ForegroundPolicyCoordinator.activeCount == 1)
+        #expect(NSApp.activationPolicy() == .regular)
+
+        ForegroundPolicyCoordinator.release("welcome")
+        #expect(ForegroundPolicyCoordinator.activeCount == 0)
+        #expect(NSApp.activationPolicy() == .accessory)
+    }
+
+    @Test("自定义控件焦点环与内部热键互撞检测")
+    func focusRingAndShortcutInternalConflict() throws {
+        _ = NSApplication.shared
+        let push = SettingsPushButton(title: "测试", target: nil, action: nil)
+        push.frame = NSRect(x: 0, y: 0, width: 80, height: 32)
+        #expect(push.focusRingMaskBounds == push.bounds)
+
+        let sidebarItem = SettingsSidebarItem(page: .general, target: nil, action: nil)
+        sidebarItem.frame = NSRect(x: 0, y: 0, width: 160, height: 32)
+        #expect(sidebarItem.focusRingMaskBounds == sidebarItem.bounds)
+
+        let delegate = AppDelegate()
+        let conflict = delegate.internalConflictMessage(
+            for: AppSettings.defaultPinToggleShortcut,
+            excluding: .capture
+        )
+        #expect(conflict?.contains("收起 / 展开全部固定截图") == true)
+        #expect(delegate.internalConflictMessage(
+            for: AppSettings.defaultCaptureShortcut,
+            excluding: .capture
+        ) == nil)
+    }
 }
 
 /// 只提供界面依赖，测试不注册或改动系统全局快捷键。

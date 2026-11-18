@@ -80,8 +80,8 @@ enum SettingsTheme {
     /// 而且侧边栏会跟着上下伸缩，观感不稳定。所以宁可让内容少的页下方
     /// 留白，也要让窗口尺寸恒定。
     ///
-    /// 新增设置项时必须重新核对这个值：内容一旦超过窗口内容区高度，
-    /// 卡片会被挤扁（`-diagnoseSettingsWindow` 有断言守着）。
+    /// 新增设置项时仍应尽量控制单页高度；若错误/状态提示展开导致内容超出窗口高度，
+    /// 右侧内容区已包裹自适应 `NSScrollView`，可垂直滚动而不会裁切控件。
     static let windowHeight: CGFloat = 580
     /// 窗口外边距。
     static let margin: CGFloat = 24
