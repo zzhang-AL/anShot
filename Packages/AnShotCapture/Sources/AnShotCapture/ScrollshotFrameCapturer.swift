@@ -108,38 +108,17 @@ public actor ScrollshotFrameCapturer: ScreenCapturing {
         }
 
         do {
-            try CaptureSetup.requirePermission()
-            let target = try CaptureSetup.resolveSingleFrameTarget(scope)
-            let content = try await CaptureSetup.fetchShareableContent(for: target)
-            guard !stopped, !Task.isCancelled else { return }
-
-            let setup = try CaptureSetup.makeSingleFrameSetup(
-                target: target,
-                scope: scope,
-                content: content,
-                showsCursor: false
-            )
-
-            let streamConfig = setup.configuration
-            streamConfig.queueDepth = 3
             let seconds = max(1.0 / 120.0, Self.seconds(from: interval))
-            streamConfig.minimumFrameInterval = CMTime(seconds: seconds, preferredTimescale: 600)
-
-            let (eventStream, continuation) = AsyncStream<Result<CapturedFrame, Error>>.makeStream(
-                bufferingPolicy: .bufferingNewest(max(capacity, 8))
+            let bufferCapacity = max(capacity, 8)
+            let (relay, eventStream) = try await Self.prepareContinuousStream(
+                scope: scope,
+                frameIntervalSeconds: seconds,
+                bufferCapacity: bufferCapacity
             )
-            let relay = ScrollshotStreamRelay(
-                displayID: setup.displayID,
-                scaleFactor: setup.scaleFactor,
-                windowInfo: setup.windowInfo,
-                continuation: continuation
-            )
-            let stream = SCStream(filter: setup.filter, configuration: streamConfig, delegate: relay)
-            let outputQueue = DispatchQueue(label: "com.anshot.capture.scrollshot-stream")
-            try stream.addStreamOutput(relay, type: .screen, sampleHandlerQueue: outputQueue)
-
-            guard !stopped, !Task.isCancelled else { return }
-            relay.attach(stream: stream)
+            guard !stopped, !Task.isCancelled else {
+                relay.stop()
+                return
+            }
             streamRelay = relay
 
             try await relay.startCapture()
@@ -246,6 +225,43 @@ public actor ScrollshotFrameCapturer: ScreenCapturing {
         return pending
     }
 
+    /// 在非隔离上下文中完成权限检查、内容查询与 `SCStream` 构造，避免非 `Sendable` 系统对象跨越 actor 边界。
+    private nonisolated static func prepareContinuousStream(
+        scope: CaptureScope,
+        frameIntervalSeconds: TimeInterval,
+        bufferCapacity: Int
+    ) async throws -> (relay: ScrollshotStreamRelay, eventStream: AsyncStream<Result<CapturedFrame, Error>>) {
+        try CaptureSetup.requirePermission()
+        let target = try CaptureSetup.resolveSingleFrameTarget(scope)
+        let content = try await CaptureSetup.fetchShareableContent(for: target)
+
+        let setup = try CaptureSetup.makeSingleFrameSetup(
+            target: target,
+            scope: scope,
+            content: content,
+            showsCursor: false
+        )
+
+        let streamConfig = setup.configuration
+        streamConfig.queueDepth = 3
+        streamConfig.minimumFrameInterval = CMTime(seconds: frameIntervalSeconds, preferredTimescale: 600)
+
+        let (eventStream, continuation) = AsyncStream<Result<CapturedFrame, Error>>.makeStream(
+            bufferingPolicy: .bufferingNewest(bufferCapacity)
+        )
+        let relay = ScrollshotStreamRelay(
+            displayID: setup.displayID,
+            scaleFactor: setup.scaleFactor,
+            windowInfo: setup.windowInfo,
+            continuation: continuation
+        )
+        let stream = SCStream(filter: setup.filter, configuration: streamConfig, delegate: relay)
+        let outputQueue = DispatchQueue(label: "com.anshot.capture.scrollshot-stream")
+        try stream.addStreamOutput(relay, type: .screen, sampleHandlerQueue: outputQueue)
+        relay.attach(stream: stream)
+        return (relay, eventStream)
+    }
+
     private static func seconds(from duration: Duration) -> TimeInterval {
         let components = duration.components
         return TimeInterval(components.seconds) + TimeInterval(components.attoseconds) / 1e18
@@ -280,7 +296,16 @@ private final class ScrollshotStreamRelay: NSObject, SCStreamOutput, SCStreamDel
     func startCapture() async throws {
         let currentStream = lock.withLock { stream }
         guard let currentStream else { return }
-        try await currentStream.startCapture()
+        // 通过回调桥接而非直接 await async 接口，避免旧版 SDK 中非 Sendable 的 SCStream 跨并发域报错。
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            currentStream.startCapture { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
     }
 
     func stop() {
@@ -292,9 +317,8 @@ private final class ScrollshotStreamRelay: NSObject, SCStreamOutput, SCStreamDel
             return (c, s)
         }
         cont?.finish()
-        if let streamToStop {
-            Task { try? await streamToStop.stopCapture() }
-        }
+        // 直接触发异步停流回调，避免在 `@Sendable` 的 Task 闭包中捕获非 Sendable 的 `SCStream`。
+        streamToStop?.stopCapture(completionHandler: nil)
     }
 
     func stream(
