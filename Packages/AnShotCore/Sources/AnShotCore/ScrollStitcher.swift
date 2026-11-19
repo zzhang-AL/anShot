@@ -92,6 +92,12 @@ public enum ScrollStitcher {
         public var joinsInsideOverlap: Bool
         /// 保留全部采纳原图供调用方审计；关闭时只存输出实际需要的像素段。
         public var retainsSourceFrames: Bool
+        /// 未滚出第二段时是否静默兜底输出首帧（交互式长截图开启，纯拼接测试默认关闭以维持既有契约）。
+        public var allowsSingleFrameFallback: Bool
+        /// 探测到静态固定侧边栏时，是否对首帧之外的侧栏延伸区做洁净纯底色延展覆写以消除腰斩重复。
+        public var cleanStaticSidebar: Bool
+        /// 是否探测窗口底部左右圆角并自动归入底帽安全余量，消除接缝黑角。
+        public var detectBottomWindowCorners: Bool
 
         public init(
             stickyHeaderRows: Int = 0,
@@ -104,7 +110,10 @@ public enum ScrollStitcher {
             unusableTopRows: Int = 0,
             unusableBottomRows: Int = 0,
             joinsInsideOverlap: Bool = false,
-            retainsSourceFrames: Bool = false
+            retainsSourceFrames: Bool = false,
+            allowsSingleFrameFallback: Bool = false,
+            cleanStaticSidebar: Bool = false,
+            detectBottomWindowCorners: Bool = false
         ) {
             self.stickyHeaderRows = stickyHeaderRows
             self.duplicateDeltaThreshold = duplicateDeltaThreshold
@@ -117,6 +126,9 @@ public enum ScrollStitcher {
             self.unusableBottomRows = unusableBottomRows
             self.joinsInsideOverlap = joinsInsideOverlap
             self.retainsSourceFrames = retainsSourceFrames
+            self.allowsSingleFrameFallback = allowsSingleFrameFallback
+            self.cleanStaticSidebar = cleanStaticSidebar
+            self.detectBottomWindowCorners = detectBottomWindowCorners
         }
     }
 
@@ -276,5 +288,97 @@ public enum ScrollStitcher {
             data: buffer,
             colorSpace: colorSpace ?? segments.first?.source.colorSpace
         )
+    }
+
+    /// 对静态固定侧边栏在首帧高度之外的延伸区做洁净底色延展，避免左侧栏导航菜单在长图中段被腰斩或反复克隆。
+    ///
+    /// - Parameters:
+    ///   - image: 已合成的整幅长图。
+    ///   - firstFrameHeight: 首帧底端在输出图中的行号（首帧内侧栏完整保留）。
+    ///   - leftWidth: 左侧固定侧边栏宽度（像素），`< 24` 视为无左侧栏。
+    ///   - rightWidth: 右侧固定侧边栏宽度（像素），`< 24` 视为无右侧栏。
+    ///   - bottomFooterRows: 输出底部的全宽固定底栏行数（像素），延展涂刷严格避开该区域以免破坏页脚/输入栏。
+    /// - Returns: 处理后的长图（无需处理时原样返回，零拷贝）。
+    public static func extendSidebarBackground(
+        in image: ScrollshotImage,
+        firstFrameHeight: Int,
+        leftWidth: Int,
+        rightWidth: Int = 0,
+        bottomFooterRows: Int = 0
+    ) -> ScrollshotImage {
+        let width = image.width
+        let height = image.height
+        let footer = max(0, min(bottomFooterRows, height))
+        let fillStartY = max(0, min(height, firstFrameHeight - footer))
+        let fillEndY = max(fillStartY, height - footer)
+        guard fillEndY > fillStartY, fillStartY >= 16 else { return image }
+
+        let effectiveLeft = (leftWidth >= 24 && leftWidth <= width / 2) ? leftWidth : 0
+        let effectiveRight = (rightWidth >= 24 && rightWidth <= width / 2 && effectiveLeft + rightWidth < width - 32) ? rightWidth : 0
+        guard effectiveLeft > 0 || effectiveRight > 0 else { return image }
+
+        var data = image.data
+        let bytesPerRow = width * 4
+
+        /// 采样侧栏底端内缩几行的中位 RGB 作为洁净底色，避开最边缘 1px 描边、文字像素及底部固定栏。
+        func sampleCleanBackground(xStart: Int, xEnd: Int) -> (UInt8, UInt8, UInt8, UInt8) {
+            let safeStart = max(0, xStart + 4)
+            let safeEnd = min(width, xEnd - 4)
+            guard safeStart < safeEnd else { return (255, 255, 255, 255) }
+            let rowStart = max(0, fillStartY - 20)
+            let rowEnd = max(rowStart + 1, fillStartY - 4)
+            var rs: [UInt8] = []
+            var gs: [UInt8] = []
+            var bs: [UInt8] = []
+            let stepX = max(1, (safeEnd - safeStart) / 16)
+            image.withPixels { pixels in
+                for y in stride(from: rowStart, to: rowEnd, by: 2) {
+                    for x in stride(from: safeStart, to: safeEnd, by: stepX) {
+                        let i = y * bytesPerRow + x * 4
+                        rs.append(pixels[i])
+                        gs.append(pixels[i + 1])
+                        bs.append(pixels[i + 2])
+                    }
+                }
+            }
+            guard !rs.isEmpty else { return (255, 255, 255, 255) }
+            rs.sort()
+            gs.sort()
+            bs.sort()
+            let mid = rs.count / 2
+            return (rs[mid], gs[mid], bs[mid], 255)
+        }
+
+        let leftColor = effectiveLeft > 0 ? sampleCleanBackground(xStart: 0, xEnd: effectiveLeft) : nil
+        let rightColor = effectiveRight > 0 ? sampleCleanBackground(xStart: width - effectiveRight, xEnd: width) : nil
+
+        data.withUnsafeMutableBytes { rawOut in
+            guard let out = rawOut.bindMemory(to: UInt8.self).baseAddress else { return }
+            for y in fillStartY..<fillEndY {
+                let rowOffset = y * bytesPerRow
+                if let c = leftColor {
+                    // 保留最右 1px 分隔线不覆写，使侧栏边界在整幅长图中连续笔直。
+                    let fillEnd = max(0, effectiveLeft - 1)
+                    for x in 0..<fillEnd {
+                        let i = rowOffset + x * 4
+                        out[i] = c.0
+                        out[i + 1] = c.1
+                        out[i + 2] = c.2
+                        out[i + 3] = c.3
+                    }
+                }
+                if let c = rightColor {
+                    let fillStart = min(width, width - effectiveRight + 1)
+                    for x in fillStart..<width {
+                        let i = rowOffset + x * 4
+                        out[i] = c.0
+                        out[i + 1] = c.1
+                        out[i + 2] = c.2
+                        out[i + 3] = c.3
+                    }
+                }
+            }
+        }
+        return ScrollshotImage(width: width, height: height, data: data, colorSpace: image.colorSpace) ?? image
     }
 }

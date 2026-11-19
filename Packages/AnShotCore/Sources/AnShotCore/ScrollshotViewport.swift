@@ -190,4 +190,67 @@ public struct ScrollshotViewport: Equatable, Sendable {
         guard movement > 0, movement <= height / 12 else { return nil }
         return min(a.x, b.x)
     }
+
+    /// 探测窗口底部左右圆角（及窗底阴影圆弧）所占的像素高度。
+    ///
+    /// macOS 窗口底部有 10~12pt（20~24px @2x）圆角，直接按满帧高拼接会把圆角底色/桌布黑角
+    /// 带入长图中段接缝。本方法对比滚动前后两帧底部左右 `4...24px` 角区：
+    /// 若角点在两帧间保持静止（不随内容滚动）且与紧邻上方正文内侧存在显著色彩突变（或透明 Alpha），
+    /// 则返回探测到的圆角行高（上限 `24px`），供会话自动归入底帽安全区。
+    public static func detectBottomCornerHeight(
+        previous: ScrollshotImage,
+        next: ScrollshotImage,
+        maxRadius: Int = 24
+    ) -> Int {
+        guard previous.width == next.width,
+              previous.height == next.height,
+              previous.width >= 80,
+              previous.height >= 80 else {
+            return 0
+        }
+        let width = previous.width
+        let height = previous.height
+        let scan = min(maxRadius, min(width / 6, height / 6))
+        guard scan >= 4 else { return 0 }
+
+        return previous.withPixels { p in
+            next.withPixels { n in
+                // 检查左下与右下两个最外角点是否透明或相对内部正文静止突变。
+                let refY = max(0, height - scan - 6)
+                let leftRef = (refY * width + min(width - 1, scan + 4)) * 4
+                let rightRef = (refY * width + max(0, width - scan - 5)) * 4
+
+                func cornerBandRows(isRight: Bool) -> Int {
+                    var rows = 0
+                    for dy in 0..<scan {
+                        let y = height - 1 - dy
+                        let x = isRight ? (width - 1) : 0
+                        let edgeIndex = (y * width + x) * 4
+                        let innerX = isRight ? max(0, width - 1 - scan) : min(width - 1, scan)
+                        let innerIndex = (y * width + innerX) * 4
+                        let refIndex = isRight ? rightRef : leftRef
+
+                        // 透明圆角（含 Alpha < 245）直接归入底角。
+                        let isTransparentCorner = p[edgeIndex + 3] < 245 && n[edgeIndex + 3] < 245
+                        // 不透明截屏下的桌面底角：边缘在两帧间完全静止且与窗口内部/参考背景色差显著。
+                        let staticEdge = difference(p, edgeIndex, n, edgeIndex) <= 6
+                        let contrastsInner = difference(p, edgeIndex, p, innerIndex) >= 24
+                            && difference(p, edgeIndex, p, refIndex) >= 24
+                        if isTransparentCorner || (staticEdge && contrastsInner) {
+                            rows = dy + 1
+                        } else if rows > 0 {
+                            break
+                        }
+                    }
+                    return rows
+                }
+
+                let leftRows = cornerBandRows(isRight: false)
+                let rightRows = cornerBandRows(isRight: true)
+                // 左右两侧均检测到圆角特征才采信，防止单侧恰好有深色按钮或滚动条误触发。
+                guard leftRows >= 4, rightRows >= 4 else { return 0 }
+                return min(scan, max(leftRows, rightRows))
+            }
+        }
+    }
 }

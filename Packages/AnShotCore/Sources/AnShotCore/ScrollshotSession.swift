@@ -292,6 +292,53 @@ public struct ScrollshotSession: Sendable {
     /// 避免「预览高度」与「最终图高度」因为两处计算而分叉。
     private var segments: [Segment] = []
 
+    /// 分段撤销快照（供长截图会话期间 `⌘Z` 撤销上一段拼接）。
+    private struct SegmentUndoSnapshot: Sendable {
+        let segments: [Segment]
+        let coveredWorldStart: Int
+        let coveredWorldEnd: Int
+        let coveredWorldHeight: Int
+        let acceptedFrameCount: Int
+        let observedOffset: Int
+        let lastObserved: ScrollshotImage?
+    }
+
+    private static let maxUndoSnapshots = 32
+    private var undoStack: [SegmentUndoSnapshot] = []
+
+    /// 当前是否可撤销上一段已拼接内容（至少存在一段非首帧扩展）。
+    public var canUndoSegment: Bool { !undoStack.isEmpty }
+
+    /// 自动探测到的左侧/右侧静态固定侧边栏宽度及固定底栏高度（像素）。
+    public private(set) var detectedSidebarLeftWidth = 0
+    public private(set) var detectedSidebarRightWidth = 0
+    private var detectedSidebarFooterRows = 0
+    private var didProbeViewportSidebar = false
+
+    /// 自动探测到的窗口底部圆角高度（像素，用于防接缝黑角）。
+    public private(set) var detectedBottomCornerRows = 0
+    private var didProbeBottomCorners = false
+
+    /// 撤销最近一次被采纳的扩展分段，精准回退世界坐标、段列表与观察基准。
+    ///
+    /// - Returns: 成功回退返回 `true`，若已退回首帧（无可撤销分段）返回 `false`。
+    @discardableResult
+    public mutating func undoLastSegment() -> Bool {
+        guard let snapshot = undoStack.popLast() else { return false }
+        segments = snapshot.segments
+        coveredWorldStart = snapshot.coveredWorldStart
+        coveredWorldEnd = snapshot.coveredWorldEnd
+        coveredWorldHeight = snapshot.coveredWorldHeight
+        acceptedFrameCount = snapshot.acceptedFrameCount
+        observedOffset = snapshot.observedOffset
+        lastObserved = snapshot.lastObserved
+        consecutiveUnresolved = 0
+        if options.retainsSourceFrames, acceptedFrames.count > acceptedFrameCount {
+            acceptedFrames.removeLast(acceptedFrames.count - acceptedFrameCount)
+        }
+        return true
+    }
+
     // MARK: - 吸顶行自动检测的状态
 
     /// 检测扫描的最大行数（帧高的 1/3 与 240 行取小）。
@@ -412,9 +459,9 @@ public struct ScrollshotSession: Sendable {
         var matchSource: VerticalOverlap.Match.Source?
         var alignmentRows: Range<Int>?
         if let previous = lastObserved {
-            // 每次配准前同步最新吸顶与底部忽略行数，确保自动检出的固定栏不污染后续配准。
+            // 每次配准前同步最新吸顶与底部忽略行数，确保自动检出的固定栏与窗口底角不污染后续配准。
             overlapOptions.ignoreTopRows = max(0, effectiveStickyRows)
-            overlapOptions.ignoreBottomRows = max(0, options.unusableBottomRows)
+            overlapOptions.ignoreBottomRows = max(0, effectiveUnusableBottomRows)
             do {
                 let match = try VerticalOverlap.estimate(
                     previous: previous, next: image, options: overlapOptions
@@ -434,10 +481,28 @@ public struct ScrollshotSession: Sendable {
             }
         }
 
-        // 吸顶行检测：用「相邻两帧之间位置不变」这一特征猜出帧顶部的固定行数。
-        // 必须在 `lastObserved` 被本帧覆盖**之前**做；`joinsInsideOverlap` 模式下也用作接缝安全边界参考。
+        // 吸顶行检测与侧栏/窗口底角探测：在 `lastObserved` 被覆盖之前执行。
         if matched, let previous = lastObserved {
             detectStickyRows(previous: previous, next: image, delta: delta)
+            if abs(delta) >= max(8, options.duplicateDeltaThreshold * 3) {
+                if options.cleanStaticSidebar, !didProbeViewportSidebar {
+                    if let viewport = ScrollshotViewport.detect(previous: previous, next: image) {
+                        let left = viewport.x
+                        let right = max(0, image.width - (viewport.x + viewport.width))
+                        detectedSidebarLeftWidth = left >= 24 ? left : 0
+                        detectedSidebarRightWidth = right >= 24 ? right : 0
+                        detectedSidebarFooterRows = max(0, image.height - (viewport.y + viewport.height))
+                        didProbeViewportSidebar = true
+                    }
+                }
+                if options.detectBottomWindowCorners, !didProbeBottomCorners {
+                    detectedBottomCornerRows = ScrollshotViewport.detectBottomCornerHeight(
+                        previous: previous,
+                        next: image
+                    )
+                    didProbeBottomCorners = true
+                }
+            }
         }
 
         // 观察基准与观察偏移**始终成对推进**：它们描述的是同一个帧的位置。
@@ -594,6 +659,20 @@ public struct ScrollshotSession: Sendable {
         // 否则会出现「结论是采纳、却什么都没贴」的不一致——实测就是这么漏掉
         // 用户停手时那最后几十像素的。
         if verdict == .accepted {
+            // 记录扩展前快照以支持会话期间 `⌘Z` 精确分段撤销。
+            undoStack.append(SegmentUndoSnapshot(
+                segments: segments,
+                coveredWorldStart: coveredWorldStart,
+                coveredWorldEnd: coveredWorldEnd,
+                coveredWorldHeight: coveredWorldHeight,
+                acceptedFrameCount: acceptedFrameCount,
+                observedOffset: observedOffset,
+                lastObserved: lastObserved
+            ))
+            if undoStack.count > Self.maxUndoSnapshots {
+                undoStack.removeFirst(undoStack.count - Self.maxUndoSnapshots)
+            }
+
             let allowedRows = max(0, outputHeightLimit - coveredWorldHeight)
             let acceptedRows = min(rows, allowedRows)
             if acceptedRows < rows {
@@ -606,9 +685,9 @@ public struct ScrollshotSession: Sendable {
             // 向上扩展丢远端（更靠上的）。两端一致，用户看到的是「从当前进度往外接」
             // 的连续内容，而不是中间横插一段。
             if options.joinsInsideOverlap {
-                // 静止补帧或弱纹理帧下，结合最近有效正文区间与吸顶/底栏安全边界钳制接缝中点，避免渗入固定栏。
+                // 静止补帧或弱纹理帧下，结合最近有效正文区间与吸顶/底栏/底角安全边界钳制接缝中点，避免渗入固定栏与黑角。
                 let safeTop = max(0, min(image.height - 1, max(effectiveStickyRows, options.unusableTopRows)))
-                let safeBottom = max(safeTop, image.height - max(0, options.unusableBottomRows))
+                let safeBottom = max(safeTop, image.height - max(0, effectiveUnusableBottomRows))
                 let safeFrameRange: Range<Int>
                 if let active = effectiveAlignment {
                     let clampedLower = max(active.lowerBound, safeTop)
@@ -699,6 +778,16 @@ public struct ScrollshotSession: Sendable {
             )
         }
         guard observationCount >= 2 else {
+            if options.allowsSingleFrameFallback {
+                return ScrollStitcher.Result(
+                    image: first,
+                    plan: ScrollStitcher.Plan(
+                        frames: planFrames, seamRows: [], outputWidth: first.width,
+                        outputHeight: first.height, warnings: resultWarnings
+                    ),
+                    failure: nil
+                )
+            }
             return ScrollStitcher.Result(
                 image: nil,
                 plan: ScrollStitcher.Plan(
@@ -714,6 +803,16 @@ public struct ScrollshotSession: Sendable {
         let beyondFirst = segments.filter { $0.inputIndex != 0 }
         let outputHeight = coveredWorldHeight
         guard !beyondFirst.isEmpty, outputHeight > first.height else {
+            if options.allowsSingleFrameFallback {
+                return ScrollStitcher.Result(
+                    image: first,
+                    plan: ScrollStitcher.Plan(
+                        frames: planFrames, seamRows: [], outputWidth: first.width,
+                        outputHeight: first.height, warnings: resultWarnings
+                    ),
+                    failure: nil
+                )
+            }
             return ScrollStitcher.Result(
                 image: nil,
                 plan: ScrollStitcher.Plan(
@@ -730,7 +829,7 @@ public struct ScrollshotSession: Sendable {
         let ordered = segments.sorted { $0.worldStart < $1.worldStart }
         // 第一段从输出第 0 行起铺，后续每段的起始位置减去起点才是真正的段间接缝行号。
         let seamRows = ordered.dropFirst().map { $0.worldStart - coveredWorldStart }
-        let image = ScrollStitcher.compose(
+        let composed = ScrollStitcher.compose(
             segments: ordered.map {
                 (source: $0.frame.image, sourceY: $0.sourceY - $0.imageRowOffset, rows: $0.rows,
                  outputY: $0.worldStart - coveredWorldStart)
@@ -739,6 +838,22 @@ public struct ScrollshotSession: Sendable {
             height: outputHeight,
             colorSpace: first.colorSpace
         )
+        // 若启用静态侧栏净化且成功识别到固定侧边栏，则对首帧以下延伸区做洁净底色延展覆写。
+        let image: ScrollshotImage?
+        if let composed,
+           options.cleanStaticSidebar,
+           (detectedSidebarLeftWidth >= 24 || detectedSidebarRightWidth >= 24) {
+            let firstBottomInOutput = max(0, min(outputHeight, first.height - coveredWorldStart))
+            image = ScrollStitcher.extendSidebarBackground(
+                in: composed,
+                firstFrameHeight: firstBottomInOutput,
+                leftWidth: detectedSidebarLeftWidth,
+                rightWidth: detectedSidebarRightWidth,
+                bottomFooterRows: detectedSidebarFooterRows
+            )
+        } else {
+            image = composed
+        }
         // 尺寸不一致属逐帧告警，但它会让用户看到的长图缺一块，必须在整体告警里也有。
         var planWarnings = resultWarnings
         for decision in decisions where decision.verdict == .sizeMismatch {
@@ -978,9 +1093,14 @@ public struct ScrollshotSession: Sendable {
         return max(declared, options.unusableTopRows)
     }
 
-    /// 向下扩展时可用的最后一行在帧内的位置（帧底部固定元素之下不可用）。
+    /// 实际生效的底部不可用行数（显式指定与自动探测到的窗口底部圆角高度取大）。
+    private var effectiveUnusableBottomRows: Int {
+        max(0, options.unusableBottomRows, options.detectBottomWindowCorners ? detectedBottomCornerRows : 0)
+    }
+
+    /// 向下扩展时可用的最后一行在帧内的位置（帧底部固定元素与底角之下不可用）。
     private var usableFrameBottom: Int {
-        let bottom = max(0, options.unusableBottomRows)
+        let bottom = effectiveUnusableBottomRows
         guard let first = firstImage else { return bottom }
         return min(bottom, max(0, first.height - 1))
     }
