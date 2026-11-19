@@ -79,6 +79,8 @@ final class ColorPickerPanel: NSPanel {
         )
 
         isFloatingPanel = true
+        // 菜单栏常驻应用默认失焦，必须关闭自动隐藏否则弹出后焦点切换会导致面板瞬间消失。
+        hidesOnDeactivate = false
         // 需要键盘输入十六进制，所以不能是「仅必要时才成为 key」。
         becomesKeyOnlyIfNeeded = false
         // 与覆盖层同一层级之上，保证不被遮住。

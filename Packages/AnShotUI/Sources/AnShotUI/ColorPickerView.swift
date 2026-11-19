@@ -48,6 +48,9 @@ final class ColorPickerView: NSView {
 
     /// 颜色变化回调（拖动过程中持续触发）。
     var onChange: ((RGBAColor) -> Void)?
+    /// 连续拖动 SV/色相条开始与结束回调，用于把整段拖动合并成单条撤销快照。
+    var onBeginDrag: (() -> Void)?
+    var onEndDrag: (() -> Void)?
 
     // MARK: - 内部状态
 
@@ -83,11 +86,11 @@ final class ColorPickerView: NSView {
     // MARK: - 布局常量
 
     private let inset: CGFloat = 12
-    private let svSize = CGSize(width: 150, height: 110)
+    private let svSize = CGSize(width: 162, height: 110)
     private let hueBarWidth: CGFloat = 14
     private let hueBarGap: CGFloat = 8
     private let blockGap: CGFloat = 10
-    private let hexFieldSize = CGSize(width: 92, height: 24)
+    private let hexFieldSize = CGSize(width: 88, height: 24)
     private let swatchSize: CGFloat = 12
     private let swatchGap: CGFloat = 3
 
@@ -113,12 +116,13 @@ final class ColorPickerView: NSView {
         )
     }
 
-    /// 色卡网格：两行六列，排在输入框右侧。
+    /// 色卡网格：两行六列，右缘严格与上方色相条右缘（x = 196）齐平。
     private func swatchRect(at index: Int) -> CGRect {
         let columns = 6
         let column = index % columns
         let row = index / columns
-        let startX = hexFieldRect.maxX + 12
+        let gridWidth = CGFloat(columns) * swatchSize + CGFloat(columns - 1) * swatchGap
+        let startX = hueBarRect.maxX - gridWidth
         let startY = hexFieldRect.midY - (swatchSize * 2 + swatchGap) / 2
         return CGRect(
             x: startX + CGFloat(column) * (swatchSize + swatchGap),
@@ -128,7 +132,7 @@ final class ColorPickerView: NSView {
         )
     }
 
-    /// 视图整体尺寸（由父级窗口使用）。
+    /// 视图整体尺寸（左右对称 inset=12，右缘均齐平于 196pt）。
     static let preferredSize = CGSize(width: 208, height: 170)
 
     // MARK: - 子视图
@@ -278,13 +282,12 @@ final class ColorPickerView: NSView {
         }
         context.restoreGState()
 
-        // 指示器：白环 + 深色描边，深浅背景上都看得见。
+        // 指示器：白环 + 深色描边，圆心内收防止极值处（0 或 1）超出取色区边界。
         let hsv = color.hsv
-        let point = CGPoint(
-            x: rect.minX + CGFloat(hsv.saturation) * rect.width,
-            y: rect.minY + (1 - CGFloat(hsv.value)) * rect.height
-        )
-        drawRingIndicator(at: point, radius: 7, in: context)
+        let ringRadius: CGFloat = 6
+        let clampedX = min(max(rect.minX + ringRadius, rect.minX + CGFloat(hsv.saturation) * rect.width), rect.maxX - ringRadius)
+        let clampedY = min(max(rect.minY + ringRadius, rect.minY + (1 - CGFloat(hsv.value)) * rect.height), rect.maxY - ringRadius)
+        drawRingIndicator(at: CGPoint(x: clampedX, y: clampedY), radius: ringRadius, in: context)
     }
 
     private func drawRingIndicator(at point: CGPoint, radius: CGFloat, in context: CGContext) {
@@ -398,12 +401,14 @@ final class ColorPickerView: NSView {
 
         if svRect.contains(point) {
             tracking = .saturationValue
+            onBeginDrag?()
             updateSaturationValue(at: point)
             return
         }
 
         if hueBarRect.insetBy(dx: -6, dy: 0).contains(point) {
             tracking = .hue
+            onBeginDrag?()
             updateHue(at: point)
             return
         }
@@ -425,7 +430,10 @@ final class ColorPickerView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
-        tracking = .none
+        if tracking != .none {
+            tracking = .none
+            onEndDrag?()
+        }
     }
 
     override func mouseMoved(with event: NSEvent) {

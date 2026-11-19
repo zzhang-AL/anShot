@@ -72,6 +72,7 @@ enum SelectionChromeRenderer {
             color: CaptureFrameStyle.selection,
             lineWidth: CaptureFrameStyle.selectionStrokeWidth,
             radii: radii(for: chrome),
+            dash: chrome.isConfirmed ? nil : CaptureFrameStyle.candidateDashPattern,
             in: context
         )
     }

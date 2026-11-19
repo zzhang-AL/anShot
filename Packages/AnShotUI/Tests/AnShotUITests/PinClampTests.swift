@@ -118,4 +118,63 @@ struct PinClampTests {
         #expect(abs(beforeAnchorScreen.x - afterAnchorScreen.x) < 1)
         #expect(abs(beforeAnchorScreen.y - afterAnchorScreen.y) < 1)
     }
+
+    @Test("贴图仅保留 3 个真实卡片按钮、descriptor 报逻辑尺寸且 ⌘+/⌘- 快捷键生效")
+    func pinCardButtonsDescriptorAndZoomShortcuts() throws {
+        _ = NSApplication.shared
+        let context = try #require(CGContext(
+            data: nil,
+            width: 400,
+            height: 200,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        let image = try #require(context.makeImage())
+        let manager = PinManager()
+        guard case .created(let window) = manager.pin(
+            image: image,
+            screenScale: 2,
+            topLeft: CGPoint(x: 300, y: 500)
+        ) else {
+            Issue.record("创建贴图失败")
+            return
+        }
+        defer { manager.closeAll() }
+
+        #expect(window.cardButtons.count == 3, "应仅保留关闭、放大、缩小 3 个真实按钮")
+        #expect(window.descriptor.contains("200×100"), "2x 屏 400×200px 贴图的 descriptor 应显示逻辑尺寸 200×100，实际=\(window.descriptor)")
+
+        let baseWidth = window.frame.width
+        let zoomInEvent = try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: "+",
+            charactersIgnoringModifiers: "+",
+            isARepeat: false,
+            keyCode: 24
+        ))
+        #expect(window.performKeyEquivalent(with: zoomInEvent))
+        #expect(window.frame.width > baseWidth)
+
+        let zoomOutEvent = try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.command],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: "-",
+            charactersIgnoringModifiers: "-",
+            isARepeat: false,
+            keyCode: 27
+        ))
+        #expect(window.performKeyEquivalent(with: zoomOutEvent))
+        #expect(abs(window.frame.width - baseWidth) < 1)
+    }
 }

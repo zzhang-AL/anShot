@@ -293,34 +293,11 @@ final class PinWindow: NSWindow {
     /// 用户主动隐藏（位图仍保留）。
     private(set) var isUserHidden = false
 
-    /// 用户是否已取消固定。
-    ///
-    /// 取消固定**不改变可见性**（用户明确要求「先不隐藏」），它解除的是
-    /// 「这张图我留着」的承诺：位图此刻仍在、仍计入上限，但「关闭」会释放它。
-    /// 因此这个状态直接决定下次点 ✕ 会不会销毁位图。
-    private(set) var isUnpinned = false
-
     private let imageView: PinImageView
 
-    /// 卡片右上角的一排控制按钮。
+    /// 卡片右上角的一排控制按钮（从右到左：`✕` 关闭释放、`＋` 放大、`－` 缩小）。
     ///
-    /// **图钉**：切换「固定 / 取消固定」，**不改变可见性**。取消固定解除的是
-    /// 「这张图我留着」的承诺：位图此刻仍在、仍计入上限，但此后的「关闭」会释放它。
-    /// **✕**：固定中只**隐藏**（位图保留，菜单栏可恢复）；已取消固定才
-    /// **隐藏并释放**。
-    /// **＋ / －**：放大 / 缩小（每次 10%，等比）。
-    ///
-    /// 缩放为什么必须有按钮，而不能只靠滚轮：滚动事件能否到达本窗口取决于系统把
-    /// 它投给谁，而按钮点击在本项目里已经验证过（含「首次点击即生效」）。把「能不
-    /// 能放大」系在一件自己无法保证的事上，正是用户觉得「不能缩放」的那类根源。
-    ///
-    /// 不是 `private`：诊断直接点它们（`performClick`），这是唯一能区分
-    /// 「两个按钮接的是不是同一个动作」的办法——看外观分不出来。
-    private(set) var pinButton = PinCardButton.make(
-        symbol: "pin.fill",
-        fallbackTitle: "取消固定",
-        toolTip: pinButtonTipWhenPinned
-    )
+    /// 隐藏但保留位图请使用 `⌘H`、右键「隐藏贴图」或菜单栏勾选态，避免无实效的二次确认开关干扰。
     private(set) var closeButton = PinCardButton.make(
         symbol: "xmark",
         fallbackTitle: "关闭",
@@ -409,7 +386,7 @@ final class PinWindow: NSWindow {
 
     // MARK: - 卡片按钮
 
-    /// 把「取消固定」与「关闭」装到卡片右上角。
+    /// 把关闭与缩放按钮装到卡片右上角。
     ///
     /// 为什么不新加一层容器视图：`contentView` **必须**是 `PinImageView`
     /// 才吃得到那套拖动修复（见文件头），另加容器会让图像不再铺满内容视图，
@@ -420,8 +397,6 @@ final class PinWindow: NSWindow {
             button.autoresizingMask = [.minXMargin, .minYMargin]
             imageView.addSubview(button)
         }
-        pinButton.target = self
-        pinButton.action = #selector(togglePinFromCard)
         closeButton.target = self
         closeButton.action = #selector(closeFromCard)
         plusButton.target = self
@@ -429,35 +404,13 @@ final class PinWindow: NSWindow {
         minusButton.target = self
         minusButton.action = #selector(zoomOutFromCard)
         layoutCardButtons()
-        // 初始文案与状态同源：不在这里刷一次，就会出现「初始文字与切换后文字」
-        // 两套写法，而它们必须逐字一致。
         refreshCardButtons()
     }
 
-    /// 卡片上的四个按钮（依序：图钉、关闭、放大、缩小）。
-    ///
-    /// 布局、安装与「全部落在卡片内」的检查都遍历它：以后再添/删按钮时
-    /// 只需改这一处，不会漏掉某个环节。
-    var cardButtons: [PinCardButton] { [pinButton, closeButton, plusButton, minusButton] }
+    /// 卡片上的三个按钮（依序：关闭、放大、缩小）。
+    var cardButtons: [PinCardButton] { [closeButton, plusButton, minusButton] }
 
-    /// 按固定状态刷新图标与说明。
-    ///
-    /// 图钉必须一眼看得出「这张卡片现在还固定着吗」：它不仅决定下一次点 ✕ 会
-    /// 不会释放内存，也是用户唯一的判断依据；✕ 的说明也要跟着改。
     private func refreshCardButtons() {
-        if isUnpinned {
-            pinButton.setSymbol(
-                "pin.slash",
-                fallbackTitle: "重新固定",
-                toolTip: pinButtonTipWhenUnpinned
-            )
-        } else {
-            pinButton.setSymbol(
-                "pin.fill",
-                fallbackTitle: "取消固定",
-                toolTip: pinButtonTipWhenPinned
-            )
-        }
         closeButton.setSymbol(
             "xmark",
             fallbackTitle: "关闭",
@@ -482,17 +435,17 @@ final class PinWindow: NSWindow {
         }
     }
 
-    /// 一种按钮排布。`rows == 1` 时四个按钮横排（从右到左：✕、图钉、＋、－）；
-    /// `rows == 2` 时出口在上排、缩放在下排。
+    /// 一种按钮排布。`rows == 1` 时三个按钮横排（从右到左：✕、＋、－）；
+    /// `rows == 2` 时关闭在上排、缩放在下排。
     private struct ButtonArrangement {
         let side: CGFloat
         let spacing: CGFloat
         let inset: CGFloat
         let rows: Int
 
-        /// 四个按钮按这个排布共需多大（含贴边距）。
+        /// 三个按钮按这个排布共需多大（含贴边距）。
         var requiredSize: CGSize {
-            let columns = rows == 1 ? 4 : 2
+            let columns = rows == 1 ? 3 : 2
             return CGSize(
                 width: CGFloat(columns) * side + CGFloat(columns - 1) * spacing + inset,
                 height: CGFloat(rows) * side + CGFloat(rows - 1) * spacing + inset
@@ -547,10 +500,9 @@ final class PinWindow: NSWindow {
         }
 
         closeButton.frame = square(closeX, topY)
-        pinButton.frame = square(closeX - (spacing + side), topY)
         if arrangement.rows == 1 {
-            plusButton.frame = square(closeX - 2 * (spacing + side), topY)
-            minusButton.frame = square(closeX - 3 * (spacing + side), topY)
+            plusButton.frame = square(closeX - (spacing + side), topY)
+            minusButton.frame = square(closeX - 2 * (spacing + side), topY)
         } else {
             let secondY = topY - (spacing + side)
             plusButton.frame = square(closeX, secondY)
@@ -601,7 +553,10 @@ final class PinWindow: NSWindow {
     /// 菜单里写像素值会与眼睛看到的不一致（2x 屏上差一倍）。
     var descriptor: String {
         let time = DateFormatter.pinTime.string(from: createdAt)
-        return "#\(pinID) · \(Int(pixelSize.width))×\(Int(pixelSize.height)) · \(time)"
+        let safeScale = max(1, screenScale)
+        let logicalWidth = Int((pixelSize.width / safeScale).rounded())
+        let logicalHeight = Int((pixelSize.height / safeScale).rounded())
+        return "#\(pinID) · \(logicalWidth)×\(logicalHeight) · \(time)"
     }
 
     /// 菜单项缩略图。
@@ -834,6 +789,12 @@ final class PinWindow: NSWindow {
             case "0":
                 resetScale()
                 return true
+            case "+", "=":
+                zoomInFromCard()
+                return true
+            case "-":
+                zoomOutFromCard()
+                return true
             default:
                 break
             }
@@ -949,14 +910,6 @@ final class PinWindow: NSWindow {
         return menu
     }
 
-    /// 图钉：切换固定状态。
-    @objc private func togglePinFromCard() {
-        isUnpinned.toggle()
-        refreshCardButtons()
-        let state = isUnpinned ? "unpinned" : "pinned"
-        logger.notice("pin #\(self.pinID, privacy: .public) \(state, privacy: .public) from card")
-    }
-
     /// 右上角 `✕` 回归直觉语义：直接关闭并释放位图与配额。
     @objc private func closeFromCard() {
         performClose(from: "card button")
@@ -970,7 +923,7 @@ final class PinWindow: NSWindow {
 
     @objc private func copyPinImage() {
         guard let image = contentImage else { return }
-        let ok = SessionExporter.copyToPasteboard(image)
+        let ok = SessionExporter.copyToPasteboard(image, backingScale: screenScale)
         ToastPresenter.show(ok ? "已复制到剪贴板" : "复制失败")
     }
 
@@ -982,7 +935,7 @@ final class PinWindow: NSWindow {
         panel.nameFieldStringValue = "anShot-pin-\(pinID).png"
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        guard let data = Exporter.pngData(from: image) else {
+        guard let data = Exporter.pngData(from: image, backingScale: screenScale) else {
             ToastPresenter.show("保存失败：无法编码图像")
             return
         }
@@ -1044,15 +997,11 @@ final class PinWindow: NSWindow {
     }
 
     /// 关闭并**释放位图**。这是释放位图的唯一实现。
-    ///
-    /// 两个调用点：卡片上的 ✕（只在**已取消固定**时走这里）、菜单栏「全部关闭」
-    /// （带确认框，一次释放全部）。
     func closeAndRelease() {
         // 先置空位图：即使后续 AppKit 侧出现异常，内存也已经交还。
         contentImage = nil
         imageView.image = nil
         isUserHidden = false
-        isUnpinned = false
         orderOut(nil)
         close()
         onClose?()
@@ -1060,12 +1009,6 @@ final class PinWindow: NSWindow {
 }
 
 // MARK: - 卡片文案
-
-/// 取消固定提示文案。
-private let pinButtonTipWhenPinned = "取消固定（切换固定标记）"
-
-/// 重新固定提示文案。
-private let pinButtonTipWhenUnpinned = "重新固定"
 
 /// 直接关闭按钮提示文案：点击立即关闭贴图并释放配额。
 private let closeButtonTipDirect = "关闭贴图（释放内存与配额；右键可隐藏）"

@@ -114,6 +114,7 @@ final class OverlayView: NSView {
 
     /// 主动释放底图与合成缓存（用于进入长截图或会话结束时快速降低内存峰值）。
     func releaseBackdropMemory() {
+        detectionSession?.cancelPendingControlLookup()
         backdrop = nil
         composedCache = nil
         loupeView.isHidden = true
@@ -755,21 +756,42 @@ final class OverlayView: NSView {
         let size = toolbar.toolbarSize
         let gap: CGFloat = 8
         let safeInsets = effectiveSafeAreaInsets
+        let layoutBounds = toolbarLayoutBounds
         let origin: CGPoint
         if let customToolbarOrigin {
-            origin = clampedToolbarOrigin(customToolbarOrigin, size: size, gap: gap, safeInsets: safeInsets)
+            origin = clampedToolbarOrigin(
+                customToolbarOrigin,
+                size: size,
+                gap: gap,
+                safeInsets: safeInsets,
+                in: layoutBounds
+            )
             self.customToolbarOrigin = origin
         } else {
             origin = AnnotationToolbarLayout.toolbarOrigin(
                 selection: selection,
                 toolbarSize: size,
                 labelReserve: decoration.labelHeight + gap,
-                viewBounds: bounds,
+                viewBounds: layoutBounds,
                 gap: gap,
                 safeInsets: safeInsets
             )
         }
         toolbar.frame = CGRect(origin: origin, size: size)
+    }
+
+    /// 工具栏布局与钳制所参考的可见视口范围。
+    ///
+    /// 全屏覆盖层下直接等于 `bounds`；在独立图片/长截图可滚动编辑窗口内等于当前滚到的可视区，
+    /// 确保滚动查看超长图时工具栏始终停留在可见区域内。
+    private var toolbarLayoutBounds: CGRect {
+        if let scrollView = enclosingScrollView {
+            let visible = scrollView.documentVisibleRect.intersection(bounds)
+            if !visible.isNull && visible.width > 0 && visible.height > 0 {
+                return visible
+            }
+        }
+        return bounds
     }
 
     /// 计算当前窗口与屏幕物理刘海/菜单栏相交时的安全边距。
@@ -784,12 +806,13 @@ final class OverlayView: NSView {
         _ origin: CGPoint,
         size: CGSize,
         gap: CGFloat,
-        safeInsets: NSEdgeInsets
+        safeInsets: NSEdgeInsets,
+        in container: CGRect
     ) -> CGPoint {
-        let minX = max(gap, safeInsets.left + gap)
-        let maxX = max(minX, bounds.width - max(gap, safeInsets.right + gap) - size.width)
-        let minY = max(gap, safeInsets.top + gap)
-        let maxY = max(minY, bounds.height - max(gap, safeInsets.bottom + gap) - size.height)
+        let minX = container.minX + max(gap, safeInsets.left + gap)
+        let maxX = max(minX, container.maxX - max(gap, safeInsets.right + gap) - size.width)
+        let minY = container.minY + max(gap, safeInsets.top + gap)
+        let maxY = max(minY, container.maxY - max(gap, safeInsets.bottom + gap) - size.height)
         return CGPoint(
             x: min(max(minX, origin.x), maxX),
             y: min(max(minY, origin.y), maxY)
@@ -804,7 +827,13 @@ final class OverlayView: NSView {
             x: toolbar.frame.origin.x + delta.width,
             y: toolbar.frame.origin.y + delta.height
         )
-        let clamped = clampedToolbarOrigin(proposed, size: toolbar.frame.size, gap: 8, safeInsets: safeInsets)
+        let clamped = clampedToolbarOrigin(
+            proposed,
+            size: toolbar.frame.size,
+            gap: 8,
+            safeInsets: safeInsets,
+            in: toolbarLayoutBounds
+        )
         customToolbarOrigin = clamped
         toolbar.frame.origin = clamped
     }
@@ -1006,7 +1035,7 @@ final class OverlayView: NSView {
         context.saveGState()
         context.translateBy(x: 0, y: bounds.height)
         context.scaleBy(x: 1, y: -1)
-        context.interpolationQuality = .none
+        context.interpolationQuality = backdropInterpolationQuality
         context.draw(
             image,
             in: CGRect(
@@ -1027,18 +1056,19 @@ final class OverlayView: NSView {
     /// 那样选中文字时看不到任何框。
     private func drawAnnotationSelection(in context: CGContext) {
         guard let annotation = editorState?.selectedAnnotation else { return }
-        guard backdrop != nil, bounds.width > 0 else { return }
-        let scale = backdropScale
-        guard scale > 0 else { return }
+        guard backdrop != nil, bounds.width > 0, bounds.height > 0 else { return }
+        let sx = backdropScaleX
+        let sy = backdropScaleY
+        guard sx > 0, sy > 0 else { return }
 
         let pixelRect = annotation.hitBoundingRect
         // 外扩几像素：虚线贴着内容边缘会被笔画本身挡住，
         // 看起来像「框只画了一半」；这是纯装饰量，不影响命中。
         let rect = CGRect(
-            x: CGFloat(pixelRect.origin.x) / scale,
-            y: CGFloat(pixelRect.origin.y) / scale,
-            width: CGFloat(pixelRect.size.width) / scale,
-            height: CGFloat(pixelRect.size.height) / scale
+            x: CGFloat(pixelRect.origin.x) / sx,
+            y: CGFloat(pixelRect.origin.y) / sy,
+            width: CGFloat(pixelRect.size.width) / sx,
+            height: CGFloat(pixelRect.size.height) / sy
         ).insetBy(dx: -3, dy: -3)
 
         context.saveGState()
@@ -1053,7 +1083,7 @@ final class OverlayView: NSView {
         // 绘制指针二次编辑几何控制手柄。
         let handles = AnnotationEditorState.controlHandles(for: annotation)
         for item in handles {
-            let viewPoint = CGPoint(x: item.point.x / scale, y: item.point.y / scale)
+            let viewPoint = CGPoint(x: item.point.x / sx, y: item.point.y / sy)
             let radius: CGFloat = 4
             let handleRect = CGRect(
                 x: viewPoint.x - radius,
@@ -1074,19 +1104,29 @@ final class OverlayView: NSView {
 
     /// 命中选中标注的几何控制手柄（视图逻辑点坐标）。
     private func annotationControlHandle(at point: CGPoint) -> AnnotationControlHandle? {
-        guard let annotation = editorState?.selectedAnnotation else { return nil }
-        let scale = backdropScale
-        guard scale > 0 else { return nil }
+        guard let annotation = editorState?.selectedAnnotation, backdrop != nil,
+              bounds.width > 0, bounds.height > 0 else { return nil }
+        let sx = backdropScaleX
+        let sy = backdropScaleY
+        guard sx > 0, sy > 0 else { return nil }
         let handles = AnnotationEditorState.controlHandles(for: annotation)
         var best: (handle: AnnotationControlHandle, dist: CGFloat)?
         for item in handles {
-            let center = CGPoint(x: item.point.x / scale, y: item.point.y / scale)
+            let center = CGPoint(x: item.point.x / sx, y: item.point.y / sy)
             let dist = hypot(point.x - center.x, point.y - center.y)
             guard dist <= 8 else { continue }
             if let current = best, dist >= current.dist { continue }
             best = (item.handle, dist)
         }
         return best?.handle
+    }
+
+    /// 底图缩放预览时启用 `.high` 抗锯齿插值；1:1 像素映射时关闭插值保锐利。
+    private var backdropInterpolationQuality: CGInterpolationQuality {
+        let displayScale = window?.backingScaleFactor ?? scaleFactor
+        let diffX = abs(backdropScaleX - displayScale)
+        let diffY = abs(backdropScaleY - displayScale)
+        return (diffX > 0.01 || diffY > 0.01) ? .high : .none
     }
 
     private func drawBackdrop(in context: CGContext) {
@@ -1102,9 +1142,7 @@ final class OverlayView: NSView {
         // 临时翻回左下原点绘制，否则底图上下颠倒。
         context.translateBy(x: 0, y: bounds.height)
         context.scaleBy(x: 1, y: -1)
-        // 底图与视图尺寸相同（都是该显示器的逻辑点尺寸），
-        // 且 CGContext 已带 backing scale 变换，故为 1:1 像素映射，不做重采样。
-        context.interpolationQuality = .none
+        context.interpolationQuality = backdropInterpolationQuality
         context.draw(backdrop, in: CGRect(origin: .zero, size: bounds.size))
         context.restoreGState()
     }
@@ -1180,6 +1218,7 @@ final class OverlayView: NSView {
 
     override func mouseExited(with event: NSEvent) {
         loupeView.isHidden = true
+        detectionSession?.cancelPendingControlLookup()
         super.mouseExited(with: event)
     }
 
@@ -1293,23 +1332,35 @@ final class OverlayView: NSView {
         return true
     }
 
-    /// 按当前鼠标位置更新识别结果。
+    /// 按当前鼠标位置更新识别结果（两阶段异步：先瞬时命中窗口，再去抖后台查询精细控件，彻底解除主线程 AX 阻塞）。
     private func updateDetection(at viewPoint: CGPoint) {
         guard isDetectionAllowed, let session = detectionSession else { return }
         // 画标注时选区是画布，不该被识别抢走。
         if let editorState, editorState.tool.isDrawingTool {
+            session.cancelPendingControlLookup()
             return
         }
 
         let globalPoint = globalScreenPoint(fromViewPoint: viewPoint)
-        guard let target = session.target(
+        let preference = detectionPreference
+        if let immediate = session.immediateTarget(
             atGlobalPoint: globalPoint,
-            preference: detectionPreference
-        ) else {
-            return
+            preference: preference
+        ) {
+            applyDetectionTarget(immediate)
         }
-
-        applyDetectionTarget(target)
+        session.scheduleControlTarget(
+            atGlobalPoint: globalPoint,
+            preference: preference
+        ) { [weak self] controlTarget in
+            guard let self,
+                  self.isDetectionAllowed,
+                  self.editorState?.tool.isDrawingTool != true,
+                  let controlTarget else {
+                return
+            }
+            self.applyDetectionTarget(controlTarget)
+        }
     }
 
     /// 视图坐标（左上原点）→ 全局屏幕坐标（左上原点）。
@@ -1488,13 +1539,22 @@ final class OverlayView: NSView {
 
     // MARK: - 坐标换算
 
+    private var backdropScaleX: CGFloat {
+        guard let backdrop, bounds.width > 0 else { return 1 }
+        return CGFloat(backdrop.width) / bounds.width
+    }
+
+    private var backdropScaleY: CGFloat {
+        guard let backdrop, bounds.height > 0 else { return 1 }
+        return CGFloat(backdrop.height) / bounds.height
+    }
+
     /// 底图像素 / 视图逻辑点的比例。
     ///
     /// 视图用逻辑点、模型用像素，所有跨边界的换算都必须走这一处，
     /// 否则字号、笔刷半径、行高这些「既出现在界面又写进模型」的值会各算各的。
     private var backdropScale: CGFloat {
-        guard let backdrop, bounds.width > 0 else { return 1 }
-        return CGFloat(backdrop.width) / bounds.width
+        backdropScaleX
     }
 
     /// 底图像素 ÷ 视图逻辑点。**会话外的换算必须用它**，不要另查显示器比例。
@@ -1528,37 +1588,37 @@ final class OverlayView: NSView {
     /// 带上标注：与导出保持「所见即所得」。尤其是马赛克——用户打码的内容
     /// 不应被识别出来，更不应在选用云端识别时被发出去。
     func recognitionImage(for logicalRect: CGRect) -> CGImage? {
-        guard let backdrop else { return nil }
+        guard let backdrop, let pixelSelection = pixelSelection(from: logicalRect) else { return nil }
         return Exporter.compose(
             backdrop: backdrop,
-            selection: CoordinateConversion.pixelRect(fromLogical: logicalRect, scaleFactor: pixelsPerPoint),
+            selection: pixelSelection,
             annotations: editorState?.annotations ?? []
         )
     }
 
-    /// 视图逻辑点 → 底图像素。
-    private func pixelPoint(from viewPoint: CGPoint) -> PixelPoint {
-        let scale = Double(backdropScale)
-        return PixelPoint(
-            x: Double(viewPoint.x) * scale,
-            y: Double(viewPoint.y) * scale
+    /// 视图逻辑点 → 底图像素（双轴独立映射，消除极端比例缩放下的累计偏差）。
+    func pixelPoint(from viewPoint: CGPoint) -> PixelPoint {
+        PixelPoint(
+            x: Double(viewPoint.x) * Double(backdropScaleX),
+            y: Double(viewPoint.y) * Double(backdropScaleY)
         )
     }
 
     /// 视图逻辑矩形 → 底图像素矩形。
-    private func pixelSelection(from selection: CGRect) -> PixelRect? {
-        guard backdrop != nil, bounds.width > 0 else {
+    func pixelSelection(from selection: CGRect) -> PixelRect? {
+        guard backdrop != nil, bounds.width > 0, bounds.height > 0 else {
             return nil
         }
-        let scale = Double(backdropScale)
+        let sx = Double(backdropScaleX)
+        let sy = Double(backdropScaleY)
         return PixelRect(
             origin: PixelPoint(
-                x: Double(selection.minX) * scale,
-                y: Double(selection.minY) * scale
+                x: Double(selection.minX) * sx,
+                y: Double(selection.minY) * sy
             ),
             size: PixelSize(
-                width: Double(selection.width) * scale,
-                height: Double(selection.height) * scale
+                width: Double(selection.width) * sx,
+                height: Double(selection.height) * sy
             )
         )
     }
@@ -1877,6 +1937,9 @@ final class OverlayView: NSView {
         // 准备阶段（面板已弹出）：截图侧的一切交互暂停。
         // 否则用户能一边看着面板里的「区域」预览框，一边把截图选区拖到别处。
         if isRecordSetupActive { return }
+
+        // 按下即取消挂起的后台 AX 控件查询，防止滞后结果覆写用户开始拖拽的选区。
+        detectionSession?.cancelPendingControlLookup()
 
         // 点工具栏是设置操作，不应顺手把刚输入的文字提交掉。
         // 正常情况下工具栏作为子视图先拿到事件，这里只是兜底。
@@ -2363,13 +2426,13 @@ final class OverlayView: NSView {
         }
         #endif
 
-        // 候选态按裸键 C：复制当前光标像素 HEX 色号并弹轻提示。
+        // 候选态按 C 复制 #HEX，按 ⇧C 复制 RGB(r, g, b)。
         if !isSelectionConfirmed,
            !event.modifierFlags.contains(.command),
            !event.modifierFlags.contains(.control),
            !event.modifierFlags.contains(.option),
            event.charactersIgnoringModifiers?.lowercased() == "c" {
-            copyColorUnderPointer()
+            copyColorUnderPointer(asRGB: event.modifierFlags.contains(.shift))
             return
         }
 
@@ -2388,8 +2451,8 @@ final class OverlayView: NSView {
         performCommand(command)
     }
 
-    /// 候选态取色：复制当前光标下像素的 #RRGGBB 色号到剪贴板并弹 Toast。
-    private func copyColorUnderPointer() {
+    /// 候选态取色：复制当前光标下像素的 `#RRGGBB` 或 `RGB(r, g, b)` 色值到剪贴板并弹 Toast。
+    private func copyColorUnderPointer(asRGB: Bool = false) {
         let sample: LoupeSample?
         if let cached = lastLoupeSample {
             sample = cached
@@ -2404,10 +2467,11 @@ final class OverlayView: NSView {
             NSSound.beep()
             return
         }
+        let text = asRGB ? sample.rgbText : sample.hexString
         NSPasteboard.general.clearContents()
-        let ok = NSPasteboard.general.setString(sample.hexString, forType: .string)
+        let ok = NSPasteboard.general.setString(text, forType: .string)
         if ok {
-            ToastPresenter.show("已复制色号 \(sample.hexString)", on: window?.screen)
+            ToastPresenter.show("已复制色值 \(text)", on: window?.screen)
         } else {
             NSSound.beep()
         }
@@ -2537,12 +2601,15 @@ final class OverlayWindow: NSPanel, NSWindowDelegate {
     ///
     /// 与截图覆盖层共用同一套 `OverlayView`（选区、标注、工具栏、导出），
     /// 区别只在窗口尺寸与层级：这里不是铺满一块屏，而是围着图片本身；
-    /// 层级用 `.floating` 而不是 `.screenSaver`，否则编辑一张图会盖住菜单栏，
-    /// 用户连「另存为」面板都可能被自己挡住。
-    init(imageFrame: NSRect, displayID: CGDirectDisplayID) {
+    /// 通过居中 `NSScrollView` 承载严格等比的 `OverlayView`，既避免小图被单边拉扁，
+    /// 又让超长截图可以按 1:1 清晰度滚轮浏览与精准标注。
+    private var scrollBoundsObserver: NSObjectProtocol?
+
+    init(imageFrame: NSRect, canvasSize: CGSize? = nil, displayID: CGDirectDisplayID) {
         self.displayID = displayID
+        let effectiveCanvasSize = canvasSize ?? imageFrame.size
         self.overlayView = OverlayView(
-            frame: NSRect(origin: .zero, size: imageFrame.size),
+            frame: NSRect(origin: .zero, size: effectiveCanvasSize),
             displayID: displayID
         )
 
@@ -2550,14 +2617,14 @@ final class OverlayWindow: NSPanel, NSWindowDelegate {
             contentRect: imageFrame,
             // 图片编辑器需要可见的关闭按钮：它不像截图覆盖层那样按 ESC 就走，
             // 用户可能在这里停留很久。标题栏同时给出「这是一张图」的身份。
-            styleMask: [.titled, .closable, .nonactivatingPanel],
+            styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
 
         title = "编辑图片"
         isOpaque = true
-        backgroundColor = .black
+        backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 1)
         level = .floating
         hasShadow = true
         hidesOnDeactivate = false
@@ -2567,12 +2634,43 @@ final class OverlayWindow: NSPanel, NSWindowDelegate {
         sharingType = .readOnly
         ignoresMouseEvents = false
         acceptsMouseMovedEvents = true
-        isMovableByWindowBackground = true
-        contentMinSize = imageFrame.size
-        contentMaxSize = imageFrame.size
+        isMovableByWindowBackground = false
+        contentMinSize = CGSize(
+            width: min(360, imageFrame.width),
+            height: min(240, imageFrame.height)
+        )
         collectionBehavior = [.fullScreenAuxiliary, .stationary]
         delegate = self
-        contentView = overlayView
+
+        let scrollView = NSScrollView(frame: NSRect(origin: .zero, size: imageFrame.size))
+        scrollView.autoresizingMask = [.width, .height]
+        scrollView.drawsBackground = true
+        scrollView.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 1)
+        scrollView.hasVerticalScroller = effectiveCanvasSize.height > imageFrame.height + 1
+        scrollView.hasHorizontalScroller = effectiveCanvasSize.width > imageFrame.width + 1
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+
+        let clipView = CenteredClipView(frame: scrollView.bounds)
+        clipView.drawsBackground = true
+        clipView.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 1)
+        clipView.postsBoundsChangedNotifications = true
+        scrollView.contentView = clipView
+        scrollView.documentView = overlayView
+        // 初始定位到顶部，超长截图打开后从最上方开始阅读与标注。
+        overlayView.scroll(.zero)
+
+        scrollBoundsObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: clipView,
+            queue: .main
+        ) { [weak overlayView] _ in
+            MainActor.assumeIsolated {
+                overlayView?.refreshToolbar()
+            }
+        }
+
+        contentView = scrollView
     }
 
     init(screen: NSScreen, displayID: CGDirectDisplayID) {
@@ -2650,7 +2748,31 @@ final class OverlayWindow: NSPanel, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        if let observer = scrollBoundsObserver {
+            NotificationCenter.default.removeObserver(observer)
+            scrollBoundsObserver = nil
+        }
         onWindowWillClose?()
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        overlayView.refreshToolbar()
+    }
+}
+
+/// 当文档视图尺寸小于滚动视口时自动居中的 `NSClipView`（用于独立图片编辑窗口展示小图不拉伸）。
+private final class CenteredClipView: NSClipView {
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
+        var constrained = super.constrainBoundsRect(proposedBounds)
+        guard let documentView else { return constrained }
+        let docFrame = documentView.frame
+        if constrained.width > docFrame.width {
+            constrained.origin.x = -((constrained.width - docFrame.width) / 2).rounded()
+        }
+        if constrained.height > docFrame.height {
+            constrained.origin.y = -((constrained.height - docFrame.height) / 2).rounded()
+        }
+        return constrained
     }
 }
 

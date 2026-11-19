@@ -387,7 +387,7 @@ final class OCRResultPanel: NSObject, NSWindowDelegate {
     ///
     /// 未翻译的行显示**原文**而不是留空：契约要求单行失败不影响整体，
     /// 界面上就该表现为「这段里夹着几句原文」，而不是凭空少了几行。
-    func showTranslation(_ result: TranslationResult) {
+    func showTranslation(_ result: TranslationResult, diagnosticMessage: String? = nil) {
         translationResult = result
         modeControl.setEnabled(true, forSegment: DisplayMode.translation.rawValue)
         modeControl.setEnabled(true, forSegment: DisplayMode.bilingual.rawValue)
@@ -395,10 +395,19 @@ final class OCRResultPanel: NSObject, NSWindowDelegate {
         modeControl.selectedSegment = DisplayMode.translation.rawValue
         refreshDisplayedText()
 
+        let detail = diagnosticMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
         if result.isEntirelyUntranslated {
-            statusLabel.stringValue = "翻译不可用，已保留原文"
+            if let detail, !detail.isEmpty {
+                statusLabel.stringValue = "翻译失败：\(detail)"
+            } else {
+                statusLabel.stringValue = "翻译不可用，已保留原文"
+            }
         } else if result.isPartiallyTranslated {
-            statusLabel.stringValue = "已翻译 \(result.translatedCount)/\(result.segments.count) 行 · 未翻译的行保留原文"
+            if let detail, !detail.isEmpty {
+                statusLabel.stringValue = "已翻译 \(result.translatedCount)/\(result.segments.count) 行（\(detail)）"
+            } else {
+                statusLabel.stringValue = "已翻译 \(result.translatedCount)/\(result.segments.count) 行 · 未翻译的行保留原文"
+            }
         } else {
             statusLabel.stringValue = "已翻译 \(result.translatedCount) 行"
         }

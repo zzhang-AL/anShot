@@ -50,12 +50,12 @@ enum SettingsPage: String, CaseIterable {
     /// 页面右上角的说明。
     var subtitle: String {
         switch self {
-        case .general: return "截图快捷键与启动方式。改动立即生效。"
-        case .save: return "截图保存到哪里。改动立即生效。"
-        case .pin: return "固定截图保留多少张，以及怎么一键收起。改动立即生效。"
-        case .recognition: return "用什么识别图片里的文字。改动立即生效。"
-        case .translation: return "把识别出的文字翻译成其他语言。改动立即生效。"
-        case .about: return "版本、更新与诊断。改动立即生效。"
+        case .general: return "管理全局快捷键与登录启动方式"
+        case .save: return "设置截图保存位置与输出行为"
+        case .pin: return "配置固定截图的数量上限与隐显快捷键"
+        case .recognition: return "选择本地或云端文字识别引擎"
+        case .translation: return "配置系统翻译与云端翻译模型"
+        case .about: return "查看应用版本、更新与诊断信息"
         }
     }
 }
@@ -134,6 +134,14 @@ enum SettingsMainMenu {
         editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editMenuItem.submenu = editMenu
         mainMenu.addItem(editMenuItem)
+
+        // 窗口菜单：提供全局标准 ⌘W 关闭当前窗口通道，避免欢迎页/历史预览/日志等独立窗失灵。
+        let windowMenuItem = NSMenuItem(title: "窗口", action: nil, keyEquivalent: "")
+        let windowMenu = NSMenu(title: "窗口")
+        windowMenu.addItem(withTitle: "关闭窗口", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenuItem.submenu = windowMenu
+        mainMenu.addItem(windowMenuItem)
 
         return mainMenu
     }

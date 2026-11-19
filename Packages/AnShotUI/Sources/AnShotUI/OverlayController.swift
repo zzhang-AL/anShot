@@ -62,6 +62,9 @@ public final class OverlayController {
     /// 图片编辑会话的来源。普通截图会话为 nil。
     private var documentSource: HistorySource?
 
+    /// 独立图片编辑会话绑定的物理缩放系数（用于导出与剪贴板写入 Retina DPI）。
+    private var sessionBackingScale: CGFloat?
+
     /// 正在后台抓取一个窗口。防止连点菜单叠出多个会话。
     private var pendingWindowCapture = false
 
@@ -126,7 +129,10 @@ public final class OverlayController {
     ///
     /// 已在展示时重复调用会被忽略（热键抖动、菜单与热键同时触发都可能发生），
     /// 而不是重入或叠加会话。
-    public func present(intent: OverlaySessionIntent = .capture) {
+    public func present(
+        intent: OverlaySessionIntent = .capture,
+        delayNanoseconds: UInt64 = 0
+    ) {
         guard !isPresenting else {
             logger.debug("present ignored: a session is already presenting")
             return
@@ -137,8 +143,79 @@ public final class OverlayController {
         isPresenting = true
         onSessionStateChanged?()
         sessionTask = Task { @MainActor [weak self] in
+            if delayNanoseconds > 0 {
+                try? await Task.sleep(nanoseconds: delayNanoseconds)
+                guard let self, self.sessionID == sessionID, !Task.isCancelled else { return }
+            }
             await self?.runSession(id: sessionID)
         }
+    }
+
+    /// 独立图片编辑窗口的布局计算结果：窗口可视区尺寸与严格等比的文档画布尺寸。
+    struct ImageEditorLayout: Equatable {
+        let windowSize: CGSize
+        let canvasSize: CGSize
+    }
+
+    /// 计算图片编辑窗口尺寸与画布尺寸，保证画布严格保持原图宽高比。
+    ///
+    /// - 纵向/横向超长图（例如长截图）按短边适配可见区并保留另一边完整可滚动尺寸，
+    ///   避免被压成极细线条或横向拉宽变形；
+    /// - 常规图与小图采用统一标量缩放，确保 `canvasSize` 宽高比与像素宽高比一致，
+    ///   窗口不足最小可视尺寸时由居中容器留白而非拉伸画布。
+    static func imageEditorLayout(
+        pixelWidth: Int,
+        pixelHeight: Int,
+        backingScale: CGFloat,
+        visibleFrame: CGRect
+    ) -> ImageEditorLayout {
+        let safeScale = max(1, backingScale)
+        let logicalWidth = max(1, CGFloat(pixelWidth) / safeScale)
+        let logicalHeight = max(1, CGFloat(pixelHeight) / safeScale)
+
+        let maxWidth = max(360, (visibleFrame.width * 0.9).rounded(.down))
+        let maxHeight = max(260, (visibleFrame.height * 0.9).rounded(.down))
+        let minWindowWidth = min(maxWidth, 420)
+        let minWindowHeight = min(maxHeight, 260)
+
+        let isTallStrip = logicalHeight > maxHeight && (logicalHeight / logicalWidth) > 2.0
+        let isWideStrip = logicalWidth > maxWidth && (logicalWidth / logicalHeight) > 2.0
+
+        let canvasSize: CGSize
+        if isTallStrip {
+            let fitScale = max(1, logicalWidth / maxWidth)
+            canvasSize = CGSize(
+                width: max(1, (logicalWidth / fitScale).rounded()),
+                height: max(1, (logicalHeight / fitScale).rounded())
+            )
+        } else if isWideStrip {
+            let fitScale = max(1, logicalHeight / maxHeight)
+            canvasSize = CGSize(
+                width: max(1, (logicalWidth / fitScale).rounded()),
+                height: max(1, (logicalHeight / fitScale).rounded())
+            )
+        } else {
+            let downScale = max(1, logicalWidth / maxWidth, logicalHeight / maxHeight)
+            let scale: CGFloat
+            if downScale > 1 {
+                scale = downScale
+            } else {
+                let maxUpFactor = min(2.0, maxWidth / logicalWidth, maxHeight / logicalHeight)
+                let desiredUpFactor = max(1.0, min(600 / logicalWidth, 400 / logicalHeight))
+                let upFactor = max(1.0, min(desiredUpFactor, maxUpFactor))
+                scale = 1.0 / upFactor
+            }
+            canvasSize = CGSize(
+                width: max(1, (logicalWidth / scale).rounded()),
+                height: max(1, (logicalHeight / scale).rounded())
+            )
+        }
+
+        let windowSize = CGSize(
+            width: min(maxWidth, max(minWindowWidth, canvasSize.width)),
+            height: min(maxHeight, max(minWindowHeight, canvasSize.height))
+        )
+        return ImageEditorLayout(windowSize: windowSize, canvasSize: canvasSize)
     }
 
     /// 编辑一张已有图片（不截图）。
@@ -154,30 +231,28 @@ public final class OverlayController {
         guard let screen = NSScreen.main ?? NSScreen.screens.first,
               let displayID = screen.displayID else { return }
 
-        // 先将像素尺寸按缩放比折算回逻辑点，避免 Retina 2x 图窗口面积膨胀 4 倍；
-        // 再限制大图不超过屏幕可见区 90%，小图不小于合适编辑窗口尺寸。
         let effectiveScale = max(1, scaleFactor ?? screen.backingScaleFactor)
-        let logicalWidth = CGFloat(image.width) / effectiveScale
-        let logicalHeight = CGFloat(image.height) / effectiveScale
+        sessionBackingScale = effectiveScale
 
         let visible = screen.visibleFrame
-        let maxWidth = max(320, visible.width * 0.9)
-        let maxHeight = max(240, visible.height * 0.9)
-        let downScale = max(1, logicalWidth / maxWidth, logicalHeight / maxHeight)
-        let upScale = min(1, max(0.5, min(logicalWidth / 600, logicalHeight / 400)))
-        let scale = downScale > 1 ? downScale : upScale
-        let size = CGSize(
-            width: max(320, (logicalWidth / scale).rounded()),
-            height: max(200, (logicalHeight / scale).rounded())
+        let layout = Self.imageEditorLayout(
+            pixelWidth: image.width,
+            pixelHeight: image.height,
+            backingScale: effectiveScale,
+            visibleFrame: visible
         )
         let frame = CGRect(
-            x: visible.midX - size.width / 2,
-            y: visible.midY - size.height / 2,
-            width: size.width,
-            height: size.height
+            x: visible.midX - layout.windowSize.width / 2,
+            y: visible.midY - layout.windowSize.height / 2,
+            width: layout.windowSize.width,
+            height: layout.windowSize.height
         )
 
-        let window = OverlayWindow(imageFrame: frame, displayID: displayID)
+        let window = OverlayWindow(
+            imageFrame: frame,
+            canvasSize: layout.canvasSize,
+            displayID: displayID
+        )
         window.onWindowWillClose = { [weak self] in
             self?.dismiss()
         }
@@ -235,7 +310,8 @@ public final class OverlayController {
         window.overlayView.refreshToolbar()
         logger.notice("""
             image editor opened; size=\(image.width, privacy: .public)x\(image.height, privacy: .public) \
-            scale=\(scale, privacy: .public) visible=\(NSStringFromRect(visible), privacy: .public) \
+            scale=\(effectiveScale, privacy: .public) canvas=\(NSStringFromSize(layout.canvasSize), privacy: .public) \
+            visible=\(NSStringFromRect(visible), privacy: .public) \
             frame=\(NSStringFromRect(frame), privacy: .public) actual=\(NSStringFromRect(window.frame), privacy: .public)
             """)
     }
@@ -1248,13 +1324,13 @@ public final class OverlayController {
                 NSSound.beep()
                 return
             }
-            let translated = await self.translationService.translate(
+            let execution = await self.translationService.translateWithDiagnostics(
                 lines: lines,
                 source: source,
                 target: target
             )
             guard !Task.isCancelled, self.translationRequestID == requestID else { return }
-            self.ocrPanel.showTranslation(translated)
+            self.ocrPanel.showTranslation(execution.result, diagnosticMessage: execution.errorMessage)
         }
     }
 
@@ -1333,7 +1409,10 @@ public final class OverlayController {
         }
 
         // PNG 只编码一次：这份数据既进剪贴板，也随产物交给历史缓存。
-        let copyResult = SessionExporter.copyToPasteboardWithPNG(image)
+        let scrollBackingScale = selectionDisplayID.map { DisplayGeometry.scaleFactor(for: $0) }
+            ?? NSScreen.main?.backingScaleFactor
+            ?? 1.0
+        let copyResult = SessionExporter.copyToPasteboardWithPNG(image, backingScale: scrollBackingScale)
         let copied = copyResult?.didCopy ?? false
 
         // 先登记产物：复制失败时结果仍在结果窗口里，
@@ -1388,10 +1467,10 @@ public final class OverlayController {
             warnings: warnings,
             actions: .init(
                 onSave: { [weak self] image in
-                    self?.saveScrollshotResult(image)
+                    self?.saveScrollshotResult(image, backingScale: scale)
                 },
                 onCopy: { image in
-                    let ok = SessionExporter.copyToPasteboard(image)
+                    let ok = SessionExporter.copyToPasteboard(image, backingScale: scale)
                     ToastPresenter.show(ok ? "长截图已复制到剪贴板" : "复制失败，图片仍在结果窗口里")
                 },
                 onPin: { [weak self] image in
@@ -1410,10 +1489,10 @@ public final class OverlayController {
                     }
                 },
                 onEdit: { [weak self] image in
-                    // 继续编辑：把长图交给图片编辑会话（同一套标注/导出）。
+                    // 继续编辑：把长图交给图片编辑会话（同一套标注/导出），透传真实缩放比。
                     // 先关结果窗口，避免两个窗口同时占着同一张位图。
                     self?.scrollshotResult?.close()
-                    self?.present(image: image)
+                    self?.present(image: image, scaleFactor: scale)
                 },
                 onClose: { [weak self] in
                     self?.scrollshotResult = nil
@@ -1429,11 +1508,12 @@ public final class OverlayController {
         }
     }
 
-    private func saveScrollshotResult(_ image: CGImage) {
+    private func saveScrollshotResult(_ image: CGImage, backingScale: CGFloat) {
         let outcome = SessionExporter.save(
             image,
             suggestedName: Exporter.defaultFileName(),
-            destination: settings.saveDestination
+            destination: settings.saveDestination,
+            backingScale: backingScale
         )
         switch outcome {
         case .saved(let url):
@@ -1581,7 +1661,8 @@ public final class OverlayController {
 
         case .copy:
             // 编码一次：成功时那份 PNG 直接进历史缓存，不再二次编码。
-            let copyResult = SessionExporter.copyToPasteboardWithPNG(image)
+            let backingScale = exportBackingScale(in: window)
+            let copyResult = SessionExporter.copyToPasteboardWithPNG(image, backingScale: backingScale)
             let copied = copyResult?.didCopy ?? false
             logger.notice("""
                 export copy: success=\(copied, privacy: .public) \
@@ -1602,10 +1683,18 @@ public final class OverlayController {
             }
 
         case .save:
+            let backingScale = exportBackingScale(in: window)
+            let destination = settings.saveDestination
+            // 系统模态保存面板默认层级低于 `.screenSaver`，弹出前先暂隐全屏覆盖层，
+            // 避免保存框被自身覆盖层挡住导致假死；取消或失败时再原样恢复。
+            let suspendedOverlays: SuspendedOverlays? = destination == .ask
+                ? suspendFullScreenOverlaysForModal()
+                : nil
             let outcome = SessionExporter.save(
                 image,
                 suggestedName: Exporter.defaultFileName(),
-                destination: settings.saveDestination
+                destination: destination,
+                backingScale: backingScale
             )
             switch outcome {
             case .saved(let url):
@@ -1620,14 +1709,63 @@ public final class OverlayController {
                 dismiss()
 
             case .cancelled:
+                if let suspendedOverlays {
+                    restoreFullScreenOverlaysAfterModal(suspendedOverlays)
+                }
                 logger.notice("export save: cancelled by user")
 
             case .failed(let reason):
+                if let suspendedOverlays {
+                    restoreFullScreenOverlaysAfterModal(suspendedOverlays)
+                }
                 // 失败时保持会话：图还在，用户可以直接重试或改路径。
                 // 关掉会话才是真的把图弄丢了。
                 logger.error("export save failed: \(reason, privacy: .public)")
                 presentSaveFailure(reason, image: image, in: window)
             }
+        }
+    }
+
+    /// 计算当前导出使用的物理缩放系数，用于写入 Retina DPI 元数据。
+    private func exportBackingScale(in window: NSWindow?) -> CGFloat {
+        if let sessionBackingScale {
+            return max(1, sessionBackingScale)
+        }
+        if let windowScale = window?.backingScaleFactor, windowScale >= 1 {
+            return windowScale
+        }
+        if let selectionDisplayID {
+            return max(1, DisplayGeometry.scaleFactor(for: selectionDisplayID))
+        }
+        return max(1, NSScreen.main?.backingScaleFactor ?? 1)
+    }
+
+    /// 模态面板弹出期间被暂隐的全屏覆盖层快照。
+    struct SuspendedOverlays {
+        let visibleWindows: [OverlayWindow]
+        let keyWindow: OverlayWindow?
+    }
+
+    /// 弹出系统模态面板（如 `NSSavePanel`）前暂隐 `.screenSaver` 全屏覆盖层。
+    func suspendFullScreenOverlaysForModal() -> SuspendedOverlays {
+        let key = windows.first(where: { $0.isKeyWindow })
+        let fullScreenVisible = windows.filter { $0.isVisible && !$0.styleMask.contains(.titled) }
+        for window in fullScreenVisible {
+            window.orderOut(nil)
+        }
+        return SuspendedOverlays(visibleWindows: fullScreenVisible, keyWindow: key)
+    }
+
+    /// 模态面板取消或失败后恢复被暂隐的全屏覆盖层。
+    func restoreFullScreenOverlaysAfterModal(_ snapshot: SuspendedOverlays) {
+        guard isPresenting else { return }
+        for window in snapshot.visibleWindows where windows.contains(where: { $0 === window }) {
+            window.presentWithoutActivating()
+        }
+        if let key = snapshot.keyWindow, windows.contains(where: { $0 === key }) {
+            key.makeKey()
+        } else {
+            windows.first?.makeKey()
         }
     }
 
@@ -2025,9 +2163,12 @@ public final class OverlayController {
 
     /// 走系统保存面板。取消则保留会话，成功则结束会话。
     private func saveWithPanelKeepingSession(_ image: CGImage) {
+        let backingScale = exportBackingScale(in: windows.first)
+        let suspended = suspendFullScreenOverlaysForModal()
         let outcome = SessionExporter.saveWithPanel(
             image,
-            suggestedName: Exporter.defaultFileName()
+            suggestedName: Exporter.defaultFileName(),
+            backingScale: backingScale
         )
         switch outcome {
         case .saved(let url):
@@ -2041,8 +2182,10 @@ public final class OverlayController {
             ))
             dismiss()
         case .cancelled:
+            restoreFullScreenOverlaysAfterModal(suspended)
             logger.notice("export save (panel): cancelled by user")
         case .failed(let reason):
+            restoreFullScreenOverlaysAfterModal(suspended)
             logger.error("export save (panel) failed: \(reason, privacy: .public)")
             NSSound.beep()
         }
@@ -2108,6 +2251,7 @@ public final class OverlayController {
         editorState = nil
         pendingIntent = .capture
         documentSource = nil
+        sessionBackingScale = nil
         isPresenting = false
         // 覆盖层的 crosshair / 对角光标不是系统光标，
         // 窗口关闭后系统不会自动恢复。

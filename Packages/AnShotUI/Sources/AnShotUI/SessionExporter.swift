@@ -75,9 +75,10 @@ enum SessionExporter {
     /// - Parameter pasteboard: 目标剪贴板。只有测试会传入私有剪贴板，避免碰用户的系统剪贴板。
     static func copyToPasteboardWithPNG(
         _ image: CGImage,
+        backingScale: CGFloat = 1.0,
         to pasteboard: NSPasteboard = .general
     ) -> PasteboardCopyResult? {
-        guard let png = Exporter.pngData(from: image) else {
+        guard let png = Exporter.pngData(from: image, backingScale: backingScale) else {
             return nil
         }
 
@@ -107,8 +108,12 @@ enum SessionExporter {
     /// 保留 Bool 形态供只关心成功与否的调用方（保存/钉住/结果窗口、测试）使用。
     /// - Parameter pasteboard: 目标剪贴板。只有测试会传入私有剪贴板，避免碰用户的系统剪贴板。
     @discardableResult
-    static func copyToPasteboard(_ image: CGImage, to pasteboard: NSPasteboard = .general) -> Bool {
-        copyToPasteboardWithPNG(image, to: pasteboard)?.didCopy ?? false
+    static func copyToPasteboard(
+        _ image: CGImage,
+        backingScale: CGFloat = 1.0,
+        to pasteboard: NSPasteboard = .general
+    ) -> Bool {
+        copyToPasteboardWithPNG(image, backingScale: backingScale, to: pasteboard)?.didCopy ?? false
     }
 
     // MARK: - 保存
@@ -133,18 +138,23 @@ enum SessionExporter {
     static func save(
         _ image: CGImage,
         suggestedName: String,
-        destination: SaveDestination
+        destination: SaveDestination,
+        backingScale: CGFloat = 1.0
     ) -> SaveOutcome {
         switch destination {
         case .ask:
-            return saveWithPanel(image, suggestedName: suggestedName)
+            return saveWithPanel(image, suggestedName: suggestedName, backingScale: backingScale)
         case .folder(let folder):
-            return saveToFolder(image, suggestedName: suggestedName, folder: folder)
+            return saveToFolder(image, suggestedName: suggestedName, folder: folder, backingScale: backingScale)
         }
     }
 
     /// 弹出保存面板并写入 PNG。
-    static func saveWithPanel(_ image: CGImage, suggestedName: String) -> SaveOutcome {
+    static func saveWithPanel(
+        _ image: CGImage,
+        suggestedName: String,
+        backingScale: CGFloat = 1.0
+    ) -> SaveOutcome {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = suggestedName
         panel.allowedContentTypes = [.png]
@@ -161,7 +171,7 @@ enum SessionExporter {
         }
 
         do {
-            try Exporter.writePNG(image, to: url)
+            try Exporter.writePNG(image, to: url, backingScale: backingScale)
             return .saved(url)
         } catch {
             return .failed("无法写入文件：\(url.path)")
@@ -172,7 +182,8 @@ enum SessionExporter {
     private static func saveToFolder(
         _ image: CGImage,
         suggestedName: String,
-        folder: URL
+        folder: URL,
+        backingScale: CGFloat = 1.0
     ) -> SaveOutcome {
         // 目录可能在设置之后被删除或改名——用户是在访达里选的它，
         // 而访达不受本应用控制。这类失效必须在写入之前查出来，
@@ -188,7 +199,7 @@ enum SessionExporter {
             return .failed("无法在所选文件夹中创建文件：\(folder.path)")
         }
         do {
-            try Exporter.writePNG(image, to: url)
+            try Exporter.writePNG(image, to: url, backingScale: backingScale)
             return .saved(url)
         } catch {
             // 写入失败要把占位文件清掉，否则会在用户目录里留下一个 0 字节垃圾。
@@ -200,8 +211,8 @@ enum SessionExporter {
     /// 直接写入指定路径。
     ///
     /// 诊断专用：绕开需要人工点击的保存面板，只验证写入路径本身。
-    static func save(_ image: CGImage, to url: URL) throws {
-        try Exporter.writePNG(image, to: url)
+    static func save(_ image: CGImage, to url: URL, backingScale: CGFloat = 1.0) throws {
+        try Exporter.writePNG(image, to: url, backingScale: backingScale)
     }
 
     /// 在目标目录里以**独占方式**占一个文件名，返回可写的 URL。

@@ -39,8 +39,8 @@ enum OverlayLoupeSampler {
     /// 默认采样半径：7 → 15×15 网格（放大到 120×120pt 即 8x 像素格）。
     static let defaultGridRadius = 7
 
-    /// 放大镜浮层默认逻辑尺寸。
-    static let defaultPanelSize = CGSize(width: 140, height: 176)
+    /// 放大镜浮层默认逻辑尺寸：提供 152pt 内容宽，彻底容纳 4K 四位坐标与 RGB/快捷键提示不碰撞。
+    static let defaultPanelSize = CGSize(width: 172, height: 204)
 
     /// 从底图采集指定视图逻辑点处的像素邻域与色值。
     static func sample(
@@ -159,7 +159,7 @@ enum OverlayLoupeSampler {
 final class OverlayLoupeView: NSView {
 
     nonisolated static var panelSize: CGSize { OverlayLoupeSampler.defaultPanelSize }
-    private static let previewSize: CGFloat = 120
+    private static let previewSize: CGFloat = 152
     private static let previewInset: CGFloat = 10
 
     private var sample: LoupeSample?
@@ -277,7 +277,7 @@ final class OverlayLoupeView: NSView {
         context.strokePath()
         context.restoreGState()
 
-        // 3. 信息栏：色块 + HEX + 坐标，下方 RGB 与按键提示
+        // 3. 信息栏：第 1 行色块 + #HEX + 右对齐像素坐标；第 2 行 RGB + 右对齐 C/⇧C 提示
         let infoTop = previewRect.maxY + 7
         let swatchRect = CGRect(x: Self.previewInset, y: infoTop + 2, width: 10, height: 10)
         context.saveGState()
@@ -289,33 +289,48 @@ final class OverlayLoupeView: NSView {
         context.restoreGState()
 
         let hexAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold),
+            .font: NSFont.monospacedSystemFont(ofSize: 10.5, weight: .semibold),
             .foregroundColor: NSColor.white,
         ]
+        let hexOriginX = swatchRect.maxX + 5
+        let hexSize = (sample.hexString as NSString).size(withAttributes: hexAttrs)
         (sample.hexString as NSString).draw(
-            at: CGPoint(x: swatchRect.maxX + 5, y: infoTop),
+            at: CGPoint(x: hexOriginX, y: infoTop),
             withAttributes: hexAttrs
         )
 
         let coordText = "(\(sample.pixelX), \(sample.pixelY))"
         let coordAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.65),
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .regular),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.68),
         ]
         let coordSize = (coordText as NSString).size(withAttributes: coordAttrs)
+        let coordX = max(hexOriginX + hexSize.width + 4, bounds.width - Self.previewInset - coordSize.width)
         (coordText as NSString).draw(
-            at: CGPoint(x: bounds.width - Self.previewInset - coordSize.width, y: infoTop + 1),
+            at: CGPoint(x: coordX, y: infoTop + 1),
             withAttributes: coordAttrs
         )
 
-        let subText = showsCopyHint ? "\(sample.rgbText) · C复制" : sample.rgbText
-        let subAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.75),
+        let rgbAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .regular),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.78),
         ]
-        (subText as NSString).draw(
+        (sample.rgbText as NSString).draw(
             at: CGPoint(x: Self.previewInset, y: infoTop + 18),
-            withAttributes: subAttrs
+            withAttributes: rgbAttrs
         )
+
+        if showsCopyHint {
+            let hintText = "C / ⇧C"
+            let hintAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .medium),
+                .foregroundColor: NSColor.white.withAlphaComponent(0.58),
+            ]
+            let hintSize = (hintText as NSString).size(withAttributes: hintAttrs)
+            (hintText as NSString).draw(
+                at: CGPoint(x: bounds.width - Self.previewInset - hintSize.width, y: infoTop + 18.5),
+                withAttributes: hintAttrs
+            )
+        }
     }
 }

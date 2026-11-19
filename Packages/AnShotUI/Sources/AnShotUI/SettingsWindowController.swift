@@ -1443,8 +1443,8 @@ private final class SettingsViewController: NSViewController {
             let cloud = translationSettings.preferredCloudKind
             if translationSettings.isConfigured(cloud) {
                 translationPrivacyLabel.stringValue = """
-                    ⚠️　自动模式会**先**把识别出的文字发给「\(cloud.displayName)」，拿不到译文时才改用本机翻译\
-                    （不会回退到另一个云端）。密钥只保存在本机文件里。
+                    ⚠️ 自动模式会优先把识别出的文字发给「\(cloud.displayName)」，拿不到译文时才回退本机翻译\
+                    （不会回退到另一个云端）。密钥仅保存在本机文件中。
                     """
                 translationPrivacyLabel.textColor = .systemOrange
             } else {
@@ -1459,8 +1459,8 @@ private final class SettingsViewController: NSViewController {
             translationPrivacyLabel.textColor = .secondaryLabelColor
         case .openAICompatible, .claude:
             translationPrivacyLabel.stringValue = """
-                ⚠️　云端翻译会把识别出的**文字**发给「\(strategy.displayName)」（不发图片）。\
-                云端失败时**不会**改用本机翻译。密钥只保存在本机文件里。
+                ⚠️ 云端翻译会把识别出的文字发给「\(strategy.displayName)」（不发图片）。\
+                云端失败时不会回退本机翻译。密钥仅保存在本机文件中。
                 """
             translationPrivacyLabel.textColor = .systemOrange
         }
@@ -1577,15 +1577,20 @@ private final class SettingsViewController: NSViewController {
                 return
             }
 
-            let result = await service.translate(lines: sample, source: source, target: "en-US")
+            let execution = await service.translateWithDiagnostics(lines: sample, source: source, target: "en-US")
             self.translationTestButton.isEnabled = true
 
+            let result = execution.result
             let translated = result.segments.compactMap(\.translatedText)
             guard !translated.isEmpty else {
-                self.setTranslationStatus("""
-                    失败：没有返回任何译文，请检查密钥、模型名与地址；\
-                    本机方案请检查系统版本与语言包
-                    """)
+                if let detail = execution.errorMessage, !detail.isEmpty {
+                    self.setTranslationStatus("失败：\(detail)")
+                } else {
+                    self.setTranslationStatus("""
+                        失败：没有返回任何译文，请检查密钥、模型名与地址；\
+                        本机方案请检查系统版本与语言包
+                        """)
+                }
                 return
             }
             let partial = result.isPartiallyTranslated
@@ -1988,12 +1993,10 @@ private final class SettingsViewController: NSViewController {
         askOption.state = isFolderMode ? .off : .on
         folderOption.state = isFolderMode ? .on : .off
 
-        // 判定依据是「记住过文件夹」，不是「当前正处于文件夹模式」。
-        // 用后者的话，用户「选目录 → 切回每次询问」之后这一项会变灰，
-        // 而那个目录其实还在——于是他再也切不回去了。
+        // 未选过目录时卡片仍保持可点击：点击后 `saveModeChanged` 会直接弹出目录选择面板。
         let remembered = settings.rememberedSaveFolder
-        folderOption.isEnabled = remembered != nil
-        folderOption.alphaValue = remembered != nil ? 1 : 0.45
+        folderOption.isEnabled = true
+        folderOption.alphaValue = 1
 
         folderSurface.render(folder: remembered)
         // 未生效时压暗：让「记住了但当前不用」与「正在用」可区分。
@@ -2380,6 +2383,12 @@ extension SettingsViewController: NSTextFieldDelegate {
             return false
         }
         NSSound.beep()
+        let hint = "为避免误粘贴错误内容，请先点击右侧「显示」切换明文后再按 ⌘V 粘贴"
+        if row === translationKeyRow {
+            setTranslationStatus(hint)
+        } else {
+            setOCRStatus(hint)
+        }
         return true
     }
 }

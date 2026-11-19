@@ -646,7 +646,7 @@ final class AnnotationToolbarView: NSView {
         case .pointer: return .pointer
         case .shape: return lastToolByFamily[family]
         case .text: return .text
-        case .mosaic: return .mosaic
+        case .mosaic: return lastToolByFamily[family] ?? .mosaic
         }
     }
 

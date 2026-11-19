@@ -95,9 +95,21 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 ToastPresenter.show("源文件已不在原位置")
                 return
             }
-            let ok = SessionExporter.copyToPasteboard(image)
+            let scale = Self.imageBackingScale(at: entry.fileURL)
+            let ok = SessionExporter.copyToPasteboard(image, backingScale: scale)
             ToastPresenter.show(ok ? "已复制到剪贴板" : "复制失败")
         }
+    }
+
+    /// 读取图片文件中记录的物理缩放系数（`DPI / 72`），缺失时回退当前主屏缩放系数。
+    private static func imageBackingScale(at url: URL) -> CGFloat {
+        if let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+           let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+           let dpi = props[kCGImagePropertyDPIWidth] as? CGFloat,
+           dpi >= 72 {
+            return max(1, (dpi / 72.0).rounded())
+        }
+        return max(1, NSScreen.main?.backingScaleFactor ?? 1)
     }
 
     /// 从历史重新打开编辑器。录屏没有可编辑的位图，交给系统默认应用。
@@ -1028,7 +1040,10 @@ private let recordingFrame = RecordingRegionFrame()
             settings: settings,
             onOpenSettings: { [weak self] in self?.openSettings() },
             onRelaunch: { [weak self] in self?.relaunch() },
-            onTryCapture: { [weak self] in self?.overlayController.present() }
+            onTryCapture: { [weak self] in
+                // 欢迎窗口关闭动画需留出收起缓冲，避免将正在消失的窗口残影拍入底图。
+                self?.overlayController.present(delayNanoseconds: 180_000_000)
+            }
         )
         controller.onClose = { [weak self] in
             self?.welcomeWindowController = nil
@@ -1385,8 +1400,11 @@ private let recordingFrame = RecordingRegionFrame()
         }
     }
 
+    /// 菜单点击触发截图时的下拉菜单淡出等待时长（150ms），避免菜单残影被拍入冻结底图。
+    private static let menuDismissDelayNanoseconds: UInt64 = 150_000_000
+
     @objc private func startCapture() {
-        overlayController.present()
+        overlayController.present(delayNanoseconds: Self.menuDismissDelayNanoseconds)
     }
 
     /// 菜单入口：编辑磁盘上已有的图片。
@@ -1421,12 +1439,12 @@ private let recordingFrame = RecordingRegionFrame()
 
     /// 菜单入口：直接进入长截图，选区确定即开始滚动。
     @objc private func startLongScreenshotFlow() {
-        overlayController.present(intent: .longScreenshot)
+        overlayController.present(intent: .longScreenshot, delayNanoseconds: Self.menuDismissDelayNanoseconds)
     }
 
     /// 菜单入口：直接进入 OCR，选区确定即识别。
     @objc private func startOCRCaptureFlow() {
-        overlayController.present(intent: .ocr)
+        overlayController.present(intent: .ocr, delayNanoseconds: Self.menuDismissDelayNanoseconds)
     }
 
     /// 菜单入口：直接进入录制准备，选区确定即弹面板（录制进行中则前置拦截提示）。
@@ -1435,7 +1453,7 @@ private let recordingFrame = RecordingRegionFrame()
             ToastPresenter.show("正在录制中，请先停止当前录制")
             return
         }
-        overlayController.present(intent: .recording)
+        overlayController.present(intent: .recording, delayNanoseconds: Self.menuDismissDelayNanoseconds)
     }
 
     /// 菜单入口：从剪贴板贴图（支持图片位图及纯文本生成便签图）。
@@ -1489,11 +1507,12 @@ private let recordingFrame = RecordingRegionFrame()
             return (HistoryThumbnail.makePNG(from: image), image.width, image.height)
         }
 
+        // 独立查询视频轨道尺寸与首帧图像，避免非 Sendable 的 AVAsset 在两个 async 步骤间共享。
+        let trackSize = await Self.videoNaturalPixelSize(at: url)
         let asset = AVURLAsset(url: url)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: 1920, height: 1920)
-        let trackSize = await Self.videoNaturalPixelSize(for: asset)
         if let cgImage = try? await generator.image(at: .zero).image {
             // 优先使用视频轨道的真实像素宽高（经 transform 校正），防止 maximumSize 缩小时记错像素。
             let width = trackSize?.width ?? cgImage.width
@@ -1503,10 +1522,10 @@ private let recordingFrame = RecordingRegionFrame()
         return (nil, trackSize?.width ?? 0, trackSize?.height ?? 0)
     }
 
-    private nonisolated static func videoNaturalPixelSize(for asset: AVAsset) async -> (width: Int, height: Int)? {
+    private nonisolated static func videoNaturalPixelSize(at url: URL) async -> (width: Int, height: Int)? {
+        let asset = AVURLAsset(url: url)
         guard let track = (try? await asset.loadTracks(withMediaType: .video))?.first,
-              let naturalSize = try? await track.load(.naturalSize),
-              let preferredTransform = try? await track.load(.preferredTransform) else {
+              let (naturalSize, preferredTransform) = try? await track.load(.naturalSize, .preferredTransform) else {
             return nil
         }
         let transformed = naturalSize.applying(preferredTransform)
@@ -1540,7 +1559,7 @@ private let recordingFrame = RecordingRegionFrame()
             // 而且必须指向**真正腾出名额**的动作：取消固定后再关闭（或菜单栏「全部关闭」）。
             // 「隐藏」不算——隐藏中的 Pin 仍计入上限（契约 §6），按旧文案用户会白试一轮。
             let tip = NSMenuItem(
-                title: "已达上限（\(count)/\(limit)）：取消固定后再关闭，或「全部关闭」",
+                title: "已达上限（\(count)/\(limit)）：请关闭几张贴图，或「全部关闭」",
                 action: nil,
                 keyEquivalent: ""
             )
@@ -1656,7 +1675,7 @@ private let recordingFrame = RecordingRegionFrame()
     /// 文案必须指向**真正腾出名额**的动作：「取消固定后再关闭」。按旧文案去菜单栏
     /// 「关闭」只会隐藏，名额一个也不会腾出（契约 §6：隐藏中的 Pin 仍计入上限）。
     private func showPinLimitNotice(limit: Int) {
-        pinNotice.show("固定截图已达上限（\(limit) 张）：先取消固定再关闭几张，或菜单栏「全部关闭」")
+        pinNotice.show("固定截图已达上限（\(limit) 张）：请关闭几张贴图，或使用菜单栏「全部关闭」")
     }
 
     /// 从历史记录重新钉一张。

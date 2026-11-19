@@ -46,6 +46,14 @@ struct SettingsWindowTests {
         #expect(editMenu?.items.contains { $0.keyEquivalent == "c" } == true)
         #expect(editMenu?.items.contains { $0.keyEquivalent == "v" } == true)
         #expect(editMenu?.items.contains { $0.keyEquivalent == "a" } == true)
+
+        let windowMenu = menu.item(withTitle: "窗口")?.submenu
+        #expect(windowMenu != nil, "主菜单必须包含窗口菜单以提供全局 ⌘W 关闭通道")
+        #expect(windowMenu?.items.contains { $0.keyEquivalent == "w" } == true)
+
+        for page in SettingsPage.allCases {
+            #expect(!page.subtitle.contains("改动立即生效"), "设置页副标题不应机械复读")
+        }
     }
 
     @Test("前台窗口激活策略协调器多窗口计数不提前退回 accessory")

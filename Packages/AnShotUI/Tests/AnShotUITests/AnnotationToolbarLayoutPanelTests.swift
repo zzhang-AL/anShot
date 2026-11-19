@@ -201,4 +201,27 @@ struct AnnotationToolbarLayoutPanelTests {
         #expect(text != mosaic)
         #expect(shape != mosaic)
     }
+
+    @Test("马赛克家族面板提供放大镜入口，且激活放大镜时彻底隔离马赛克无效控件")
+    func mosaicAndMagnifierPanelIsolation() {
+        var mosaicLayout = AnnotationToolbarLayout()
+        mosaicLayout.tool = .mosaic
+        mosaicLayout.style.mosaicMode = .brush
+        let mosaicKinds = mosaicLayout.layoutPanel().items.map(\.kind)
+        #expect(mosaicKinds.contains(.tool(.mosaic)))
+        #expect(mosaicKinds.contains(.tool(.magnifier)))
+        #expect(mosaicKinds.contains(.mosaicBrushDiameterSlider))
+
+        var magnifierLayout = AnnotationToolbarLayout()
+        magnifierLayout.tool = .magnifier
+        magnifierLayout.style.mosaicMode = .brush
+        let magnifierKinds = magnifierLayout.layoutPanel().items.map(\.kind)
+        #expect(magnifierKinds.contains(.tool(.mosaic)))
+        #expect(magnifierKinds.contains(.tool(.magnifier)))
+        #expect(magnifierKinds.contains { if case .magnifierZoom = $0 { return true } else { return false } })
+        #expect(!magnifierKinds.contains { if case .mosaicMode = $0 { return true } else { return false } })
+        #expect(!magnifierKinds.contains { if case .mosaicEffectMode = $0 { return true } else { return false } })
+        #expect(!magnifierKinds.contains { if case .mosaicBlockSize = $0 { return true } else { return false } })
+        #expect(!magnifierKinds.contains(.mosaicBrushDiameterSlider))
+    }
 }

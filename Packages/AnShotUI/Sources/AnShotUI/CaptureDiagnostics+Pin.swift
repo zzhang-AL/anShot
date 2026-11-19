@@ -397,40 +397,20 @@ extension CaptureDiagnostics {
         manager.closeAll()
 
         // ─── ⑪ 卡片右上角的两个出口 ───
-        // 用户给的规则：**「关闭」本身从不销毁**。固定中它只隐藏（位图保留，
-        // 菜单栏可恢复）；只有先按图钉「取消固定」，关闭才隐藏并释放。
-        // 两个维度正交：图钉管「这张图留不留」，✕ 管「现在收不收」。
-        //
-        // 这套语义在屏幕上几乎看不出来（两种状态的外观一样），所以断言全部落在
-        // 「点完之后位图、管理列表、可见性各自怎样」，而不是外观。
+        // ux-polish Phase 1 新契约：卡片右上角保留 ✕（直接关闭释放）、＋、－ 三个真实按钮；
+        // 仅需隐藏保留位图走右键「隐藏贴图」/ ⌘H / 菜单栏子菜单。
         guard case .created(let card) = manager.pin(image: image, screenScale: 2) else {
             report("卡片按钮场景构造", "limitReached", "created", false)
             exit(1)
         }
         try? await Task.sleep(for: .milliseconds(200))
 
-        report("卡片有图钉按钮", String(describing: type(of: card.pinButton)), "PinCardButton",
-               String(describing: type(of: card.pinButton)) == "PinCardButton")
         report("卡片有关闭按钮", String(describing: type(of: card.closeButton)), "PinCardButton",
                String(describing: type(of: card.closeButton)) == "PinCardButton")
-        report("两个按钮是两个对象（各接一个动作，不是同一个按钮）",
-               "\(card.pinButton === card.closeButton)", "false", card.pinButton !== card.closeButton)
-        report("`pin.slash` 符号在本机可用（取消固定后要换图标）",
-               "\(NSImage(systemSymbolName: "pin.slash", accessibilityDescription: nil) != nil)",
-               "true", NSImage(systemSymbolName: "pin.slash", accessibilityDescription: nil) != nil)
-        report("初始状态是「固定中」", "\(card.isUnpinned)", "false", !card.isUnpinned)
-        report("图钉按钮说明写明它是「取消固定」", card.pinButton.toolTip ?? "nil", "含「取消固定」",
-               (card.pinButton.toolTip ?? "").contains("取消固定"))
-        report("固定中时关闭按钮说明写明只隐藏、不释放（只靠图标分不出这一点）",
-               card.closeButton.toolTip ?? "nil", "含「隐藏」与「不释放」",
-               (card.closeButton.toolTip ?? "").contains("隐藏")
-                   && (card.closeButton.toolTip ?? "").contains("不释放"))
-        // 卡片常浮在别的应用之上、而本应用多是不活跃那个；无边框 `NSWindow`
-        // 会把「第一次点击」拿去激活窗口。按钮必须对这条免疫——本项目已有同类实测：
-        // `-diagnoseSettingsWindow` 里「应用处于激活态是合成鼠标点击的前提」。
-        // 实测结论：`NSControl` 的默认实现已返回 true（下方对照组），所以**不需要**
-        // 在 `PinCardButton` 里重写 `acceptsFirstMouse`；这里把前提钉住——
-        // 将来把按钮换成普通自绘视图，会先在这里失败。
+        report("关闭按钮说明写明会关闭并释放（右键可隐藏）",
+               card.closeButton.toolTip ?? "nil", "含「关闭」与「释放」",
+               (card.closeButton.toolTip ?? "").contains("关闭")
+                   && (card.closeButton.toolTip ?? "").contains("释放"))
         let probeEvent = NSEvent.mouseEvent(
             with: .leftMouseDown,
             location: .zero,
@@ -442,15 +422,15 @@ extension CaptureDiagnostics {
             clickCount: 1,
             pressure: 1
         )
-        report("两个按钮接受首次点击（非活跃应用下点一次即生效）",
-               "图钉=\(card.pinButton.acceptsFirstMouse(for: probeEvent)) 关闭=\(card.closeButton.acceptsFirstMouse(for: probeEvent))",
+        report("关闭与缩放按钮接受首次点击（非活跃应用下点一次即生效）",
+               "关闭=\(card.closeButton.acceptsFirstMouse(for: probeEvent)) 放大=\(card.plusButton.acceptsFirstMouse(for: probeEvent))",
                "true / true",
-               card.pinButton.acceptsFirstMouse(for: probeEvent)
-                   && card.closeButton.acceptsFirstMouse(for: probeEvent))
+               card.closeButton.acceptsFirstMouse(for: probeEvent)
+                   && card.plusButton.acceptsFirstMouse(for: probeEvent))
         report("对照组：普通 NSButton 也是 true（故不需额外代码，只需钉住前提）",
                "\(NSButton().acceptsFirstMouse(for: probeEvent))", "true",
                NSButton().acceptsFirstMouse(for: probeEvent))
-        report("四个按钮都是内容视图的子视图（未新增容器，拖动修复不受影响）",
+        report("三个按钮都是内容视图的子视图（未新增容器，拖动修复不受影响）",
                "\(card.cardButtons.allSatisfy { $0.superview === card.contentView })",
                "true", card.cardButtons.allSatisfy { $0.superview === card.contentView })
         report("卡片有放大按钮", String(describing: type(of: card.plusButton)), "PinCardButton",
@@ -469,18 +449,17 @@ extension CaptureDiagnostics {
             guard let bounds = window.contentView?.bounds else { return false }
             return abs(window.closeButton.frame.maxX - (bounds.maxX - inset)) < 1
                 && abs(window.closeButton.frame.maxY - (bounds.maxY - inset)) < 1
-                && abs(window.pinButton.frame.maxY - window.closeButton.frame.maxY) < 0.01
+                && abs(window.plusButton.frame.maxY - window.closeButton.frame.maxY) < 0.01
         }
         report("✕ 贴卡片右上角（出口在最前）",
                "卡片右上=(\(Int(card.contentView?.bounds.maxX ?? 0)), \(Int(card.contentView?.bounds.maxY ?? 0)))",
                "✕ 右上=(卡片右上 − \(Int(inset)))", topRightSatisfied(card))
-        report("四个按钮都完整落在卡片内（超出会被 masksToBounds 剪掉）",
+        report("三个按钮都完整落在卡片内（超出会被 masksToBounds 剪掉）",
                cardButtonBounds(card), "全部在卡片内", buttonsInsideCard(card))
-        report("从右到左的顺序是 ✕、图钉、＋、－（破坏性动作与缩放分开得开）",
-               "\(Int(card.closeButton.frame.minX)) > \(Int(card.pinButton.frame.minX)) > \(Int(card.plusButton.frame.minX)) > \(Int(card.minusButton.frame.minX))",
+        report("从右到左的顺序是 ✕、＋、－（破坏性动作与缩放分开得开）",
+               "\(Int(card.closeButton.frame.minX)) > \(Int(card.plusButton.frame.minX)) > \(Int(card.minusButton.frame.minX))",
                "递减",
-               card.closeButton.frame.minX > card.pinButton.frame.minX
-                   && card.pinButton.frame.minX > card.plusButton.frame.minX
+               card.closeButton.frame.minX > card.plusButton.frame.minX
                    && card.plusButton.frame.minX > card.minusButton.frame.minX)
         report("同一排按钮的上下边对齐", "\(Int(card.minusButton.frame.minY))",
                "\(Int(card.closeButton.frame.minY))",
@@ -499,7 +478,7 @@ extension CaptureDiagnostics {
                    && abs(card.closeButton.frame.height - side) < 1)
         card.applyScale(1, pixelSize: CGSize(width: 400, height: 300), screenScale: 2)
 
-        // 卡片上的缩放按钮：不依赖滚轮也能放大缩小（滚轮能否到达本窗口由系统决定）。
+        // 卡片上的缩放按钮：不依赖滚轮也能放大缩小。
         let baseWidth = card.frame.width
         card.plusButton.performClick(nil)
         report("点「＋」放大 10%（等比）",
@@ -513,60 +492,28 @@ extension CaptureDiagnostics {
         report("缩放按钮点击后按钮仍在卡片内", cardButtonBounds(card), "全部在卡片内",
                buttonsInsideCard(card))
 
-        // 右键菜单：出口已经移到卡片上，菜单里不得再有两者的重复入口。
         let menuTitles = card.cardAdjustmentMenu().items.map(\.title)
-        report("右键菜单不再提供「隐藏」/「关闭」", "\(menuTitles)", "不含这两项",
-               !menuTitles.contains("隐藏") && !menuTitles.contains("关闭"))
-        report("右键菜单仍保留调整项（未随出口一起被删）", "\(menuTitles)", "含「原始大小」「不透明」",
-               menuTitles.contains("原始大小") && menuTitles.contains("不透明"))
+        report("右键菜单提供隐藏/关闭与调整项", "\(menuTitles)", "含「原始大小」「不透明」「隐藏贴图」「关闭贴图」",
+               menuTitles.contains("原始大小") && menuTitles.contains("不透明")
+                   && menuTitles.contains("隐藏贴图") && menuTitles.contains("关闭贴图"))
 
-        // ① 固定中 + 关闭 = 只隐藏，位图保留、仍在管理列表（菜单栏可恢复）。
-        card.closeButton.performClick(nil)
-        report("固定中点关闭 → 卡片收起", "\(card.isVisible)", "false", !card.isVisible)
-        report("固定中点关闭 → **位图仍在**（关闭本身从不销毁）",
-               "\(card.contentImage != nil)", "true", card.contentImage != nil)
-        report("固定中点关闭 → 仍在管理列表里（可从菜单栏恢复）",
+        // ① 隐藏保留位图，菜单栏可恢复；点关闭直接释放位图。
+        card.hidePin()
+        report("隐藏 → 卡片收起", "\(card.isVisible)", "false", !card.isVisible)
+        report("隐藏 → 位图仍在", "\(card.contentImage != nil)", "true", card.contentImage != nil)
+        report("隐藏 → 仍在管理列表里",
                "\(manager.pins.count) 张 / 隐藏 \(manager.hiddenCount)", "1 张 / 隐藏 1",
                manager.pins.count == 1 && manager.hiddenCount == 1)
 
-        // ② 恢复显示后按图钉 = 取消固定，但**先不隐藏**。
         card.showPin()
-        card.pinButton.performClick(nil)
-        report("按图钉后进入「已取消固定」", "\(card.isUnpinned)", "true", card.isUnpinned)
-        report("按图钉**不隐藏**（卡片仍在屏幕上）", "\(card.isVisible)", "true", card.isVisible)
-        report("按图钉后位图仍在且仍计入上限",
-               "位图=\(card.contentImage != nil) / 列表 \(manager.pins.count) 张", "true / 1 张",
-               card.contentImage != nil && manager.pins.count == 1)
-        report("图钉按钮图标与说明随状态变化（否则用户看不出关闭会释放）",
-               card.pinButton.toolTip ?? "nil", "含「重新固定」",
-               (card.pinButton.toolTip ?? "").contains("重新固定"))
-        report("已取消固定时关闭按钮说明改为会释放（两态的文案必须不同）",
-               card.closeButton.toolTip ?? "nil", "含「并释放」",
-               (card.closeButton.toolTip ?? "").contains("并释放"))
-
-        // ③ 再按一次图钉 = 回到固定中（toggle 往返）。
-        card.pinButton.performClick(nil)
-        report("再按图钉可恢复固定（状态可往返）", "\(card.isUnpinned)", "false", !card.isUnpinned)
-        report("恢复固定后关闭按钮说明回到「不释放」",
-               card.closeButton.toolTip ?? "nil", "含「隐藏」与「不释放」",
-               (card.closeButton.toolTip ?? "").contains("隐藏")
-                   && (card.closeButton.toolTip ?? "").contains("不释放"))
-
-        // ④ 已取消固定 + 关闭 = 隐藏并释放（唯一销毁路径）。
-        card.pinButton.performClick(nil)
         card.closeButton.performClick(nil)
-        report("已取消固定后点关闭 → 释放位图", "\(card.contentImage == nil)", "true",
+        report("点关闭 → 释放位图", "\(card.contentImage == nil)", "true",
                card.contentImage == nil)
-        report("已取消固定后点关闭 → 窗口不可见", "\(card.isVisible)", "false", !card.isVisible)
-        report("已取消固定后点关闭 → 从管理列表移除（菜单栏条目消失）",
-               "\(manager.pins.count)", "0", manager.pins.isEmpty)
+        report("点关闭 → 窗口不可见", "\(card.isVisible)", "false", !card.isVisible)
+        report("点关闭 → 从管理列表移除", "\(manager.pins.count)", "0", manager.pins.isEmpty)
         report("释放后占用归零", "\(manager.estimatedBytes)", "0", manager.estimatedBytes == 0)
 
-        // ⑤ ESC 关闭 + 指针命中（捏合的全局监视器靠命中判定决定把事件给谁）。
-        //
-        // 断言方式：合成 keyDown（`NSEvent.keyEvent` 是公开 API，可以造），
-        // 走的是窗口真实的 `keyDown` 入口——不是直接调关闭方法，
-        // 后者只能证明方法存在，证明不了「按 ESC 会走到那里」。
+        // ② ESC 关闭：直接关闭并释放位图。
         guard case .created(let escCard) = manager.pin(image: image, screenScale: 2) else {
             report("ESC 场景构造", "limitReached", "created", false)
             exit(1)
@@ -591,25 +538,12 @@ extension CaptureDiagnostics {
             )
         }
 
-        // 固定中按 ESC = 隐藏（保留位图），与 ✕ 的规则逐字相同。
         if let escape = keyEvent(keyCode: PinWindow.escapeKeyCode, characters: "\u{1b}", for: escCard) {
             escCard.keyDown(with: escape)
         }
-        report("固定中按 ESC → 卡片收起", "\(escCard.isVisible)", "false", !escCard.isVisible)
-        report("固定中按 ESC → **位图保留**（不能比 ✕ 更狠）",
-               "位图=\(escCard.contentImage != nil) / 列表 \(manager.pins.count) 张",
-               "true / 1 张",
-               escCard.contentImage != nil && manager.pins.count == 1)
-
-        // 已取消固定按 ESC = 隐藏并释放，同样与 ✕ 一致。
-        escCard.showPin()
-        escCard.pinButton.performClick(nil)
-        if let escape = keyEvent(keyCode: PinWindow.escapeKeyCode, characters: "\u{1b}", for: escCard) {
-            escCard.keyDown(with: escape)
-        }
-        report("已取消固定按 ESC → 释放位图", "\(escCard.contentImage == nil)", "true",
+        report("按 ESC → 释放位图", "\(escCard.contentImage == nil)", "true",
                escCard.contentImage == nil)
-        report("已取消固定按 ESC → 从管理列表移除", "\(manager.pins.count)", "0", manager.pins.isEmpty)
+        report("按 ESC → 从管理列表移除", "\(manager.pins.count)", "0", manager.pins.isEmpty)
 
         // 其它按键不得被当成关闭：否则任何一次键入都会把卡片关掉。
         guard case .created(let keyCard) = manager.pin(image: image, screenScale: 2) else {

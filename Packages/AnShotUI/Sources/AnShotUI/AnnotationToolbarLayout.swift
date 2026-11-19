@@ -259,25 +259,29 @@ struct AnnotationToolbarLayout {
         let leftMargin = max(gap, safeInsets.left + gap)
         let rightMargin = max(gap, safeInsets.right + gap)
 
+        let minXBound = viewBounds.minX + leftMargin
+        let maxXBound = max(minXBound, viewBounds.maxX - rightMargin - toolbarSize.width)
+        let minYBound = viewBounds.minY + topMargin
+        let maxYBound = viewBounds.maxY - bottomMargin
+
         // 优先贴在标签下方；放不下就翻到选区上方（标签之上）；
-        // 两边都不够时落在视图安全区内，避开 MacBook 顶部刘海与菜单栏。
+        // 两边都不够时落在当前可视区域安全区内，避开 MacBook 顶部刘海与滚动滚出视口。
         let below = selection.maxY + labelReserve + gap
         let above = selection.minY - labelReserve - gap - toolbarSize.height
 
         let y: CGFloat
-        if below + toolbarSize.height <= viewBounds.height - bottomMargin {
+        if below + toolbarSize.height <= maxYBound && below >= minYBound {
             y = below
-        } else if above >= topMargin {
+        } else if above >= minYBound && above + toolbarSize.height <= maxYBound {
             y = above
         } else {
-            // 选区几乎占满整个视图（整屏截图、图片编辑）：上下都放不下。
-            // 放顶部安全区下方而不是底部——尺寸标签在下方，放底部会压住读数，且需避开刘海。
-            y = topMargin
+            // 选区几乎占满整个可见视口（整屏截图、图片/长截图滚动编辑）：上下都放不下。
+            // 放当前可视区顶部安全区下方而不是底部——尺寸标签在下方，且滚动长图时始终随视口可见。
+            y = minYBound
         }
 
-        // 水平方向与选区左对齐，并钳制在视图安全区内。
-        let maxX = max(leftMargin, viewBounds.width - rightMargin - toolbarSize.width)
-        let x = min(max(leftMargin, selection.minX), maxX)
+        // 水平方向与选区左对齐，并钳制在可见视口安全区内。
+        let x = min(max(minXBound, selection.minX), maxXBound)
         return CGPoint(x: x, y: y)
     }
 
@@ -698,22 +702,38 @@ struct AnnotationToolbarLayout {
         let buttonHeight = Self.panelHeight - buttonY * 2
         let iconY = (Self.panelHeight - Self.iconButtonSize) / 2
 
-        // 框选 / 涂抹
-        for (index, mode) in MosaicToolMode.allCases.enumerated() {
+        // 子工具切换：马赛克 / 放大镜（补齐鼠标可直达的放大镜入口）。
+        let familyTools: [AnnotationTool] = [.mosaic, .magnifier]
+        for (index, subTool) in familyTools.enumerated() {
             if index > 0 {
                 x += Self.itemSpacing
             }
-            let width = textButtonWidth(for: mode.displayName)
             items.append(Item(
-                kind: .mosaicMode(mode),
-                rect: CGRect(x: x, y: buttonY, width: width, height: buttonHeight),
+                kind: .tool(subTool),
+                rect: CGRect(x: x, y: iconY, width: Self.iconButtonSize, height: Self.iconButtonSize),
                 isEnabled: true
             ))
-            x += width
+            x += Self.iconButtonSize
         }
 
-        // 打码效果（像素化 / 高斯模糊）：仅马赛克工具显示，放大镜无效果模式切换。
         if tool == .mosaic {
+            x += Self.groupSpacing
+
+            // 框选 / 涂抹
+            for (index, mode) in MosaicToolMode.allCases.enumerated() {
+                if index > 0 {
+                    x += Self.itemSpacing
+                }
+                let width = textButtonWidth(for: mode.displayName)
+                items.append(Item(
+                    kind: .mosaicMode(mode),
+                    rect: CGRect(x: x, y: buttonY, width: width, height: buttonHeight),
+                    isEnabled: true
+                ))
+                x += width
+            }
+
+            // 打码效果（像素化 / 高斯模糊）
             x += Self.groupSpacing
             let effectModes: [MosaicMode] = [.pixelate, .blur]
             for (index, effectMode) in effectModes.enumerated() {
@@ -728,25 +748,34 @@ struct AnnotationToolbarLayout {
                 ))
                 x += width
             }
-        }
 
-        x += Self.groupSpacing
-
-        // 块大小：档位画的是粒度递增的块阵，用图标按钮尺寸。
-        for (index, size) in AnnotationStyle.mosaicBlockSizes.enumerated() {
-            if index > 0 {
-                x += Self.itemSpacing
+            // 块大小 / 模糊强度档位
+            x += Self.groupSpacing
+            for (index, size) in AnnotationStyle.mosaicBlockSizes.enumerated() {
+                if index > 0 {
+                    x += Self.itemSpacing
+                }
+                items.append(Item(
+                    kind: .mosaicBlockSize(size),
+                    rect: CGRect(x: x, y: iconY, width: Self.iconButtonSize, height: Self.iconButtonSize),
+                    isEnabled: true
+                ))
+                x += Self.iconButtonSize
             }
-            items.append(Item(
-                kind: .mosaicBlockSize(size),
-                rect: CGRect(x: x, y: iconY, width: Self.iconButtonSize, height: Self.iconButtonSize),
-                isEnabled: true
-            ))
-            x += Self.iconButtonSize
-        }
 
-        // 放大镜倍率：只在放大镜工具下出现（它没有块大小/笔刷概念）。
-        if tool == .magnifier {
+            // 笔刷大小只在马赛克涂抹模式下出现。
+            if style.mosaicMode == .brush {
+                x += Self.groupSpacing
+                items.append(Item(
+                    kind: .mosaicBrushDiameterSlider,
+                    rect: CGRect(x: x, y: buttonY, width: Self.sliderWidth, height: buttonHeight),
+                    isEnabled: true
+                ))
+                x += Self.sliderWidth
+            }
+        } else if tool == .magnifier {
+            // 放大镜倍率：仅展示放大镜专属参数，彻底隔离马赛克无效控件。
+            x += Self.groupSpacing
             for (index, zoom) in AnnotationStyle.magnifierZooms.enumerated() {
                 if index > 0 { x += Self.itemSpacing }
                 let width = textButtonWidth(for: Self.formatZoomLabel(zoom))
@@ -757,18 +786,6 @@ struct AnnotationToolbarLayout {
                 ))
                 x += width
             }
-            x += Self.groupSpacing
-        }
-
-        // 笔刷大小只在涂抹模式下出现：框选模式没有笔刷。
-        if style.mosaicMode == .brush {
-            x += Self.groupSpacing
-            items.append(Item(
-                kind: .mosaicBrushDiameterSlider,
-                rect: CGRect(x: x, y: buttonY, width: Self.sliderWidth, height: buttonHeight),
-                isEnabled: true
-            ))
-            x += Self.sliderWidth
         }
 
         x += Self.padding

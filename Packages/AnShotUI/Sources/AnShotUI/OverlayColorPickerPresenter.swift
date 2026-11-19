@@ -120,8 +120,15 @@ final class OverlayColorPickerPresenter {
         panel.pickerView.color = state.style.color(for: state.tool)
             ?? AnnotationStyle.default.shapeColor
         // 只弱引用编辑器：会话结束后它随会话释放，闭包不该把它留住。
+        // 连续拖动 SV/色相条时包进单次编辑事务，避免往撤销栈灌入几十条中间快照。
+        panel.pickerView.onBeginDrag = { [weak state] in
+            state?.beginEditTransaction()
+        }
         panel.pickerView.onChange = { [weak state] color in
             state?.selectColor(color)
+        }
+        panel.pickerView.onEndDrag = { [weak state] in
+            state?.commitEditTransaction()
         }
         panel.onCancel = { [weak self] in
             self?.dismiss()

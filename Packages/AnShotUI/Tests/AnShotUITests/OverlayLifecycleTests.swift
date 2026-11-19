@@ -93,10 +93,67 @@ struct OverlayLifecycleTests {
         #expect(field.isSelectable, "替换 CenteredHexFieldCell 后 Hex 输入框必须保持可选中")
 
         let panel = ColorPickerPanel()
+        #expect(panel.hidesOnDeactivate == false, "ColorPickerPanel 必须关闭失焦自动隐藏")
         var cancelled = false
         panel.onCancel = { cancelled = true }
         panel.cancelOperation(nil)
         #expect(cancelled, "ColorPickerPanel 按 ESC 必须触发关闭回调")
+    }
+
+    @Test("超长截图进入编辑窗口保持严格等比且画布坐标映射零错位")
+    func tallScrollshotEditorPreservesAspectRatioAndCoordinates() throws {
+        _ = NSApplication.shared
+        let visible = CGRect(x: 0, y: 40, width: 1440, height: 860)
+        let layout = OverlayController.imageEditorLayout(
+            pixelWidth: 1440,
+            pixelHeight: 12000,
+            backingScale: 2.0,
+            visibleFrame: visible
+        )
+        // 纵长图应按宽度适配并保留完整可滚动高度，不得压扁或横向拉宽。
+        let expectedAspect = 12000.0 / 1440.0
+        let actualAspect = layout.canvasSize.height / layout.canvasSize.width
+        #expect(abs(actualAspect - expectedAspect) < 0.05)
+        #expect(layout.canvasSize.width == 720)
+        #expect(layout.canvasSize.height == 6000)
+        #expect(layout.windowSize.height <= visible.height * 0.9 + 1)
+
+        // 验证 OverlayView 居中映射：点击画布正中应精确落回原图 (720, 6000)。
+        guard let screen = NSScreen.main ?? NSScreen.screens.first,
+              let displayID = screen.displayID else { return }
+        let tallImage = makeSolidCGImage(width: 1440, height: 12000)
+        let window = OverlayWindow(
+            imageFrame: CGRect(origin: .zero, size: layout.windowSize),
+            canvasSize: layout.canvasSize,
+            displayID: displayID
+        )
+        window.overlayView.backdrop = tallImage
+        let centerPixel = window.overlayView.pixelPoint(from: CGPoint(
+            x: layout.canvasSize.width / 2,
+            y: layout.canvasSize.height / 2
+        ))
+        #expect(abs(centerPixel.x - 720) < 1)
+        #expect(abs(centerPixel.y - 6000) < 1)
+    }
+
+    @Test("放大镜卡片宽度足以无碰撞容纳 4K 坐标与 RGB/快捷键提示")
+    func loupePanelFits4KCoordinatesAndRGBHintWithoutOverlap() {
+        let contentWidth = OverlayLoupeSampler.defaultPanelSize.width - 20
+        let hexWidth = ("#FFFFFF" as NSString).size(withAttributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 10.5, weight: .semibold),
+        ]).width
+        let coordWidth = ("(3840, 2160)" as NSString).size(withAttributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .regular),
+        ]).width
+        #expect(10 + 5 + hexWidth + 4 + coordWidth <= contentWidth, "第 1 行 #HEX 与 4K 坐标不应重叠")
+
+        let rgbWidth = ("RGB(255, 255, 255)" as NSString).size(withAttributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .regular),
+        ]).width
+        let hintWidth = ("C / ⇧C" as NSString).size(withAttributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .medium),
+        ]).width
+        #expect(rgbWidth + 4 + hintWidth <= contentWidth, "第 2 行 RGB 与快捷键提示不应裁断")
     }
 
     @Test("长截图结果窗对超长图默认适应宽度并支持切换全览")
