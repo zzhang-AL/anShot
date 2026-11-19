@@ -746,11 +746,12 @@ public final class OverlayController {
                 overlayWindow: window
             )
         case .longScreenshot:
+            let axis: ScrollAxis = NSEvent.modifierFlags.contains(.option) ? .horizontal : .vertical
             handleLongScreenshotRequest(
                 logical,
                 displayID: displayID,
                 overlayWindow: window,
-                axis: .vertical
+                axis: axis
             )
         case .ocr:
             handleRecognizeTextRequest(
@@ -857,6 +858,14 @@ public final class OverlayController {
         for target in targets {
             let window = OverlayWindow(screen: target.screen, displayID: target.displayID)
             window.overlayView.hidesToolbarForIntent = (pendingIntent != .capture && pendingIntent != .windowCapture)
+            if pendingIntent == .longScreenshot {
+                window.overlayView.intentBannerText = "滚动长截图 · 拖选滚动区域 · 按住 ⌥ 可横向滚动 · Esc 退出"
+                window.overlayView.preventsImplicitFullScreenExport = true
+            } else if pendingIntent == .ocr {
+                window.overlayView.intentBannerText = "文字识别 (OCR) · 拖选包含文字或二维码的区域 · Esc 退出"
+            } else if pendingIntent == .ocrAutoTranslate {
+                window.overlayView.intentBannerText = "框选翻译 · 拖选文字区域后将自动翻译 · Esc 退出"
+            }
             window.overlayView.editorState = editor
             window.overlayView.appSettings = settings
             window.overlayView.isWindowPickerMode = startsInWindowPickerMode
@@ -1168,9 +1177,47 @@ public final class OverlayController {
         // 选区在屏幕上的位置（AppKit 坐标）：覆盖层窗口 frame + 视图内偏移。
         let selectionScreenRect = Self.screenRect(for: rect, in: overlayWindow)
         scrollshotBar.onFinish = { [weak self] in
-            Task { await self?.finishScrollshot() }
+            Task { await self?.finishScrollshot(mode: .defaultResult) }
         }
         scrollshotBar.onCancel = { [weak self] in self?.cancelScrollshot() }
+        scrollshotBar.onOCR = { [weak self] in
+            Task { await self?.finishScrollshot(mode: .ocr) }
+        }
+        scrollshotBar.onEdit = { [weak self] in
+            Task { await self?.finishScrollshot(mode: .edit) }
+        }
+        scrollshotBar.onUndo = { [weak self] in
+            Task { [weak self] in
+                guard let self else { return }
+                let didUndo = await self.scrollshot?.undoLastSegment() ?? false
+                if didUndo {
+                    ToastPresenter.show("已撤销上一段拼接")
+                } else {
+                    NSSound.beep()
+                }
+            }
+        }
+        scrollshotBar.onToggleAutoScroll = { [weak self] in
+            self?.scrollshot?.toggleAutoScroll()
+        }
+        scrollshotBar.onCycleAutoScrollSpeed = { [weak self] in
+            guard let self, let controller = self.scrollshot else { return }
+            let nextSpeed = controller.currentAutoScrollSpeed.next
+            self.settings.setLongshotAutoScrollSpeed(nextSpeed)
+            controller.setAutoScrollSpeed(nextSpeed)
+        }
+        scrollshotBar.onRequestAccessibility = {
+            SystemElementDetector.openAccessibilitySettings()
+        }
+        scrollshotBar.onHoverChanged = { [weak self] hovered in
+            self?.scrollshot?.setControlBarHovered(hovered)
+        }
+
+        scrollshotBar.updateDimensions(
+            width: Int(pixelRect.size.width.rounded()),
+            height: Int(pixelRect.size.height.rounded())
+        )
+        scrollshotBar.updateUndoAvailability(false)
         scrollshotBar.show(near: selectionScreenRect)
         // 选区框要的就是「覆盖层收起之后仍然看得见边界」。
         scrollshotRegionFrame.show(rect: selectionScreenRect, appearance: .scrollshot)
@@ -1180,14 +1227,29 @@ public final class OverlayController {
             selection: pixelRect,
             displayID: displayID,
             scaleFactor: scale,
-            axis: axis
+            axis: axis,
+            selectionScreenRect: selectionScreenRect,
+            autoScrollEnabled: settings.longshotAutoScrollEnabled,
+            autoScrollSpeed: settings.longshotAutoScrollSpeed,
+            enableTransientHotKeys: !AppDelegate.isDiagnosticLaunch()
         )
+        controller.onExternalCancel = { [weak self] in
+            self?.cancelScrollshot()
+        }
         controller.onReady = { [weak self] in
-            self?.scrollshotBar.updateGuide(ScrollshotProgressBar.guideScrolling)
+            guard let self else { return }
+            if !self.settings.longshotAutoScrollEnabled {
+                self.scrollshotBar.updateGuide(ScrollshotProgressBar.guideScrolling)
+            }
+        }
+        controller.onAutoScrollStateChanged = { [weak self] state, speed in
+            self?.scrollshotBar.updateAutoScrollState(state, speed: speed)
+        }
+        controller.onDimensionsChanged = { [weak self] width, height, canUndo in
+            self?.scrollshotBar.updateDimensions(width: width, height: height)
+            self?.scrollshotBar.updateUndoAvailability(canUndo)
         }
         // 预览：节流在控制器内，这里只负责把整幅导航图与定位框贴到浮层上。
-        // 进度回调不再驱动界面——「已采集 N 帧」是给开发者看的统计，不是用户的
-        // 问题；用户要看的是长图的样子与当前位置，那由预览回答。
         controller.onPreview = { [weak self] content in
             self?.scrollshotBar.updatePreview(content)
         }
@@ -1203,7 +1265,14 @@ public final class OverlayController {
             self?.scrollshotBar.updateGuide(ScrollshotProgressBar.guideStalled, isWarning: true)
         }
         controller.onRecovery = { [weak self] in
-            self?.scrollshotBar.updateGuide(ScrollshotProgressBar.guideScrolling)
+            guard let self else { return }
+            let state = self.scrollshot?.currentAutoScrollState ?? .idle
+            let speed = self.scrollshot?.currentAutoScrollSpeed ?? self.settings.longshotAutoScrollSpeed
+            if state == .idle {
+                self.scrollshotBar.updateGuide(ScrollshotProgressBar.guideScrolling)
+            } else {
+                self.scrollshotBar.updateAutoScrollState(state, speed: speed)
+            }
         }
         // 「上限」与「跟丢」必须说成不同的话：前者已经采够了（长图可用），
         // 后者暂停收录、等待回滚对齐。
@@ -1562,9 +1631,9 @@ public final class OverlayController {
         }
     }
 
-    /// 用户点「完成」：拼接并交付。
-    private func finishScrollshot() async {
-        await scrollshot?.finish()
+    /// 用户点「完成」或触发快捷交付出口：拼接并交付。
+    private func finishScrollshot(mode: ScrollshotController.FinishMode = .defaultResult) async {
+        await scrollshot?.finish(mode: mode)
     }
 
     /// 用户点「取消」。
@@ -1619,18 +1688,47 @@ public final class OverlayController {
             滚动截图完成：\(image.width, privacy: .public)x\(image.height, privacy: .public) \
             采纳帧=\(outcome.capturedFrames, privacy: .public) \
             观测帧=\(outcome.observedFrames, privacy: .public) 复制=\(copied, privacy: .public) \
+            mode=\(String(describing: outcome.finishMode), privacy: .public) \
             告警=\(outcome.plan?.warnings.joined(separator: " | ") ?? "-", privacy: .public)
             """)
 
-        presentScrollshotResult(
-            image,
-            warnings: outcome.plan?.warnings ?? [],
-            copied: copied
-        )
+        let finishMode = outcome.finishMode
+        let warnings = outcome.plan?.warnings ?? []
 
-        // 覆盖层在长截图开始时就已收起；这里结束会话、释放底图。
-        // 结果窗口是独立对象，不受 dismiss 影响。
-        dismiss()
+        // 覆盖层在长截图开始时就已收起；先按出口分流并结束覆盖层会话。
+        switch finishMode {
+        case .defaultResult:
+            presentScrollshotResult(image, warnings: warnings, copied: copied)
+            dismiss()
+        case .copy:
+            ToastPresenter.show(copied ? "长截图已复制到剪贴板" : "复制失败")
+            dismiss()
+        case .save(let forceAsk):
+            dismiss()
+            if forceAsk {
+                let outcome = SessionExporter.saveWithPanel(
+                    image,
+                    suggestedName: Exporter.defaultFileName(),
+                    backingScale: scrollBackingScale
+                )
+                if case .saved(let url) = outcome {
+                    onPromoteLongScreenshotHistory?(url)
+                    ToastPresenter.show("长截图已保存：\(url.lastPathComponent)", actionTitle: "在访达中显示") {
+                        NSWorkspace.shared.activateFileViewerSelecting([url])
+                    }
+                } else if case .failed(let reason) = outcome {
+                    ToastPresenter.show("保存失败：\(reason)")
+                }
+            } else {
+                saveScrollshotResult(image, backingScale: scrollBackingScale)
+            }
+        case .edit:
+            dismiss()
+            present(image: image, scaleFactor: scrollBackingScale)
+        case .ocr:
+            dismiss()
+            presentOCR(for: image, autoTranslate: false)
+        }
     }
 
     /// 当前长截图的来源描述。当前实现只记录「长截图」这一层，

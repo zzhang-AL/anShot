@@ -2,45 +2,17 @@
 //  ScrollshotProgressBar.swift
 //  AnShotUI
 //
-//  滚动截图会话的浮层：左栏**整幅长图导航 + 可拖动定位框**，右栏**定位处放大详情**，
-//  外加完成 / 取消。
+//  长截图实时交互界面（Phase 4 重构）：
+//    1. `~42pt` 自适配浅/深色紧凑单行药丸主控制栏（避让 Dock、鼠标移入防抖、实时 W×H 像素尺寸、
+//       自动翻页控制、速度切换、无权限内联「授权」、撤销、预览开关、OCR/标注直达、高亮完成/取消）；
+//    2. 选区外侧独立可穿透/可折叠预览卡（整幅导航 + 定位框 + 高质量抗锯齿细节放大，
+//       动态适配 1x/2x 屏缩放、空态居中与横向朝向修正）。
 //
-//  ── 为什么要两栏（「整幅可见」与「看得清」的矛盾）──────────
-//
-//  长图是竖长的，比例常见 1:4 ~ 1:10。把它整个塞进一个容器，只剩两个选择：
-//
-//  * **按宽度铺满**（上一版的做法）：细节清楚，但高度是容器的好几倍，一屏只能
-//    看到长图的一小段——用户始终不知道「整体还剩多少、我现在在哪」；
-//  * **整幅 contain**：整体可见，但缩成几十点宽的一条，内容完全认不出来。
-//
-//  上一版选前者，靠滚动 + 位置标记补「我在哪」，代价就是**看不到整体**。
-//  这一版把两个诉求拆给两栏：导航栏整幅 contain（回答「整体在哪、我在哪一段」），
-//  放大栏按定位取原图切片（回答「那一段长什么样」）。两栏各自只做一件事，
-//  合起来才同时成立。
-//
-//  ── 定位框是「窗口」而不是「游标」────────────────────────
-//
-//  蓝框高度 = 放大栏一屏能装下的世界行数，于是**框住多少 = 右边显示多少**，
-//  拖动它等于把查看窗口滑到别处。用户拖走之后不再自动跟随采集位置——他主动去
-//  看了别处，再把框弹回去是打断；状态行会提示，点一下即回到采集位置。
-//
-//  ── 位置一律用世界坐标 ────────────────────────────────────
-//
-//  导航图的像素高度会随长图长度、窗口尺寸与像素上限变化，把「用户拖到哪了」挂在
-//  它上面就会在每次预览更新时漂移。所以浮层内部只保存 `focusWorldRow`（世界行），
-//  显示时才换算成视图坐标；换算基准（`worldStart/worldHeight`）随预览一起下发。
-//
-//  ── 为什么必须让它「不被拍到」 ────────────────────────────
-//
-//  抓帧用的是固定区域（`CaptureScope.region`），**无法按窗口排除**。
-//  浮层若压在选区里，就会被逐帧抓进长图。解法是 `sharingType = .none`：
-//  在窗口层面声明「本窗口不可被共享/捕获」，ScreenCaptureKit 会遵守它。
-//  这条设置让浮层可以自由摆放，不必再挤在选区外的缝隙里。
-//
-//  ⚠️ 该设置同时意味着浮层也无法被诊断**自拍**到（诊断抓的帧里它会是空白）。
-//  验证浮层本身的外观要靠渲染成图（`contentViewForDiagnostics`）。
+//  两个浮窗均声明 `sharingType = .none`，绝不会被抓进长图。
 //
 
+import AnShotCapture
+import AnShotCore
 import AppKit
 
 /// 滚动截图浮层要显示的预览内容。
@@ -56,18 +28,148 @@ struct ScrollshotPreviewContent {
     let worldHeight: Int
     /// 当前屏幕视口在**世界坐标**里的行区间；无法确定时为 nil。
     let viewportWorldRows: Range<Int>?
+    /// 长截图滚动轴（竖向或横向），用于预览卡正确朝向与尺寸展示。
+    let axis: ScrollAxis
+
+    init(
+        navigatorImage: CGImage,
+        navigatorPixelWidth: Int,
+        navigatorPixelHeight: Int,
+        worldWidth: Int,
+        worldStart: Int,
+        worldHeight: Int,
+        viewportWorldRows: Range<Int>?,
+        axis: ScrollAxis = .vertical
+    ) {
+        self.navigatorImage = navigatorImage
+        self.navigatorPixelWidth = navigatorPixelWidth
+        self.navigatorPixelHeight = navigatorPixelHeight
+        self.worldWidth = worldWidth
+        self.worldStart = worldStart
+        self.worldHeight = worldHeight
+        self.viewportWorldRows = viewportWorldRows
+        self.axis = axis
+    }
 }
 
-/// 导航栏：整幅长图缩略图 + 可上下拖动的定位框。
-///
-/// 自己处理鼠标事件而不是用 `NSPanGestureRecognizer`：这里要的是「按哪儿，框就
-/// 到哪儿，然后跟着手走」，而不是「把拖动转成滚动量」。手势识别器给不了前一半。
+/// 自适配系统浅/深主题的动态背景胶囊容器，支持鼠标移入/移出追踪。
+private final class ScrollshotSurfaceView: NSView {
+    var onHoverChanged: ((Bool) -> Void)?
+    private let cornerRadius: CGFloat
+    private let backgroundProvider: () -> NSColor
+    private let borderProvider: () -> NSColor
+    private var hoverArea: NSTrackingArea?
+
+    init(
+        frame frameRect: NSRect = .zero,
+        cornerRadius: CGFloat,
+        background: @escaping () -> NSColor = { NSColor.windowBackgroundColor.withAlphaComponent(0.94) },
+        border: @escaping () -> NSColor = { NSColor.separatorColor }
+    ) {
+        self.cornerRadius = cornerRadius
+        self.backgroundProvider = background
+        self.borderProvider = border
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("不支持从 nib 构造")
+    }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        layer?.backgroundColor = backgroundProvider().cgColor
+        layer?.borderColor = borderProvider().cgColor
+        layer?.borderWidth = 1
+        layer?.cornerRadius = cornerRadius
+        layer?.masksToBounds = true
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea {
+            removeTrackingArea(hoverArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self
+        )
+        addTrackingArea(area)
+        hoverArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        onHoverChanged?(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onHoverChanged?(false)
+    }
+}
+
+/// 高质量抗锯齿图像视图：启用 `.high` 插值并按比例绘制，消除长图缩略图的锯齿毛刺。
+private final class ScrollshotHighQualityImageView: NSView {
+    var cgImage: CGImage? {
+        didSet { needsDisplay = true }
+    }
+    var drawsAspectFit: Bool = true {
+        didSet { needsDisplay = true }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("不支持从 nib 构造")
+    }
+
+    override var wantsUpdateLayer: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current else { return }
+        let cg = context.cgContext
+        cg.saveGState()
+        cg.setFillColor(NSColor.textBackgroundColor.withAlphaComponent(0.45).cgColor)
+        cg.fill(bounds)
+
+        if let cgImage, cgImage.width > 0, cgImage.height > 0 {
+            context.imageInterpolation = .high
+            cg.interpolationQuality = .high
+            let drawRect: CGRect
+            if drawsAspectFit {
+                let imgW = CGFloat(cgImage.width)
+                let imgH = CGFloat(cgImage.height)
+                let scale = min(bounds.width / imgW, bounds.height / imgH)
+                let targetW = imgW * scale
+                let targetH = imgH * scale
+                drawRect = CGRect(
+                    x: (bounds.width - targetW) / 2,
+                    y: (bounds.height - targetH) / 2,
+                    width: targetW,
+                    height: targetH
+                )
+            } else {
+                drawRect = bounds
+            }
+            cg.draw(cgImage, in: drawRect)
+        }
+        cg.restoreGState()
+    }
+}
+
+/// 导航栏：整幅长图缩略图 + 可上下拖动的定位框（自适应 1x/2x 屏比例与抗锯齿渲染）。
 private final class ScrollshotNavigatorView: NSView {
 
-    /// 用户把定位框拖到了新的世界行（中心行）。
     var onFocusChange: (@MainActor (Int) -> Void)?
 
-    private let thumbnailView = NSImageView()
+    private let thumbnailView = ScrollshotHighQualityImageView(frame: .zero)
     private let focusView = NSView()
 
     private var thumbnailPixelSize = CGSize.zero
@@ -76,30 +178,20 @@ private final class ScrollshotNavigatorView: NSView {
     private var focusWorldRow = 0
     private var focusWindowRows = 1
 
-    /// 定位框的最小显示高度（点）：长图很长时一屏会被压成一条线，太细就拖不住。
     private static let minimumFocusHeight: CGFloat = 14
 
-    /// 左上原点：与图像的行方向一致，省掉上下翻转的换算。
     override var isFlipped: Bool { true }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.white.withAlphaComponent(0.06).cgColor
-        layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
-        layer?.borderWidth = 1
-        layer?.cornerRadius = 4
-
-        thumbnailView.imageScaling = .scaleAxesIndependently
+        thumbnailView.drawsAspectFit = false
         addSubview(thumbnailView)
 
-        // 当前位置标记：标出「放大栏正在显示的是长图里的哪一段」。
         focusView.wantsLayer = true
-        focusView.layer?.backgroundColor = NSColor.controlAccentColor
-            .withAlphaComponent(0.22).cgColor
-        focusView.layer?.borderColor = NSColor.controlAccentColor
-            .withAlphaComponent(0.95).cgColor
-        focusView.layer?.borderWidth = 1
+        focusView.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.22).cgColor
+        focusView.layer?.borderColor = NSColor.controlAccentColor.withAlphaComponent(0.95).cgColor
+        focusView.layer?.borderWidth = 1.5
         focusView.layer?.cornerRadius = 2
         focusView.isHidden = true
         addSubview(focusView)
@@ -107,20 +199,35 @@ private final class ScrollshotNavigatorView: NSView {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+        fatalError("不支持从 nib 构造")
     }
 
-    /// 缩略图在视图内的显示框（点）。缩略图按 2x 生成、按 1x 显示，所以是像素的一半。
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        layer?.backgroundColor = NSColor.textBackgroundColor.withAlphaComponent(0.6).cgColor
+        layer?.borderColor = NSColor.separatorColor.cgColor
+        layer?.borderWidth = 1
+        layer?.cornerRadius = 4
+    }
+
+    /// 根据当前视图尺寸与所在屏 `backingScaleFactor` 计算缩略图等比显示框（彻底修复 1x 屏硬编码 0.5 问题）。
     private var imageFrame: CGRect {
-        let size = CGSize(
-            width: CGFloat(thumbnailPixelSize.width) * 0.5,
-            height: CGFloat(thumbnailPixelSize.height) * 0.5
-        )
+        guard thumbnailPixelSize.width > 0, thumbnailPixelSize.height > 0,
+              bounds.width > 0, bounds.height > 0 else {
+            return .zero
+        }
+        let scale = max(1, window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2)
+        let rawW = thumbnailPixelSize.width / scale
+        let rawH = thumbnailPixelSize.height / scale
+        let fit = min(1, min(bounds.width / rawW, bounds.height / rawH))
+        let displayW = max(1, rawW * fit)
+        let displayH = max(1, rawH * fit)
         return CGRect(
-            x: (bounds.width - size.width) / 2,
-            y: (bounds.height - size.height) / 2,
-            width: size.width,
-            height: size.height
+            x: (bounds.width - displayW) / 2,
+            y: (bounds.height - displayH) / 2,
+            width: displayW,
+            height: displayH
         )
     }
 
@@ -129,7 +236,7 @@ private final class ScrollshotNavigatorView: NSView {
             thumbnailPixelSize = .zero
             worldStart = 0
             worldHeight = 0
-            thumbnailView.image = nil
+            thumbnailView.cgImage = nil
             focusView.isHidden = true
             needsLayout = true
             return
@@ -140,11 +247,7 @@ private final class ScrollshotNavigatorView: NSView {
         )
         worldStart = content.worldStart
         worldHeight = content.worldHeight
-        let displaySize = CGSize(
-            width: CGFloat(content.navigatorPixelWidth) * 0.5,
-            height: CGFloat(content.navigatorPixelHeight) * 0.5
-        )
-        thumbnailView.image = NSImage(cgImage: content.navigatorImage, size: displaySize)
+        thumbnailView.cgImage = content.navigatorImage
         self.focusWorldRow = focusWorldRow
         self.focusWindowRows = windowRows
         focusView.isHidden = false
@@ -170,14 +273,10 @@ private final class ScrollshotNavigatorView: NSView {
         focusView.frame = CGRect(x: 0, y: top, width: bounds.width, height: height)
     }
 
-    /// 面板是 `nonactivatingPanel`：不覆写这条，第一次点击只会激活窗口、拖不动框。
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     #if DEBUG
-    /// 诊断专用：缩略图在导航栏里的显示框（点，左上原点）。
     var thumbnailFrameForDiagnostics: CGRect { imageFrame }
-
-    /// 诊断专用：定位框的框；未显示时为 nil。
     var focusFrameForDiagnostics: CGRect? { focusView.isHidden ? nil : focusView.frame }
     #endif
 
@@ -192,237 +291,534 @@ private final class ScrollshotNavigatorView: NSView {
     private func moveFocus(toViewY y: CGFloat) {
         let frame = imageFrame
         guard worldHeight > 0, frame.height > 0 else { return }
-        // 拖出边界时夹住：夹的是位置，不是事件——这样手指回到视图内能立刻追上。
         let clampedY = min(max(y, frame.minY), frame.maxY)
         let ratio = (clampedY - frame.minY) / frame.height
         onFocusChange?(worldStart + Int((ratio * CGFloat(worldHeight)).rounded()))
     }
 }
 
-/// 滚动截图的进度浮层。
+/// 长截图 `42pt` 轻量悬浮控制栏 + 独立侧边预览卡。
 @MainActor
 final class ScrollshotProgressBar {
 
+    // MARK: - 尺寸常量
+
+    /// 主控制栏高度（42pt 紧凑单行药丸，契约 `ux-polish/plan.md` §4.3）。
+    static let controlBarHeight: CGFloat = 42
+    static let controlBarMinWidth: CGFloat = 620
+    /// 独立侧边预览卡尺寸。
+    static let previewCardSize = CGSize(width: 300, height: 280)
+
+    /// 导航图的像素尺寸（按 2x 屏生成，1x 屏由 `ScrollshotNavigatorView` 动态 fit）。
+    static let navigatorPixelSize = CGSize(width: 144, height: 440)
+    /// 放大详情图的像素宽度。
+    static let detailPixelWidth = 420
+
+    // 侧边预览卡内部子区坐标（左下原点）
+    private static let navigatorFrame = CGRect(x: 10, y: 10, width: 72, height: 224)
+    private static let detailFrame = CGRect(x: 90, y: 10, width: 200, height: 224)
+    private static let statusFrame = CGRect(x: 10, y: 242, width: 208, height: 26)
+
+    // MARK: - 窗口与控件
+
     private let panel: NSPanel
+    private let barSurface: ScrollshotSurfaceView
+    private let statusDot = NSView()
+    private let dimensionsLabel = NSTextField(labelWithString: "0 × 0")
+    private let guideLabel = NSTextField(labelWithString: "")
+    private let authorizeButton = NSButton(title: "授权", target: nil, action: nil)
+    private let autoScrollButton = NSButton(title: "暂停", target: nil, action: nil)
+    private let speedButton = NSButton(title: "标准", target: nil, action: nil)
+    private let undoButton = NSButton(title: "撤销", target: nil, action: nil)
+    private let previewToggleButton = NSButton(title: "预览", target: nil, action: nil)
+    private let ocrButton = NSButton(title: "OCR", target: nil, action: nil)
+    private let editButton = NSButton(title: "标注", target: nil, action: nil)
+    private let finishButton = NSButton(title: "完成", target: nil, action: nil)
+    private let cancelButton = NSButton(title: "取消", target: nil, action: nil)
+
+    // 选区外侧独立可穿透/可折叠预览卡
+    private let previewPanel: NSPanel
+    private let previewSurface: ScrollshotSurfaceView
     private let navigatorView: ScrollshotNavigatorView
-    private let detailView: NSImageView
+    private let detailView: ScrollshotHighQualityImageView
     private let detailHintLabel: NSTextField
-    /// 引导行：告诉用户「现在该做什么」。
-    ///
-    /// 长截图靠用户**自己滚动**推进（自动滚动需要辅助功能权限，不为一个功能再要一次），
-    /// 所以「请滚动」是这个界面唯一必须说清的操作指引。
-    ///
-    /// 位置在**底部左侧、与完成/取消同一行**：那时用户的视线本来就在这一带
-    /// （他刚点完按钮、正在看下方的内容），而且它说的与那两个按钮是同一件事——
-    /// 「接下来该怎么办」。它不是按钮，所以用纯文字（无底、白色字重）与
-    /// 带底的按钮分开，不会被误认为可以点。
-    private let guideLabel: NSTextField
     private let statusButton: NSButton
-    private let finishButton: NSButton
-    private let cancelButton: NSButton
+    private let clickThroughButton: NSButton
+    private let collapsePreviewButton: NSButton
 
-    /// 最近一次预览快照。
+    // 状态
     private var content: ScrollshotPreviewContent?
-    /// 定位框中心的世界行。
     private var focusWorldRow = 0
-    /// 用户是否把定位框拖离了采集位置（此后不再自动跟随）。
     private var isPinned = false
+    private(set) var isPreviewVisible = true
+    private(set) var isPreviewClickThrough = false
+    private var lastSelectionScreenRect: CGRect = .zero
 
-    /// 详情栏请求：按世界行区间取原图切片。
-    ///
-    /// 浮层不持有长图（那是几百 MB 的像素缓冲），只按需向会话要**当前这一段**。
+    // MARK: - 回调
+
     var onDetailRequest: (@MainActor (Range<Int>, Int) -> CGImage?)?
-    /// 用户点了「完成」。
     var onFinish: (() -> Void)?
-    /// 用户点了「取消」。
     var onCancel: (() -> Void)?
+    var onOCR: (() -> Void)?
+    var onEdit: (() -> Void)?
+    var onUndo: (() -> Void)?
+    var onToggleAutoScroll: (() -> Void)?
+    var onCycleAutoScrollSpeed: (() -> Void)?
+    var onRequestAccessibility: (() -> Void)?
+    var onHoverChanged: ((Bool) -> Void)?
 
-    /// 面板窗口号（诊断/排除用）。
+    /// 主控制栏窗口号（诊断/排除用）。
     var windowID: Int? {
         panel.windowNumber > 0 ? panel.windowNumber : nil
     }
 
     var isVisible: Bool { panel.isVisible }
 
-    /// 浮层尺寸（点）。
-    private static let size = CGSize(width: 460, height: 332)
-    /// 导航区（视图内坐标，左下原点）。
-    private static let navigatorFrame = CGRect(x: 12, y: 52, width: 84, height: 244)
-    /// 放大详情区。
-    private static let detailFrame = CGRect(x: 104, y: 52, width: 344, height: 244)
-    /// 状态行。
-    private static let statusFrame = CGRect(x: 12, y: 302, width: 436, height: 20)
-    /// 引导行（底部左侧，与完成/取消同一行；右侧 280pt 留给按钮）。
-    ///
-    /// 坐标是**左下原点**：`y = 17` 贴着底边，与 `cancelButton` 的 `y = 12` 基本对齐。
-    private static let guideFrame = CGRect(x: 14, y: 17, width: 268, height: 20)
+    /// 主控制栏当前高度（供测试校验 `~42pt` 契约）。
+    var controlBarHeightForTesting: CGFloat { panel.frame.height }
 
-    /// 导航图的像素尺寸（导航区 84×244 点 @2x）：缩略图按它等比 contain。
-    static let navigatorPixelSize = CGSize(width: 168, height: 488)
-    /// 放大详情图的像素宽度（详情区 344 点 @2x）。
-    static let detailPixelWidth = 688
+    /// 独立预览卡当前是否可见（供测试校验折叠/展开）。
+    var isPreviewCardWindowVisibleForTesting: Bool { previewPanel.isVisible }
+
+    /// 独立预览卡当前是否处于穿透态（供测试校验）。
+    var isPreviewCardClickThroughForTesting: Bool { previewPanel.ignoresMouseEvents }
 
     init() {
+        // ── 1. 构建 42pt 轻量自适配主控制栏 ────────────────────
+        let initialBarSize = CGSize(width: Self.controlBarMinWidth, height: Self.controlBarHeight)
         panel = NSPanel(
-            contentRect: CGRect(origin: .zero, size: Self.size),
+            contentRect: CGRect(origin: .zero, size: initialBarSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
-        // 与录制范围框同层级：高于覆盖层，避免被截图覆盖层盖住。
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        // 不抢焦点：用户会话期间还要继续滚下层应用。
         panel.becomesKeyOnlyIfNeeded = true
-        // 允许按住背景空白区拖动浮层，避免遮挡目标页面控件；定位框与按钮各自拦截鼠标。
         panel.isMovable = true
         panel.isMovableByWindowBackground = true
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
-        panel.appearance = NSAppearance(named: .darkAqua)
-        // **关键**：声明本窗口不可被屏幕捕获，否则它会出现在长图里。
         panel.sharingType = .none
 
-        let contentView = NSView(frame: CGRect(origin: .zero, size: Self.size))
-        contentView.wantsLayer = true
-        contentView.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.86).cgColor
-        contentView.layer?.cornerRadius = 10
+        barSurface = ScrollshotSurfaceView(
+            frame: CGRect(origin: .zero, size: initialBarSize),
+            cornerRadius: Self.controlBarHeight / 2
+        )
+
+        // ── 2. 构建选区外侧独立可穿透/可折叠预览卡 ─────────────
+        previewPanel = NSPanel(
+            contentRect: CGRect(origin: .zero, size: Self.previewCardSize),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        previewPanel.isFloatingPanel = true
+        previewPanel.hidesOnDeactivate = false
+        previewPanel.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
+        previewPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        previewPanel.becomesKeyOnlyIfNeeded = true
+        previewPanel.isMovable = true
+        previewPanel.isMovableByWindowBackground = true
+        previewPanel.backgroundColor = .clear
+        previewPanel.isOpaque = false
+        previewPanel.hasShadow = true
+        previewPanel.sharingType = .none
+
+        previewSurface = ScrollshotSurfaceView(
+            frame: CGRect(origin: .zero, size: Self.previewCardSize),
+            cornerRadius: 10
+        )
 
         navigatorView = ScrollshotNavigatorView(frame: Self.navigatorFrame)
-        contentView.addSubview(navigatorView)
-
-        detailView = NSImageView(frame: Self.detailFrame)
-        detailView.imageScaling = .scaleProportionallyUpOrDown
-        detailView.wantsLayer = true
-        detailView.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.05).cgColor
-        detailView.layer?.cornerRadius = 4
-        detailView.layer?.masksToBounds = true
-        contentView.addSubview(detailView)
-
-        // 放大栏空态说明：没有它，用户看到一块空白不知道能干什么。
-        detailHintLabel = NSTextField(labelWithString: "拖动蓝色定位框\n查看该处细节")
-        detailHintLabel.font = .systemFont(ofSize: 11)
-        detailHintLabel.textColor = .secondaryLabelColor
-        detailHintLabel.alignment = .center
-        detailHintLabel.frame = Self.detailFrame
-        contentView.addSubview(detailHintLabel)
-
-        guideLabel = NSTextField(labelWithString: "")
-        guideLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        guideLabel.textColor = .white
-        guideLabel.alignment = .left
-        guideLabel.lineBreakMode = .byTruncatingTail
-        guideLabel.frame = Self.guideFrame
-        contentView.addSubview(guideLabel)
-
+        detailView = ScrollshotHighQualityImageView(frame: Self.detailFrame)
+        detailHintLabel = NSTextField(wrappingLabelWithString: "滚动页面开始拼接\n拖动蓝框查看细节")
         statusButton = NSButton(title: "", target: nil, action: nil)
-        statusButton.isBordered = false
-        statusButton.font = .systemFont(ofSize: 11)
-        statusButton.alignment = .center
-        statusButton.frame = Self.statusFrame
-        contentView.addSubview(statusButton)
+        clickThroughButton = NSButton(title: "穿透", target: nil, action: nil)
+        collapsePreviewButton = NSButton(title: "收起", target: nil, action: nil)
 
-        cancelButton = NSButton(title: "取消", target: nil, action: nil)
-        cancelButton.bezelStyle = .rounded
-        cancelButton.controlSize = .small
-        cancelButton.frame = CGRect(x: 292, y: 12, width: 74, height: 28)
-        contentView.addSubview(cancelButton)
+        configureControlBarUI()
+        configurePreviewCardUI()
 
-        finishButton = NSButton(title: "完成", target: nil, action: nil)
-        finishButton.bezelStyle = .rounded
-        finishButton.controlSize = .small
-        finishButton.keyEquivalent = "\r"
-        finishButton.frame = CGRect(x: 374, y: 12, width: 74, height: 28)
-        contentView.addSubview(finishButton)
-
-        panel.contentView = contentView
-
-        finishButton.target = self
-        finishButton.action = #selector(handleFinish)
-        cancelButton.target = self
-        cancelButton.action = #selector(handleCancel)
-        statusButton.target = self
-        statusButton.action = #selector(handleFollowCurrent)
+        barSurface.onHoverChanged = { [weak self] hovered in
+            self?.onHoverChanged?(hovered)
+        }
         navigatorView.onFocusChange = { [weak self] worldRow in
             self?.handleFocusChange(worldRow)
         }
+
         updateStatus()
-        // 默认引导文案在这里就给：`show(near:)` 只负责「新一轮重置」，
-        // 而诊断/自检路径不会调 `show`，不在这里设就会是一个空标签。
         updateGuide(Self.guideScrolling)
+        updateAutoScrollState(.idle, speed: .normal)
+        updateUndoAvailability(false)
     }
 
-    /// 显示在选区附近。浮层声明了 `sharingType = .none`，因此**压在选区上也不会
-    /// 被抓进长图**；布局仍然优先选区外的空白，放不下时再贴可用区域。
+    private func configureControlBarUI() {
+        statusDot.wantsLayer = true
+        statusDot.layer?.cornerRadius = 4
+        statusDot.layer?.backgroundColor = NSColor.systemBlue.cgColor
+        statusDot.translatesAutoresizingMaskIntoConstraints = false
+
+        dimensionsLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+        dimensionsLabel.textColor = .labelColor
+        dimensionsLabel.setContentHuggingPriority(.required, for: .horizontal)
+        dimensionsLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        dimensionsLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        guideLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        guideLabel.textColor = .secondaryLabelColor
+        guideLabel.lineBreakMode = .byTruncatingTail
+        guideLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        guideLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        guideLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        authorizeButton.bezelStyle = .rounded
+        authorizeButton.controlSize = .mini
+        authorizeButton.contentTintColor = .systemOrange
+        authorizeButton.isHidden = true
+        authorizeButton.toolTip = "授予辅助功能权限后自动平滑翻页"
+        authorizeButton.target = self
+        authorizeButton.action = #selector(handleAuthorize)
+
+        func configureSmallButton(
+            _ button: NSButton,
+            symbol: String? = nil,
+            toolTip: String,
+            action: Selector
+        ) {
+            button.bezelStyle = .rounded
+            button.controlSize = .small
+            button.toolTip = toolTip
+            button.target = self
+            button.action = action
+            if let symbol, let img = NSImage(systemSymbolName: symbol, accessibilityDescription: toolTip) {
+                button.image = img
+                button.imagePosition = .imageLeading
+            }
+            button.setContentHuggingPriority(.required, for: .horizontal)
+            button.setContentCompressionResistancePriority(.required, for: .horizontal)
+        }
+
+        configureSmallButton(autoScrollButton, symbol: "pause.fill", toolTip: "暂停 / 继续自动翻页（Space）", action: #selector(handleToggleAutoScroll))
+        configureSmallButton(speedButton, toolTip: "切换自动翻页速度（慢 / 标准 / 快）", action: #selector(handleCycleSpeed))
+        configureSmallButton(undoButton, symbol: "arrow.uturn.backward", toolTip: "撤销上一段拼接（⌘Z）", action: #selector(handleUndo))
+        configureSmallButton(previewToggleButton, symbol: "sidebar.right", toolTip: "展开 / 折叠侧边实时预览卡", action: #selector(handleTogglePreviewCard))
+        configureSmallButton(ocrButton, symbol: "text.viewfinder", toolTip: "完成并识别长图文字 (OCR)", action: #selector(handleOCR))
+        configureSmallButton(editButton, symbol: "pencil.tip", toolTip: "完成并进入标注编辑", action: #selector(handleEdit))
+        configureSmallButton(finishButton, symbol: "checkmark", toolTip: "完成长截图（Enter）", action: #selector(handleFinish))
+        finishButton.keyEquivalent = "\r"
+        finishButton.bezelColor = .controlAccentColor
+        configureSmallButton(cancelButton, symbol: "xmark", toolTip: "取消长截图（Esc）", action: #selector(handleCancel))
+
+        let divider = NSBox()
+        divider.boxType = .separator
+        divider.translatesAutoresizingMaskIntoConstraints = false
+
+        let row = NSStackView(views: [
+            statusDot,
+            dimensionsLabel,
+            guideLabel,
+            authorizeButton,
+            divider,
+            autoScrollButton,
+            speedButton,
+            undoButton,
+            previewToggleButton,
+            ocrButton,
+            editButton,
+            finishButton,
+            cancelButton,
+        ])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 6
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        barSurface.addSubview(row)
+        NSLayoutConstraint.activate([
+            statusDot.widthAnchor.constraint(equalToConstant: 8),
+            statusDot.heightAnchor.constraint(equalToConstant: 8),
+            divider.widthAnchor.constraint(equalToConstant: 1),
+            divider.heightAnchor.constraint(equalToConstant: 18),
+            guideLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 88),
+            guideLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 180),
+
+            row.leadingAnchor.constraint(equalTo: barSurface.leadingAnchor, constant: 14),
+            row.trailingAnchor.constraint(equalTo: barSurface.trailingAnchor, constant: -12),
+            row.centerYAnchor.constraint(equalTo: barSurface.centerYAnchor),
+        ])
+
+        panel.contentView = barSurface
+        resizeBarToFit()
+    }
+
+    private func configurePreviewCardUI() {
+        previewSurface.addSubview(navigatorView)
+
+        detailView.wantsLayer = true
+        detailView.layer?.cornerRadius = 4
+        detailView.layer?.masksToBounds = true
+        detailView.layer?.borderWidth = 1
+        detailView.layer?.borderColor = NSColor.separatorColor.cgColor
+        previewSurface.addSubview(detailView)
+
+        // 空态文案真正垂直 + 水平居中（修复旧版顶对齐缺陷）。
+        detailHintLabel.font = .systemFont(ofSize: 11)
+        detailHintLabel.textColor = .secondaryLabelColor
+        detailHintLabel.alignment = .center
+        detailHintLabel.maximumNumberOfLines = 3
+        detailHintLabel.translatesAutoresizingMaskIntoConstraints = false
+        detailView.addSubview(detailHintLabel)
+        NSLayoutConstraint.activate([
+            detailHintLabel.centerXAnchor.constraint(equalTo: detailView.centerXAnchor),
+            detailHintLabel.centerYAnchor.constraint(equalTo: detailView.centerYAnchor),
+            detailHintLabel.leadingAnchor.constraint(greaterThanOrEqualTo: detailView.leadingAnchor, constant: 8),
+            detailHintLabel.trailingAnchor.constraint(lessThanOrEqualTo: detailView.trailingAnchor, constant: -8),
+        ])
+
+        statusButton.isBordered = false
+        statusButton.font = .systemFont(ofSize: 11)
+        statusButton.alignment = .left
+        statusButton.frame = Self.statusFrame
+        statusButton.target = self
+        statusButton.action = #selector(handleFollowCurrent)
+        previewSurface.addSubview(statusButton)
+
+        clickThroughButton.bezelStyle = .rounded
+        clickThroughButton.controlSize = .mini
+        clickThroughButton.frame = CGRect(x: 212, y: 245, width: 38, height: 20)
+        clickThroughButton.toolTip = "开启鼠标穿透（不遮挡滚轮操作，可在主控制栏点击「预览」恢复）"
+        clickThroughButton.target = self
+        clickThroughButton.action = #selector(handleTogglePreviewClickThrough)
+        previewSurface.addSubview(clickThroughButton)
+
+        collapsePreviewButton.bezelStyle = .rounded
+        collapsePreviewButton.controlSize = .mini
+        collapsePreviewButton.frame = CGRect(x: 254, y: 245, width: 38, height: 20)
+        collapsePreviewButton.toolTip = "折叠预览卡"
+        collapsePreviewButton.target = self
+        collapsePreviewButton.action = #selector(handleTogglePreviewCard)
+        previewSurface.addSubview(collapsePreviewButton)
+
+        previewPanel.contentView = previewSurface
+    }
+
+    private func resizeBarToFit() {
+        barSurface.layoutSubtreeIfNeeded()
+        let fittingWidth = max(Self.controlBarMinWidth, ceil(barSurface.fittingSize.width))
+        let screenWidth = (panel.screen ?? NSScreen.main)?.visibleFrame.width ?? 1440
+        let finalWidth = min(fittingWidth, max(480, screenWidth - 24))
+        var frame = panel.frame
+        let centerX = frame.midX
+        frame.size = CGSize(width: finalWidth, height: Self.controlBarHeight)
+        if frame.origin != .zero {
+            frame.origin.x = centerX - finalWidth / 2
+        }
+        panel.setFrame(frame, display: true)
+    }
+
+    // MARK: - 定位计算（纯函数，避让 Dock 与选区）
+
+    /// 计算 42pt 主控制栏的最佳落点：优先选区下方居中，不够翻上方，均不够则贴屏幕可见区底部（避让 Dock）。
+    static func preferredControlBarFrame(
+        near selectionScreenRect: CGRect,
+        barSize: CGSize,
+        visibleFrame: CGRect,
+        gap: CGFloat = 12
+    ) -> CGRect {
+        let clampedX = min(
+            max(visibleFrame.minX + gap, selectionScreenRect.midX - barSize.width / 2),
+            max(visibleFrame.minX + gap, visibleFrame.maxX - barSize.width - gap)
+        )
+        let belowY = selectionScreenRect.minY - barSize.height - gap
+        let aboveY = selectionScreenRect.maxY + gap
+        let y: CGFloat
+        if belowY >= visibleFrame.minY + gap {
+            y = belowY
+        } else if aboveY + barSize.height <= visibleFrame.maxY - gap {
+            y = aboveY
+        } else {
+            y = visibleFrame.minY + gap
+        }
+        return CGRect(origin: CGPoint(x: clampedX, y: y), size: barSize)
+    }
+
+    /// 计算侧边独立预览卡的最佳落点：优先选区右侧，放不下翻左侧，均放不下靠可见区右缘。
+    static func preferredPreviewCardFrame(
+        near selectionScreenRect: CGRect,
+        cardSize: CGSize,
+        visibleFrame: CGRect,
+        gap: CGFloat = 12
+    ) -> CGRect {
+        let minY = visibleFrame.minY + gap
+        let maxY = max(minY, visibleFrame.maxY - cardSize.height - gap)
+        let y = min(max(selectionScreenRect.maxY - cardSize.height, minY), maxY)
+
+        let rightX = selectionScreenRect.maxX + gap
+        if rightX + cardSize.width <= visibleFrame.maxX - gap {
+            return CGRect(origin: CGPoint(x: rightX, y: y), size: cardSize)
+        }
+        let leftX = selectionScreenRect.minX - cardSize.width - gap
+        if leftX >= visibleFrame.minX + gap {
+            return CGRect(origin: CGPoint(x: leftX, y: y), size: cardSize)
+        }
+        let fallbackX = max(visibleFrame.minX + gap, visibleFrame.maxX - cardSize.width - gap)
+        return CGRect(origin: CGPoint(x: fallbackX, y: y), size: cardSize)
+    }
+
+    // MARK: - 展示与状态更新
+
     func show(near selectionScreenRect: CGRect) {
+        lastSelectionScreenRect = selectionScreenRect
+        isPreviewVisible = true
+        setPreviewClickThrough(false)
+
         let screen = NSScreen.screens.first { $0.frame.intersects(selectionScreenRect) } ?? NSScreen.main
         let visible = screen?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
-        let gap: CGFloat = 10
 
-        var y = selectionScreenRect.minY - Self.size.height - gap
-        if y < visible.minY + gap {
-            y = selectionScreenRect.maxY + gap
-        }
-        if y + Self.size.height > visible.maxY - gap {
-            y = max(visible.minY + gap, min(y, visible.maxY - Self.size.height - gap))
-        }
-        let x = min(
-            max(visible.minX + gap, selectionScreenRect.minX),
-            visible.maxX - Self.size.width - gap
+        resizeBarToFit()
+        let barFrame = Self.preferredControlBarFrame(
+            near: selectionScreenRect,
+            barSize: panel.frame.size,
+            visibleFrame: visible
         )
-        panel.setFrame(CGRect(origin: CGPoint(x: x, y: y), size: Self.size), display: true)
+        panel.setFrame(barFrame, display: true)
         panel.orderFrontRegardless()
+
+        let cardFrame = Self.preferredPreviewCardFrame(
+            near: selectionScreenRect,
+            cardSize: Self.previewCardSize,
+            visibleFrame: visible
+        )
+        previewPanel.setFrame(cardFrame, display: true)
+        previewPanel.orderFrontRegardless()
+
         updateGuide(Self.guidePreparing)
     }
 
-    /// 引导文案：等待/进行中。
-    static let guidePreparing = "正在准备首帧，请稍候"
+    /// 引导文案常量（保持语义稳定，兼容既有诊断校验）。
+    static let guidePreparing = "准备首帧…"
     static let guideScrolling = "滚动页面，自动捕获更多内容"
-    /// 配准失败时保留已有内容，回到重叠画面即可继续。
-    static let guideStalled = "暂未对齐，请缓慢回滚到已采内容后继续"
-    /// 引导文案：输出高度到顶。
-    ///
-    /// 到顶**不是失败**：已采到的部分是一张可用的长图，所以说的是
-    /// 「可以收尾」而不是「请重新开始」——把上限说成跟丢，用户会白丢一张图。
-    static let guideHeightLimit = "已达长度上限，已采内容可以保存"
-    /// 引导文案：抓帧数到顶（紧接着会自动生成长图）。
+    static let guideAutoScrolling = "自动翻页中 · 空格暂停"
+    static let guidePaused = "已暂停 · 可继续滚动或空格恢复"
+    static let guideReachedBottom = "已自动触底 · 可按回车完成"
+    static let guideNeedsAccessibility = "手动滚动（授权可自动翻页）"
+    static let guideStalled = "暂未对齐，回滚重叠区可继续滚动"
+    static let guideHeightLimit = "已达长度上限，可按回车保存"
     static let guideFrameLimit = "已达抓帧上限，正在生成长图"
 
-    /// 更新引导文案。
-    ///
-    /// - Parameter isWarning: 出问题时用警示色，让「需要你处理」与「继续滚就行」一眼可分。
-    func updateGuide(_ text: String, isWarning: Bool = false) {
-        guideLabel.stringValue = text
-        guideLabel.textColor = isWarning ? .systemOrange : .white
+    /// 更新实时像素尺寸显示（如 `1280 × 3420`）。
+    func updateDimensions(width: Int, height: Int) {
+        dimensionsLabel.stringValue = "\(width) × \(height)"
     }
 
-    /// 更新预览：整幅导航图 + 定位框 + 该处的放大详情。
+    /// 更新分段撤销按钮可用性。
+    func updateUndoAvailability(_ canUndo: Bool) {
+        undoButton.isEnabled = canUndo
+    }
+
+    /// 更新自动翻页状态与速度按钮视觉。
+    func updateAutoScrollState(_ state: AutoScrollState, speed: AutoScrollSpeed) {
+        speedButton.title = speed.displayName
+        switch state {
+        case .running:
+            statusDot.layer?.backgroundColor = NSColor.systemGreen.cgColor
+            autoScrollButton.title = "暂停"
+            autoScrollButton.image = NSImage(systemSymbolName: "pause.fill", accessibilityDescription: "暂停")
+            authorizeButton.isHidden = true
+            updateGuide(Self.guideAutoScrolling)
+        case .pausedForHover:
+            statusDot.layer?.backgroundColor = NSColor.systemYellow.cgColor
+            autoScrollButton.title = "悬停"
+            autoScrollButton.image = NSImage(systemSymbolName: "pause.fill", accessibilityDescription: "悬停暂停")
+            authorizeButton.isHidden = true
+        case .pausedByUser:
+            statusDot.layer?.backgroundColor = NSColor.systemOrange.cgColor
+            autoScrollButton.title = "自动"
+            autoScrollButton.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "继续自动")
+            authorizeButton.isHidden = true
+            updateGuide(Self.guidePaused)
+        case .reachedBottom:
+            statusDot.layer?.backgroundColor = NSColor.systemGreen.cgColor
+            autoScrollButton.title = "继续"
+            autoScrollButton.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "继续")
+            authorizeButton.isHidden = true
+            updateGuide(Self.guideReachedBottom)
+        case .needsAccessibilityPermission:
+            statusDot.layer?.backgroundColor = NSColor.systemOrange.cgColor
+            autoScrollButton.title = "手动"
+            autoScrollButton.image = NSImage(systemSymbolName: "hand.draw", accessibilityDescription: "手动模式")
+            authorizeButton.isHidden = false
+            updateGuide(Self.guideNeedsAccessibility, isWarning: true)
+        case .idle:
+            statusDot.layer?.backgroundColor = NSColor.systemBlue.cgColor
+            autoScrollButton.title = "自动"
+            autoScrollButton.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "开启自动翻页")
+            authorizeButton.isHidden = true
+        }
+        resizeBarToFit()
+    }
+
+    /// 更新引导文案。
+    func updateGuide(_ text: String, isWarning: Bool = false) {
+        guideLabel.stringValue = text
+        guideLabel.textColor = isWarning ? .systemOrange : .secondaryLabelColor
+        if isWarning {
+            statusDot.layer?.backgroundColor = NSColor.systemOrange.cgColor
+        }
+    }
+
+    /// 切换侧边预览卡的展开 / 折叠。
+    func setPreviewVisible(_ visible: Bool) {
+        isPreviewVisible = visible
+        if visible {
+            if isPreviewClickThrough {
+                setPreviewClickThrough(false)
+            }
+            if panel.isVisible {
+                previewPanel.orderFrontRegardless()
+            }
+            previewToggleButton.title = "预览"
+        } else {
+            previewPanel.orderOut(nil)
+            previewToggleButton.title = "显图"
+        }
+    }
+
+    /// 切换侧边预览卡鼠标穿透（避免在窄屏上遮挡底部应用滚轮交互）。
+    func setPreviewClickThrough(_ clickThrough: Bool) {
+        isPreviewClickThrough = clickThrough
+        previewPanel.ignoresMouseEvents = clickThrough
+        previewPanel.alphaValue = clickThrough ? 0.65 : 1.0
+        clickThroughButton.title = clickThrough ? "锁定" : "穿透"
+    }
+
+    /// 更新预览：整幅导航图 + 定位框 + 放大详情 + 实时像素宽高。
     func updatePreview(_ content: ScrollshotPreviewContent?) {
         self.content = content
         guard let content else {
             focusWorldRow = 0
             isPinned = false
             navigatorView.update(content: nil, focusWorldRow: 0, windowRows: 1)
-            detailView.image = nil
+            detailView.cgImage = nil
             detailHintLabel.isHidden = false
             updateStatus()
             return
         }
-        // 自动跟随：定位框落在「当前屏幕视口」上；用户拖走后不再改它。
+        if content.axis == .horizontal {
+            updateDimensions(width: content.worldHeight, height: content.worldWidth)
+        } else {
+            updateDimensions(width: content.worldWidth, height: content.worldHeight)
+        }
         if !isPinned, let viewport = content.viewportWorldRows {
             focusWorldRow = viewport.lowerBound + viewport.count / 2
         }
         refreshFocus()
     }
 
-    /// 放大栏一屏能装下的世界行数。
-    ///
-    /// 详情图横向铺满详情区（`detailPixelWidth` 像素），纵向按同一比例，于是可容纳
-    /// 的行数 = 详情区高度(点) × 长图宽度 / 详情区宽度(点)。定位框的高度取的就是它，
-    /// 「框住多少」与「右边显示多少」因此永远是同一段。
     private var detailWindowRows: Int {
         guard let content else { return 1 }
         let rows = Double(Self.detailFrame.height) * Double(content.worldWidth)
@@ -430,7 +826,6 @@ final class ScrollshotProgressBar {
         return max(1, Int(rows.rounded()))
     }
 
-    /// 定位框覆盖的世界行区间：以 `focusWorldRow` 为中心，夹在已覆盖范围内。
     private func focusWindow() -> Range<Int>? {
         guard let content, content.worldHeight > 0 else { return nil }
         let rows = min(detailWindowRows, content.worldHeight)
@@ -441,10 +836,8 @@ final class ScrollshotProgressBar {
         return start..<(start + rows)
     }
 
-    /// 按当前 `focusWorldRow` 把定位框、放大栏与状态行刷一遍。
     private func refreshFocus() {
         guard let content, let window = focusWindow() else { return }
-        // 夹过界之后回写：`focusWorldRow` 始终是「框的中心」，拖动与跟随后都对得上。
         focusWorldRow = window.lowerBound + window.count / 2
         navigatorView.update(
             content: content,
@@ -455,18 +848,16 @@ final class ScrollshotProgressBar {
         updateStatus()
     }
 
-    /// 渲染放大栏：取定位框那一段的原图切片。
     private func refreshDetail(window: Range<Int>) {
         guard let image = onDetailRequest?(window, Self.detailPixelWidth) else {
-            detailView.image = nil
+            detailView.cgImage = nil
             detailHintLabel.isHidden = false
             return
         }
-        detailView.image = NSImage(cgImage: image, size: Self.detailFrame.size)
+        detailView.cgImage = image
         detailHintLabel.isHidden = true
     }
 
-    /// 用户拖动定位框：进入「锁定查看」，不再跟随采集位置。
     private func handleFocusChange(_ worldRow: Int) {
         guard content != nil else { return }
         isPinned = true
@@ -474,7 +865,6 @@ final class ScrollshotProgressBar {
         refreshFocus()
     }
 
-    /// 回到采集位置（状态行可点击）。
     @objc private func handleFollowCurrent() {
         guard let content else { return }
         isPinned = false
@@ -492,11 +882,11 @@ final class ScrollshotProgressBar {
             return
         }
         if isPinned {
-            statusButton.title = "已锁定查看 · 点此回到采集位置"
+            statusButton.title = "已锁定 · 点此跟随"
             statusButton.isEnabled = true
             statusButton.contentTintColor = .controlAccentColor
         } else {
-            statusButton.title = "跟随采集位置"
+            statusButton.title = "实时跟随中"
             statusButton.isEnabled = false
             statusButton.contentTintColor = .secondaryLabelColor
         }
@@ -506,47 +896,46 @@ final class ScrollshotProgressBar {
         isPinned = false
         content = nil
         panel.orderOut(nil)
+        previewPanel.orderOut(nil)
     }
+
+    // MARK: - 诊断支持
 
     #if DEBUG
-    /// 诊断专用：当前引导文案（核对「跟丢时确实换成了警示语」）。
     var guideTextForDiagnostics: String { guideLabel.stringValue }
 
-    /// 诊断专用：把浮层直接摆到指定位置（AppKit 屏幕坐标）。
-    ///
-    /// 存在的理由：验证 `sharingType = .none` 是否真的生效，必须让浮层**压在
-    /// 待抓区域上**，而正式布局总是尽量把它放到区域外。
     func placeForDiagnostics(at frame: CGRect) {
-        panel.setFrame(frame, display: true)
+        panel.setFrame(CGRect(origin: frame.origin, size: CGSize(width: max(Self.controlBarMinWidth, frame.width), height: Self.controlBarHeight)), display: true)
         panel.orderFrontRegardless()
+        previewPanel.setFrame(
+            CGRect(origin: CGPoint(x: frame.minX, y: frame.minY + Self.controlBarHeight + 12), size: Self.previewCardSize),
+            display: true
+        )
+        previewPanel.orderFrontRegardless()
     }
 
-    /// 诊断专用：浮层的实际屏幕框。
     var frameForDiagnostics: CGRect { panel.frame }
 
-    /// 诊断专用：模拟用户把定位框拖到某个世界行（无法合成真实鼠标事件时用它）。
     func focusForDiagnostics(worldRow: Int) {
         handleFocusChange(worldRow)
     }
 
-    /// 诊断专用：当前定位框覆盖的世界行区间。
     var focusWindowForDiagnostics: Range<Int>? { focusWindow() }
-
-    /// 诊断专用：是否处于「锁定查看」（已脱离采集位置）。
     var isPinnedForDiagnostics: Bool { isPinned }
 
-    /// 诊断专用：各栏在内容视图坐标里的框（断言互不重叠、都在面板内）。
     var layoutFramesForDiagnostics: (
         navigator: CGRect, detail: CGRect, status: CGRect, guide: CGRect, cancel: CGRect, finish: CGRect
     ) {
         (
-            Self.navigatorFrame, Self.detailFrame, Self.statusFrame,
-            Self.guideFrame, cancelButton.frame, finishButton.frame
+            Self.navigatorFrame,
+            Self.detailFrame,
+            Self.statusFrame,
+            guideLabel.frame,
+            cancelButton.frame,
+            finishButton.frame
         )
     }
 
-    /// 诊断专用：导航栏里缩略图与定位框的框（**已换算到内容视图坐标**，
-    /// 与 `layoutFramesForDiagnostics` 同一套，才能直接比较）。
     var navigatorFramesForDiagnostics: (thumbnail: CGRect, focus: CGRect?) {
         let container = navigatorView.superview
         let thumbnail = navigatorView.convert(navigatorView.thumbnailFrameForDiagnostics, to: container)
@@ -556,21 +945,20 @@ final class ScrollshotProgressBar {
         return (thumbnail, focus)
     }
 
-    /// 诊断专用：点一下状态行（回到采集位置）。
     func followCurrentForDiagnostics() { handleFollowCurrent() }
-
-    /// 诊断专用：浮层的内容视图，用于**渲染成图**核对观感。
-    ///
-    /// 不能用屏幕捕获来核对：`sharingType = .none` 让浮层对所有屏幕捕获都不可见
-    /// （那正是它不会被拍进长图的原因）。直接渲染视图不受这条限制。
     var contentViewForDiagnostics: NSView? { panel.contentView }
     #endif
 
-    @objc private func handleFinish() {
-        onFinish?()
-    }
+    // MARK: - 按钮动作
 
-    @objc private func handleCancel() {
-        onCancel?()
-    }
+    @objc private func handleFinish() { onFinish?() }
+    @objc private func handleCancel() { onCancel?() }
+    @objc private func handleOCR() { onOCR?() }
+    @objc private func handleEdit() { onEdit?() }
+    @objc private func handleUndo() { onUndo?() }
+    @objc private func handleToggleAutoScroll() { onToggleAutoScroll?() }
+    @objc private func handleCycleSpeed() { onCycleAutoScrollSpeed?() }
+    @objc private func handleAuthorize() { onRequestAccessibility?() }
+    @objc private func handleTogglePreviewCard() { setPreviewVisible(!isPreviewVisible) }
+    @objc private func handleTogglePreviewClickThrough() { setPreviewClickThrough(!isPreviewClickThrough) }
 }

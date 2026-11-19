@@ -59,29 +59,24 @@ extension CaptureDiagnostics {
         // 视图布局与首帧渲染都排到主线程的下一轮才生效。
         try? await Task.sleep(for: .milliseconds(200))
 
-        // ① 布局：各栏都在面板内，且互不重叠。
+        // ① 布局：预览卡各子栏（navigator / detail / status）在 300×280 预览卡内互不重叠，主控制栏高 42pt。
         let frames = bar.layoutFramesForDiagnostics
-        let panel = CGRect(origin: .zero, size: panelSize)
-        let allFrames = [frames.navigator, frames.detail, frames.status, frames.guide, frames.cancel, frames.finish]
+        let previewCard = CGRect(origin: .zero, size: ScrollshotProgressBar.previewCardSize)
+        let previewFrames = [frames.navigator, frames.detail, frames.status]
         report(
-            "各栏都在面板内",
-            allFrames.map { "\(Int($0.width))x\(Int($0.height))@\(Int($0.minX)),\(Int($0.minY))" }
+            "预览卡各栏都在预览卡内",
+            previewFrames.map { "\(Int($0.width))x\(Int($0.height))@\(Int($0.minX)),\(Int($0.minY))" }
                 .joined(separator: " "),
-            "都在 460×332 内",
-            allFrames.allSatisfy { panel.contains($0) }
+            "都在 \(Int(previewCard.width))×\(Int(previewCard.height)) 内",
+            previewFrames.allSatisfy { previewCard.contains($0) }
         )
         let pairs = [
             (frames.navigator, frames.detail),
             (frames.navigator, frames.status),
             (frames.detail, frames.status),
-            (frames.detail, frames.finish),
-            (frames.guide, frames.cancel),
-            (frames.guide, frames.finish),
-            (frames.cancel, frames.finish),
-            (frames.status, frames.finish)
         ]
         let overlapCount = pairs.filter { $0.0.intersects($0.1) }.count
-        report("各栏互不重叠", "\(overlapCount) 处", "0 处", overlapCount == 0)
+        report("预览卡各栏互不重叠", "\(overlapCount) 处", "0 处", overlapCount == 0)
 
         // ①' 引导行：长截图靠用户自己滚动推进（不申请辅助功能权限），
         //     所以「请滚动」是界面唯一必须说清的操作指引；

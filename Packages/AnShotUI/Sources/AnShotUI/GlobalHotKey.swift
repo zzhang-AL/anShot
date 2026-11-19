@@ -223,3 +223,178 @@ private func globalHotKeyEventHandler(
     }
     return noErr
 }
+
+// MARK: - 会话级 Carbon 瞬态热键（用于长截图期间防浏览器/聊天软件吞键）
+
+/// 长截图会话期间需要全局截获并消费的按键集合（契约 `ux-polish/model.md` §5.3）。
+public enum TransientScrollshotKey: UInt32, CaseIterable, Sendable {
+    case space = 1001
+    case returnKey = 1002
+    case keypadEnter = 1003
+    case escape = 1004
+    case commandS = 1005
+    case shiftCommandS = 1006
+    case commandC = 1007
+    case commandZ = 1008
+
+    public var keyCode: UInt32 {
+        switch self {
+        case .space: return UInt32(kVK_Space)
+        case .returnKey: return UInt32(kVK_Return)
+        case .keypadEnter: return UInt32(kVK_ANSI_KeypadEnter)
+        case .escape: return UInt32(kVK_Escape)
+        case .commandS, .shiftCommandS: return UInt32(kVK_ANSI_S)
+        case .commandC: return UInt32(kVK_ANSI_C)
+        case .commandZ: return UInt32(kVK_ANSI_Z)
+        }
+    }
+
+    public var modifiers: UInt32 {
+        switch self {
+        case .space, .returnKey, .keypadEnter, .escape:
+            return 0
+        case .commandS, .commandC, .commandZ:
+            return UInt32(cmdKey)
+        case .shiftCommandS:
+            return UInt32(cmdKey | shiftKey)
+        }
+    }
+}
+
+/// 会话级 Carbon 瞬态热键管理器。
+///
+/// 使用独立四字符签名 `'anST'`（与常驻全局热键 `'anSt'` 彻底隔离）。
+/// 会话启动时批量注册，任意退出路径（完成/取消/报错/`deinit`）同步反注册全部句柄。
+@MainActor
+public final class TransientHotKeySet {
+
+    /// 四字符签名 `'anST'`。
+    nonisolated static let signature: OSType = 0x616E_5354
+
+    private let onTrigger: (TransientScrollshotKey) -> Void
+    private nonisolated(unsafe) var eventHandlerRef: EventHandlerRef?
+    private nonisolated(unsafe) var hotKeyRefs: [EventHotKeyRef] = []
+
+    /// 当前已成功注册的键位集合（供测试与诊断核对）。
+    public private(set) var registeredKeys: Set<TransientScrollshotKey> = []
+
+    public init(
+        keys: [TransientScrollshotKey] = TransientScrollshotKey.allCases,
+        installSystemHooks: Bool = true,
+        onTrigger: @escaping (TransientScrollshotKey) -> Void
+    ) {
+        self.onTrigger = onTrigger
+        guard installSystemHooks else {
+            self.registeredKeys = Set(keys)
+            return
+        }
+
+        var eventType = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+        let selfPointer = Unmanaged.passUnretained(self).toOpaque()
+        let handlerStatus = InstallEventHandler(
+            GetApplicationEventTarget(),
+            transientHotKeyEventHandler,
+            1,
+            &eventType,
+            selfPointer,
+            &eventHandlerRef
+        )
+        guard handlerStatus == noErr else {
+            logger.error("transient hotkey handler install failed; status=\(handlerStatus, privacy: .public)")
+            return
+        }
+
+        for key in keys {
+            var ref: EventHotKeyRef?
+            let hotKeyID = EventHotKeyID(signature: Self.signature, id: key.rawValue)
+            let status = RegisterEventHotKey(
+                key.keyCode,
+                key.modifiers,
+                hotKeyID,
+                GetApplicationEventTarget(),
+                0,
+                &ref
+            )
+            if status == noErr, let ref {
+                hotKeyRefs.append(ref)
+                registeredKeys.insert(key)
+            } else {
+                logger.debug("transient hotkey skipped; key=\(key.rawValue, privacy: .public) status=\(status, privacy: .public)")
+            }
+        }
+        logger.notice("transient hotkeys registered; count=\(self.registeredKeys.count, privacy: .public)")
+    }
+
+    deinit {
+        for ref in hotKeyRefs {
+            UnregisterEventHotKey(ref)
+        }
+        if let handler = eventHandlerRef {
+            RemoveEventHandler(handler)
+        }
+    }
+
+    /// 主动反注册全部瞬态热键并拆除事件处理器。重复调用安全。
+    public func invalidateAll() {
+        for ref in hotKeyRefs {
+            UnregisterEventHotKey(ref)
+        }
+        hotKeyRefs.removeAll()
+        if let handler = eventHandlerRef {
+            RemoveEventHandler(handler)
+            eventHandlerRef = nil
+        }
+        if !registeredKeys.isEmpty {
+            logger.notice("transient hotkeys invalidated; count=\(self.registeredKeys.count, privacy: .public)")
+            registeredKeys.removeAll()
+        }
+    }
+
+    /// 手动派发一个瞬态键事件（供单元测试模拟按键触发）。
+    public func dispatchForTesting(_ key: TransientScrollshotKey) {
+        guard registeredKeys.contains(key) else { return }
+        onTrigger(key)
+    }
+
+    fileprivate func handleIncomingID(_ id: UInt32) -> Bool {
+        guard let key = TransientScrollshotKey(rawValue: id),
+              registeredKeys.contains(key) else {
+            return false
+        }
+        onTrigger(key)
+        return true
+    }
+}
+
+private func transientHotKeyEventHandler(
+    _ nextHandler: EventHandlerCallRef?,
+    _ event: EventRef?,
+    _ userData: UnsafeMutableRawPointer?
+) -> OSStatus {
+    guard let userData, let event else { return OSStatus(eventNotHandledErr) }
+
+    var hotKeyID = EventHotKeyID()
+    let status = GetEventParameter(
+        event,
+        EventParamName(kEventParamDirectObject),
+        EventParamType(typeEventHotKeyID),
+        nil,
+        MemoryLayout<EventHotKeyID>.size,
+        nil,
+        &hotKeyID
+    )
+    guard status == noErr, hotKeyID.signature == TransientHotKeySet.signature else {
+        return OSStatus(eventNotHandledErr)
+    }
+
+    let identifier = hotKeyID.id
+    let set = Unmanaged<TransientHotKeySet>.fromOpaque(userData).takeUnretainedValue()
+    var handled = false
+    MainActor.assumeIsolated {
+        handled = set.handleIncomingID(identifier)
+    }
+    return handled ? noErr : OSStatus(eventNotHandledErr)
+}

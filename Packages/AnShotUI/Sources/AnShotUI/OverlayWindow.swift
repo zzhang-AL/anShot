@@ -313,6 +313,17 @@ final class OverlayView: NSView {
         }
     }
 
+    /// 直达动作模式在未框选阶段展示的顶部居中引导横幅文案（如直达长截图操作提示）。
+    var intentBannerText: String? {
+        didSet {
+            guard intentBannerText != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    /// 为 `true` 时，未框选状态下按 `Enter`/`⌘C` 等不隐式回退成整屏普通截图（用于直达长截图防误触）。
+    var preventsImplicitFullScreenExport = false
+
     /// 是否处于录制准备阶段（准备面板已弹出）。
     ///
     /// 准备阶段整个会话的输入都归面板：截图识别、框选、标注、工具快捷键一律暂停。
@@ -1258,25 +1269,29 @@ final class OverlayView: NSView {
 
     /// 独立窗体捕获模式顶部信息胶囊（展示序号/总数、应用名、尺寸、无阴影状态及快捷键提示）。
     private func drawWindowPickerHUD(in context: CGContext) {
-        guard isWindowPickerMode else { return }
-
-        let total = windowPickerCandidates.count
-        let noShadowActive: Bool = {
-            let base = appSettings?.windowCaptureShadow ?? true
-            let optionFlipped = NSEvent.modifierFlags.contains(.option)
-            return !(optionFlipped ? !base : base)
-        }()
-
         let text: String
-        if total > 0, windowPickerIndex < total {
-            let target = windowPickerCandidates[windowPickerIndex]
-            let app = target.applicationName ?? target.title ?? "窗口"
-            let w = Int((target.rect.width * pixelsPerPoint).rounded())
-            let h = Int((target.rect.height * pixelsPerPoint).rounded())
-            let shadowSuffix = noShadowActive ? " · 无阴影" : ""
-            text = "\(windowPickerIndex + 1)/\(total) · \(app) · \(w) × \(h)\(shadowSuffix)   Tab 穿透 · ⌥ 阴影 · Space 区域"
+        if isWindowPickerMode {
+            let total = windowPickerCandidates.count
+            let noShadowActive: Bool = {
+                let base = appSettings?.windowCaptureShadow ?? true
+                let optionFlipped = NSEvent.modifierFlags.contains(.option)
+                return !(optionFlipped ? !base : base)
+            }()
+
+            if total > 0, windowPickerIndex < total {
+                let target = windowPickerCandidates[windowPickerIndex]
+                let app = target.applicationName ?? target.title ?? "窗口"
+                let w = Int((target.rect.width * pixelsPerPoint).rounded())
+                let h = Int((target.rect.height * pixelsPerPoint).rounded())
+                let shadowSuffix = noShadowActive ? " · 无阴影" : ""
+                text = "\(windowPickerIndex + 1)/\(total) · \(app) · \(w) × \(h)\(shadowSuffix)   Tab 穿透 · ⌥ 阴影 · Space 区域"
+            } else {
+                text = "独立窗体模式 · 移动指针选择窗口 · Space 切换区域框选"
+            }
+        } else if let banner = intentBannerText, !banner.isEmpty, effectiveSelection == nil {
+            text = banner
         } else {
-            text = "独立窗体模式 · 移动指针选择窗口 · Space 切换区域框选"
+            return
         }
 
         let attrs: [NSAttributedString.Key: Any] = [
@@ -1914,9 +1929,14 @@ final class OverlayView: NSView {
         // 先落定进行中的编号就地编辑（若有）。
         commitNumberingEditing()
 
-        // 静默首帧兜底：若用户呼出截图后尚未框选就直接按 Enter / ⌘C / ⌘S / ⌘P，
-        // 自动以当前屏整屏作为选区执行导出，保留「呼出 → 回车截全屏」的零阻力路径。
+        // 静默首帧兜底：若用户呼出普通截图后尚未框选就直接按 Enter / ⌘C / ⌘S / ⌘P，
+        // 自动以当前屏整屏作为选区执行导出；但在直达长截图模式下拦截隐式全屏，避免误触普通截图。
         if effectiveSelection == nil, !isInteracting, !isWindowPickerMode, bounds.width >= 8, bounds.height >= 8 {
+            if preventsImplicitFullScreenExport {
+                NSSound.beep()
+                ToastPresenter.show("请先拖拽框选滚动区域（按住 ⌥ 可横向滚动）")
+                return
+            }
             selectionRect = bounds
             onSelectionChanged?(bounds)
             onSelectionCommitted?(bounds)

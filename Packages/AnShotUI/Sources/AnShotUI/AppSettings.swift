@@ -14,6 +14,7 @@
 //  所以校验留在应用层（`AppDelegate`），本类型只负责记录「用户想要什么」。
 //
 
+import AnShotCapture
 import AnShotCore
 import AppKit
 import Carbon.HIToolbox
@@ -435,6 +436,9 @@ public final class AppSettings {
             : "zh-Hans"
         self.selectionTranslateFloatingButton = store.object(forKey: Key.selectionTranslateFloatingButton) as? Bool ?? false
         self.pinShowBorder = store.object(forKey: Key.pinShowBorder) as? Bool ?? true
+        self.longshotAutoScrollEnabled = store.object(forKey: Key.longshotAutoScrollEnabled) as? Bool ?? true
+        self.longshotAutoScrollSpeed = store.string(forKey: Key.longshotAutoScrollSpeed)
+            .flatMap(AutoScrollSpeed.init(rawValue:)) ?? .normal
     }
 
     /// 读文件夹。路径缺失或为空时返回 `nil`。
@@ -688,6 +692,24 @@ public final class AppSettings {
         store.set(enabled, forKey: Key.pinShowBorder)
     }
 
+    /// 长截图是否默认开启像素级自动平滑翻页（默认开启；缺辅助功能权限自动零中断降级手动）。
+    public private(set) var longshotAutoScrollEnabled: Bool
+
+    public func setLongshotAutoScrollEnabled(_ enabled: Bool) {
+        guard enabled != longshotAutoScrollEnabled else { return }
+        longshotAutoScrollEnabled = enabled
+        store.set(enabled, forKey: Key.longshotAutoScrollEnabled)
+    }
+
+    /// 长截图自动翻页速度档位（慢 / 标准 / 快，默认标准）。
+    public private(set) var longshotAutoScrollSpeed: AutoScrollSpeed
+
+    public func setLongshotAutoScrollSpeed(_ speed: AutoScrollSpeed) {
+        guard speed != longshotAutoScrollSpeed else { return }
+        longshotAutoScrollSpeed = speed
+        store.set(speed.rawValue, forKey: Key.longshotAutoScrollSpeed)
+    }
+
     // MARK: 键名
 
     private enum Key {
@@ -703,6 +725,8 @@ public final class AppSettings {
         static let translationTargetLanguage = "settings.translationTargetLanguage"
         static let selectionTranslateFloatingButton = "settings.selectionTranslateFloatingButton"
         static let pinShowBorder = "settings.pinShowBorder"
+        static let longshotAutoScrollEnabled = "settings.longshotAutoScrollEnabled"
+        static let longshotAutoScrollSpeed = "settings.longshotAutoScrollSpeed"
     }
 
     private enum Mode {

@@ -38,6 +38,15 @@ import AppKit
 @MainActor
 final class ScrollshotController {
 
+    /// 长截图完成时的期望后续交付出口（支持控制栏快捷按钮与 Carbon 瞬态热键直达）。
+    enum FinishMode: Equatable, Sendable {
+        case defaultResult
+        case copy
+        case save(forceAsk: Bool)
+        case edit
+        case ocr
+    }
+
     /// 会话结果。
     struct Outcome {
         /// 拼好的长图；失败时为 nil。
@@ -52,6 +61,26 @@ final class ScrollshotController {
         let observedFrames: Int
         /// 收尾时是否仍未恢复对齐；已经采集的连续内容仍可保存。
         let stalled: Bool
+        /// 本次完成的交付出口。
+        let finishMode: FinishMode
+
+        init(
+            image: CGImage?,
+            plan: ScrollStitcher.Plan?,
+            failure: String?,
+            capturedFrames: Int,
+            observedFrames: Int,
+            stalled: Bool,
+            finishMode: FinishMode = .defaultResult
+        ) {
+            self.image = image
+            self.plan = plan
+            self.failure = failure
+            self.capturedFrames = capturedFrames
+            self.observedFrames = observedFrames
+            self.stalled = stalled
+            self.finishMode = finishMode
+        }
     }
 
     /// 会话触到的上限。
@@ -87,19 +116,51 @@ final class ScrollshotController {
     /// 重新对齐到已知内容，引导语恢复为正常滚动。
     var onRecovery: (() -> Void)?
     /// 触到上限回调（高度或帧数），每种各报一次。
-    ///
-    /// 它有存在的必要：高度到顶之后帧虽被拒收，但**配准本身仍然成功**，
-    /// 所以这个状态既不会走 `onStall`、也不会让长图增长——用户继续滚却看不到
-    /// 任何反应，只能怀疑「是不是卡了」。
     var onLimitReached: ((Limit) -> Void)?
+    /// 自动翻页状态或速度档位变化回调（驱动轻量控制栏 UI 实时同步）。
+    var onAutoScrollStateChanged: ((AutoScrollState, AutoScrollSpeed) -> Void)?
+    /// 实时像素宽高与撤销可用性更新回调（宽、高、是否可撤销）。
+    var onDimensionsChanged: ((Int, Int, Bool) -> Void)?
+    /// 会话级 Carbon 瞬态热键 `Esc` 触发时的外部取消入口（让 `OverlayController` 同步收起选区框与控制栏）。
+    var onExternalCancel: (() -> Void)?
 
     private let capturer: ScreenCapturing
     private let selection: PixelRect
+    private let selectionScreenRect: CGRect?
     private let displayID: CGDirectDisplayID
     private let scaleFactor: CGFloat
     private let options: ScrollStitcher.Options
     /// 增长轴。会话内部永远按**竖直**工作，横向靠出入口转置映射。
     private let axis: ScrollAxis
+    private let autoScrollEnabledByDefault: Bool
+    private var autoScrollSpeed: AutoScrollSpeed
+    private let enableTransientHotKeys: Bool
+
+    /// 可选像素级自动平滑翻页驱动器。
+    private var autoScrollDriver: AutoScrollDriver?
+    /// 会话级 Carbon 瞬态热键集合（会话结束/取消/销毁时多重兜底反注册）。
+    private var transientHotKeys: TransientHotKeySet?
+
+    /// 当前自动翻页状态（供控制栏与单测查询）。
+    var currentAutoScrollState: AutoScrollState {
+        autoScrollDriver?.state ?? .idle
+    }
+
+    /// 当前自动翻页速度。
+    var currentAutoScrollSpeed: AutoScrollSpeed { autoScrollSpeed }
+
+    /// 当前是否可撤销上一段拼接。
+    var canUndoSegment: Bool { sessionSnapshot.canUndoSegment }
+
+    /// 当前已覆盖长图在屏幕朝向下的实时像素尺寸（`W × H`）。
+    var currentOutputPixelSize: (width: Int, height: Int) {
+        let rawWidth = Int(selection.size.width.rounded())
+        let rawHeight = max(1, sessionSnapshot.coveredWorldHeight)
+        if axis == .horizontal {
+            return (width: rawHeight, height: Int(selection.size.height.rounded()))
+        }
+        return (width: rawWidth, height: rawHeight)
+    }
 
     /// 世界坐标追踪与采纳决策最新快照（供主线程同步读取进度、切片与诊断字节数）。
     private var sessionSnapshot: ScrollshotSession
@@ -163,29 +224,143 @@ final class ScrollshotController {
         scaleFactor: CGFloat,
         options: ScrollStitcher.Options? = nil,
         axis: ScrollAxis = .vertical,
-        frameInterval: TimeInterval = 1.0 / 30
+        frameInterval: TimeInterval = 1.0 / 30,
+        selectionScreenRect: CGRect? = nil,
+        autoScrollEnabled: Bool = false,
+        autoScrollSpeed: AutoScrollSpeed = .normal,
+        enableTransientHotKeys: Bool = false
     ) {
         self.capturer = capturer
         self.selection = selection
+        self.selectionScreenRect = selectionScreenRect
         self.displayID = displayID
         self.scaleFactor = scaleFactor
         self.axis = axis
         self.frameInterval = frameInterval
         self.nextCaptureInterval = frameInterval
-        // 保留完整选区，在对齐的重叠内容中接缝；不自动裁掉侧栏或窗口界面。
-        let resolved = options ?? ScrollStitcher.Options(joinsInsideOverlap: true, retainsSourceFrames: false)
+        self.autoScrollEnabledByDefault = autoScrollEnabled
+        self.autoScrollSpeed = autoScrollSpeed
+        self.enableTransientHotKeys = enableTransientHotKeys
+        // 默认启用重叠加缝、首帧静默兜底、静态侧栏背景延展与窗口底角防黑角。
+        let resolved = options ?? ScrollStitcher.Options(
+            joinsInsideOverlap: true,
+            retainsSourceFrames: false,
+            allowsSingleFrameFallback: true,
+            cleanStaticSidebar: true,
+            detectBottomWindowCorners: true
+        )
         self.options = resolved
         self.sessionSnapshot = ScrollshotSession(options: resolved)
         self.worker = ScrollshotSessionWorker(options: resolved, axis: axis)
     }
 
-    /// 开始会话：先抓首帧，然后按间隔轮询。
+    /// 响应 `Space` 或控制栏「暂停/继续」切换自动翻页。
+    func toggleAutoScroll() {
+        guard isRunning else { return }
+        if autoScrollDriver == nil {
+            installAutoScrollDriver()
+            autoScrollDriver?.start()
+            return
+        }
+        autoScrollDriver?.togglePauseResume()
+    }
+
+    /// 切换自动翻页速度档位（慢 / 标准 / 快）。
+    func setAutoScrollSpeed(_ speed: AutoScrollSpeed) {
+        autoScrollSpeed = speed
+        autoScrollDriver?.speed = speed
+        onAutoScrollStateChanged?(currentAutoScrollState, speed)
+    }
+
+    /// 控制栏鼠标悬停防抖回调：移入自动暂停滚轮投递，移出恢复。
+    func setControlBarHovered(_ hovered: Bool) {
+        autoScrollDriver?.setControlBarHovered(hovered)
+    }
+
+    /// 撤销上一段已拼接内容（响应 `⌘Z` 或控制栏「撤销」按钮）。
+    @discardableResult
+    func undoLastSegment() async -> Bool {
+        guard isRunning, !isFinishing else { return false }
+        let generation = sessionGeneration
+        let result = await worker.undoLastSegment()
+        guard result.didUndo, sessionGeneration == generation else { return false }
+        sessionSnapshot = result.snapshot
+        emitDimensionsUpdate()
+        lastPreviewAt = .distantPast
+        emitPreviewIfDue()
+        ScrollshotLogStore.shared.appendEvent("session-undo 撤销上一段，当前覆盖高=\(sessionSnapshot.coveredWorldHeight)")
+        return true
+    }
+
+    private func installAutoScrollDriver() {
+        guard autoScrollDriver == nil, let rect = selectionScreenRect else { return }
+        let driver = AutoScrollDriver(
+            selectionAppKitRect: rect,
+            axis: axis,
+            speed: autoScrollSpeed
+        )
+        driver.onStateChanged = { [weak self] state in
+            guard let self else { return }
+            self.onAutoScrollStateChanged?(state, self.autoScrollSpeed)
+        }
+        driver.onManualTakeover = { [weak self] in
+            guard let self else { return }
+            self.onAutoScrollStateChanged?(self.currentAutoScrollState, self.autoScrollSpeed)
+        }
+        driver.onReachedBottom = { [weak self] in
+            guard let self else { return }
+            self.onAutoScrollStateChanged?(.reachedBottom, self.autoScrollSpeed)
+        }
+        autoScrollDriver = driver
+    }
+
+    private func installTransientHotKeysIfNeeded() {
+        guard enableTransientHotKeys, transientHotKeys == nil else { return }
+        transientHotKeys = TransientHotKeySet { [weak self] key in
+            guard let self else { return }
+            switch key {
+            case .space:
+                self.toggleAutoScroll()
+            case .returnKey, .keypadEnter:
+                Task { await self.finish(mode: .defaultResult) }
+            case .escape:
+                if let onExternalCancel = self.onExternalCancel {
+                    onExternalCancel()
+                } else {
+                    self.cancel()
+                }
+            case .commandC:
+                Task { await self.finish(mode: .copy) }
+            case .commandS:
+                Task { await self.finish(mode: .save(forceAsk: false)) }
+            case .shiftCommandS:
+                Task { await self.finish(mode: .save(forceAsk: true)) }
+            case .commandZ:
+                Task { _ = await self.undoLastSegment() }
+            }
+        }
+    }
+
+    private func teardownInputHooks() {
+        autoScrollDriver?.stop()
+        autoScrollDriver = nil
+        transientHotKeys?.invalidateAll()
+        transientHotKeys = nil
+    }
+
+    private func emitDimensionsUpdate() {
+        let size = currentOutputPixelSize
+        onDimensionsChanged?(size.width, size.height, sessionSnapshot.canUndoSegment)
+    }
+
+    /// 开始会话：先注册瞬态热键并抓首帧，随后启动自动翻页（若开启）并按间隔采样。
     func start() {
         guard !isRunning else { return }
         isRunning = true
         captureFailure = nil
         sessionGeneration += 1
         let generation = sessionGeneration
+        installTransientHotKeysIfNeeded()
         // 日志分段：一次长截图 == 一次会话，异常时能把多次会话区分开。
         ScrollshotLogStore.shared.beginSession()
         captureTask = Task { [weak self] in
@@ -216,11 +391,12 @@ final class ScrollshotController {
     }
 
     /// 结束并拼接。
-    func finish(waitForCaptureTask: Bool = true) async {
+    func finish(mode: FinishMode = .defaultResult, waitForCaptureTask: Bool = true) async {
         guard isRunning else { return }
         let generation = sessionGeneration
         isFinishing = true
         isRunning = false
+        teardownInputHooks()
         let activeTask = captureTask
         captureTask?.cancel()
         captureTask = nil
@@ -261,20 +437,14 @@ final class ScrollshotController {
             failure: captureFailure ?? finished.failure,
             capturedFrames: finished.capturedFrames,
             observedFrames: finished.observedFrames,
-            stalled: finished.stalled
+            stalled: finished.stalled,
+            finishMode: mode
         ))
     }
 
     /// 取消：不产出结果。
-    ///
-    /// `isFinishing` 为 true 时也必须生效：用户点「完成」后排空缓冲、拼接与编码
-    /// 需要时间，这期间进度浮层仍在、按钮仍可点。若这里因 `isRunning == false`
-    /// 直接返回，收尾流程会照常调用 `onFinish`，把用户明确取消掉的长图写进剪贴板
-    /// （写剪贴板的代码在 OverlayController，本类只能靠「不回调」来拦住它）。
-    ///
-    /// 递增 `sessionGeneration` 是让仍在进行的 `finish` 在任一 await 之后认出
-    /// 结果已作废并直接返回。
     func cancel() {
+        teardownInputHooks()
         guard isRunning || isFinishing else { return }
         isRunning = false
         isFinishing = false
@@ -326,6 +496,7 @@ final class ScrollshotController {
               let submitted = await worker.submitInitial(cgImage: frame.image) else {
             guard sessionGeneration == generation else { return }
             isRunning = false
+            teardownInputHooks()
             if let buffered = capturer as? ScrollshotFrameCapturer { _ = await buffered.stopAndDrain() }
             onFinish?(Outcome(
                 image: nil, plan: nil, failure: "首帧抓取失败",
@@ -336,13 +507,20 @@ final class ScrollshotController {
         guard isRunning, sessionGeneration == generation, !Task.isCancelled else { return }
         sessionSnapshot = submitted.snapshot
         lastSubmittedAt = .now
-        // 帧录制改为**运行时开关**（`-recordFrames` / `-recordAllFrames`）：Release
-        // 构建下也能留证据，而 Debug 构建里配准要 437ms/帧、根本不适合日常使用。
         ScrollshotFrameRecorder.begin()
         recordFrame(submitted.image, index: submitted.decision.inputIndex, decision: submitted.decision)
         onReady?()
+        emitDimensionsUpdate()
         onProgress?(sessionSnapshot.acceptedFrameCount, sessionSnapshot.coveredWorldHeight)
         emitPreviewIfDue()
+
+        // 首帧建好后再启动自动翻页，避免冷启动首帧尚未落定就被提前滚偏。
+        if autoScrollEnabledByDefault {
+            installAutoScrollDriver()
+            autoScrollDriver?.start()
+        } else {
+            onAutoScrollStateChanged?(.idle, autoScrollSpeed)
+        }
     }
 
     /// 单次采样。
@@ -399,10 +577,15 @@ final class ScrollshotController {
             return
         case .unchanged:
             nextCaptureInterval = max(frameInterval, 0.125)
+            autoScrollDriver?.observeFrameFeedback(didAdvance: false, isUnresolved: false)
             emitPreviewIfDue()
             return
         case let .processed(image, decision, snapshot):
             sessionSnapshot = snapshot
+            autoScrollDriver?.observeFrameFeedback(
+                didAdvance: decision.isAccepted,
+                isUnresolved: decision.verdict == .unresolved
+            )
             let now = ContinuousClock.now
             let elapsed = lastSubmittedAt.duration(to: now)
             let elapsedSeconds = Double(elapsed.components.seconds)
@@ -435,9 +618,11 @@ final class ScrollshotController {
             // 否则窄窗口下内存已经吃紧、回调却还说没到顶。
             if sessionSnapshot.coveredWorldHeight >= sessionSnapshot.outputHeightLimit, !hasReportedHeightLimit {
                 hasReportedHeightLimit = true
+                autoScrollDriver?.stop()
                 onLimitReached?(.outputHeight(sessionSnapshot.outputHeightLimit))
             }
             guard decision.isAccepted else { return }
+            emitDimensionsUpdate()
             onProgress?(sessionSnapshot.acceptedFrameCount, sessionSnapshot.coveredWorldHeight)
             emitPreviewIfDue()
         }
@@ -536,7 +721,8 @@ final class ScrollshotController {
             worldWidth: preview.worldWidth,
             worldStart: preview.worldStart,
             worldHeight: preview.worldHeight,
-            viewportWorldRows: preview.viewportWorldRows
+            viewportWorldRows: preview.viewportWorldRows,
+            axis: axis
         ))
     }
 
@@ -666,6 +852,15 @@ private actor ScrollshotSessionWorker {
         lastSubmitted = image
         let decision = session.submit(image)
         return .processed(image: image, decision: decision, snapshot: session)
+    }
+
+    func undoLastSegment() -> (didUndo: Bool, snapshot: ScrollshotSession) {
+        let didUndo = session.undoLastSegment()
+        if didUndo {
+            // 清空去重基准，确保撤销后用户继续微滚仍会被立刻采纳。
+            lastSubmitted = nil
+        }
+        return (didUndo, session)
     }
 
     func finishAndReset() -> FinishResult {

@@ -415,6 +415,8 @@ private final class SettingsViewController: NSViewController {
     private var ocrDetectBarcodesRow: SettingsToggleRow!
     private var translationTargetPrefPopUp: NSPopUpButton!
     private var selectionFloatingButtonRow: SettingsToggleRow!
+    private var longshotAutoScrollRow: SettingsToggleRow!
+    private var longshotSpeedPopUp: NSPopUpButton!
 
     /// 录制 / 长截图 / OCR / 框选翻译 / 划词翻译直达入口的录制控件。
     private var intentRecorders: [GlobalShortcutAction: ShortcutRecorderView] = [:]
@@ -1054,6 +1056,30 @@ private final class SettingsViewController: NSViewController {
         cancelGuardRow.toggle.target = self
         cancelGuardRow.toggle.action = #selector(confirmCancelChanged(_:))
 
+        let autoScrollRow = SettingsToggleRow(
+            title: "长截图默认开启自动平滑翻页",
+            subtitle: "可按 Space 暂停或直接手动滚动无缝接管；无辅助功能权限时自动降级手动"
+        )
+        autoScrollRow.toggle.state = settings.longshotAutoScrollEnabled ? .on : .off
+        autoScrollRow.toggle.target = self
+        autoScrollRow.toggle.action = #selector(longshotAutoScrollChanged(_:))
+        longshotAutoScrollRow = autoScrollRow
+
+        let speedPopUp = NSPopUpButton(frame: .zero, pullsDown: false)
+        for speed in AutoScrollSpeed.allCases {
+            speedPopUp.addItem(withTitle: speed.displayName)
+        }
+        if let speedIndex = AutoScrollSpeed.allCases.firstIndex(of: settings.longshotAutoScrollSpeed) {
+            speedPopUp.selectItem(at: speedIndex)
+        }
+        speedPopUp.target = self
+        speedPopUp.action = #selector(longshotSpeedChanged)
+        speedPopUp.isBordered = false
+        speedPopUp.bezelStyle = .inline
+        speedPopUp.font = .systemFont(ofSize: 13)
+        longshotSpeedPopUp = speedPopUp
+        let speedRow = SettingsControlRow(label: "自动翻页速度", control: speedPopUp)
+
         let slotTitle = NSTextField(labelWithString: "主工具栏快捷项显示（隐藏不禁用快捷键）")
         slotTitle.font = .systemFont(ofSize: 12, weight: .medium)
         slotTitle.textColor = .secondaryLabelColor
@@ -1092,12 +1118,17 @@ private final class SettingsViewController: NSViewController {
         firstSep.boxType = .separator
         let secondSep = NSBox()
         secondSep.boxType = .separator
+        let thirdSep = NSBox()
+        thirdSep.boxType = .separator
 
         let content = NSStackView(views: [
             shadowRow,
             firstSep,
             cancelGuardRow,
             secondSep,
+            autoScrollRow,
+            speedRow,
+            thirdSep,
             slotTitle,
             slotGrid,
         ])
@@ -1121,6 +1152,16 @@ private final class SettingsViewController: NSViewController {
 
     @objc private func confirmCancelChanged(_ sender: NSSwitch) {
         settings.setConfirmCancelWithAnnotations(sender.state == .on)
+    }
+
+    @objc private func longshotAutoScrollChanged(_ sender: NSSwitch) {
+        settings.setLongshotAutoScrollEnabled(sender.state == .on)
+    }
+
+    @objc private func longshotSpeedChanged() {
+        let index = longshotSpeedPopUp.indexOfSelectedItem
+        guard index >= 0, index < AutoScrollSpeed.allCases.count else { return }
+        settings.setLongshotAutoScrollSpeed(AutoScrollSpeed.allCases[index])
     }
 
     @objc private func toolbarSlotToggled(_ sender: NSButton) {
@@ -2409,6 +2450,10 @@ private final class SettingsViewController: NSViewController {
         pinLimitValueLabel.stringValue = Self.pinLimitText(settings.pinMaximumCount)
         pinToggleRecorder.shortcut = settings.pinToggleShortcut
         pinShowBorderRow?.isOn = settings.pinShowBorder
+        longshotAutoScrollRow?.isOn = settings.longshotAutoScrollEnabled
+        if let speedIdx = AutoScrollSpeed.allCases.firstIndex(of: settings.longshotAutoScrollSpeed) {
+            longshotSpeedPopUp?.selectItem(at: speedIdx)
+        }
         for action in Self.intentShortcutActions {
             intentRecorders[action]?.shortcut = settings.shortcut(for: action)
         }
