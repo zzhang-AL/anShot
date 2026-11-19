@@ -16,6 +16,33 @@
 
 import AnShotCore
 import Foundation
+import os
+
+/// macOS 15.0+ SwiftUI `.translationTask` 极薄桥接执行器协议。
+///
+/// 由 `AnShotUI` 层的 `AppleTranslationBridge` 实现并注册，
+/// 既保持 `AnShotCapture` 不依赖 `SwiftUI`/`AppKit`，又把本机系统翻译能力门槛从 macOS 26.0 降至 macOS 15.0，
+/// 且可触发系统原生语言包下载弹窗。
+public protocol AppleTranslationBridgeExecutor: Sendable {
+    func translate(
+        _ lines: [OCRTextLine],
+        from source: String?,
+        to target: String
+    ) async -> TranslationExecutionResult
+}
+
+/// 线程安全的本机翻译桥接注册表。
+public enum AppleTranslationBridgeRegistry {
+    private static let lock = OSAllocatedUnfairLock<(any AppleTranslationBridgeExecutor)?>(initialState: nil)
+
+    public static var executor: (any AppleTranslationBridgeExecutor)? {
+        lock.withLock { $0 }
+    }
+
+    public static func register(_ executor: (any AppleTranslationBridgeExecutor)?) {
+        lock.withLock { $0 = executor }
+    }
+}
 
 /// 附带诊断错误信息的翻译执行结果（用于向结果面板与设置页透传云端失败原因）。
 public struct TranslationExecutionResult: Equatable, Sendable {
@@ -80,9 +107,9 @@ func untranslatedResult(
 
 /// Apple 系统 Translation 框架（本机）。
 ///
-/// 完全委托 `TextTranslator`，不添任何加工：它已经实现了批量提交、
-/// 结果对齐与逐行降级，这里再包一层逻辑只会产生第二套行为。
-public struct AppleTranslationProvider: TranslationProvider {
+/// 在 macOS 15.0+ 上优先委托 `AnShotUI` 注册的极薄 SwiftUI `.translationTask` 桥接执行器（支持语言包自动弹窗下载）；
+/// 未注册桥接且处于 macOS 26.0+ 时回退到无视图 `TextTranslator`。
+public struct AppleTranslationProvider: DiagnosticTranslationProvider {
 
     public init() {}
 
@@ -93,19 +120,44 @@ public struct AppleTranslationProvider: TranslationProvider {
         from source: String?,
         to target: String
     ) async -> TranslationResult {
+        await translateWithDiagnostics(lines, from: source, to: target).result
+    }
+
+    public func translateWithDiagnostics(
+        _ lines: [OCRTextLine],
+        from source: String?,
+        to target: String
+    ) async -> TranslationExecutionResult {
         guard !lines.isEmpty else {
-            return untranslatedResult(lines: lines, source: source, target: target)
+            return TranslationExecutionResult(result: untranslatedResult(lines: lines, source: source, target: target))
         }
-        // 系统版本不够就是不可用，而不是「翻译失败」：这里返回全部原文，
-        // 界面上的按钮本来就会因为这个原因被禁用。
-        guard #available(macOS 26.0, *) else {
-            return untranslatedResult(lines: lines, source: source, target: target)
+        guard #available(macOS 15.0, *) else {
+            return TranslationExecutionResult(
+                result: untranslatedResult(lines: lines, source: source, target: target),
+                errorMessage: "本机系统翻译需要 macOS 15.0 或更新版本，请在设置中改用云端翻译服务。"
+            )
         }
-        // 系统框架要求明确的源语言（不存在「自动检测」这个入参），
-        // 识别不出源语言时只能降级——交给系统去猜会得到一个语种错乱的原文回显。
-        guard let detected = source ?? TextTranslator.detectSourceLanguage(of: lines), !detected.isEmpty else {
-            return untranslatedResult(lines: lines, source: source, target: target)
+
+        // 优先走 macOS 15.0+ SwiftUI `.translationTask` 桥接（支持系统语言包下载提示）。
+        if let bridge = AppleTranslationBridgeRegistry.executor {
+            return await bridge.translate(lines, from: source, to: target)
         }
-        return await TextTranslator.translate(lines: lines, source: detected, target: target)
+
+        // 无 UI 宿主环境（例如纯 CLI/测试）：macOS 26.0+ 可直接走无视图 `TextTranslator`。
+        if #available(macOS 26.0, *) {
+            guard let detected = source ?? TextTranslator.detectSourceLanguage(of: lines), !detected.isEmpty else {
+                return TranslationExecutionResult(
+                    result: untranslatedResult(lines: lines, source: source, target: target),
+                    errorMessage: "无法自动识别源语言，请手动指定源语言后重试。"
+                )
+            }
+            let translated = await TextTranslator.translate(lines: lines, source: detected, target: target)
+            return TranslationExecutionResult(result: translated)
+        }
+
+        return TranslationExecutionResult(
+            result: untranslatedResult(lines: lines, source: source, target: target),
+            errorMessage: "当前环境未加载系统翻译桥接，请在应用窗口内重试或改用云端翻译。"
+        )
     }
 }

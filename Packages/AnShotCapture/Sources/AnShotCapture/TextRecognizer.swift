@@ -174,45 +174,160 @@ public enum TextRecognizer {
         return context.makeImage()
     }
 
-    /// 识别图中的文字。
+    /// 识别图中的文字（并在开启时同步识别二维码/条码；超长图自动走 2048×2048 分块识别）。
     ///
     /// - Parameters:
     ///   - image: 待识别的图像（像素尺寸即结果包围盒的参照系）。
-    ///   - languages: 指定语言；nil 表示用 `availability()` 挑出的偏好集。
+    ///   - languages: 显式指定语言数组；nil 时按 `languagePreference` 解析并按系统支持列表过滤。
+    ///   - languagePreference: 界面选择的语言偏好，默认 `.auto`。
+    ///   - detectBarcodes: 是否同步检测二维码/条码（默认 `true`，失败绝不阻断文字识别）。
     /// - Returns: 按分栏阅读序与代码块缩进整理后的结果，包围盒为**模型坐标系（像素、原点左上）**。
     public static func recognize(
         in image: CGImage,
-        languages: [String]? = nil
+        languages: [String]? = nil,
+        languagePreference: OCRLanguagePreference = .auto,
+        detectBarcodes: Bool = true
     ) async throws -> OCRResult {
         let pixelSize = PixelSize(width: Double(image.width), height: Double(image.height))
         guard pixelSize.width > 0, pixelSize.height > 0 else {
             throw Failure.invalidImage
         }
-        let chosen = languages ?? availability().preferredLanguages
+        let chosen: [String]
+        if let languages {
+            chosen = languages
+        } else {
+            let supported = availability().supportedLanguages
+            let preferred = languagePreference.recognitionLanguages.filter { supported.contains($0) }
+            chosen = preferred.isEmpty ? availability().preferredLanguages : preferred
+        }
 
-        // Vision 的请求执行是同步阻塞的，放到后台执行，避免卡住主线程
-        //（整屏识别是几百毫秒量级）。
+        // Vision 的请求执行是同步阻塞的，放到后台执行，避免卡住主线程。
         return try await Task.detached(priority: .userInitiated) {
-            let observations = try Self.performWithComputeFallback(on: image, languages: chosen)
-            let rawLines: [OCRTextLine] = observations.compactMap { observation in
-                let candidates = observation.topCandidates(3)
-                guard let best = candidates.first else { return nil }
-                return OCRTextLine(
-                    text: best.string,
-                    candidates: candidates.map(\.string),
-                    confidence: Double(best.confidence),
-                    // 坐标转换只在模型边界做一次（契约 §4.2）。
-                    boundingBox: OCRCoordinateConversion.pixelRect(
-                        normalized: observation.boundingBox,
-                        imagePixelSize: pixelSize
-                    )
-                )
+            let rawLines: [OCRTextLine]
+            if OCRTilePlanner.shouldTile(width: image.width, height: image.height) {
+                rawLines = try Self.recognizeTiled(on: image, languages: chosen)
+            } else {
+                let observations = try Self.performWithComputeFallback(on: image, languages: chosen)
+                rawLines = Self.convertObservations(observations, imagePixelSize: pixelSize, offsetX: 0, offsetY: 0)
             }
+
+            let barcodes = detectBarcodes ? Self.detectBarcodesSync(in: image) : []
             return OCRResult(
                 lines: layoutLines(rawLines, imagePixelSize: pixelSize),
-                imagePixelSize: pixelSize
+                imagePixelSize: pixelSize,
+                barcodes: barcodes
             )
         }.value
+    }
+
+    /// 独立同步识别图像中的二维码/条形码（带 CPU 兜底且失败不抛错，供云端 OCR 路径复用）。
+    public static func detectBarcodesSync(in image: CGImage) -> [BarcodeItem] {
+        guard image.width > 0, image.height > 0 else { return [] }
+        let tiers: [Bool] = [false, true]
+        for forceCPU in tiers {
+            let request = VNDetectBarcodesRequest()
+            if forceCPU {
+                if #available(macOS 14.0, *) {
+                    if let cpuDevice = MLComputeDevice.allComputeDevices.first(where: {
+                        if case .cpu = $0 { return true }
+                        return false
+                    }) {
+                        request.setComputeDevice(cpuDevice, for: .main)
+                    } else {
+                        request.usesCPUOnly = true
+                    }
+                } else {
+                    request.usesCPUOnly = true
+                }
+            }
+            do {
+                try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+                let observations = request.results ?? []
+                var seen = Set<String>()
+                var items: [BarcodeItem] = []
+                for obs in observations {
+                    guard let payload = obs.payloadStringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          !payload.isEmpty,
+                          seen.insert(payload).inserted else {
+                        continue
+                    }
+                    let symbology = Self.readableSymbologyName(obs.symbology)
+                    items.append(BarcodeItem(payload: payload, symbology: symbology))
+                }
+                return items
+            } catch {
+                continue
+            }
+        }
+        return []
+    }
+
+    private static func readableSymbologyName(_ symbology: VNBarcodeSymbology) -> String {
+        switch symbology {
+        case .qr: return "二维码"
+        case .aztec: return "Aztec"
+        case .dataMatrix: return "DataMatrix"
+        case .pdf417: return "PDF417"
+        case .ean13: return "EAN-13"
+        case .ean8: return "EAN-8"
+        case .code128: return "Code 128"
+        case .code39: return "Code 39"
+        default: return symbology.rawValue.replacingOccurrences(of: "VNBarcodeSymbology", with: "")
+        }
+    }
+
+    /// 超长图分块 OCR：按 2048×2048（重叠 256px）切片逐块识别，逐块包裹 `autoreleasepool` 控内存峰值，
+    /// 随后平移至整图坐标并经由 `OCRTilePlanner.deduplicateTiledLines` 去重。
+    private static func recognizeTiled(
+        on image: CGImage,
+        languages: [String]
+    ) throws -> [OCRTextLine] {
+        let tiles = OCRTilePlanner.planTiles(width: image.width, height: image.height)
+        var collected: [OCRTextLine] = []
+        for tile in tiles {
+            try Task.checkCancellation()
+            let tileLines: [OCRTextLine] = try autoreleasepool {
+                guard let cropped = image.cropping(to: tile.cgRect) else {
+                    return []
+                }
+                let observations = try Self.performWithComputeFallback(on: cropped, languages: languages)
+                let tileSize = PixelSize(width: Double(cropped.width), height: Double(cropped.height))
+                return Self.convertObservations(
+                    observations,
+                    imagePixelSize: tileSize,
+                    offsetX: Double(tile.x),
+                    offsetY: Double(tile.y)
+                )
+            }
+            collected.append(contentsOf: tileLines)
+        }
+        return OCRTilePlanner.deduplicateTiledLines(collected)
+    }
+
+    private static func convertObservations(
+        _ observations: [VNRecognizedTextObservation],
+        imagePixelSize: PixelSize,
+        offsetX: Double,
+        offsetY: Double
+    ) -> [OCRTextLine] {
+        observations.compactMap { observation in
+            let candidates = observation.topCandidates(3)
+            guard let best = candidates.first else { return nil }
+            let localBox = OCRCoordinateConversion.pixelRect(
+                normalized: observation.boundingBox,
+                imagePixelSize: imagePixelSize
+            )
+            let globalBox = PixelRect(
+                origin: PixelPoint(x: localBox.origin.x + offsetX, y: localBox.origin.y + offsetY),
+                size: localBox.size
+            )
+            return OCRTextLine(
+                text: best.string,
+                candidates: candidates.map(\.string),
+                confidence: Double(best.confidence),
+                boundingBox: globalBox
+            )
+        }
     }
 
     /// 构造标准化的 Vision 文字识别请求（供真实识别与预热共用同一份配置）。

@@ -20,6 +20,9 @@
 import AnShotCore
 import Foundation
 import os
+#if canImport(Translation)
+import Translation
+#endif
 
 let translationServiceLogger = AnShotLog.translation
 /// 翻译入口。
@@ -237,12 +240,38 @@ public final class TranslationService: Sendable {
         source: String?,
         target: String
     ) async -> TranslationAvailability {
-        guard #available(macOS 26.0, *) else {
-            // 不用 `TextTranslator.requiredSystemVersion`：那个符号本身标了
-            // macOS 26.0 可用性，在「版本不够」的分支里引用它编译不过。
+        guard #available(macOS 15.0, *) else {
             return .requiresNewerSystem(
-                required: TranslationProviderKind.appleTranslation.requiredSystemVersion ?? "macOS 26.0"
+                required: TranslationProviderKind.appleTranslation.requiredSystemVersion ?? "macOS 15.0"
             )
+        }
+
+        // 若 UI 桥接已注册（支持 `.translationTask` 唤起系统语言包下载弹窗），
+        // 在 macOS 15.0+ 上 `.installed` 与 `.supported` 均视为可用。
+        if AppleTranslationBridgeRegistry.executor != nil {
+            #if canImport(Translation)
+            guard let source, !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return .available
+            }
+            let status = await LanguageAvailability().status(
+                from: Locale.Language(identifier: source),
+                to: Locale.Language(identifier: target)
+            )
+            switch status {
+            case .installed, .supported:
+                return .available
+            case .unsupported:
+                return .unsupportedLanguagePair(source: source, target: target)
+            @unknown default:
+                return .unsupportedLanguagePair(source: source, target: target)
+            }
+            #else
+            return .available
+            #endif
+        }
+
+        guard #available(macOS 26.0, *) else {
+            return .requiresNewerSystem(required: "macOS 15.0")
         }
         return await TextTranslator.availability(source: source, target: target)
     }

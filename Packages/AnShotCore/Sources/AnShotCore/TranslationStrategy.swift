@@ -122,6 +122,29 @@ public enum TranslationLanguage {
         return left == right
     }
 
+    /// 界面提供的 7 种常用目标语言（契约 `ux-polish/model.md` §3.3）。
+    public static let commonTargetLanguages: [(id: String, name: String)] = [
+        ("zh-Hans", "简体中文"),
+        ("zh-Hant", "繁体中文"),
+        ("en", "英文"),
+        ("ja", "日文"),
+        ("ko", "韩文"),
+        ("fr", "法文"),
+        ("de", "德文"),
+    ]
+
+    /// 界面提供的源语言选项（首位为自动检测 `nil`）。
+    public static let commonSourceLanguages: [(id: String?, name: String)] = [
+        (nil, "自动检测"),
+        ("zh-Hans", "简体中文"),
+        ("zh-Hant", "繁体中文"),
+        ("en", "英文"),
+        ("ja", "日文"),
+        ("ko", "韩文"),
+        ("fr", "法文"),
+        ("de", "德文"),
+    ]
+
     /// 面向用户的语言名。
     ///
     /// 认不出来就原样回传标识：编一个错的名字比给出 `xx-YY` 更难排查。

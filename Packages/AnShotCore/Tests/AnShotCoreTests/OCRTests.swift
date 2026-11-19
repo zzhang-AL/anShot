@@ -153,4 +153,80 @@ struct OCRTests {
         #expect(result.plainText == "第一行\n第二行")
         #expect(!result.isEmpty)
     }
+
+    @Test("段落软换行合并：英文连字符拼接、CJK 紧拼不插空格、列表项与空行保留分段")
+    func paragraphMergerHandlesCJKHyphenAndLists() {
+        let raw = """
+        这是一段被截图软换行的中文
+        继续接在上一句后面没有空格
+        The quick brown fox imple-
+        mentation works well
+        - 第一条列表项
+        - 第二条列表项
+
+        空行之后的独立新段落
+        """
+        let merged = OCRParagraphMerger.merge(plainText: raw)
+        let lines = merged.components(separatedBy: "\n")
+        #expect(lines.contains { $0.contains("中文继续接在上一句") })
+        #expect(lines.contains { $0.contains("implementation works well") })
+        #expect(lines.contains("- 第一条列表项"))
+        #expect(lines.contains("- 第二条列表项"))
+        #expect(lines.last == "空行之后的独立新段落")
+    }
+
+    @Test("超长图分块 OCR 瓦片规划完整覆盖且重叠区空间去重保留更完整行")
+    func tilePlannerCoverageAndSpatialDeduplication() {
+        #expect(!OCRTilePlanner.shouldTile(width: 1920, height: 1080))
+        #expect(OCRTilePlanner.shouldTile(width: 1440, height: 8000))
+        #expect(OCRTilePlanner.shouldTile(width: 600, height: 3000))
+
+        let tiles = OCRTilePlanner.planTiles(width: 1440, height: 6000)
+        #expect(tiles.count >= 3)
+        #expect(tiles.first?.y == 0)
+        #expect((tiles.last!.y + tiles.last!.height) == 6000)
+        for index in 1 ..< tiles.count {
+            let prevEnd = tiles[index - 1].y + tiles[index - 1].height
+            #expect(tiles[index].y < prevEnd, "相邻瓦片应有重叠区以防拦腰切断文字")
+        }
+
+        // 重叠区两份重复行应合并为置信度更高 / 文本更完整的一份。
+        let lineA = OCRTextLine(
+            text: "重复行内容",
+            candidates: ["重复行内容"],
+            confidence: 0.72,
+            boundingBox: PixelRect(origin: PixelPoint(x: 40, y: 1900), size: PixelSize(width: 200, height: 28))
+        )
+        let lineB = OCRTextLine(
+            text: "重复行内容完整版",
+            candidates: ["重复行内容完整版"],
+            confidence: 0.95,
+            boundingBox: PixelRect(origin: PixelPoint(x: 42, y: 1901), size: PixelSize(width: 240, height: 28))
+        )
+        let lineC = OCRTextLine(
+            text: "另一行独立文字",
+            candidates: ["另一行独立文字"],
+            confidence: 0.9,
+            boundingBox: PixelRect(origin: PixelPoint(x: 40, y: 2100), size: PixelSize(width: 220, height: 28))
+        )
+        let deduped = OCRTilePlanner.deduplicateTiledLines([lineA, lineB, lineC])
+        #expect(deduped.count == 2)
+        #expect(deduped.first?.text == "重复行内容完整版")
+        #expect(deduped.last?.text == "另一行独立文字")
+    }
+
+    @Test("二维码载荷准确识别 HTTP/HTTPS 网页链接与纯文本，语言偏好展开符合契约")
+    func barcodeItemAndLanguagePreference() {
+        let link = BarcodeItem(payload: "https://github.com/zzusec/isnip", symbology: "二维码")
+        #expect(link.isWebURL)
+        #expect(link.webURL?.host == "github.com")
+
+        let plain = BarcodeItem(payload: "WIFI:T:WPA;S:Office;P:123456;;", symbology: "二维码")
+        #expect(!plain.isWebURL)
+        #expect(plain.webURL == nil)
+
+        #expect(OCRLanguagePreference.auto.recognitionLanguages == ["zh-Hans", "zh-Hant", "en-US", "ja-JP", "ko-KR"])
+        #expect(TranslationProviderKind.appleTranslation.requiredSystemVersion == "macOS 15.0")
+        #expect(TranslationLanguage.commonTargetLanguages.count == 7)
+    }
 }

@@ -41,10 +41,18 @@ public final class OCRService: Sendable {
     /// 当前生效的 provider。
     public var selectedKind: OCRProviderKind { settings.selectedKind }
 
-    /// 识别图像中的文字。
+    /// 识别图像中的文字与可选二维码/条码。
     ///
+    /// - Parameters:
+    ///   - image: 待识别图像。
+    ///   - languagePreference: 识别语言偏好（对本机 Vision 生效）。
+    ///   - detectBarcodes: 是否同步执行本机二维码/条码识别（默认开启，云端 OCR 下也零外发补扫二维码）。
     /// - Throws: `OCRProviderFailure`。未配置密钥的云端 provider 会在发请求前失败。
-    public func recognize(in image: CGImage) async throws -> OCRResult {
+    public func recognize(
+        in image: CGImage,
+        languagePreference: OCRLanguagePreference = .auto,
+        detectBarcodes: Bool = true
+    ) async throws -> OCRResult {
         let kind = settings.selectedKind
 
         // 提前挡一次：拿空密钥去发请求只会换回一个 401，
@@ -56,13 +64,36 @@ public final class OCRService: Sendable {
         let config = settings.config(for: kind)
         switch kind {
         case .appleVision:
-            return try await AppleVisionOCRProvider().recognize(in: image)
+            return try await AppleVisionOCRProvider().recognize(
+                in: image,
+                languagePreference: languagePreference,
+                detectBarcodes: detectBarcodes
+            )
         case .openAICompatible:
-            return try await OpenAICompatibleOCRProvider(config: config).recognize(in: image)
+            let cloudResult = try await OpenAICompatibleOCRProvider(config: config).recognize(in: image)
+            return Self.attachBarcodesIfNeeded(to: cloudResult, image: image, detectBarcodes: detectBarcodes)
         case .claude:
-            return try await ClaudeOCRProvider(config: config).recognize(in: image)
+            let cloudResult = try await ClaudeOCRProvider(config: config).recognize(in: image)
+            return Self.attachBarcodesIfNeeded(to: cloudResult, image: image, detectBarcodes: detectBarcodes)
         case .baiduPPOCR:
-            return try await BaiduPPOCRProvider(config: config, settings: settings).recognize(in: image)
+            let cloudResult = try await BaiduPPOCRProvider(config: config, settings: settings).recognize(in: image)
+            return Self.attachBarcodesIfNeeded(to: cloudResult, image: image, detectBarcodes: detectBarcodes)
         }
+    }
+
+    private static func attachBarcodesIfNeeded(
+        to result: OCRResult,
+        image: CGImage,
+        detectBarcodes: Bool
+    ) -> OCRResult {
+        guard detectBarcodes, result.barcodes.isEmpty else { return result }
+        let barcodes = TextRecognizer.detectBarcodesSync(in: image)
+        guard !barcodes.isEmpty else { return result }
+        return OCRResult(
+            lines: result.lines,
+            imagePixelSize: result.imagePixelSize,
+            coordinateCapability: result.coordinateCapability,
+            barcodes: barcodes
+        )
     }
 }

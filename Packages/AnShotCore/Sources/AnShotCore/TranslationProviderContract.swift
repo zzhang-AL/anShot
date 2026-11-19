@@ -24,7 +24,7 @@ import Foundation
 /// 翻译的提供者。
 public enum TranslationProviderKind: String, Codable, CaseIterable, Sendable {
 
-    /// Apple 系统 Translation 框架（本机，需 macOS 26.0 与语言包）。
+    /// Apple 系统 Translation 框架（本机，需 macOS 15.0 及以上）。
     case appleTranslation
 
     /// 任何 OpenAI chat-completions 兼容的服务。
@@ -78,7 +78,7 @@ public enum TranslationProviderKind: String, Codable, CaseIterable, Sendable {
     /// 系统不够新时，翻译功能仍然可用。
     public var requiredSystemVersion: String? {
         switch self {
-        case .appleTranslation: return "macOS 26.0"
+        case .appleTranslation: return "macOS 15.0"
         case .openAICompatible, .claude: return nil
         }
     }

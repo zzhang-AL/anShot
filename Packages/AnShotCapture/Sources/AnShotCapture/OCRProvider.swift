@@ -55,8 +55,18 @@ public struct AppleVisionOCRProvider: OCRProvider {
     public var coordinateCapability: OCRCoordinateCapability { .precise }
 
     public func recognize(in image: CGImage) async throws -> OCRResult {
-        // 直接委托：识别级别、语言矫正、自动语言检测、坐标转换全在 TextRecognizer，
-        // 这里不做任何二次加工，保证改造前后逐字段一致。
-        try await TextRecognizer.recognize(in: image)
+        try await recognize(in: image, languagePreference: .auto, detectBarcodes: true)
+    }
+
+    public func recognize(
+        in image: CGImage,
+        languagePreference: OCRLanguagePreference,
+        detectBarcodes: Bool
+    ) async throws -> OCRResult {
+        try await TextRecognizer.recognize(
+            in: image,
+            languagePreference: languagePreference,
+            detectBarcodes: detectBarcodes
+        )
     }
 }
