@@ -1292,7 +1292,7 @@ private final class ToolbarTooltipContentView: NSView {
         self.isDark = isDark
 
         let titleFont = NSFont.systemFont(ofSize: 11.5, weight: .medium)
-        let titleW = ceil((title as NSString).size(withAttributes: [.font: titleFont]).width)
+        let titleW = ceil((title as NSString).size(withAttributes: [.font: titleFont]).width) + 1
         var totalW = 10 + titleW + 10
         if let shortcut, !shortcut.isEmpty {
             let keyFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold)

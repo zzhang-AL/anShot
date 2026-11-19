@@ -110,31 +110,19 @@ public final class ToastPresenter {
         let trimmedTitle = actionTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
         let usableTitle = (action != nil && trimmedTitle?.isEmpty == false) ? trimmedTitle : nil
 
-        let buttonFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        let buttonTitleSize = usableTitle.map {
-            ($0 as NSString).size(withAttributes: [.font: buttonFont])
-        } ?? .zero
-        let buttonSize = CGSize(
-            width: ceil(buttonTitleSize.width) + buttonHorizontalPadding * 2,
-            height: ceil(buttonTitleSize.height) + buttonVerticalPadding * 2
+        let layout = measureLayout(
+            message: message,
+            messageFont: messageFont,
+            actionTitle: usableTitle,
+            screenFrame: screenFrame
         )
-        let buttonAreaWidth = usableTitle == nil ? 0 : buttonGap + buttonSize.width
+        let capsuleWidth = layout.capsuleSize.width
+        let capsuleHeight = layout.capsuleSize.height
+        let textWidth = layout.textSize.width
+        let messageHeight = layout.textSize.height
+        let buttonSize = layout.buttonSize
+        let buttonFont = Self.actionButtonFont
         let iconAreaWidth: CGFloat = iconSize + iconGap
-
-        let maxCapsuleWidth = max(minimumAvailableWidth, screenFrame.width - screenInset * 2)
-        let maxTextWidth = max(1, min(maximumTextWidth, maxCapsuleWidth - horizontalPadding * 2 - iconAreaWidth - buttonAreaWidth))
-        let boundingRect = (message as NSString).boundingRect(
-            with: CGSize(width: maxTextWidth, height: 140),
-            options: [.usesLineFragmentOrigin, .usesFontLeading],
-            attributes: [.font: messageFont]
-        )
-        let textWidth = max(1, min(ceil(boundingRect.width), maxTextWidth))
-        let singleLineHeight = ceil((("样本" as NSString).size(withAttributes: [.font: messageFont])).height)
-        let messageHeight = max(singleLineHeight, ceil(boundingRect.height))
-        let isMultiline = messageHeight > singleLineHeight * 1.4
-
-        let capsuleHeight = max(minimumCapsuleHeight, messageHeight + verticalPadding * 2)
-        let capsuleWidth = horizontalPadding * 2 + iconAreaWidth + textWidth + buttonAreaWidth
 
         let origin = CGPoint(
             x: screenFrame.midX - capsuleWidth / 2,
@@ -143,10 +131,10 @@ public final class ToastPresenter {
 
         let capsule = ToastCapsuleView(frame: CGRect(x: 0, y: 0, width: capsuleWidth, height: capsuleHeight))
         capsule.wantsLayer = true
-        capsule.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.84).cgColor
-        capsule.layer?.cornerRadius = isMultiline ? 12 : (capsuleHeight / 2)
+        capsule.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.86).cgColor
+        capsule.layer?.cornerRadius = layout.isMultiline ? 12 : (capsuleHeight / 2)
         capsule.layer?.borderWidth = 1
-        capsule.layer?.borderColor = NSColor.white.withAlphaComponent(0.10).cgColor
+        capsule.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
 
         let iconView = NSImageView(frame: CGRect(
             x: horizontalPadding - 2,
@@ -159,16 +147,14 @@ public final class ToastPresenter {
         iconView.imageScaling = .scaleProportionallyUpOrDown
         capsule.addSubview(iconView)
 
-        let label = NSTextField(wrappingLabelWithString: message)
-        label.font = messageFont
-        label.textColor = .white
-        label.lineBreakMode = .byWordWrapping
-        label.maximumNumberOfLines = 4
-        label.alignment = .left
-        label.isSelectable = false
+        let label = makeMessageLabel(
+            message: message,
+            font: messageFont,
+            isMultiline: layout.isMultiline
+        )
         label.frame = CGRect(
             x: horizontalPadding + iconAreaWidth,
-            y: (capsuleHeight - messageHeight) / 2,
+            y: ((capsuleHeight - messageHeight) / 2).rounded(),
             width: textWidth,
             height: messageHeight
         )
@@ -322,7 +308,95 @@ public final class ToastPresenter {
     private static var activeDuration: TimeInterval = 0
     private static var toastGeneration: UInt64 = 0
 
+    private static let actionButtonFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
     private static let toastLevel = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
+
+    /// 供生产展示与单元测试共用的精确排版度量结果。
+    struct MeasuredLayout {
+        let capsuleSize: CGSize
+        let textSize: CGSize
+        let buttonSize: CGSize
+        let isMultiline: Bool
+    }
+
+    /// 通过真实 `NSTextFieldCell` 测量文本宽高（天然计入 AppKit 单元格左右内边距），
+    /// 彻底杜绝单行中文（如「已复制到剪贴板」）因少算 4pt cell padding 被折行裁断成「已复制到」。
+    static func measureLayout(
+        message: String,
+        messageFont: NSFont = NSFont.systemFont(ofSize: 13, weight: .medium),
+        actionTitle: String?,
+        screenFrame: CGRect
+    ) -> MeasuredLayout {
+        let buttonTitleSize = actionTitle.map {
+            ($0 as NSString).size(withAttributes: [.font: actionButtonFont])
+        } ?? .zero
+        let buttonSize = CGSize(
+            width: ceil(buttonTitleSize.width) + buttonHorizontalPadding * 2 + 2,
+            height: ceil(buttonTitleSize.height) + buttonVerticalPadding * 2
+        )
+        let buttonAreaWidth = actionTitle == nil ? 0 : buttonGap + buttonSize.width
+        let iconAreaWidth: CGFloat = iconSize + iconGap
+
+        let maxCapsuleWidth = max(minimumAvailableWidth, screenFrame.width - screenInset * 2)
+        let maxTextWidth = max(1, min(maximumTextWidth, maxCapsuleWidth - horizontalPadding * 2 - iconAreaWidth - buttonAreaWidth))
+
+        let hasExplicitNewline = message.contains("\n")
+        // 1. 先按单行标签实测自然宽度（含 NSTextFieldCell 自身左右 padding）。
+        let singleProbe = NSTextField(labelWithString: message)
+        singleProbe.font = messageFont
+        let naturalSingleSize = singleProbe.cell?.cellSize(
+            forBounds: CGRect(x: 0, y: 0, width: CGFloat.greatestFiniteMagnitude, height: 140)
+        ) ?? singleProbe.fittingSize
+        let naturalSingleWidth = ceil(naturalSingleSize.width) + 4
+        let singleLineHeight = ceil(naturalSingleSize.height)
+
+        let textWidth: CGFloat
+        let messageHeight: CGFloat
+        let isMultiline: Bool
+
+        if !hasExplicitNewline && naturalSingleWidth <= maxTextWidth {
+            textWidth = max(1, naturalSingleWidth)
+            messageHeight = singleLineHeight
+            isMultiline = false
+        } else {
+            let multiProbe = makeMessageLabel(message: message, font: messageFont, isMultiline: true)
+            let wrappedSize = multiProbe.cell?.cellSize(
+                forBounds: CGRect(x: 0, y: 0, width: maxTextWidth, height: 200)
+            ) ?? CGSize(width: maxTextWidth, height: singleLineHeight * 2)
+            textWidth = max(1, min(maxTextWidth, ceil(wrappedSize.width) + 4))
+            messageHeight = max(singleLineHeight, ceil(wrappedSize.height) + 2)
+            isMultiline = messageHeight > singleLineHeight * 1.35 || hasExplicitNewline
+        }
+
+        let capsuleHeight = max(minimumCapsuleHeight, messageHeight + verticalPadding * 2)
+        let capsuleWidth = horizontalPadding * 2 + iconAreaWidth + textWidth + buttonAreaWidth
+        return MeasuredLayout(
+            capsuleSize: CGSize(width: capsuleWidth, height: capsuleHeight),
+            textSize: CGSize(width: textWidth, height: messageHeight),
+            buttonSize: buttonSize,
+            isMultiline: isMultiline
+        )
+    }
+
+    private static func makeMessageLabel(message: String, font: NSFont, isMultiline: Bool) -> NSTextField {
+        let label: NSTextField
+        if isMultiline {
+            label = NSTextField(wrappingLabelWithString: message)
+            label.usesSingleLineMode = false
+            label.lineBreakMode = .byWordWrapping
+            label.maximumNumberOfLines = 4
+        } else {
+            label = NSTextField(labelWithString: message)
+            label.usesSingleLineMode = true
+            label.lineBreakMode = .byTruncatingTail
+            label.maximumNumberOfLines = 1
+        }
+        label.font = font
+        label.textColor = .white
+        label.alignment = .left
+        label.isSelectable = false
+        return label
+    }
     private static let bottomInset: CGFloat = 72
     private static let horizontalPadding: CGFloat = 16
     private static let verticalPadding: CGFloat = 10

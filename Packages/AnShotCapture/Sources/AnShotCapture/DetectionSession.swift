@@ -173,6 +173,12 @@ public final class DetectionSession {
         }
     }
 
+    /// 返回光标下方最顶层可见窗口的 `windowID`（不发起 AX 跨进程查询，用于判断光标是否仍在同一窗口内）。
+    public func topWindowID(atGlobalPoint point: CGPoint) -> CGWindowID? {
+        guard isLoaded else { return nil }
+        return windows.first(where: { $0.frame.contains(point) })?.windowID
+    }
+
     /// 阶段一零阻塞即时命中：仅使用内存中的窗口快照，不发起跨进程 AX 查询。
     public func immediateTarget(
         atGlobalPoint point: CGPoint,

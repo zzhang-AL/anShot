@@ -1321,11 +1321,16 @@ final class OverlayView: NSView {
             .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
             .foregroundColor: NSColor.white.withAlphaComponent(0.96),
         ]
-        let attributed = NSAttributedString(string: text, attributes: attrs)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingMiddle
+        var drawAttrs = attrs
+        drawAttrs[.paragraphStyle] = paragraph
+        let attributed = NSAttributedString(string: text, attributes: drawAttrs)
         let textSize = attributed.size()
         let padX: CGFloat = 14
         let height: CGFloat = 28
-        let width = ceil(textSize.width) + padX * 2
+        let maxPillWidth = max(220, bounds.width - 40)
+        let width = min(maxPillWidth, ceil(textSize.width) + padX * 2 + 2)
         let topSafe = max(16, effectiveSafeAreaInsets.top + 12)
         let pillRect = CGRect(
             x: ((bounds.width - width) / 2).rounded(),
@@ -1347,10 +1352,13 @@ final class OverlayView: NSView {
         NSGraphicsContext.saveGraphicsState()
         let nsContext = NSGraphicsContext(cgContext: context, flipped: true)
         NSGraphicsContext.current = nsContext
-        attributed.draw(at: CGPoint(
+        let textRect = CGRect(
             x: pillRect.minX + padX,
-            y: pillRect.midY - textSize.height / 2
-        ))
+            y: pillRect.midY - textSize.height / 2,
+            width: max(1, pillRect.width - padX * 2),
+            height: ceil(textSize.height) + 1
+        )
+        attributed.draw(in: textRect)
         NSGraphicsContext.restoreGraphicsState()
         context.restoreGState()
     }
@@ -1447,6 +1455,10 @@ final class OverlayView: NSView {
     /// 清空未确认态下的候选预览框，回归 100% 原亮度静默画面。
     private func clearPreviewCandidate() {
         guard !isSelectionConfirmed else { return }
+        // 若当前已经处于空候选静默态，直接跳过，避免重复触发无效重绘。
+        if currentDetectionTarget == nil, effectiveSelection == nil {
+            return
+        }
         currentDetectionTarget = nil
         detectionTitle = nil
         detectionLayerName = nil
@@ -1517,8 +1529,8 @@ final class OverlayView: NSView {
 
         if loupeView.superview == nil {
             addSubview(loupeView)
-        } else {
-            // 确保放大镜始终浮在工具栏之上，不被遮挡。
+        } else if subviews.last !== loupeView {
+            // 仅在放大镜不在最顶层时置顶一次，避免每次 mouseMoved 反复重排子视图树引发闪烁。
             addSubview(loupeView, positioned: .above, relativeTo: nil)
         }
 
@@ -1594,7 +1606,11 @@ final class OverlayView: NSView {
         return true
     }
 
-    /// 按当前鼠标位置更新识别结果（两阶段异步：先瞬时命中窗口，再去抖后台查询精细控件，彻底解除主线程 AX 阻塞）。
+    /// 按当前鼠标位置更新识别结果（两阶段防闪烁异步探测）：
+    ///
+    /// 若光标仍在当前已命中的控件/目标区域内且未切换顶层窗口，**不**在同步阶段把选区
+    /// 强行退回整窗或清空（否则鼠标在同一区域缓慢移动会引发「控件 ↔ 整窗/空白」的高频乒乓闪烁），
+    /// 而是保持当前高亮稳定，交由后台去抖查询确认后再平滑切换或回退。
     private func updateDetection(at viewPoint: CGPoint) {
         guard isDetectionAllowed, let session = detectionSession else { return }
         // 画标注时选区是画布，不该被识别抢走。
@@ -1605,14 +1621,33 @@ final class OverlayView: NSView {
 
         let globalPoint = globalScreenPoint(fromViewPoint: viewPoint)
         let preference = detectionPreference
-        if let immediate = session.immediateTarget(
-            atGlobalPoint: globalPoint,
-            preference: preference
-        ) {
-            applyDetectionTarget(immediate)
-        } else if session.suppressesMaximizedWindow {
-            clearPreviewCandidate()
+
+        // 粘性保稳判定：自动模式下，只要当前已命中控件且光标仍在同一个顶层窗口内，
+        // 同步阶段暂不提前覆盖为整窗或清屏（避免同一控件内慢移、以及相邻控件切换时出现
+        // 20ms 的「控件 ↔ 整窗/空白」乒乓闪烁），统一由后台 AX 回调无缝切换或平滑回退。
+        let topWindowID = session.topWindowID(atGlobalPoint: globalPoint)
+        let shouldHoldCurrentControl: Bool = {
+            guard preference == .automatic,
+                  let current = currentDetectionTarget,
+                  current.layer == .control,
+                  current.displayID == displayID,
+                  current.windowID == topWindowID else {
+                return false
+            }
+            return true
+        }()
+
+        if !shouldHoldCurrentControl {
+            if let immediate = session.immediateTarget(
+                atGlobalPoint: globalPoint,
+                preference: preference
+            ) {
+                applyDetectionTarget(immediate)
+            } else if session.suppressesMaximizedWindow {
+                clearPreviewCandidate()
+            }
         }
+
         session.scheduleControlTarget(
             atGlobalPoint: globalPoint,
             preference: preference
@@ -1620,11 +1655,22 @@ final class OverlayView: NSView {
             guard let self,
                   self.isDetectionAllowed,
                   !self.isWindowPickerMode,
-                  self.editorState?.tool.isDrawingTool != true,
-                  let controlTarget else {
+                  self.editorState?.tool.isDrawingTool != true else {
                 return
             }
-            self.applyDetectionTarget(controlTarget)
+            if let controlTarget {
+                self.applyDetectionTarget(controlTarget)
+            } else if shouldHoldCurrentControl {
+                // 后台确认光标下已无细控件命中时，再平滑回退到窗口候选或静默空态。
+                if let fallback = session.immediateTarget(
+                    atGlobalPoint: globalPoint,
+                    preference: preference
+                ) {
+                    self.applyDetectionTarget(fallback)
+                } else if session.suppressesMaximizedWindow {
+                    self.clearPreviewCandidate()
+                }
+            }
         }
     }
 
@@ -1644,19 +1690,29 @@ final class OverlayView: NSView {
         )
     }
 
-    /// 把识别结果落到选区上。
+    /// 把识别结果落到选区上（同目标去重，避免鼠标微移触发无效整屏重绘）。
     private func applyDetectionTarget(_ target: DetectionTarget) {
-        // 留存当前命中目标：录制准备面板需要它的身份（windowID / processID）
-        // 才能提供「窗口」「应用」范围。身份只在命中测试那一刻有效，
-        // 事后再查会因窗口移动或被遮挡而得到不同结果。
-        currentDetectionTarget = target
-
         let scale = backdropScale
         let pixel = CoordinateConversion.pixelRect(
             fromLogical: target.rect,
             scaleFactor: scale
         )
         guard pixel.isNonEmpty else { return }
+
+        // 若新候选与当前已显示的候选完全相同，直接短路，避免重复触发视图重绘。
+        if let existing = currentDetectionTarget,
+           existing.layer == target.layer,
+           existing.displayID == target.displayID,
+           existing.windowID == target.windowID,
+           existing.rect == target.rect,
+           editorState?.selection == pixel {
+            return
+        }
+
+        // 留存当前命中目标：录制准备面板需要它的身份（windowID / processID）
+        // 才能提供「窗口」「应用」范围。身份只在命中测试那一刻有效，
+        // 事后再查会因窗口移动或被遮挡而得到不同结果。
+        currentDetectionTarget = target
 
         // 仅在层级或标题变化时记录：鼠标在同一目标上移动会高频触发，
         // 每次都记会刷满日志且看不出规律。

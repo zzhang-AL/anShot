@@ -291,6 +291,108 @@ struct Phase5PolishAndMigrationTests {
         #expect(rightFrame.minX >= leftHistory.maxX)
         #expect(!rightFrame.intersects(leftHistory))
     }
+
+    @Test("ToastPresenter 中文胶囊精确计入 NSTextFieldCell 内边距，单行绝不折行截断成半句")
+    func toastPresenterDoesNotTruncateChineseSingleLine() throws {
+        _ = NSApplication.shared
+        let screenFrame = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        let singleLineCases = [
+            "已复制到剪贴板",
+            "已固定在屏幕上",
+            "长截图已复制到剪贴板",
+            "已复制色值 #FF3B30",
+            "已撤销上一段拼接",
+        ]
+
+        for text in singleLineCases {
+            let layout = ToastPresenter.measureLayout(
+                message: text,
+                messageFont: font,
+                actionTitle: nil,
+                screenFrame: screenFrame
+            )
+            let probe = NSTextField(labelWithString: text)
+            probe.font = font
+            let cellNeeded = try #require(probe.cell?.cellSize(
+                forBounds: CGRect(x: 0, y: 0, width: CGFloat.greatestFiniteMagnitude, height: 100)
+            ))
+            #expect(!layout.isMultiline, "短消息「\(text)」不应误判为多行")
+            #expect(layout.textSize.width >= ceil(cellNeeded.width), "「\(text)」宽度必须完整容纳 NSTextFieldCell 内边距")
+            #expect(layout.textSize.height >= ceil(cellNeeded.height))
+        }
+
+        // 多行长消息或显式换行应正确按多行高度展开
+        let multiLayout = ToastPresenter.measureLayout(
+            message: "第一行提示\n第二行补充说明",
+            messageFont: font,
+            actionTitle: "在访达中显示",
+            screenFrame: screenFrame
+        )
+        #expect(multiLayout.isMultiline)
+        #expect(multiLayout.capsuleSize.height > 44)
+    }
+
+    @Test("DetectionSession.topWindowID 准确识别最顶层窗口，供覆盖层慢移保稳防闪烁")
+    func detectionSessionTopWindowIDAndControlStability() async {
+        let displayBounds = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let maxWindow = DetectedWindow(
+            windowID: 101,
+            frame: CGRect(x: 0, y: 25, width: 1440, height: 875),
+            layer: 0,
+            title: "Editor",
+            processID: 1001,
+            applicationName: "Xcode"
+        )
+        let floatingWindow = DetectedWindow(
+            windowID: 202,
+            frame: CGRect(x: 900, y: 120, width: 420, height: 360),
+            layer: 0,
+            title: "Note",
+            processID: 2002,
+            applicationName: "Notes"
+        )
+        let controlFrame = CGRect(x: 120, y: 140, width: 320, height: 260)
+        let detector = FlickerRegressionDetector(
+            windows: [floatingWindow, maxWindow],
+            controlHit: ControlHit(frame: controlFrame, role: "AXGroup")
+        )
+        let session = DetectionSession(
+            detector: detector,
+            displayID: 1,
+            displayBounds: displayBounds
+        )
+        session.suppressesMaximizedWindow = true
+        await session.load()
+
+        // 光标在最大化窗口区域内：顶层窗口为 101，且 immediateTarget 抑制整屏误吸返回 nil
+        #expect(session.topWindowID(atGlobalPoint: CGPoint(x: 200, y: 200)) == 101)
+        #expect(session.immediateTarget(atGlobalPoint: CGPoint(x: 200, y: 200), preference: .automatic) == nil)
+        // 移入上层悬浮窗：顶层窗口切换为 202，immediateTarget 立即命中浮窗
+        #expect(session.topWindowID(atGlobalPoint: CGPoint(x: 960, y: 200)) == 202)
+        #expect(session.immediateTarget(atGlobalPoint: CGPoint(x: 960, y: 200), preference: .automatic)?.windowID == 202)
+    }
+}
+
+private final class FlickerRegressionDetector: ScreenElementDetecting, @unchecked Sendable {
+    let windowsList: [DetectedWindow]
+    let controlHit: ControlHit?
+
+    init(windows: [DetectedWindow], controlHit: ControlHit?) {
+        self.windowsList = windows
+        self.controlHit = controlHit
+    }
+
+    var hasAccessibilityPermission: Bool { true }
+
+    func windows(onDisplay displayID: CGDirectDisplayID) async throws -> [DetectedWindow] {
+        windowsList
+    }
+
+    func control(atGlobalPoint point: CGPoint, inApplication processID: pid_t) -> ControlHit? {
+        guard let controlHit, controlHit.frame.contains(point) else { return nil }
+        return controlHit
+    }
 }
 
 @MainActor

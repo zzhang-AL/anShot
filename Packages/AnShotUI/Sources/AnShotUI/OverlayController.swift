@@ -937,10 +937,12 @@ public final class OverlayController {
             }
             window.overlayView.onDetectedDisplayID = { [weak self] displayID in
                 guard let self else { return }
+                let changed = self.selectionDisplayID != displayID
                 self.selectionDisplayID = displayID
-                // 识别把选区候选换到了另一块屏：焦点也要跟过去，
-                // 否则此刻按回车 / ⌘C 仍由旧窗口用旧屏底图导出。
-                self.focusOverlayWindow(for: displayID)
+                // 仅当识别跨屏切换到另一块显示器时才转移窗口焦点，避免同屏慢移反复抢焦闪烁。
+                if changed {
+                    self.focusOverlayWindow(for: displayID)
+                }
             }
             window.overlayView.onUndoRequested = { [weak self] in
                 self?.undoEditing()

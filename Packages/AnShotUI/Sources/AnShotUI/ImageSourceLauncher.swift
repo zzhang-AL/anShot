@@ -146,8 +146,8 @@ enum ImageSourceLauncher {
             options: [.usesLineFragmentOrigin, .usesFontLeading]
         )
 
-        let logicalWidth = max(minWidth, min(maxContentWidth, ceil(measured.width)) + horizontalPadding * 2)
-        let logicalHeight = max(56, min(maxContentHeight, ceil(measured.height)) + verticalPadding * 2)
+        let logicalWidth = max(minWidth, min(maxContentWidth, ceil(measured.width) + 4) + horizontalPadding * 2)
+        let logicalHeight = max(56, min(maxContentHeight, ceil(measured.height) + 4) + verticalPadding * 2)
         let pixelWidth = max(1, Int((logicalWidth * clampedScale).rounded()))
         let pixelHeight = max(1, Int((logicalHeight * clampedScale).rounded()))
 
