@@ -39,13 +39,16 @@ final class AnnotationToolbarView: NSView {
     var tool: AnnotationTool = .pointer {
         didSet {
             guard tool != oldValue else { return }
-            // 记住每个分组**上次用过的具体工具**。不能只靠当前 `tool` 反推：
-            // 切到文字/马赛克后 `tool.family` 已不是 `.shape`，
-            // 形状组上次用矩形还是箭头就再也想不起来了。
             lastToolByFamily[tool.family] = tool
+            if AnnotationToolbarLayout.isSecondaryTool(tool) {
+                lastSecondaryTool = tool
+            }
             needsDisplay = true
         }
     }
+
+    /// 记住「更多工具」收纳槽上次选用的具体次高频工具（默认直线）。
+    private var lastSecondaryTool: AnnotationTool = .line
 
     /// 每个分组上次使用的工具。
     ///
@@ -299,12 +302,10 @@ final class AnnotationToolbarView: NSView {
     var onPin: (() -> Void)?
     var onCopy: (() -> Void)?
     var onSave: (() -> Void)?
+    /// 按指定格式保存或临时强制弹出另存为面板（`⌥+点击保存` 或右键「保存」菜单）。
+    var onSaveAs: ((ExportFormatOption?, Bool) -> Void)?
 
     /// 打开系统取色器。
-    ///
-    /// 颜色是高频操作，所以给一级入口而不是藏在各工具的分组面板里；
-    /// 系统取色器自带色轮、色卡、滑块数值输入与放大镜取色，
-    /// 正是「预设色卡 + 拖动色图 + 手动输入」这三种取色方式。
     var onOpenColorPanel: (() -> Void)?
 
     /// 二级面板折叠/展开导致工具栏固有尺寸变化时回调。
@@ -314,38 +315,105 @@ final class AnnotationToolbarView: NSView {
     var onSliderGestureBegan: (() -> Void)?
     var onSliderGestureEnded: (() -> Void)?
 
-    /// 按住工具栏空白背景拖动时回调（参数为视图坐标下的位移增量）。
+    /// 按住工具栏空白背景或拖拽握把拖动时回调（参数为视图坐标下的位移增量）。
     var onDragMove: ((CGSize) -> Void)?
+
+    /// 双击拖拽握把或工具栏空白处，请求一键复位到选区默认停靠位置。
+    var onResetPosition: (() -> Void)?
 
     // MARK: - 布局常量
 
 
     // MARK: - 命中项
 
-    /// 可点击项的身份。
-    ///
-    /// 不是 `private`：诊断需要按语义拿到项的真实坐标来合成点击。
-    /// 直接调编辑器方法证明不了「按钮画在哪里、点击落在哪里」，
-    /// 而那正是 P4 出过问题的地方。
-
-
-    /// 面板是否展开。点当前分组会收起，再点展开。
-    private var isPanelExpanded = true
+    /// 面板是否展开。点击当前激活工具可手动收起/展开；落笔绘制时自动轻收起不挡画面。
+    private(set) var isPanelExpanded = true
 
     private var hoveredKind: Kind?
+    private var pressedKind: Kind?
 
     /// 正在拖动的滑块。
-    ///
-    /// 为什么需要这个状态：滑块一旦按下，后续的拖动**不再重新命中**。
-    /// 面板只有 26pt 高，拖动时指针纵向抖出滑块条是必然的，
-    /// 若每次拖动都重新命中，手一抖滑块就「脱手」，表现为拖到一半就不动了。
     private var draggingSliderKind: Kind?
 
     /// 是否正在按住工具栏空白区域整体拖动位置。
     private var isDraggingToolbar = false
     private var lastDragScreenPoint: CGPoint = .zero
 
+    /// 悬停瞬时毛玻璃 Tooltip 控制器与延迟任务。
+    private let tooltipHUD = ToolbarTooltipHUD()
+    private var tooltipDelayWorkItem: DispatchWorkItem?
+    /// 滚轮调滑块结束后自动提交撤销事务的去抖定时器。
+    private var wheelCommitWorkItem: DispatchWorkItem?
+    private var isWheelTransactionActive = false
+
+    override var isHidden: Bool {
+        didSet {
+            if isHidden {
+                hideTooltipImmediately()
+                pressedKind = nil
+                hoveredKind = nil
+            }
+        }
+    }
+
+    /// 落笔在画布开始绘制或拖动标注时调用：轻收起二级属性气泡，让出全部画布视野。
+    func collapsePanelForDrawing() {
+        hideTooltipImmediately()
+        guard isPanelExpanded else { return }
+        isPanelExpanded = false
+        needsDisplay = true
+        onIntrinsicSizeChanged?()
+    }
+
+    /// 切换工具或单击选中已有标注时调用：展开对应工具/标注的属性气泡。
+    func expandPanelForInteraction() {
+        guard !isPanelExpanded else { return }
+        isPanelExpanded = true
+        needsDisplay = true
+        onIntrinsicSizeChanged?()
+    }
+
+    /// 主栏在当前视图坐标系中的纵向原点（供外层在折叠/展开上方气泡时锁定主栏位置不跳动）。
+    var barOriginY: CGFloat { layoutInput.barOriginY }
+
+    /// 精准命中判定：主栏与二级气泡之外的透明空气区返回 `false`，100% 穿透回画布。
+    func containsInteractivePoint(_ point: CGPoint) -> Bool {
+        layoutInput.containsInteractivePoint(point)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden else { return nil }
+        let local = convert(point, from: superview)
+        guard containsInteractivePoint(local) else { return nil }
+        return self
+    }
+
     override var isFlipped: Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureFloatingShadow()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureFloatingShadow()
+    }
+
+    private func configureFloatingShadow() {
+        wantsLayer = true
+        layer?.masksToBounds = false
+        let dropShadow = NSShadow()
+        dropShadow.shadowColor = NSColor.black.withAlphaComponent(0.36)
+        dropShadow.shadowBlurRadius = 18
+        dropShadow.shadowOffset = NSSize(width: 0, height: -6)
+        self.shadow = dropShadow
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
 
     // MARK: - 布局
     //
@@ -465,6 +533,8 @@ final class AnnotationToolbarView: NSView {
         renderer.panelPlacement = panelPlacement
         renderer.hiddenSlots = hiddenSlots
         renderer.hoveredKind = hoveredKind
+        renderer.pressedKind = pressedKind
+        renderer.isDarkAppearance = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) != .aqua
         renderer.draw(in: context)
     }
 
@@ -473,32 +543,95 @@ final class AnnotationToolbarView: NSView {
     // MARK: - 命中测试
 
     override func mouseDown(with event: NSEvent) {
+        hideTooltipImmediately()
         let point = convert(event.locationInWindow, from: nil)
 
-        // 面板优先：它绘制在主栏之下，两者不重叠，顺序不影响正确性。
+        // 面板优先：它与主栏不重叠，顺序不影响正确性。
         if let item = hitTestItem(point, in: layoutPanel()) {
-            // 滑块按下即取值，并进入拖动态（后续交给 `mouseDragged`）。
-            // 不进入拖动态的话，用户必须精确点中那 3pt 高的轨道才能改值，
-            // 而看到的是一个半径 5pt 的手柄——点中手柄反而没反应。
             if isSlider(item.kind), item.isEnabled {
                 draggingSliderKind = item.kind
                 onSliderGestureBegan?()
                 updateSlider(item.kind, in: item.rect, at: point)
                 return
             }
-            handle(item)
+            if item.isEnabled {
+                pressedKind = item.kind
+                needsDisplay = true
+            }
+            handle(item, isInPanel: true, modifiers: event.modifierFlags)
             return
         }
 
         if let item = hitTestItem(point, in: layoutBar()) {
-            handle(item)
+            if item.isEnabled {
+                pressedKind = item.kind
+                needsDisplay = true
+            }
+            handle(item, isInPanel: false, modifiers: event.modifierFlags)
             return
         }
 
-        // 未命中任何条目：按住工具栏空白背景可自由拖拽移动工具栏位置。
+        // 双击拖拽握把或空白背景：一键复位回选区默认停靠位置。
+        if event.clickCount >= 2 {
+            onResetPosition?()
+            return
+        }
+
+        // 未命中任何条目：按住工具栏握把或空白背景可自由拖拽移动工具栏位置。
         isDraggingToolbar = true
         lastDragScreenPoint = NSEvent.mouseLocation
         NSCursor.closedHand.set()
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        hideTooltipImmediately()
+        let point = convert(event.locationInWindow, from: nil)
+        if let item = hitTestItem(point, in: layoutBar()), item.kind == .save, item.isEnabled {
+            presentSaveFormatMenu(with: event)
+            return
+        }
+        super.rightMouseDown(with: event)
+    }
+
+    private func presentSaveFormatMenu(with event: NSEvent) {
+        let menu = NSMenu(title: "快速保存格式")
+        for option in ExportFormatOption.allCases {
+            let item = NSMenuItem(
+                title: "保存为 \(option.displayName)",
+                action: #selector(handleQuickFormatSaveMenuItem(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = option.rawValue
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        let saveAs = NSMenuItem(
+            title: "另存为…",
+            action: #selector(handleQuickSaveAsMenuItem),
+            keyEquivalent: ""
+        )
+        saveAs.target = self
+        menu.addItem(saveAs)
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    @objc private func handleQuickFormatSaveMenuItem(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let option = ExportFormatOption(rawValue: raw) else { return }
+        if let onSaveAs {
+            onSaveAs(option, false)
+        } else {
+            onSave?()
+        }
+    }
+
+    @objc private func handleQuickSaveAsMenuItem() {
+        if let onSaveAs {
+            onSaveAs(nil, true)
+        } else {
+            onSave?()
+        }
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -519,17 +652,19 @@ final class AnnotationToolbarView: NSView {
             super.mouseDragged(with: event)
             return
         }
-        // 用**当前布局**里的矩形（不是按下时缓存的那一份）：
-        // 拖动期间线宽在变，而线宽会影响面板宽度，条目位置可能跟着移。
         let point = convert(event.locationInWindow, from: nil)
         guard let item = currentItem(kind) else { return }
         updateSlider(kind, in: item.rect, at: point)
     }
 
     override func mouseUp(with event: NSEvent) {
+        if pressedKind != nil {
+            pressedKind = nil
+            needsDisplay = true
+        }
         if isDraggingToolbar {
             isDraggingToolbar = false
-            NSCursor.arrow.set()
+            updateCursor(at: convert(event.locationInWindow, from: nil))
             return
         }
         guard draggingSliderKind != nil else {
@@ -538,6 +673,67 @@ final class AnnotationToolbarView: NSView {
         }
         draggingSliderKind = nil
         onSliderGestureEnded?()
+    }
+
+    /// 滑块悬停滚轮微调：无需精准拖手柄，滚轮轻拨即平滑调节线宽、箭头大小或笔刷直径。
+    override func scrollWheel(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let delta = event.scrollingDeltaY != 0 ? event.scrollingDeltaY : event.scrollingDeltaX
+        guard delta != 0 else { return }
+
+        if let item = hitTestItem(point, in: layoutPanel()), isSlider(item.kind), item.isEnabled {
+            let direction: Double = delta > 0 ? 1 : -1
+            beginWheelTransactionIfNeeded()
+            switch item.kind {
+            case .lineWidthSlider:
+                let next = min(
+                    max(style.shapeLineWidth + direction * 1.0, AnnotationStyle.lineWidthRange.lowerBound),
+                    AnnotationStyle.lineWidthRange.upperBound
+                )
+                onSelectLineWidth?(next)
+            case .arrowHeadScaleSlider:
+                let next = min(
+                    max(style.arrowHeadScale + direction * 0.1, AnnotationStyle.arrowHeadScaleRange.lowerBound),
+                    AnnotationStyle.arrowHeadScaleRange.upperBound
+                )
+                onSelectArrowHeadScale?(next)
+            case .mosaicBrushDiameterSlider:
+                let current = style.mosaicBrushRadius * 2
+                let next = min(
+                    max(current + direction * 4.0, AnnotationStyle.mosaicBrushDiameterRange.lowerBound),
+                    AnnotationStyle.mosaicBrushDiameterRange.upperBound
+                )
+                onSelectMosaicBrushDiameter?(next)
+            default:
+                break
+            }
+            scheduleWheelTransactionCommit()
+            return
+        }
+
+        // 其余工具栏区域吸收滚轮事件，避免在工具栏上误滚影响下方画布参数。
+        if containsInteractivePoint(point) {
+            return
+        }
+        super.scrollWheel(with: event)
+    }
+
+    private func beginWheelTransactionIfNeeded() {
+        if !isWheelTransactionActive {
+            isWheelTransactionActive = true
+            onSliderGestureBegan?()
+        }
+    }
+
+    private func scheduleWheelTransactionCommit() {
+        wheelCommitWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isWheelTransactionActive else { return }
+            self.isWheelTransactionActive = false
+            self.onSliderGestureEnded?()
+        }
+        wheelCommitWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
     }
 
     /// 是否是滑块类条目。
@@ -591,19 +787,84 @@ final class AnnotationToolbarView: NSView {
 
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        let kind = itemKind(at: point)
+        updateCursor(at: point)
+        let hit = hitTestAnyItem(at: point)
+        let kind = hit?.kind
         guard kind != hoveredKind else { return }
         hoveredKind = kind
-        let effectMode = activeMosaicEffectMode
-        toolTip = kind.map { Self.tooltipText(for: $0, mosaicEffectMode: effectMode) }
+        if let hit, hit.isEnabled {
+            scheduleTooltip(for: hit)
+        } else {
+            hideTooltipImmediately()
+        }
         needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) {
-        toolTip = nil
-        guard hoveredKind != nil else { return }
+        hideTooltipImmediately()
+        guard hoveredKind != nil || pressedKind != nil else { return }
         hoveredKind = nil
+        pressedKind = nil
         needsDisplay = true
+    }
+
+    private func updateCursor(at point: CGPoint) {
+        guard !isDraggingToolbar else {
+            NSCursor.closedHand.set()
+            return
+        }
+        if let hit = hitTestAnyItem(at: point), hit.isEnabled {
+            if isSlider(hit.kind) {
+                NSCursor.resizeLeftRight.set()
+            } else {
+                NSCursor.pointingHand.set()
+            }
+        } else if containsInteractivePoint(point) {
+            NSCursor.openHand.set()
+        }
+    }
+
+    private func hitTestAnyItem(at point: CGPoint) -> Item? {
+        if let item = hitTestItem(point, in: layoutPanel()) {
+            return item
+        }
+        return hitTestItem(point, in: layoutBar())
+    }
+
+    private func scheduleTooltip(for item: Item) {
+        tooltipDelayWorkItem?.cancel()
+        let spec = Self.tooltipSpec(for: item.kind, mosaicEffectMode: activeMosaicEffectMode)
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) != .aqua
+        let itemRect = item.rect
+
+        let present = { [weak self] in
+            guard let self, !self.isHidden, let window = self.window else { return }
+            let rectInWindow = self.convert(itemRect, to: nil)
+            let rectInScreen = window.convertToScreen(rectInWindow)
+            let preferBelow = (self.panelPlacement == .above)
+            self.tooltipHUD.show(
+                title: spec.title,
+                shortcut: spec.shortcut,
+                near: rectInScreen,
+                preferBelow: preferBelow,
+                isDark: isDark
+            )
+        }
+
+        // 若 Tooltip 已处于可见态，相邻按钮移动 0ms 瞬时切换；首次悬停延迟 220ms 优雅弹出。
+        if tooltipHUD.isVisible {
+            present()
+            return
+        }
+        let work = DispatchWorkItem(block: present)
+        tooltipDelayWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: work)
+    }
+
+    private func hideTooltipImmediately() {
+        tooltipDelayWorkItem?.cancel()
+        tooltipDelayWorkItem = nil
+        tooltipHUD.hide()
     }
 
     override func updateTrackingAreas() {
@@ -636,12 +897,11 @@ final class AnnotationToolbarView: NSView {
         return nil
     }
 
-    private func handle(_ item: Item) {
+    private func handle(_ item: Item, isInPanel: Bool, modifiers: NSEvent.ModifierFlags) {
         guard item.isEnabled else { return }
 
         switch item.kind {
         case let .family(family):
-            // 点当前分组 = 收起/展开面板；点别的分组 = 切过去并展开。
             if tool.family == family {
                 isPanelExpanded.toggle()
                 needsDisplay = true
@@ -650,22 +910,44 @@ final class AnnotationToolbarView: NSView {
             }
             isPanelExpanded = true
             onIntrinsicSizeChanged?()
-            // 分组记住上一次用的具体工具，不必每次重新挑。
             if let last = lastTool(in: family) {
                 onSelectTool?(last)
             } else if let first = AnnotationTool.tools(in: family).first {
                 onSelectTool?(first)
             }
 
+        case .moreTools:
+            // 当前已选中次高频工具时再点「更多」收起/展开；否则直接切入上次选用的次高频工具并展开气泡。
+            if AnnotationToolbarLayout.isSecondaryTool(tool) {
+                isPanelExpanded.toggle()
+                needsDisplay = true
+                onIntrinsicSizeChanged?()
+                return
+            }
+            isPanelExpanded = true
+            onSelectTool?(lastSecondaryTool)
+            onIntrinsicSizeChanged?()
+
         case let .tool(candidate):
+            if !isInPanel && tool == candidate {
+                // 主栏点击当前已激活的工具：切换属性气泡显隐（指针无选中标注时无需展开）。
+                if candidate != .pointer || hasSelectedAnnotation {
+                    isPanelExpanded.toggle()
+                    needsDisplay = true
+                    onIntrinsicSizeChanged?()
+                }
+                return
+            }
+            if candidate != .pointer || hasSelectedAnnotation {
+                isPanelExpanded = true
+            }
             onSelectTool?(candidate)
+            onIntrinsicSizeChanged?()
 
         case let .color(color):
             onSelectColor?(color)
 
         case .lineWidthSlider, .arrowHeadScaleSlider, .mosaicBrushDiameterSlider:
-            // 滑块的取值走 `mouseDown` / `mouseDragged`，不经 `handle`。
-            // 保留分支是为了让 switch 穷尽：新增条目时编译器会要求在这里表态。
             break
 
         case let .numberingRadius(radius):
@@ -736,7 +1018,11 @@ final class AnnotationToolbarView: NSView {
             onCopy?()
 
         case .save:
-            onSave?()
+            if modifiers.contains(.option), let onSaveAs {
+                onSaveAs(nil, true)
+            } else {
+                onSave?()
+            }
 
         case .cancel:
             onCancel?()
@@ -774,12 +1060,14 @@ final class AnnotationToolbarView: NSView {
             }
         case let .tool(tool):
             return "\(tool.displayName) (\(String(tool.keyCharacter).uppercased()))"
+        case .moreTools:
+            return "更多工具：直线 / 曲线箭头 / 测量 / 放大镜"
         case let .color(color):
             return "颜色 \(color.hexString)"
         case .lineWidthSlider:
-            return "线宽"
+            return "线宽（支持滚轮微调）"
         case .arrowHeadScaleSlider:
-            return "箭头大小"
+            return "箭头大小（支持滚轮微调）"
         case let .fontSize(size):
             return "字号 \(Int(size))pt"
         case let .mosaicMode(mode):
@@ -807,7 +1095,7 @@ final class AnnotationToolbarView: NSView {
             let labels = ["细", "中", "粗"]
             return "马赛克粒度：\(labels[min(index, labels.count - 1)])"
         case .mosaicBrushDiameterSlider:
-            return "涂抹笔刷直径"
+            return "涂抹笔刷直径（支持滚轮微调）"
         case let .numberingRadius(radius):
             return "编号半径 \(Int(radius))"
         case let .magnifierZoom(zoom):
@@ -825,7 +1113,7 @@ final class AnnotationToolbarView: NSView {
         case .copy:
             return "复制截图 (⌘C / Enter)"
         case .save:
-            return "保存截图 (⌘S)"
+            return "保存截图 (⌘S · ⌥另存为 · 右键选格式)"
         case .cancel:
             return "取消截图 (Esc)"
         case .record:
@@ -838,6 +1126,43 @@ final class AnnotationToolbarView: NSView {
             return "钉在屏幕上 (⌘P)"
         case .deleteSelected:
             return "删除选中标注 (Delete)"
+        }
+    }
+
+    /// 拆分主标题与快捷键键帽徽章，供自绘无遮挡毛玻璃 Tooltip 渲染。
+    nonisolated static func tooltipSpec(
+        for kind: Kind,
+        mosaicEffectMode: MosaicMode = .pixelate
+    ) -> (title: String, shortcut: String?) {
+        switch kind {
+        case let .tool(tool):
+            return (tool.displayName, String(tool.keyCharacter).uppercased())
+        case .moreTools:
+            return ("更多工具", "L / U / E / G")
+        case .undo:
+            return ("撤销", "⌘Z")
+        case .redo:
+            return ("重做", "⇧⌘Z")
+        case .copy:
+            return ("复制截图", "⌘C / ↵")
+        case .save:
+            return ("保存 · 右键选格式", "⌘S / ⌥")
+        case .cancel:
+            return ("取消截图", "Esc")
+        case .longScreenshot:
+            return ("滚动长截图", "⌥横向")
+        case .pin:
+            return ("钉在屏幕上", "⌘P")
+        case .deleteSelected:
+            return ("删除标注", "⌫")
+        case .lineWidthSlider:
+            return ("线宽", "滚轮")
+        case .arrowHeadScaleSlider:
+            return ("箭头大小", "滚轮")
+        case .mosaicBrushDiameterSlider:
+            return ("笔刷直径", "滚轮")
+        default:
+            return (tooltipText(for: kind, mosaicEffectMode: mosaicEffectMode), nil)
         }
     }
 
@@ -886,4 +1211,160 @@ final class AnnotationToolbarView: NSView {
     // MARK: - 布局
 
 
+}
+
+// MARK: - 自绘瞬时无遮挡毛玻璃 Tooltip
+
+/// 独立于系统原生 Tooltip 的轻量无焦点提示胶囊（置于 `screenSaver + 3` 层级，永不被覆盖层遮挡，支持快捷键键帽）。
+@MainActor
+private final class ToolbarTooltipHUD {
+    private let panel: NSPanel
+    private let contentView: ToolbarTooltipContentView
+
+    var isVisible: Bool { panel.isVisible }
+
+    init() {
+        let view = ToolbarTooltipContentView(frame: .zero)
+        let panel = NSPanel(
+            contentRect: CGRect(x: 0, y: 0, width: 120, height: 26),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: true
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.ignoresMouseEvents = true
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 3)
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        panel.contentView = view
+        self.panel = panel
+        self.contentView = view
+    }
+
+    func show(
+        title: String,
+        shortcut: String?,
+        near anchorScreenRect: CGRect,
+        preferBelow: Bool,
+        isDark: Bool
+    ) {
+        let size = contentView.configure(title: title, shortcut: shortcut, isDark: isDark)
+        let screen = NSScreen.screens.first { $0.frame.intersects(anchorScreenRect) } ?? NSScreen.main
+        let bounds = screen?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let gap: CGFloat = 7
+
+        let x = min(
+            max(bounds.minX + 8, anchorScreenRect.midX - size.width / 2),
+            bounds.maxX - size.width - 8
+        )
+        let aboveY = anchorScreenRect.maxY + gap
+        let belowY = anchorScreenRect.minY - size.height - gap
+        let y: CGFloat
+        if preferBelow {
+            y = (belowY >= bounds.minY + 6) ? belowY : min(aboveY, bounds.maxY - size.height - 6)
+        } else {
+            y = (aboveY + size.height <= bounds.maxY - 6) ? aboveY : max(belowY, bounds.minY + 6)
+        }
+
+        panel.setFrame(CGRect(origin: CGPoint(x: x.rounded(), y: y.rounded()), size: size), display: true)
+        contentView.frame = CGRect(origin: .zero, size: size)
+        contentView.needsDisplay = true
+        panel.orderFrontRegardless()
+    }
+
+    func hide() {
+        guard panel.isVisible else { return }
+        panel.orderOut(nil)
+    }
+}
+
+private final class ToolbarTooltipContentView: NSView {
+    private var titleText: String = ""
+    private var shortcutText: String?
+    private var isDark: Bool = true
+
+    override var isFlipped: Bool { true }
+
+    func configure(title: String, shortcut: String?, isDark: Bool) -> CGSize {
+        self.titleText = title
+        self.shortcutText = shortcut
+        self.isDark = isDark
+
+        let titleFont = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        let titleW = ceil((title as NSString).size(withAttributes: [.font: titleFont]).width)
+        var totalW = 10 + titleW + 10
+        if let shortcut, !shortcut.isEmpty {
+            let keyFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold)
+            let keyW = ceil((shortcut as NSString).size(withAttributes: [.font: keyFont]).width)
+            totalW += 6 + keyW + 10
+        }
+        return CGSize(width: totalW, height: 26)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = CGPath(roundedRect: rect, cornerWidth: 7, cornerHeight: 7, transform: nil)
+
+        let bg = isDark
+            ? NSColor(srgbRed: 0.12, green: 0.13, blue: 0.16, alpha: 0.96)
+            : NSColor(srgbRed: 0.99, green: 0.99, blue: 1.0, alpha: 0.97)
+        let border = isDark
+            ? NSColor.white.withAlphaComponent(0.16)
+            : NSColor.black.withAlphaComponent(0.12)
+        let textColor = isDark
+            ? NSColor.white.withAlphaComponent(0.95)
+            : NSColor(srgbRed: 0.12, green: 0.14, blue: 0.18, alpha: 0.94)
+
+        ctx.saveGState()
+        ctx.addPath(path)
+        ctx.setFillColor(bg.cgColor)
+        ctx.fillPath()
+        ctx.addPath(path)
+        ctx.setStrokeColor(border.cgColor)
+        ctx.setLineWidth(0.8)
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        let titleFont = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        let titleAttrs: [NSAttributedString.Key: Any] = [.font: titleFont, .foregroundColor: textColor]
+        let titleSize = (titleText as NSString).size(withAttributes: titleAttrs)
+        (titleText as NSString).draw(
+            at: NSPoint(x: 10, y: (bounds.height - titleSize.height) / 2),
+            withAttributes: titleAttrs
+        )
+
+        if let shortcut = shortcutText, !shortcut.isEmpty {
+            let keyFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold)
+            let keyColor = isDark
+                ? NSColor.white.withAlphaComponent(0.78)
+                : NSColor(srgbRed: 0.25, green: 0.28, blue: 0.34, alpha: 0.88)
+            let keyAttrs: [NSAttributedString.Key: Any] = [.font: keyFont, .foregroundColor: keyColor]
+            let keySize = (shortcut as NSString).size(withAttributes: keyAttrs)
+            let pillRect = CGRect(
+                x: 10 + ceil(titleSize.width) + 6,
+                y: (bounds.height - 17) / 2,
+                width: ceil(keySize.width) + 10,
+                height: 17
+            )
+            let pillPath = CGPath(roundedRect: pillRect, cornerWidth: 4.5, cornerHeight: 4.5, transform: nil)
+            let pillBg = isDark
+                ? NSColor.white.withAlphaComponent(0.12)
+                : NSColor.black.withAlphaComponent(0.065)
+            ctx.saveGState()
+            ctx.addPath(pillPath)
+            ctx.setFillColor(pillBg.cgColor)
+            ctx.fillPath()
+            ctx.restoreGState()
+
+            (shortcut as NSString).draw(
+                at: NSPoint(
+                    x: pillRect.minX + 5,
+                    y: pillRect.midY - keySize.height / 2
+                ),
+                withAttributes: keyAttrs
+            )
+        }
+    }
 }

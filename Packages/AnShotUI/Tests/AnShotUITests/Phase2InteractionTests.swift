@@ -217,8 +217,8 @@ struct Phase2InteractionTests {
         // 上翻时面板在上方（y = 0），主栏在下方，互不重叠。
         #expect(panel.items.allSatisfy { $0.rect.maxY <= AnnotationToolbarLayout.panelHeight })
         #expect(bar.items.allSatisfy { $0.rect.minY >= AnnotationToolbarLayout.panelHeight + AnnotationToolbarLayout.panelGap })
-        let shapeIcon = bar.items.first { $0.kind == .family(.shape) }!
-        #expect(abs(layout.panelAnchorX() - shapeIcon.rect.midX) < 0.01)
+        let rectIcon = bar.items.first { $0.kind == .tool(.rectangle) }!
+        #expect(abs(layout.panelAnchorX() - rectIcon.rect.midX) < 0.01)
 
         // 隐藏部分主栏槽位后，主栏移除对应条目并变窄，但核心输出（复制/保存）始终保留。
         let fullWidth = layout.barSize.width

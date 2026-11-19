@@ -695,7 +695,7 @@ extension CaptureDiagnostics {
         editor.select(.pointer)
         let centers = view.toolbarItemCenters()
 
-        guard let first = centers[.family(.pointer)] else {
+        guard let first = centers[.tool(.pointer)] else {
             logger.error("bar geometry: 取不到主栏首个按钮位置")
             return
         }
@@ -704,7 +704,10 @@ extension CaptureDiagnostics {
         let origin = view.toolbarFrame.origin
         let local = CGPoint(x: first.x - origin.x, y: first.y - origin.y)
 
-        let expected = CGPoint(x: 22, y: 18)
+        let expected = CGPoint(
+            x: AnnotationToolbarLayout.firstBarItemX + AnnotationToolbarLayout.iconButtonSize / 2,
+            y: AnnotationToolbarLayout.barHeight / 2
+        )
         let tolerant = abs(local.x - expected.x) < 1.5 && abs(local.y - expected.y) < 1.5
         logger.notice("""
             bar geometry vs constants: local=(\(Int(local.x.rounded()), privacy: .public),\(Int(local.y.rounded()), privacy: .public)) \
@@ -731,11 +734,11 @@ extension CaptureDiagnostics {
         let centers = view.toolbarItemCenters()
 
         let barKinds: [AnnotationToolbarView.Kind] = [
-            .family(.pointer), .family(.shape), .family(.text), .family(.mosaic),
+            .tool(.pointer), .tool(.rectangle), .tool(.text), .tool(.mosaic),
             .undo, .redo,
         ]
         let panelKinds: [AnnotationToolbarView.Kind] = [
-            .tool(.rectangle), .tool(.line), .tool(.arrow),
+            .lineWidthSlider, .fillToggle, .colorPicker,
         ]
 
         let barCenters = barKinds.compactMap { centers[$0]?.y }

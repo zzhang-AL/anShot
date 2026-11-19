@@ -23,19 +23,39 @@ struct AnnotationToolbarLayout {
 
     // MARK: - 布局常量
 
-    static let barHeight: CGFloat = 36
-    static let panelHeight: CGFloat = 32
-    static let panelGap: CGFloat = 7
-    static let panelArrowHeight: CGFloat = 5
-    static let panelArrowWidth: CGFloat = 10
-    static let padding: CGFloat = 8
+    static let barHeight: CGFloat = 40
+    static let panelHeight: CGFloat = 36
+    static let panelGap: CGFloat = 9
+    static let panelArrowHeight: CGFloat = 6
+    static let panelArrowWidth: CGFloat = 13
+    static let padding: CGFloat = 10
+    /// 主栏最左侧 6 点微粒拖拽握把占位宽（清晰暗示用户可按住拖移工具栏，双击一键复位）。
+    static let dragHandleWidth: CGFloat = 10
+    /// 主栏首个按钮的起始横坐标（左留白 + 拖拽握把）。
+    static var firstBarItemX: CGFloat { padding + dragHandleWidth }
     static let itemSpacing: CGFloat = 2
-    static let groupSpacing: CGFloat = 6
+    static let groupSpacing: CGFloat = 12
     static let separatorWidth: CGFloat = 1
-    static let iconButtonSize: CGFloat = 28
-    static let swatchSize: CGFloat = 19
-    static let swatchSpacing: CGFloat = 4
-    static let textButtonMinWidth: CGFloat = 34
+    static let iconButtonSize: CGFloat = 30
+    static let swatchSize: CGFloat = 18
+    static let swatchSpacing: CGFloat = 6
+    static let textButtonMinWidth: CGFloat = 36
+
+    /// 主栏一键直达的高频工具（90% 日常标注场景 1 次点击切换，无需先展开二级面板）。
+    static let primaryTools: [AnnotationTool] = [
+        .pointer, .rectangle, .ellipse, .arrow, .freehand,
+        .highlight, .text, .mosaic, .numbering, .spotlight,
+    ]
+
+    /// 收纳在「更多工具」中的次高频工具（点击主栏 `.moreTools` 在精巧二级气泡内切换，激活时主栏直接展示对应图标）。
+    static let secondaryTools: [AnnotationTool] = [
+        .line, .curvedArrow, .measure, .magnifier,
+    ]
+
+    /// 判断工具是否归属「更多工具」收纳槽。
+    static func isSecondaryTool(_ tool: AnnotationTool) -> Bool {
+        secondaryTools.contains(tool)
+    }
 
     /// 二级气泡面板相对主栏的展开方向。
     enum PanelPlacement: Equatable, Sendable {
@@ -60,18 +80,18 @@ struct AnnotationToolbarLayout {
     /// 图标从原有的 106pt 里重新分配（轨道从 68pt 收到 48pt），
     /// 面板宽度保持不变。代价仅是拖动精度略降，而 48pt 覆盖 1~24px
     /// 仍是每像素 2pt，足够精确。
-    static let sliderWidth: CGFloat = 106
+    static let sliderWidth: CGFloat = 114
     /// 滑块左端标识图标的尺寸。
     static let sliderIconSize: CGFloat = 16
     /// 标识图标与轨道之间的间距。
-    static let sliderIconGap: CGFloat = 4
+    static let sliderIconGap: CGFloat = 5
     /// 滑块右端留给数值读数的宽度。按最长读数「24.5」定：
     /// 11pt 字体下约 22pt，留 26pt 才不会顶到面板右边缘。
     static let sliderValueWidth: CGFloat = 26
     /// 轨道两端各留的余量（至少容下手柄半径），避免手柄贴到条目边界之外。
     static let sliderTrackInset: CGFloat = 6
     /// 轨道高度。
-    static let sliderTrackHeight: CGFloat = 3
+    static let sliderTrackHeight: CGFloat = 3.5
 
     /// 放大镜倍率展示文案（如 1.5x / 2x / 3x）。
     static func formatZoomLabel(_ zoom: Double) -> String {
@@ -115,6 +135,8 @@ struct AnnotationToolbarLayout {
     enum Kind: Hashable {
         case family(AnnotationTool.Family)
         case tool(AnnotationTool)
+        /// 主栏「更多工具」收纳槽（包含直线、曲线箭头、测量与放大镜；激活其中之一时动态显示该工具图标）。
+        case moreTools
         case color(RGBAColor)
         /// 线宽滑块（连续值）。取代了旧的三档按钮：线宽是连续量，
         /// 档位制在细线/粗线两头都不够用。
@@ -278,19 +300,72 @@ struct AnnotationToolbarLayout {
         return rawPanelContent().size
     }
 
-    /// 计算二级面板尖角相对工具栏局部坐标系的锚点横坐标（对准激活工具家族图标中心）。
+    /// 计算二级面板尖角相对工具栏局部坐标系的锚点横坐标（精准对准主栏当前激活工具图标中心）。
     func panelAnchorX() -> CGFloat {
         let bar = layoutBar()
-        let panel = layoutPanel()
-        let panelWidth = panel.size.width
-        guard panelWidth > 0 else { return 0 }
-        let targetFamily = tool.family
-        let familyCenterX = bar.items
-            .first(where: { $0.kind == .family(targetFamily) })?
-            .rect.midX ?? (Self.padding + Self.iconButtonSize / 2)
-        let minAnchor = min(panelWidth / 2, 16)
-        let maxAnchor = max(minAnchor, panelWidth - 16)
-        return min(max(familyCenterX, minAnchor), maxAnchor)
+        let barWidth = bar.size.width
+        guard barWidth > 0 else { return 0 }
+        let targetKind: Kind = Self.isSecondaryTool(tool) ? .moreTools : .tool(tool)
+        let centerX = bar.items.first(where: { $0.kind == targetKind })?.rect.midX
+            ?? bar.items.first?.rect.midX
+            ?? (Self.firstBarItemX + Self.iconButtonSize / 2)
+        let minAnchor = min(barWidth / 2, 16)
+        let maxAnchor = max(minAnchor, barWidth - 16)
+        return min(max(centerX, minAnchor), maxAnchor)
+    }
+
+    /// 二级属性气泡的水平原点：以当前激活工具按钮为中心优雅居中，并钳制在工具栏总宽内。
+    var panelOriginX: CGFloat {
+        let panelW = panelSize.width
+        guard panelW > 0 else { return 0 }
+        let totalW = max(barSize.width, panelW)
+        let ideal = panelAnchorX() - panelW / 2
+        return min(max(0, ideal), max(0, totalW - panelW)).rounded()
+    }
+
+    /// 主栏实际可见胶囊区域（工具栏局部坐标系）。
+    var barFrame: CGRect {
+        CGRect(origin: CGPoint(x: 0, y: barOriginY), size: barSize)
+    }
+
+    /// 二级属性气泡实际可见区域（工具栏局部坐标系；收起或无内容时为 `.zero`）。
+    var panelFrame: CGRect {
+        let size = panelSize
+        guard size.height > 0 else { return .zero }
+        return CGRect(x: panelOriginX, y: panelOriginY, width: size.width, height: size.height)
+    }
+
+    /// 精准命中判定：仅对实际可见的主栏或二级气泡（含尖角区）返回 `true`，其余透明空气区 100% 穿透回画布。
+    func containsInteractivePoint(_ point: CGPoint) -> Bool {
+        if barFrame.contains(point) {
+            return true
+        }
+        let panel = panelFrame
+        guard panel.height > 0 else { return false }
+        if panel.contains(point) {
+            return true
+        }
+        // 尖角小三角区域也纳入命中，防止鼠标沿尖角从主栏滑向二级气泡时中途触发 mouseExited。
+        let anchorX = panelAnchorX()
+        let halfW = Self.panelArrowWidth / 2 + 4
+        let arrowRect: CGRect
+        switch panelPlacement {
+        case .below:
+            arrowRect = CGRect(
+                x: anchorX - halfW,
+                y: barFrame.maxY,
+                width: halfW * 2,
+                height: max(0, panel.minY - barFrame.maxY)
+            )
+        case .above:
+            arrowRect = CGRect(
+                x: anchorX - halfW,
+                y: panel.maxY,
+                width: halfW * 2,
+                height: max(0, barFrame.minY - panel.maxY)
+            )
+        }
+        return arrowRect.contains(point)
     }
 
     /// 整个工具栏（主栏 + 面板）的尺寸。
@@ -397,33 +472,25 @@ struct AnnotationToolbarLayout {
         let baseY = barOriginY
         let centerY = baseY + (Self.barHeight - Self.iconButtonSize) / 2
         let iconSize = CGSize(width: Self.iconButtonSize, height: Self.iconButtonSize)
-        var cursor = ItemRowCursor(x: Self.padding)
+        var cursor = ItemRowCursor(x: Self.firstBarItemX)
 
         func isVisible(_ kind: Kind) -> Bool {
             guard let slot = kind.customizableSlotID else { return true }
-            // 「撤销 / 重做」合并在单一 `undo` 槽位里同时显隐。
             if slot == "redo" {
                 return !hiddenSlots.contains("undo") && !hiddenSlots.contains("redo")
             }
             return !hiddenSlots.contains(slot)
         }
 
-        // 本函数的条目**全部**是等尺寸图标按钮，故把 size 与 y 收敛进这个局部简写，
-        // 免得每一行都重复传同样的两个值。
         func place(_ kind: Kind, leading: CGFloat, isEnabled: Bool = true) {
             cursor.append(kind, leading: leading, size: iconSize, y: centerY, isEnabled: isEnabled)
         }
 
-        // 工具家族组。首个之前不留空隙（左侧留白由游标初值承担）。
-        let families: [AnnotationTool.Family] = [.pointer, .shape, .text, .mosaic]
-        for (index, family) in families.enumerated() {
-            place(.family(family), leading: index == 0 ? 0 : Self.itemSpacing)
+        // 高频直达工具组（1 次点击即切工具）+ 更多工具收纳槽。
+        for (index, primaryTool) in Self.primaryTools.enumerated() {
+            place(.tool(primaryTool), leading: index == 0 ? 0 : Self.itemSpacing)
         }
-
-        // 颜色入口：仅在当前工具取色时才存在。
-        if style.color(for: tool) != nil {
-            place(.colorButton, leading: Self.groupSpacing)
-        }
+        place(.moreTools, leading: Self.itemSpacing)
 
         // 历史组。
         let showUndo = isVisible(.undo)
@@ -435,19 +502,23 @@ struct AnnotationToolbarLayout {
             place(.redo, leading: showUndo ? Self.itemSpacing : Self.groupSpacing, isEnabled: canRedo)
         }
 
-        // 抓屏与输出组：录制/长截图仅在实时屏幕捕获下显示；OCR 始终保留，支持全场景识别。
-        var exportKinds: [Kind] = []
+        // 抓屏与扩展动作组（录屏 / 长截图 / OCR / 钉住贴图）与最终输出组（复制 / 保存 / 取消）分两组排布，
+        // 组间以 `groupSpacing` 隔开并渲染竖向细分隔线，让主栏视觉层次一目了然。
+        var captureAndUtilityKinds: [Kind] = []
         if allowsCaptureActions {
-            if isVisible(.record) { exportKinds.append(.record) }
-            if isVisible(.longScreenshot) { exportKinds.append(.longScreenshot) }
+            if isVisible(.record) { captureAndUtilityKinds.append(.record) }
+            if isVisible(.longScreenshot) { captureAndUtilityKinds.append(.longScreenshot) }
         }
-        if isVisible(.recognizeText) { exportKinds.append(.recognizeText) }
-        if isVisible(.pin) { exportKinds.append(.pin) }
-        exportKinds.append(.copy)
-        exportKinds.append(.save)
-        if isVisible(.cancel) { exportKinds.append(.cancel) }
+        if isVisible(.recognizeText) { captureAndUtilityKinds.append(.recognizeText) }
+        if isVisible(.pin) { captureAndUtilityKinds.append(.pin) }
 
-        for (index, kind) in exportKinds.enumerated() {
+        for (index, kind) in captureAndUtilityKinds.enumerated() {
+            place(kind, leading: index == 0 ? Self.groupSpacing : Self.itemSpacing)
+        }
+
+        var finishKinds: [Kind] = [.copy, .save]
+        if isVisible(.cancel) { finishKinds.append(.cancel) }
+        for (index, kind) in finishKinds.enumerated() {
             place(kind, leading: index == 0 ? Self.groupSpacing : Self.itemSpacing)
         }
 
@@ -503,19 +574,22 @@ struct AnnotationToolbarLayout {
         guard isPanelExpanded else {
             return ([], .zero)
         }
-        switch tool.family {
-        case .pointer:
-            // 指针分组平时没有可调项；只有选中了标注，面板才按需展开。
+        if tool == .pointer {
             guard hasSelectedAnnotation else {
                 return ([], .zero)
             }
             return layoutPointerSelectionPanel()
-        case .shape:
-            return layoutShapePanel()
+        }
+        if Self.isSecondaryTool(tool) {
+            return layoutSecondaryToolsPanel()
+        }
+        switch tool {
         case .text:
             return layoutTextPanel()
         case .mosaic:
             return layoutMosaicPanel()
+        default:
+            return layoutShapePanel()
         }
     }
 
@@ -525,12 +599,13 @@ struct AnnotationToolbarLayout {
             return ([], .zero)
         }
 
-        // 面板项一律返回**含纵向偏移的绝对坐标**，随 `panelPlacement` 自动向上或向下翻转。
+        // 面板项一律返回**含横向居中与纵向偏移的绝对坐标**，随激活工具水平居中并随 `panelPlacement` 上下翻转。
+        let offsetX = panelOriginX
         let offsetY = panelOriginY
         let shifted = content.items.map { item in
             Item(
                 kind: item.kind,
-                rect: item.rect.offsetBy(dx: 0, dy: offsetY),
+                rect: item.rect.offsetBy(dx: offsetX, dy: offsetY),
                 isEnabled: item.isEnabled
             )
         }
@@ -712,10 +787,54 @@ struct AnnotationToolbarLayout {
         return (items, CGSize(width: x, height: Self.panelHeight))
     }
 
+    /// 「更多工具」二级气泡：左侧展示 4 个次高频工具（直线 / 曲线箭头 / 测量 / 放大镜），右侧紧跟当前激活项专属属性。
+    private func layoutSecondaryToolsPanel() -> (items: [Item], size: CGSize) {
+        let iconY = (Self.panelHeight - Self.iconButtonSize) / 2
+        let buttonY: CGFloat = 3
+        let buttonHeight = Self.panelHeight - buttonY * 2
+        let iconSize = CGSize(width: Self.iconButtonSize, height: Self.iconButtonSize)
+
+        var cursor = ItemRowCursor(x: Self.padding)
+
+        for (index, secondaryTool) in Self.secondaryTools.enumerated() {
+            cursor.append(
+                .tool(secondaryTool),
+                leading: index == 0 ? 0 : Self.itemSpacing,
+                size: iconSize,
+                y: iconY
+            )
+        }
+
+        if tool == .magnifier {
+            // 放大镜仅展示倍率档位，彻底隔离颜色与线宽。
+            for (index, zoom) in AnnotationStyle.magnifierZooms.enumerated() {
+                let width = textButtonWidth(for: Self.formatZoomLabel(zoom))
+                cursor.append(
+                    .magnifierZoom(zoom),
+                    leading: index == 0 ? Self.groupSpacing : Self.itemSpacing,
+                    size: CGSize(width: width, height: buttonHeight),
+                    y: buttonY
+                )
+            }
+        } else {
+            appendShapeAttributes(to: &cursor, hasLeadingGroup: true)
+        }
+
+        cursor.advance(Self.padding)
+        return (cursor.items, CGSize(width: cursor.x, height: Self.panelHeight))
+    }
+
+    /// 高频形状/标注工具的精巧属性气泡（仅放当前工具颜色、线宽与专属开关，气泡宽度瘦身一半）。
     private func layoutShapePanel() -> (items: [Item], size: CGSize) {
+        var cursor = ItemRowCursor(x: Self.padding)
+        appendShapeAttributes(to: &cursor, hasLeadingGroup: false)
+        cursor.advance(Self.padding)
+        return (cursor.items, CGSize(width: cursor.x, height: Self.panelHeight))
+    }
+
+    private func appendShapeAttributes(to cursor: inout ItemRowCursor, hasLeadingGroup: Bool) {
         let iconY = (Self.panelHeight - Self.iconButtonSize) / 2
         let swatchY = (Self.panelHeight - Self.swatchSize) / 2
-        // 数值型选项（编号半径、弯曲度）用文字按钮，与字号/块大小同一套尺寸。
         let buttonY: CGFloat = 3
         let buttonHeight = Self.panelHeight - buttonY * 2
 
@@ -723,17 +842,7 @@ struct AnnotationToolbarLayout {
         let swatchSize = CGSize(width: Self.swatchSize, height: Self.swatchSize)
         let sliderSize = CGSize(width: Self.sliderWidth, height: buttonHeight)
 
-        var cursor = ItemRowCursor(x: Self.padding)
-
-        // 具体形状
-        for (index, shape) in AnnotationTool.tools(in: .shape).enumerated() {
-            cursor.append(
-                .tool(shape),
-                leading: index == 0 ? 0 : Self.itemSpacing,
-                size: iconSize,
-                y: iconY
-            )
-        }
+        var hasPreceding = hasLeadingGroup
 
         // 颜色（聚光灯不取前景色；荧光笔展示半透明荧光色板）
         if tool != .spotlight {
@@ -741,90 +850,108 @@ struct AnnotationToolbarLayout {
                 ? AnnotationStyle.highlightColors
                 : AnnotationStyle.palette
             for (index, color) in swatches.enumerated() {
+                let leading: CGFloat = (index == 0) ? (hasPreceding ? Self.groupSpacing : 0) : Self.swatchSpacing
                 cursor.append(
                     .color(color),
-                    leading: index == 0 ? Self.groupSpacing : Self.swatchSpacing,
+                    leading: leading,
                     size: swatchSize,
                     y: swatchY
                 )
             }
-
-            // 完整取色器入口：色卡只是高频色的快捷方式，
-            // 选任意颜色必须能从面板里直接进系统取色器。
             cursor.append(
                 .colorPicker,
-                leading: Self.groupSpacing + Self.swatchSpacing,
+                leading: Self.swatchSpacing,
                 size: swatchSize,
                 y: swatchY
             )
+            hasPreceding = true
         }
 
-        // 聚光灯压暗透明度三档：只在聚光灯工具下出现。
+        // 聚光灯压暗透明度三档
         if tool == .spotlight {
             for (index, opacity) in AnnotationStyle.spotlightDimOpacities.enumerated() {
                 let width = textButtonWidth(for: Self.spotlightOpacityLabel(opacity))
+                let leading: CGFloat = (index == 0) ? (hasPreceding ? Self.groupSpacing : 0) : Self.itemSpacing
                 cursor.append(
                     .spotlightDimOpacity(opacity),
-                    leading: index == 0 ? Self.groupSpacing : Self.itemSpacing,
+                    leading: leading,
                     size: CGSize(width: width, height: buttonHeight),
                     y: buttonY
                 )
             }
+            hasPreceding = true
         }
 
-        // 编号半径：只在编号工具下出现。按工具条件显示，面板不会为其它工具变长。
+        // 编号半径
         if tool == .numbering {
             for (index, radius) in AnnotationStyle.numberingRadii.enumerated() {
+                let leading: CGFloat = (index == 0) ? (hasPreceding ? Self.groupSpacing : 0) : Self.itemSpacing
                 cursor.append(
                     .numberingRadius(radius),
-                    leading: index == 0 ? Self.groupSpacing : Self.itemSpacing,
+                    leading: leading,
                     size: iconSize,
                     y: iconY
                 )
             }
+            hasPreceding = true
         }
 
-        // 弯曲程度：只在曲线箭头工具下出现。
+        // 弯曲程度：仅曲线箭头
         if tool == .curvedArrow {
             for (index, bend) in AnnotationStyle.curvedArrowBends.enumerated() {
+                let leading: CGFloat = (index == 0) ? (hasPreceding ? Self.groupSpacing : 0) : Self.itemSpacing
                 cursor.append(
                     .curvedArrowBend(bend),
-                    leading: index == 0 ? Self.groupSpacing : Self.itemSpacing,
+                    leading: leading,
                     size: iconSize,
                     y: iconY
                 )
             }
+            hasPreceding = true
         }
 
-        // 箭头大小：只在箭头与曲线箭头下出现。
+        // 箭头大小：仅箭头与曲线箭头
         if tool == .arrow || tool == .curvedArrow {
             cursor.append(
                 .arrowHeadScaleSlider,
-                leading: Self.groupSpacing,
+                leading: hasPreceding ? Self.groupSpacing : 0,
                 size: sliderSize,
                 y: buttonY
             )
+            hasPreceding = true
         }
 
-        // 线宽：仅对真正拥有描边线宽的形状工具展示（荧光笔与聚光灯不显示无效滑块）。
+        // 线宽：仅对真正拥有描边线宽的工具展示
         if tool.supportsLineWidth {
-            cursor.append(.lineWidthSlider, leading: Self.groupSpacing, size: sliderSize, y: buttonY)
+            cursor.append(
+                .lineWidthSlider,
+                leading: hasPreceding ? Self.groupSpacing : 0,
+                size: sliderSize,
+                y: buttonY
+            )
+            hasPreceding = true
         }
 
-        // 填充开关：矩形与椭圆可切换空心描边 / 半透明填充。
+        // 填充开关：矩形与椭圆
         if tool.supportsFill {
-            cursor.append(.fillToggle, leading: Self.groupSpacing, size: iconSize, y: iconY)
+            cursor.append(
+                .fillToggle,
+                leading: hasPreceding ? Self.groupSpacing : 0,
+                size: iconSize,
+                y: iconY
+            )
+            hasPreceding = true
         }
 
-        // 手绘风格开关：支持手绘的线框工具（矩形/椭圆/直线/箭头/手绘/曲线箭头）可切换。
+        // 手绘风格开关
         if tool.supportsSketchy {
-            cursor.append(.sketchyToggle, leading: Self.itemSpacing, size: iconSize, y: iconY)
+            cursor.append(
+                .sketchyToggle,
+                leading: tool.supportsFill ? Self.itemSpacing : (hasPreceding ? Self.groupSpacing : 0),
+                size: iconSize,
+                y: iconY
+            )
         }
-
-        // 右侧留白
-        cursor.advance(Self.padding)
-
-        return (cursor.items, CGSize(width: cursor.x, height: Self.panelHeight))
     }
 
     private func layoutTextPanel() -> (items: [Item], size: CGSize) {
@@ -899,6 +1026,7 @@ struct AnnotationToolbarLayout {
         return (items, CGSize(width: x, height: Self.panelHeight))
     }
 
+    /// 马赛克专属精巧属性气泡（放大镜已归入「更多工具」，马赛克面板纯粹只放打码方式/效果/强度）。
     private func layoutMosaicPanel() -> (items: [Item], size: CGSize) {
         var items: [Item] = []
         var x = Self.padding
@@ -906,90 +1034,59 @@ struct AnnotationToolbarLayout {
         let buttonHeight = Self.panelHeight - buttonY * 2
         let iconY = (Self.panelHeight - Self.iconButtonSize) / 2
 
-        // 子工具切换：马赛克 / 放大镜（补齐鼠标可直达的放大镜入口）。
-        let familyTools: [AnnotationTool] = [.mosaic, .magnifier]
-        for (index, subTool) in familyTools.enumerated() {
+        // 框选 / 涂抹
+        for (index, mode) in MosaicToolMode.allCases.enumerated() {
+            if index > 0 {
+                x += Self.itemSpacing
+            }
+            let width = textButtonWidth(for: mode.displayName)
+            items.append(Item(
+                kind: .mosaicMode(mode),
+                rect: CGRect(x: x, y: buttonY, width: width, height: buttonHeight),
+                isEnabled: true
+            ))
+            x += width
+        }
+
+        // 打码效果（像素化 / 高斯模糊）
+        x += Self.groupSpacing
+        let effectModes: [MosaicMode] = [.pixelate, .blur]
+        for (index, effectMode) in effectModes.enumerated() {
+            if index > 0 {
+                x += Self.itemSpacing
+            }
+            let width = textButtonWidth(for: Self.mosaicEffectLabel(effectMode))
+            items.append(Item(
+                kind: .mosaicEffectMode(effectMode),
+                rect: CGRect(x: x, y: buttonY, width: width, height: buttonHeight),
+                isEnabled: true
+            ))
+            x += width
+        }
+
+        // 块大小 / 模糊强度档位
+        x += Self.groupSpacing
+        for (index, size) in AnnotationStyle.mosaicBlockSizes.enumerated() {
             if index > 0 {
                 x += Self.itemSpacing
             }
             items.append(Item(
-                kind: .tool(subTool),
+                kind: .mosaicBlockSize(size),
                 rect: CGRect(x: x, y: iconY, width: Self.iconButtonSize, height: Self.iconButtonSize),
                 isEnabled: true
             ))
             x += Self.iconButtonSize
         }
 
-        if tool == .mosaic {
+        // 笔刷大小只在马赛克涂抹模式下出现。
+        if style.mosaicMode == .brush {
             x += Self.groupSpacing
-
-            // 框选 / 涂抹
-            for (index, mode) in MosaicToolMode.allCases.enumerated() {
-                if index > 0 {
-                    x += Self.itemSpacing
-                }
-                let width = textButtonWidth(for: mode.displayName)
-                items.append(Item(
-                    kind: .mosaicMode(mode),
-                    rect: CGRect(x: x, y: buttonY, width: width, height: buttonHeight),
-                    isEnabled: true
-                ))
-                x += width
-            }
-
-            // 打码效果（像素化 / 高斯模糊）
-            x += Self.groupSpacing
-            let effectModes: [MosaicMode] = [.pixelate, .blur]
-            for (index, effectMode) in effectModes.enumerated() {
-                if index > 0 {
-                    x += Self.itemSpacing
-                }
-                let width = textButtonWidth(for: Self.mosaicEffectLabel(effectMode))
-                items.append(Item(
-                    kind: .mosaicEffectMode(effectMode),
-                    rect: CGRect(x: x, y: buttonY, width: width, height: buttonHeight),
-                    isEnabled: true
-                ))
-                x += width
-            }
-
-            // 块大小 / 模糊强度档位
-            x += Self.groupSpacing
-            for (index, size) in AnnotationStyle.mosaicBlockSizes.enumerated() {
-                if index > 0 {
-                    x += Self.itemSpacing
-                }
-                items.append(Item(
-                    kind: .mosaicBlockSize(size),
-                    rect: CGRect(x: x, y: iconY, width: Self.iconButtonSize, height: Self.iconButtonSize),
-                    isEnabled: true
-                ))
-                x += Self.iconButtonSize
-            }
-
-            // 笔刷大小只在马赛克涂抹模式下出现。
-            if style.mosaicMode == .brush {
-                x += Self.groupSpacing
-                items.append(Item(
-                    kind: .mosaicBrushDiameterSlider,
-                    rect: CGRect(x: x, y: buttonY, width: Self.sliderWidth, height: buttonHeight),
-                    isEnabled: true
-                ))
-                x += Self.sliderWidth
-            }
-        } else if tool == .magnifier {
-            // 放大镜倍率：仅展示放大镜专属参数，彻底隔离马赛克无效控件。
-            x += Self.groupSpacing
-            for (index, zoom) in AnnotationStyle.magnifierZooms.enumerated() {
-                if index > 0 { x += Self.itemSpacing }
-                let width = textButtonWidth(for: Self.formatZoomLabel(zoom))
-                items.append(Item(
-                    kind: .magnifierZoom(zoom),
-                    rect: CGRect(x: x, y: buttonY, width: width, height: buttonHeight),
-                    isEnabled: true
-                ))
-                x += width
-            }
+            items.append(Item(
+                kind: .mosaicBrushDiameterSlider,
+                rect: CGRect(x: x, y: buttonY, width: Self.sliderWidth, height: buttonHeight),
+                isEnabled: true
+            ))
+            x += Self.sliderWidth
         }
 
         x += Self.padding

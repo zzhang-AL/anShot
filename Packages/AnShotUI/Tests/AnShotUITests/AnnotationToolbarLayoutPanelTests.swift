@@ -54,19 +54,21 @@ struct AnnotationToolbarLayoutPanelTests {
         #expect(size == .zero)
     }
 
-    @Test("首个条目从左侧留白开始")
+    @Test("首个条目紧贴属性气泡左内边距（panelOriginX + padding）")
     func firstItemRespectsLeadingPadding() {
-        // 这一条正是重构时写错的那处：形状组第一个条目被多加了 groupSpacing，
-        // 整个面板因此右移。断言绝对左边界能把这类「整体偏移」直接抓住。
-        for tool in [AnnotationTool.rectangle, .text, .mosaic] {
-            let (items, _) = makePanel(tool: tool)
+        for tool in [AnnotationTool.rectangle, .text, .mosaic, .line, .magnifier] {
+            var layout = AnnotationToolbarLayout()
+            layout.tool = tool
+            layout.isPanelExpanded = true
+            let (items, _) = layout.layoutPanel()
             guard let first = items.min(by: { $0.rect.minX < $1.rect.minX }) else {
                 Issue.record("\(tool) 的面板不应为空")
                 continue
             }
+            let expectedMinX = layout.panelOriginX + AnnotationToolbarLayout.padding
             #expect(
-                first.rect.minX == AnnotationToolbarLayout.padding,
-                "\(tool) 的首个条目 minX=\(first.rect.minX)，应为 padding=\(AnnotationToolbarLayout.padding)"
+                first.rect.minX == expectedMinX,
+                "\(tool) 的首个条目 minX=\(first.rect.minX)，应为 panelOriginX + padding=\(expectedMinX)"
             )
         }
     }
@@ -105,16 +107,19 @@ struct AnnotationToolbarLayoutPanelTests {
         }
     }
 
-    @Test("总宽 = 最后条目右缘 + 右侧留白")
+    @Test("总宽 = 最后条目右缘相对气泡左缘 + 右侧留白")
     func totalWidthLeavesTrailingPadding() {
-        for tool in [AnnotationTool.rectangle, .arrow, .curvedArrow, .numbering, .text, .mosaic] {
-            let (items, size) = makePanel(tool: tool)
+        for tool in [AnnotationTool.rectangle, .arrow, .curvedArrow, .numbering, .text, .mosaic, .magnifier] {
+            var layout = AnnotationToolbarLayout()
+            layout.tool = tool
+            layout.isPanelExpanded = true
+            let (items, size) = layout.layoutPanel()
             guard let last = items.max(by: { $0.rect.maxX < $1.rect.maxX }) else {
                 Issue.record("\(tool) 的面板不应为空")
                 continue
             }
             #expect(
-                size.width == last.rect.maxX + AnnotationToolbarLayout.padding,
+                size.width == (last.rect.maxX - layout.panelOriginX) + AnnotationToolbarLayout.padding,
                 "\(tool) 总宽 \(size.width) 与最后条目右缘 \(last.rect.maxX) 不吻合"
             )
             #expect(size.height == AnnotationToolbarLayout.panelHeight)
@@ -207,21 +212,24 @@ struct AnnotationToolbarLayoutPanelTests {
         #expect(shape != mosaic)
     }
 
-    @Test("马赛克家族面板提供放大镜入口，且激活放大镜时彻底隔离马赛克无效控件")
+    @Test("马赛克面板纯粹展示打码属性，更多工具面板展示放大镜并彻底隔离马赛克无效控件")
     func mosaicAndMagnifierPanelIsolation() {
         var mosaicLayout = AnnotationToolbarLayout()
         mosaicLayout.tool = .mosaic
         mosaicLayout.style.mosaicMode = .brush
         let mosaicKinds = mosaicLayout.layoutPanel().items.map(\.kind)
-        #expect(mosaicKinds.contains(.tool(.mosaic)))
-        #expect(mosaicKinds.contains(.tool(.magnifier)))
+        #expect(mosaicKinds.contains(.mosaicMode(.brush)))
+        #expect(mosaicKinds.contains(.mosaicEffectMode(.blur)))
         #expect(mosaicKinds.contains(.mosaicBrushDiameterSlider))
+        #expect(!mosaicKinds.contains(.tool(.magnifier)))
 
         var magnifierLayout = AnnotationToolbarLayout()
         magnifierLayout.tool = .magnifier
         magnifierLayout.style.mosaicMode = .brush
         let magnifierKinds = magnifierLayout.layoutPanel().items.map(\.kind)
-        #expect(magnifierKinds.contains(.tool(.mosaic)))
+        #expect(magnifierKinds.contains(.tool(.line)))
+        #expect(magnifierKinds.contains(.tool(.curvedArrow)))
+        #expect(magnifierKinds.contains(.tool(.measure)))
         #expect(magnifierKinds.contains(.tool(.magnifier)))
         #expect(magnifierKinds.contains { if case .magnifierZoom = $0 { return true } else { return false } })
         #expect(!magnifierKinds.contains { if case .mosaicMode = $0 { return true } else { return false } })

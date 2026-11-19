@@ -1952,15 +1952,24 @@ public final class OverlayController {
                 ToastPresenter.show((copyResult?.didCopy == true) ? "已原地更新贴图并复制到剪贴板" : "已原地更新贴图")
                 dismiss()
                 return
-            case .save:
-                let forceAsk = NSEvent.modifierFlags.contains(.option) || NSEvent.modifierFlags.contains(.shift)
+            case .save, .saveAs:
+                let overrideFormat: ExportFormatOption?
+                let explicitAsk: Bool
+                if case let .saveAs(format, forceAsk) = action {
+                    overrideFormat = format
+                    explicitAsk = forceAsk
+                } else {
+                    overrideFormat = nil
+                    explicitAsk = false
+                }
+                let forceAsk = explicitAsk || NSEvent.modifierFlags.contains(.option) || NSEvent.modifierFlags.contains(.shift)
                 let destination: SaveDestination = forceAsk ? .ask : settings.saveDestination
                 let outcome = SessionExporter.save(
                     image,
                     suggestedName: Exporter.defaultFileName(),
                     destination: destination,
                     backingScale: scale,
-                    formatOption: settings.exportFormat,
+                    formatOption: overrideFormat ?? settings.exportFormat,
                     quality: settings.exportQuality,
                     enablePNGOptimization: settings.pngLosslessOptimize,
                     fallbackToPanelWhenFolderMissing: true
@@ -2055,9 +2064,18 @@ public final class OverlayController {
                 NSSound.beep()
             }
 
-        case .save:
+        case .save, .saveAs:
+            let overrideFormat: ExportFormatOption?
+            let explicitAsk: Bool
+            if case let .saveAs(format, forceAsk) = action {
+                overrideFormat = format
+                explicitAsk = forceAsk
+            } else {
+                overrideFormat = nil
+                explicitAsk = false
+            }
             let backingScale = exportBackingScale(in: window)
-            let forceAsk = NSEvent.modifierFlags.contains(.option) || NSEvent.modifierFlags.contains(.shift)
+            let forceAsk = explicitAsk || NSEvent.modifierFlags.contains(.option) || NSEvent.modifierFlags.contains(.shift)
             let rawDestination: SaveDestination = forceAsk ? .ask : settings.saveDestination
             // 检查目标目录是否有效：若为 `.ask` 或固定目录已失效需降级弹窗，先暂隐全屏 `.screenSaver` 覆盖层防遮挡。
             let willShowPanel: Bool
@@ -2077,7 +2095,7 @@ public final class OverlayController {
                 suggestedName: Exporter.defaultFileName(),
                 destination: rawDestination,
                 backingScale: backingScale,
-                formatOption: settings.exportFormat,
+                formatOption: overrideFormat ?? settings.exportFormat,
                 quality: settings.exportQuality,
                 enablePNGOptimization: settings.pngLosslessOptimize,
                 fallbackToPanelWhenFolderMissing: true

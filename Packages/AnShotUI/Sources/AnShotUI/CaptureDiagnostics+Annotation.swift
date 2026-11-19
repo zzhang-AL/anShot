@@ -319,62 +319,54 @@ extension CaptureDiagnostics {
         defer { view.isDetectionPausedForDiagnostics = false }
 
         let bar = view.toolbarItemCenters()
-        guard let shapeFamily = bar[.family(.shape)],
-              let textFamily = bar[.family(.text)] else {
+        guard let rectButton = bar[.tool(.rectangle)],
+              let arrowButton = bar[.tool(.arrow)],
+              let textButton = bar[.tool(.text)] else {
             logger.error("toolbar clicks: 主栏未提供可点击项，工具栏可能未显示")
             return
         }
-        let shapePanelHiddenBefore = bar[.tool(.arrow)] == nil
+        let shapePanelHiddenBefore = bar[.lineWidthSlider] == nil
 
-        // 布局一致性：面板项必须整体位于主栏项之下。
-        //
-        // 这一条针对一个真实缺陷：首版绘制面板时漏了纵向偏移，
-        // 于是面板按钮画在主栏位置上、可点击区域却在下方，
-        // 用户看到的和点得到的完全对不上。而当时的诊断只验证「点击命中」，
-        // 用命中坐标点命中坐标，自证了那个 bug —— 所以这里改为验证
-        // 「面板与主栏在几何上不重叠」。
         assertPanelBelowBar(view: view, editor: editor)
 
-        // 点「形状」分组：应切到形状工具并展开形状面板。
-        synthesizeClick(in: window, at: shapeFamily)
+        // 点主栏「矩形」：一次点击即激活矩形并展开属性气泡。
+        synthesizeClick(in: window, at: rectButton)
         try? await Task.sleep(for: .milliseconds(300))
-        let shapeSelected = editor.tool.family == .shape
+        let shapeSelected = editor.tool == .rectangle
 
         let panel = view.toolbarItemCenters()
         guard let redColor = AnnotationStyle.palette.first,
-              let arrowTool = panel[.tool(.arrow)],
               let redSwatchPoint = panel[.color(redColor)] else {
             logger.error("""
-                toolbar clicks: 形状面板未展开 \
+                toolbar clicks: 矩形属性气泡未展开 \
                 tool=\(editor.tool.rawValue, privacy: .public) \
                 hiddenBefore=\(shapePanelHiddenBefore, privacy: .public)
                 """)
             return
         }
 
-        // 点二级面板里的箭头工具。
-        synthesizeClick(in: window, at: arrowTool)
+        // 点主栏「箭头」：一次点击直达箭头。
+        synthesizeClick(in: window, at: arrowButton)
         try? await Task.sleep(for: .milliseconds(250))
         let arrowSelected = editor.tool == .arrow
 
-        // 点二级面板里的颜色。
-        synthesizeClick(in: window, at: redSwatchPoint)
+        // 点属性气泡里的颜色。
+        let arrowPanel = view.toolbarItemCenters()
+        let activeRedPoint = arrowPanel[.color(redColor)] ?? redSwatchPoint
+        synthesizeClick(in: window, at: activeRedPoint)
         try? await Task.sleep(for: .milliseconds(250))
         let colorApplied = editor.style.shapeColor == redColor
         let colorKeptArrow = editor.tool == .arrow
 
-        // 切到文字分组：面板应换成文字面板（形状项消失、字号项出现）。
-        synthesizeClick(in: window, at: textFamily)
+        // 切到文字工具：属性气泡切换为文字专属属性（出现字号档位、隐藏线宽滑块）。
+        synthesizeClick(in: window, at: textButton)
         try? await Task.sleep(for: .milliseconds(300))
         let textSelected = editor.tool == .text
         let textPanel = view.toolbarItemCenters()
-        let panelSwitched = textPanel[.tool(.arrow)] == nil
+        let panelSwitched = textPanel[.lineWidthSlider] == nil
             && !AnnotationStyle.fontSizes.isEmpty
             && textPanel[.fontSize(AnnotationStyle.fontSizes[0])] != nil
 
-        // 面板里的完整取色器入口：从工具面板也应能进取色器。
-        // 注意这里必须重新取一次坐标——上面切换过工具，
-        // 旧坐标对应的面板已经不存在了（曾因此得到假失败）。
         var pickerOpened = false
         if let picker = view.toolbarItemCenters()[.colorPicker] {
             view.dismissColorPanel()
@@ -386,23 +378,22 @@ extension CaptureDiagnostics {
             try? await Task.sleep(for: .milliseconds(200))
         }
 
-        // 不取色的工具下，颜色入口应当**连位置都不存在**；
-        // 取色的工具下应当回来。
+        // 不取色的工具下，二级属性气泡不包含色轮入口；取色工具下包含。
         editor.select(.pointer)
         try? await Task.sleep(for: .milliseconds(300))
-        let pointerHasNoColor = view.toolbarItemCenters()[.colorButton] == nil
+        let pointerHasNoColor = view.toolbarItemCenters()[.colorPicker] == nil
 
         editor.select(.mosaic)
         try? await Task.sleep(for: .milliseconds(300))
-        let mosaicHasNoColor = view.toolbarItemCenters()[.colorButton] == nil
+        let mosaicHasNoColor = view.toolbarItemCenters()[.colorPicker] == nil
 
         editor.select(.rectangle)
         try? await Task.sleep(for: .milliseconds(300))
-        let shapeHasColor = view.toolbarItemCenters()[.colorButton] != nil
+        let shapeHasColor = view.toolbarItemCenters()[.colorPicker] != nil
 
         editor.select(.arrow)
         try? await Task.sleep(for: .milliseconds(300))
-        let arrowHasColor = view.toolbarItemCenters()[.colorButton] != nil
+        let arrowHasColor = view.toolbarItemCenters()[.colorPicker] != nil
 
         let colorEntryOK = pointerHasNoColor && mosaicHasNoColor
             && shapeHasColor && arrowHasColor
@@ -466,7 +457,7 @@ extension CaptureDiagnostics {
         editor.select(.rectangle)
         try? await Task.sleep(for: .milliseconds(300))
 
-        guard let colorButton = view.toolbarItemCenters()[.colorButton] else {
+        guard let colorButton = view.toolbarItemCenters()[.colorPicker] else {
             logger.error("color picker diag: 取不到颜色入口位置")
             controller.dismiss()
             return

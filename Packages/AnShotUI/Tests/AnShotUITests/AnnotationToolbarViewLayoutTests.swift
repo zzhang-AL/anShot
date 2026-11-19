@@ -94,29 +94,25 @@ struct AnnotationToolbarViewLayoutTests {
 
     // MARK: - 独立预期（取自布局常量，不用被测函数的输出反推）
 
-    @Test("分组按钮中心由布局常量独立算出：左内边距 + 序号 × (按钮 + 间距) + 按钮一半")
-    func familyButtonsSitAtConstantPositions() {
-        // 主栏分组按钮的固定顺序是布局的对外契约（`AnnotationToolbarLayoutTests`
-        // 也锁了它），因此这里用一份**独立写出**的顺序与算出来的期望位置，
-        // 而不是从被测的布局结果里反推。
-        let familyOrder: [AnnotationTool.Family] = [.pointer, .shape, .text, .mosaic]
+    @Test("主栏高频直达按钮中心由布局常量独立算出：firstBarItemX + 序号 × (按钮 + 间距) + 按钮一半")
+    func primaryToolButtonsSitAtConstantPositions() {
+        let primaryOrder = AnnotationToolbarLayout.primaryTools
         let centers = Self.makeToolbar(tool: .rectangle).visibleItemCenters()
 
-        for (index, family) in familyOrder.enumerated() {
-            guard let center = centers[.family(family)] else {
-                Issue.record("主栏缺少分组按钮 .family(\(family))")
+        for (index, tool) in primaryOrder.enumerated() {
+            guard let center = centers[.tool(tool)] else {
+                Issue.record("主栏缺少高频直达按钮 .tool(\(tool))")
                 continue
             }
             let expectedX =
-                AnnotationToolbarLayout.padding
+                AnnotationToolbarLayout.firstBarItemX
                 + CGFloat(index) * (AnnotationToolbarLayout.iconButtonSize + AnnotationToolbarLayout.itemSpacing)
                 + AnnotationToolbarLayout.iconButtonSize / 2
-            #expect(abs(center.x - expectedX) < 0.5, "\(family) 的横向位置与布局常量不符")
+            #expect(abs(center.x - expectedX) < 0.5, "\(tool) 的横向位置与布局常量不符")
             #expect(abs(center.y - AnnotationToolbarLayout.barHeight / 2) < 0.5)
         }
-        // 首个分组按钮正是 `-diagnoseSelection` 里以 (22, 18) 硬编码断言的那个位置。
         #expect(
-            centers[.family(.pointer)]?.x == AnnotationToolbarLayout.padding
+            centers[.tool(.pointer)]?.x == AnnotationToolbarLayout.firstBarItemX
                 + AnnotationToolbarLayout.iconButtonSize / 2)
     }
 
@@ -191,12 +187,12 @@ struct AnnotationToolbarViewLayoutTests {
         #expect(!rectangle.contains(.arrowHeadScaleSlider))
     }
 
-    @Test("颜色入口只对有颜色的工具出现（马赛克没有颜色槽）")
+    @Test("颜色入口只对有颜色的工具出现（马赛克没有颜色槽，统一收敛在属性气泡的色轮入口）")
     func colorEntryFollowsToolCapability() {
         let rectangle = Set(Self.makeToolbar(tool: .rectangle).visibleItemCenters().keys)
         let mosaic = Set(Self.makeToolbar(tool: .mosaic).visibleItemCenters().keys)
-        #expect(rectangle.contains(.colorButton))
-        #expect(!mosaic.contains(.colorButton))
+        #expect(rectangle.contains(.colorPicker))
+        #expect(!mosaic.contains(.colorPicker))
     }
 
     @Test("滑块轨道落在它的条目矩形内，且是用户真正能拖的那一段")
@@ -236,8 +232,8 @@ struct AnnotationToolbarViewLayoutTests {
         var sizeChanges = 0
         view.onIntrinsicSizeChanged = { sizeChanges += 1 }
 
-        // 点击当前分组按钮（形状）触发收起
-        let shapeCenter = try #require(view.itemCenter(.family(.shape)))
+        // 点击主栏当前已激活的工具按钮（矩形）触发收起
+        let rectCenter = try #require(view.itemCenter(.tool(.rectangle)))
         let window = NSWindow(
             contentRect: CGRect(origin: .zero, size: view.toolbarSize),
             styleMask: [.borderless],
@@ -247,7 +243,7 @@ struct AnnotationToolbarViewLayoutTests {
         window.contentView = view
         let event = NSEvent.mouseEvent(
             with: .leftMouseDown,
-            location: view.convert(shapeCenter, to: nil),
+            location: view.convert(rectCenter, to: nil),
             modifierFlags: [],
             timestamp: 0,
             windowNumber: window.windowNumber,
@@ -266,6 +262,77 @@ struct AnnotationToolbarViewLayoutTests {
         #expect(children.allSatisfy { ($0.accessibilityLabel()?.isEmpty == false) })
         #expect(AnnotationToolbarView.tooltipText(for: .longScreenshot).contains("⌥点击横向"))
         #expect(AnnotationToolbarView.tooltipText(for: .pin).contains("⌘P"))
+    }
+
+    @Test("透明空气区精准穿透回画布，不拦截主栏与精巧属性气泡之外的点击")
+    func transparentAirspacePassesThroughToCanvas() {
+        let view = Self.makeToolbar(tool: .spotlight)
+        let barRect = Self.layoutInput(tool: .spotlight).barFrame
+        let panelRect = Self.layoutInput(tool: .spotlight).panelFrame
+        // 聚光灯属性气泡很窄（仅 3 个压暗度按钮），位于主栏中段下方，其左侧和右侧大片区域均为透明空气。
+        #expect(panelRect.width < barRect.width * 0.5)
+        #expect(view.containsInteractivePoint(CGPoint(x: barRect.midX, y: barRect.midY)))
+        #expect(view.containsInteractivePoint(CGPoint(x: panelRect.midX, y: panelRect.midY)))
+
+        // 气泡左侧空气区与右侧空气区必须返回 false（穿透回画布）
+        let leftAir = CGPoint(x: 4, y: panelRect.midY)
+        let rightAir = CGPoint(x: barRect.maxX - 4, y: panelRect.midY)
+        if leftAir.x < panelRect.minX {
+            #expect(!view.containsInteractivePoint(leftAir), "气泡左侧透明空气区不应吞掉画布点击")
+        }
+        if rightAir.x > panelRect.maxX {
+            #expect(!view.containsInteractivePoint(rightAir), "气泡右侧透明空气区不应吞掉画布点击")
+        }
+    }
+
+    @Test("落笔绘制自动轻收起二级气泡，切工具或选中标注后按需展开，且支持 ⌥+点击保存直达另存为")
+    func drawAutoCollapseAndOptionSaveAsInteraction() throws {
+        let view = Self.makeToolbar(tool: .rectangle)
+        var sizeChanges = 0
+        view.onIntrinsicSizeChanged = { sizeChanges += 1 }
+        #expect(view.isPanelExpanded)
+
+        // 落笔绘制：自动收起气泡释放画布视野
+        view.collapsePanelForDrawing()
+        #expect(!view.isPanelExpanded)
+        #expect(view.toolbarSize.height == AnnotationToolbarLayout.barHeight)
+        #expect(sizeChanges == 1)
+
+        // 重复调用保持幂等
+        view.collapsePanelForDrawing()
+        #expect(sizeChanges == 1)
+
+        // 选中标注或切工具：重新展开属性气泡
+        view.expandPanelForInteraction()
+        #expect(view.isPanelExpanded)
+        #expect(view.toolbarSize.height > AnnotationToolbarLayout.barHeight)
+
+        // ⌥+点击保存按钮触发强制另存为
+        var receivedSaveAs: (ExportFormatOption?, Bool)?
+        view.onSaveAs = { format, forceAsk in
+            receivedSaveAs = (format, forceAsk)
+        }
+        let saveCenter = try #require(view.itemCenter(.save))
+        let window = NSWindow(
+            contentRect: CGRect(origin: .zero, size: view.toolbarSize),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = view
+        let optClick = NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: view.convert(saveCenter, to: nil),
+            modifierFlags: [.option],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 1
+        )!
+        view.mouseDown(with: optClick)
+        #expect(receivedSaveAs?.1 == true, "⌥+点击保存应直接请求弹出另存为面板")
     }
 
     /// 构造与视图等价的布局输入（两者的状态在这里显式对齐）。

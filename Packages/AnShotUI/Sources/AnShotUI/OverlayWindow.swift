@@ -62,8 +62,10 @@ private let logger = AnShotLog.overlay
 enum ExportAction {
     /// 拷贝到系统剪贴板。
     case copy
-    /// 存为 PNG 文件。
+    /// 按当前默认格式保存文件。
     case save
+    /// 按指定格式保存或临时强制弹出另存为面板（工具栏 `⌥+点击保存` 或右键快捷格式菜单）。
+    case saveAs(format: ExportFormatOption?, forceAsk: Bool)
     /// 钉在屏幕上（固定截图）。
     case pin
 }
@@ -717,6 +719,9 @@ final class OverlayView: NSView {
         view.onDragMove = { [weak self] delta in
             self?.moveToolbar(by: delta)
         }
+        view.onResetPosition = { [weak self] in
+            self?.resetToolbarPosition()
+        }
         view.onUndo = { [weak self] in
             guard let self else { return }
             if let handler = self.onUndoRequested {
@@ -768,6 +773,9 @@ final class OverlayView: NSView {
         }
         view.onSave = { [weak self] in
             self?.performExport(.save)
+        }
+        view.onSaveAs = { [weak self] format, forceAsk in
+            self?.performExport(.saveAs(format: format, forceAsk: forceAsk))
         }
         // 删除按钮与键盘上的 Delete 走同一个收口（`deleteSelected`）：
         // 它同时清掉选中、记一步历史并通知控制器刷新。
@@ -856,15 +864,24 @@ final class OverlayView: NSView {
 
         let size = toolbar.toolbarSize
         let origin: CGPoint
-        if let customToolbarOrigin {
+        if let customBarOrigin = customToolbarOrigin {
+            // `customToolbarOrigin` 锚定主栏自身的左上角坐标，而非外接大矩形：
+            // 这样无论上方二级气泡展开还是收起，主栏在屏幕上 100% 纹丝不动，零上下跳动。
+            let proposedContainerOrigin = CGPoint(
+                x: customBarOrigin.x,
+                y: customBarOrigin.y - toolbar.barOriginY
+            )
             origin = clampedToolbarOrigin(
-                customToolbarOrigin,
+                proposedContainerOrigin,
                 size: size,
                 gap: gap,
                 safeInsets: safeInsets,
                 in: layoutBounds
             )
-            self.customToolbarOrigin = origin
+            self.customToolbarOrigin = CGPoint(
+                x: origin.x,
+                y: origin.y + toolbar.barOriginY
+            )
         } else {
             origin = AnnotationToolbarLayout.toolbarOrigin(
                 selection: selection,
@@ -927,7 +944,7 @@ final class OverlayView: NSView {
         )
     }
 
-    /// 用户按住工具栏空白处拖移位置。
+    /// 用户按住工具栏握把或空白处拖移位置（记录主栏自身原点，折叠上方气泡不跳动）。
     private func moveToolbar(by delta: CGSize) {
         guard !toolbar.isHidden else { return }
         let safeInsets = effectiveSafeAreaInsets
@@ -942,8 +959,14 @@ final class OverlayView: NSView {
             safeInsets: safeInsets,
             in: toolbarLayoutBounds
         )
-        customToolbarOrigin = clamped
+        customToolbarOrigin = CGPoint(x: clamped.x, y: clamped.y + toolbar.barOriginY)
         toolbar.frame.origin = clamped
+    }
+
+    /// 双击拖拽握把或工具栏空白处一键复位到选区默认停靠位置。
+    private func resetToolbarPosition() {
+        customToolbarOrigin = nil
+        refreshToolbar()
     }
 
     /// 选中的标注是否是文字（面板据此显示字号档位）。
@@ -2047,8 +2070,11 @@ final class OverlayView: NSView {
 
     private func toggleColorPanel() {
         guard let editorState else { return }
-        // 锚点取颜色入口按钮的中心；取不到时退回工具栏左上角。
-        let itemCenter = toolbar.itemCenter(.colorButton) ?? CGPoint(x: 24, y: 18)
+        // 锚点优先取自定义取色器色环按钮中心，次选当前激活工具图标中心，退回左上角。
+        let itemCenter = toolbar.itemCenter(.colorPicker)
+            ?? toolbar.itemCenter(.tool(editorState.tool))
+            ?? toolbar.itemCenter(.moreTools)
+            ?? CGPoint(x: 24, y: 18)
         colorPicker.toggle(
             anchorInView: CGPoint(
                 x: toolbarFrame.minX + itemCenter.x,
@@ -2133,11 +2159,11 @@ final class OverlayView: NSView {
         return result
     }
 
-    /// 点击是否落在工具栏（或它的二级面板）上。
-    ///
-    /// 设置操作不应顺手把刚输入的文字提交掉，所以点击工具栏时要排除在外。
+    /// 点击是否落在工具栏实际可见区域（主栏胶囊或二级属性气泡）上；透明空气区返回 `false` 穿透回画布。
     private func isPointInsideToolbar(_ point: CGPoint) -> Bool {
-        !toolbar.isHidden && toolbar.frame.contains(point)
+        guard !toolbar.isHidden else { return false }
+        let local = CGPoint(x: point.x - toolbar.frame.minX, y: point.y - toolbar.frame.minY)
+        return toolbar.containsInteractivePoint(local)
     }
 
     /// 双击命中已有文字时进入重新编辑。命中返回 true。
@@ -2396,6 +2422,7 @@ final class OverlayView: NSView {
 
             if editorState.tool == .pointer {
                 if editorState.selectAnnotation(at: pixel, tolerance: tolerance) {
+                    toolbar.expandPanelForInteraction()
                     editorState.beginEditTransaction()
                     interaction = .movingAnnotation(lastPixel: pixel)
                     NSCursor.closedHand.set()
@@ -2410,6 +2437,7 @@ final class OverlayView: NSView {
                 // 绘图工具下按住 ⌘ / ⌃ 直接选中并平移已有标注。
                 if (flags.contains(.command) || flags.contains(.control)),
                    editorState.selectAnnotation(at: pixel, tolerance: tolerance) {
+                    toolbar.expandPanelForInteraction()
                     editorState.beginEditTransaction()
                     interaction = .movingAnnotation(lastPixel: pixel)
                     NSCursor.closedHand.set()
@@ -2427,9 +2455,11 @@ final class OverlayView: NSView {
                     if let hitExisting {
                         // 单击已有非文字标注（或文字标注）先选中，双击文字已在上方进入编辑。
                         editorState.selectAnnotation(id: hitExisting.id)
+                        toolbar.expandPanelForInteraction()
                         return
                     }
                     guard !editorState.isEditingText else { return }
+                    toolbar.collapsePanelForDrawing()
                     editorState.clearAnnotationSelection()
                     editorState.beginTextEditing(at: pixel)
                     syncTextEditor()
@@ -2485,8 +2515,9 @@ final class OverlayView: NSView {
 
         switch interaction {
         case .idle:
-            // 绘制模式下的拖拽不改变选区，只更新未提交的草稿。
+            // 绘制模式下的拖拽不改变选区，只更新未提交的草稿；一落笔拖拽立即轻收起二级属性气泡让出画布视野。
             if editorState?.hasDraft == true {
+                toolbar.collapsePanelForDrawing()
                 editorState?.updateDraft(to: pixelPoint(from: point), isShiftPressed: isShiftPressed)
             }
             return
@@ -2495,11 +2526,13 @@ final class OverlayView: NSView {
             let current = pixelPoint(from: point)
             let delta = PixelPoint(x: current.x - lastPixel.x, y: current.y - lastPixel.y)
             guard delta != PixelPoint.zero else { return }
+            toolbar.collapsePanelForDrawing()
             editorState?.moveSelected(by: delta)
             interaction = .movingAnnotation(lastPixel: current)
             return
 
         case .resizingAnnotation(let handle):
+            toolbar.collapsePanelForDrawing()
             editorState?.updateSelectedControlHandle(
                 handle,
                 to: pixelPoint(from: point),
@@ -2657,6 +2690,7 @@ final class OverlayView: NSView {
                 pendingDrawingDownPoint = nil
                 editorState.discardDraft()
                 editorState.selectAnnotation(id: hitID)
+                toolbar.expandPanelForInteraction()
                 updateCursor(at: point)
                 return
             }
@@ -3060,6 +3094,9 @@ final class OverlayView: NSView {
                 onSelectionCommitted?(selection)
             }
             editorState?.select(tool)
+            if tool != .pointer || editorState?.hasSelectedAnnotation == true {
+                toolbar.expandPanelForInteraction()
+            }
             if colorPicker.isPresented,
                editorState?.style.color(for: tool) == nil {
                 dismissColorPanel()

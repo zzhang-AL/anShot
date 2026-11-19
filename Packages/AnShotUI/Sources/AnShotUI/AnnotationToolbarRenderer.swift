@@ -68,6 +68,89 @@ final class AnnotationToolbarRenderer {
     var panelPlacement: AnnotationToolbarLayout.PanelPlacement = .below
     var hiddenSlots: Set<String> = []
     var hoveredKind: AnnotationToolbarLayout.Kind?
+    /// 当前正被鼠标按下的条目（提供即时按压反馈，移出按钮松手可安全取消）。
+    var pressedKind: AnnotationToolbarLayout.Kind?
+    /// 当前外观是否为深色（默认深色碳墨浮岛；随设置窗口与系统浅/深模式实时响应）。
+    var isDarkAppearance = true
+
+    /// 供下层手绘字形读取的当前条目墨水色（选中态恒为纯白；浅色/深色自适应高对比前景色）。
+    private var currentGlyphInkColor: NSColor = .white
+
+    private struct ToolbarPalette {
+        let barTop: NSColor
+        let barBottom: NSColor
+        let panelTop: NSColor
+        let panelBottom: NSColor
+        let border: NSColor
+        let topInnerHighlight: NSColor
+        let separator: NSColor
+        let primaryInk: NSColor
+        let secondaryInk: NSColor
+        let hoverFill: NSColor
+        let copyIdleFill: NSColor
+        let copyHoverFill: NSColor
+        let copyInk: NSColor
+        let dangerHoverFill: NSColor
+        let dangerInk: NSColor
+        let sliderTrack: NSColor
+        let swatchSelectedRing: NSColor
+        let swatchHoverRing: NSColor
+
+        static func resolve(isDark: Bool) -> ToolbarPalette {
+            if isDark {
+                return ToolbarPalette(
+                    barTop: NSColor(srgbRed: 0.165, green: 0.176, blue: 0.204, alpha: 0.94),
+                    barBottom: NSColor(srgbRed: 0.102, green: 0.110, blue: 0.130, alpha: 0.96),
+                    panelTop: NSColor(srgbRed: 0.145, green: 0.156, blue: 0.184, alpha: 0.94),
+                    panelBottom: NSColor(srgbRed: 0.094, green: 0.102, blue: 0.122, alpha: 0.96),
+                    border: NSColor.white.withAlphaComponent(0.15),
+                    topInnerHighlight: NSColor.white.withAlphaComponent(0.07),
+                    separator: NSColor.white.withAlphaComponent(0.15),
+                    primaryInk: NSColor.white.withAlphaComponent(0.94),
+                    secondaryInk: NSColor.white.withAlphaComponent(0.68),
+                    hoverFill: NSColor.white.withAlphaComponent(0.12),
+                    copyIdleFill: NSColor(srgbRed: 0.20, green: 0.78, blue: 0.52, alpha: 0.18),
+                    copyHoverFill: NSColor(srgbRed: 0.20, green: 0.78, blue: 0.52, alpha: 0.30),
+                    copyInk: NSColor(srgbRed: 0.42, green: 0.94, blue: 0.68, alpha: 1.0),
+                    dangerHoverFill: NSColor(srgbRed: 0.98, green: 0.32, blue: 0.30, alpha: 0.24),
+                    dangerInk: NSColor(srgbRed: 1.0, green: 0.45, blue: 0.43, alpha: 1.0),
+                    sliderTrack: NSColor.white.withAlphaComponent(0.22),
+                    swatchSelectedRing: NSColor.white.withAlphaComponent(0.95),
+                    swatchHoverRing: NSColor.white.withAlphaComponent(0.45)
+                )
+            } else {
+                return ToolbarPalette(
+                    barTop: NSColor(srgbRed: 1.0, green: 1.0, blue: 1.0, alpha: 0.95),
+                    barBottom: NSColor(srgbRed: 0.955, green: 0.962, blue: 0.976, alpha: 0.96),
+                    panelTop: NSColor(srgbRed: 0.992, green: 0.995, blue: 1.0, alpha: 0.95),
+                    panelBottom: NSColor(srgbRed: 0.948, green: 0.956, blue: 0.972, alpha: 0.96),
+                    border: NSColor.black.withAlphaComponent(0.11),
+                    topInnerHighlight: NSColor.white.withAlphaComponent(0.92),
+                    separator: NSColor.black.withAlphaComponent(0.10),
+                    primaryInk: NSColor(srgbRed: 0.12, green: 0.14, blue: 0.18, alpha: 0.92),
+                    secondaryInk: NSColor(srgbRed: 0.28, green: 0.31, blue: 0.37, alpha: 0.75),
+                    hoverFill: NSColor.black.withAlphaComponent(0.065),
+                    copyIdleFill: NSColor(srgbRed: 0.08, green: 0.66, blue: 0.42, alpha: 0.13),
+                    copyHoverFill: NSColor(srgbRed: 0.08, green: 0.66, blue: 0.42, alpha: 0.22),
+                    copyInk: NSColor(srgbRed: 0.05, green: 0.52, blue: 0.32, alpha: 1.0),
+                    dangerHoverFill: NSColor(srgbRed: 0.92, green: 0.22, blue: 0.20, alpha: 0.14),
+                    dangerInk: NSColor(srgbRed: 0.86, green: 0.18, blue: 0.18, alpha: 1.0),
+                    sliderTrack: NSColor.black.withAlphaComponent(0.14),
+                    swatchSelectedRing: NSColor(srgbRed: 0.12, green: 0.14, blue: 0.18, alpha: 0.88),
+                    swatchHoverRing: NSColor.black.withAlphaComponent(0.32)
+                )
+            }
+        }
+    }
+
+    private var palette: ToolbarPalette {
+        ToolbarPalette.resolve(isDark: isDarkAppearance)
+    }
+
+    /// 结合条目语义色与禁用态透明度的统一字形墨水色。
+    private func ink(_ alpha: CGFloat) -> NSColor {
+        currentGlyphInkColor.withAlphaComponent(currentGlyphInkColor.alphaComponent * alpha)
+    }
 
     // MARK: - 布局
 
@@ -108,13 +191,18 @@ final class AnnotationToolbarRenderer {
 
     // MARK: - 入口
 
-    /// 绘制整个工具栏（主栏 + 面板）。
+    /// 绘制整个工具栏（主栏 + 二级尖角气泡 + 组间细分隔线 + 全部条目）。
     func draw(in context: CGContext) {
         let bar = layoutBar()
         let panel = layoutPanel()
 
         drawBarBackground(bar.size, in: context)
         drawPanelBackground(panel.size, in: context)
+
+        drawGroupSeparators(for: bar.items, containerOriginY: layoutInput.barOriginY, containerHeight: bar.size.height, in: context)
+        if panel.size.height > 0 {
+            drawGroupSeparators(for: panel.items, containerOriginY: layoutInput.panelOriginY, containerHeight: panel.size.height, in: context)
+        }
 
         for item in bar.items {
             drawItem(item, in: context, isInPanel: false)
@@ -124,54 +212,208 @@ final class AnnotationToolbarRenderer {
         }
     }
 
+    /// 组间精致竖向细分隔线：凡相邻条目间距达到 `groupSpacing`，在其水平正中绘制圆头细线。
+    private func drawGroupSeparators(
+        for items: [Item],
+        containerOriginY: CGFloat,
+        containerHeight: CGFloat,
+        in context: CGContext
+    ) {
+        guard items.count >= 2 else { return }
+        let sorted = items.sorted { $0.rect.minX < $1.rect.minX }
+        let sepHeight = min(16, max(10, containerHeight - 20))
+        let topY = containerOriginY + (containerHeight - sepHeight) / 2
+        let threshold = AnnotationToolbarLayout.groupSpacing - 0.5
+
+        context.saveGState()
+        context.setStrokeColor(palette.separator.cgColor)
+        context.setLineWidth(AnnotationToolbarLayout.separatorWidth)
+        context.setLineCap(.round)
+        for (prev, next) in zip(sorted, sorted.dropFirst()) {
+            let gap = next.rect.minX - prev.rect.maxX
+            guard gap >= threshold else { continue }
+            let x = ((prev.rect.maxX + next.rect.minX) / 2).rounded() + 0.5
+            context.beginPath()
+            context.move(to: CGPoint(x: x, y: topY))
+            context.addLine(to: CGPoint(x: x, y: topY + sepHeight))
+            context.strokePath()
+        }
+        context.restoreGState()
+    }
+
     private func drawBarBackground(_ size: CGSize, in context: CGContext) {
         let originY = layoutInput.barOriginY
-        fillRoundedRect(
-            CGRect(origin: CGPoint(x: 0, y: originY), size: size),
-            radius: 9,
-            color: NSColor.black.withAlphaComponent(0.84),
+        let rect = CGRect(origin: CGPoint(x: 0, y: originY), size: size)
+        let radius: CGFloat = 11
+        let path = CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
+        drawGlassSurface(
+            path: path,
+            bounds: rect,
+            topColor: palette.barTop,
+            bottomColor: palette.barBottom,
+            in: context
+        )
+        // 顶部柔和微反光，收在圆角内侧避免与外描边产生双线。
+        let highlightRect = rect.insetBy(dx: radius + 4, dy: 0)
+        if highlightRect.width > 4 {
+            context.saveGState()
+            context.setStrokeColor(palette.topInnerHighlight.cgColor)
+            context.setLineWidth(0.75)
+            context.beginPath()
+            context.move(to: CGPoint(x: highlightRect.minX, y: rect.minY + 1.1))
+            context.addLine(to: CGPoint(x: highlightRect.maxX, y: rect.minY + 1.1))
+            context.strokePath()
+            context.restoreGState()
+        }
+
+        // 主栏最左端 6 点微粒拖拽握把（2 列 × 3 行），低干扰暗示可拖动移位、双击复位。
+        drawDragHandleDots(in: rect, context: context)
+    }
+
+    private func drawDragHandleDots(in barRect: CGRect, context: CGContext) {
+        let dotSize: CGFloat = 1.9
+        let colGap: CGFloat = 3.2
+        let rowGap: CGFloat = 3.8
+        let centerX = barRect.minX + AnnotationToolbarLayout.padding + 1.5
+        let centerY = barRect.midY
+
+        context.saveGState()
+        context.setFillColor(palette.secondaryInk.withAlphaComponent(isDarkAppearance ? 0.36 : 0.32).cgColor)
+        for col in 0 ..< 2 {
+            for row in -1 ... 1 {
+                let x = centerX + (CGFloat(col) - 0.5) * colGap - dotSize / 2
+                let y = centerY + CGFloat(row) * rowGap - dotSize / 2
+                context.fillEllipse(in: CGRect(x: x, y: y, width: dotSize, height: dotSize))
+            }
+        }
+        context.restoreGState()
+    }
+
+    /// 绘制二级气泡面板背景及平滑一体化的 `▲`/`▼` 尖角轮廓（水平自动对齐激活工具中心）。
+    private func drawPanelBackground(_ size: CGSize, in context: CGContext) {
+        guard size.height > 0 else { return }
+        let input = layoutInput
+        let rect = input.panelFrame
+        guard rect.height > 0 else { return }
+        let radius: CGFloat = 10
+        let halfW = AnnotationToolbarLayout.panelArrowWidth / 2
+        let arrowH = AnnotationToolbarLayout.panelArrowHeight
+        let rawAnchorX = input.panelAnchorX()
+        let anchorX = min(max(rawAnchorX, rect.minX + radius + halfW + 2), rect.maxX - radius - halfW - 2)
+
+        let path = makePopoverBubblePath(
+            rect: rect,
+            cornerRadius: radius,
+            arrowCenterX: anchorX,
+            arrowHalfWidth: halfW,
+            arrowHeight: arrowH,
+            placement: input.panelPlacement
+        )
+        let gradientBounds = CGRect(
+            x: rect.minX,
+            y: input.panelPlacement == .below ? rect.minY - arrowH : rect.minY,
+            width: rect.width,
+            height: rect.height + arrowH
+        )
+        drawGlassSurface(
+            path: path,
+            bounds: gradientBounds,
+            topColor: palette.panelTop,
+            bottomColor: palette.panelBottom,
             in: context
         )
     }
 
-    /// 绘制二级气泡面板背景及指向当前激活工具图标中心的 `▲`/`▼` 尖角。
-    private func drawPanelBackground(_ size: CGSize, in context: CGContext) {
-        guard size.height > 0 else { return }
-        let input = layoutInput
-        let rect = CGRect(
-            x: 0,
-            y: input.panelOriginY,
-            width: size.width,
-            height: size.height
-        )
-        let panelColor = NSColor.black.withAlphaComponent(0.78)
-        fillRoundedRect(
-            rect,
-            radius: 8,
-            color: panelColor,
-            in: context
-        )
+    /// 构造单条连续闭合的圆角气泡 + 平滑微圆润尖角路径，使渐变填充与高光描边浑然一体。
+    private func makePopoverBubblePath(
+        rect: CGRect,
+        cornerRadius r: CGFloat,
+        arrowCenterX ax: CGFloat,
+        arrowHalfWidth hw: CGFloat,
+        arrowHeight ah: CGFloat,
+        placement: AnnotationToolbarLayout.PanelPlacement
+    ) -> CGPath {
+        let path = CGMutablePath()
+        let minX = rect.minX
+        let maxX = rect.maxX
+        let minY = rect.minY
+        let maxY = rect.maxY
+        let tipRound: CGFloat = 1.6
 
-        // 绘制气泡尖角：向下展开时尖角朝上指向主栏工具图标；向上翻转时尖角朝下指向主栏工具图标。
-        let anchorX = input.panelAnchorX()
-        let halfW = AnnotationToolbarLayout.panelArrowWidth / 2
-        let arrowH = AnnotationToolbarLayout.panelArrowHeight
-        let arrowPath = CGMutablePath()
-        switch input.panelPlacement {
-        case .below:
-            arrowPath.move(to: CGPoint(x: anchorX - halfW, y: rect.minY))
-            arrowPath.addLine(to: CGPoint(x: anchorX, y: rect.minY - arrowH))
-            arrowPath.addLine(to: CGPoint(x: anchorX + halfW, y: rect.minY))
-        case .above:
-            arrowPath.move(to: CGPoint(x: anchorX - halfW, y: rect.maxY))
-            arrowPath.addLine(to: CGPoint(x: anchorX, y: rect.maxY + arrowH))
-            arrowPath.addLine(to: CGPoint(x: anchorX + halfW, y: rect.maxY))
+        // 视图是 flipped（y 向下）：从左上圆角终点顺时针绕行。
+        path.move(to: CGPoint(x: minX + r, y: minY))
+
+        if placement == .below {
+            // 顶边向右，插入朝上的圆润尖角 ▲
+            path.addLine(to: CGPoint(x: ax - hw, y: minY))
+            path.addLine(to: CGPoint(x: ax - tipRound, y: minY - ah + tipRound * 0.8))
+            path.addQuadCurve(
+                to: CGPoint(x: ax + tipRound, y: minY - ah + tipRound * 0.8),
+                control: CGPoint(x: ax, y: minY - ah - 0.6)
+            )
+            path.addLine(to: CGPoint(x: ax + hw, y: minY))
         }
-        arrowPath.closeSubpath()
+        path.addLine(to: CGPoint(x: maxX - r, y: minY))
+        path.addArc(tangent1End: CGPoint(x: maxX, y: minY), tangent2End: CGPoint(x: maxX, y: minY + r), radius: r)
+
+        // 右边向下
+        path.addLine(to: CGPoint(x: maxX, y: maxY - r))
+        path.addArc(tangent1End: CGPoint(x: maxX, y: maxY), tangent2End: CGPoint(x: maxX - r, y: maxY), radius: r)
+
+        if placement == .above {
+            // 底边向左，插入朝下的圆润尖角 ▼
+            path.addLine(to: CGPoint(x: ax + hw, y: maxY))
+            path.addLine(to: CGPoint(x: ax + tipRound, y: maxY + ah - tipRound * 0.8))
+            path.addQuadCurve(
+                to: CGPoint(x: ax - tipRound, y: maxY + ah - tipRound * 0.8),
+                control: CGPoint(x: ax, y: maxY + ah + 0.6)
+            )
+            path.addLine(to: CGPoint(x: ax - hw, y: maxY))
+        }
+        path.addLine(to: CGPoint(x: minX + r, y: maxY))
+        path.addArc(tangent1End: CGPoint(x: minX, y: maxY), tangent2End: CGPoint(x: minX, y: maxY - r), radius: r)
+
+        // 左边向上回到起点
+        path.addLine(to: CGPoint(x: minX, y: minY + r))
+        path.addArc(tangent1End: CGPoint(x: minX, y: minY), tangent2End: CGPoint(x: minX + r, y: minY), radius: r)
+        path.closeSubpath()
+        return path
+    }
+
+    /// 通用精致微光泽玻璃浮层填充 + 细腻高光外描边。
+    private func drawGlassSurface(
+        path: CGPath,
+        bounds: CGRect,
+        topColor: NSColor,
+        bottomColor: NSColor,
+        in context: CGContext
+    ) {
         context.saveGState()
-        context.setFillColor(panelColor.cgColor)
-        context.addPath(arrowPath)
-        context.fillPath()
+        context.addPath(path)
+        context.clip()
+        if let gradient = CGGradient(
+            colorsSpace: CGColorSpaceCreateDeviceRGB(),
+            colors: [topColor.cgColor, bottomColor.cgColor] as CFArray,
+            locations: [0, 1]
+        ) {
+            context.drawLinearGradient(
+                gradient,
+                start: CGPoint(x: bounds.midX, y: bounds.minY),
+                end: CGPoint(x: bounds.midX, y: bounds.maxY),
+                options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
+            )
+        } else {
+            context.setFillColor(bottomColor.cgColor)
+            context.fill(bounds)
+        }
+        context.restoreGState()
+
+        context.saveGState()
+        context.addPath(path)
+        context.setStrokeColor(palette.border.cgColor)
+        context.setLineWidth(0.9)
+        context.setLineJoin(.round)
+        context.strokePath()
         context.restoreGState()
     }
 
@@ -181,8 +423,6 @@ final class AnnotationToolbarRenderer {
         color: NSColor,
         in context: CGContext
     ) {
-        // 用 CGPath 而非 NSBezierPath(cgPath:)：后者是 macOS 14.0+，
-        // 会超出本项目的 13.0 基线。
         let path = CGPath(
             roundedRect: rect,
             cornerWidth: radius,
@@ -197,32 +437,54 @@ final class AnnotationToolbarRenderer {
     }
 
     private func drawItem(_ item: Item, in context: CGContext, isInPanel: Bool) {
-        // 背景高亮只在这一处决定，字形交给 `drawGlyph`。
-        //
-        // 原先每个 case 各写一遍 `drawHighlight(…)`（共 16 处，参数只差
-        // `isSelected`），其中 13 处硬编码 `false`——而那些 kind 在
-        // `isSelected(_:)` 里本来就恒为 false（见该函数的 case 清单）。
-        // 统一传值后**行为完全等价**，且「哪些条目有背景」从 16 处收敛为
-        // `drawsItemHighlight(_:)` 一处可枚举的判断。
         let hover = hoveredKind == item.kind && item.isEnabled
+        let pressed = pressedKind == item.kind && item.isEnabled
+        let selected = isSelected(item.kind)
+        // 按压态提供 0.75pt 微内缩质感，松手回弹。
+        let visualRect = pressed ? item.rect.insetBy(dx: 0.75, dy: 0.75) : item.rect
 
         if Self.drawsItemHighlight(item.kind) {
             drawHighlight(
-                item.rect,
+                visualRect,
                 radius: Self.itemCornerRadius,
-                isSelected: isSelected(item.kind),
+                kind: item.kind,
+                isInPanel: isInPanel,
+                isSelected: selected,
                 isHovered: hover,
+                isPressed: pressed,
                 in: context
             )
         }
 
-        drawGlyph(for: item, in: context)
+        // 计算当前条目的语义前景色：
+        // - 主栏选中态：实心强调色胶囊配纯白；
+        // - 二级面板选中态：深色下柔光玻璃胶囊配纯白，浅色下浅强调胶囊配系统强调色，克制不抢主栏焦点。
+        if selected {
+            if isInPanel && !isDarkAppearance {
+                currentGlyphInkColor = NSColor.controlAccentColor
+            } else {
+                currentGlyphInkColor = .white
+            }
+        } else {
+            switch item.kind {
+            case .copy:
+                currentGlyphInkColor = palette.copyInk
+            case .cancel:
+                currentGlyphInkColor = (hover || pressed) ? palette.dangerInk : palette.secondaryInk
+            case .deleteSelected:
+                currentGlyphInkColor = palette.dangerInk
+            default:
+                currentGlyphInkColor = palette.primaryInk
+            }
+        }
 
-        _ = isInPanel
+        let drawTarget = pressed ? Item(kind: item.kind, rect: visualRect, isEnabled: item.isEnabled) : item
+        drawGlyph(for: drawTarget, in: context)
+        currentGlyphInkColor = palette.primaryInk
     }
 
     /// 条目背景高亮的圆角。
-    private static let itemCornerRadius: CGFloat = 6
+    private static let itemCornerRadius: CGFloat = 7.5
 
     /// 该条目是否绘制「悬停 / 选中底」。
     ///
@@ -259,6 +521,9 @@ final class AnnotationToolbarRenderer {
 
         case let .tool(tool):
             drawToolGlyph(tool, rect: rect, alpha: alpha, in: context)
+
+        case .moreTools:
+            drawMoreToolsGlyph(rect: rect, alpha: alpha, in: context)
 
         case let .color(color):
             drawSwatch(
@@ -334,16 +599,16 @@ final class AnnotationToolbarRenderer {
             )
 
         case .sketchyToggle:
-            drawSketchyToggleGlyph(rect: rect, alpha: alpha, in: context)
+            AnnotationToolbarIcons.drawSketchyToggle(in: rect, style: iconStyle(alpha), context: context)
 
         case .fillToggle:
-            drawFillToggleGlyph(rect: rect, isFilled: selected, alpha: alpha, in: context)
+            AnnotationToolbarIcons.drawFillToggle(isFilled: selected, in: rect, style: iconStyle(alpha), context: context)
 
         case .textBoldToggle:
-            drawTypographicBadge("B", bold: true, italic: false, rect: rect, alpha: alpha, in: context)
+            AnnotationToolbarIcons.drawTypographicToggle(isItalic: false, in: rect, style: iconStyle(alpha), context: context)
 
         case .textItalicToggle:
-            drawTypographicBadge("I", bold: false, italic: true, rect: rect, alpha: alpha, in: context)
+            AnnotationToolbarIcons.drawTypographicToggle(isItalic: true, in: rect, style: iconStyle(alpha), context: context)
 
         case .textFontFamily:
             let activeFamily = (hasSelectedAnnotation && selectedAnnotationIsText)
@@ -384,30 +649,28 @@ final class AnnotationToolbarRenderer {
             )
 
         case .pin:
-            drawPinGlyph(rect: rect, alpha: alpha, in: context)
+            AnnotationToolbarIcons.drawPin(in: rect, style: iconStyle(alpha), context: context)
 
         case .recognizeText:
-            drawRecognizeTextGlyph(rect: iconBox(in: rect), alpha: alpha, in: context)
+            AnnotationToolbarIcons.drawRecognizeText(in: rect, style: iconStyle(alpha), context: context)
 
         case .longScreenshot:
-            drawScrollshotGlyph(rect: iconBox(in: rect), alpha: alpha, in: context)
+            AnnotationToolbarIcons.drawScrollshot(in: rect, style: iconStyle(alpha), context: context)
 
         case .record:
-            drawRecordGlyph(rect: rect, alpha: alpha, in: context)
+            AnnotationToolbarIcons.drawRecord(in: rect, style: iconStyle(alpha), context: context)
 
         case .copy:
-            drawCopyGlyph(rect: rect, alpha: alpha, in: context)
+            AnnotationToolbarIcons.drawCopy(in: rect, style: iconStyle(alpha), context: context)
 
         case .save:
-            drawSaveGlyph(rect: rect, alpha: alpha, in: context)
+            AnnotationToolbarIcons.drawSave(in: rect, style: iconStyle(alpha), context: context)
 
         case .cancel:
-            drawSymbolGlyph("xmark", rect: rect, alpha: alpha, scale: 0.46, in: context)
+            AnnotationToolbarIcons.drawCancel(in: rect, style: iconStyle(alpha), context: context)
 
         case .deleteSelected:
-            // 垃圾桶符号：与其它「结束/破坏性」动作一样用系统符号，
-            // 手绘的桶身在 16pt 里分不清是杯子还是垃圾桶。
-            drawSymbolGlyph("trash", rect: rect, alpha: alpha, scale: 0.52, in: context)
+            AnnotationToolbarIcons.drawDelete(in: rect, style: iconStyle(alpha), context: context)
 
         case .colorPicker:
             drawColorPickerGlyph(rect: rect, alpha: alpha, in: context)
@@ -418,34 +681,126 @@ final class AnnotationToolbarRenderer {
             drawColorButton(currentColor, rect: rect, alpha: alpha, in: context)
 
         case .undo:
-            drawHistoryGlyph(isUndo: true, rect: rect, alpha: alpha, in: context)
+            AnnotationToolbarIcons.drawHistory(isUndo: true, in: rect, style: iconStyle(alpha), context: context)
 
         case .redo:
-            drawHistoryGlyph(isUndo: false, rect: rect, alpha: alpha, in: context)
+            AnnotationToolbarIcons.drawHistory(isUndo: false, in: rect, style: iconStyle(alpha), context: context)
         }
     }
 
-    /// 选中高亮：系统强调色只用于「当前生效的那个」，
-    /// 不做放大或加阴影，避免工具条里到处是彩色块。
+    private func iconStyle(_ alpha: CGFloat) -> AnnotationToolbarIcons.Style {
+        AnnotationToolbarIcons.Style(inkColor: currentGlyphInkColor, alpha: alpha)
+    }
+
+    /// 选中与悬停胶囊高亮：
+    /// - 选中态采用强调色微光泽纵渐变 + 顶部 1px 细腻内高光；
+    /// - 主栏「复制」常态带克制翡翠绿完成徽底，悬停点亮；
+    /// - 「取消 / 删除」悬停态显示柔和危险红微底。
     private func drawHighlight(
         _ rect: CGRect,
         radius: CGFloat,
+        kind: Kind? = nil,
+        isInPanel: Bool = false,
         isSelected: Bool,
         isHovered: Bool,
+        isPressed: Bool = false,
         in context: CGContext
     ) {
-        guard isSelected || isHovered else { return }
-        let color = isSelected
-            ? NSColor.controlAccentColor
-            : NSColor.white.withAlphaComponent(0.14)
-        fillRoundedRect(rect, radius: radius, color: color, in: context)
+        if isSelected {
+            if isInPanel {
+                let accent = NSColor.controlAccentColor.usingColorSpace(.sRGB)
+                    ?? NSColor(srgbRed: 0.04, green: 0.52, blue: 1.0, alpha: 1.0)
+                let fillColor = isDarkAppearance
+                    ? NSColor.white.withAlphaComponent(isPressed ? 0.24 : 0.17)
+                    : accent.withAlphaComponent(isPressed ? 0.20 : 0.13)
+                let strokeColor = isDarkAppearance
+                    ? NSColor.white.withAlphaComponent(0.18)
+                    : accent.withAlphaComponent(0.30)
+                fillRoundedRect(rect, radius: radius, color: fillColor, in: context)
+                context.saveGState()
+                context.addPath(CGPath(
+                    roundedRect: rect.insetBy(dx: 0.5, dy: 0.5),
+                    cornerWidth: max(1, radius - 0.5),
+                    cornerHeight: max(1, radius - 0.5),
+                    transform: nil
+                ))
+                context.setStrokeColor(strokeColor.cgColor)
+                context.setLineWidth(0.8)
+                context.strokePath()
+                context.restoreGState()
+                return
+            }
+
+            let accent = NSColor.controlAccentColor.usingColorSpace(.sRGB)
+                ?? NSColor(srgbRed: 0.04, green: 0.52, blue: 1.0, alpha: 1.0)
+            let topAccent = isPressed
+                ? (accent.blended(withFraction: 0.12, of: .black) ?? accent)
+                : (accent.blended(withFraction: 0.16, of: .white) ?? accent)
+            let bottomAccent = accent.blended(withFraction: isPressed ? 0.20 : 0.10, of: .black) ?? accent
+            let path = CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
+
+            context.saveGState()
+            context.addPath(path)
+            context.clip()
+            if let gradient = CGGradient(
+                colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                colors: [topAccent.cgColor, bottomAccent.cgColor] as CFArray,
+                locations: [0, 1]
+            ) {
+                context.drawLinearGradient(
+                    gradient,
+                    start: CGPoint(x: rect.midX, y: rect.minY),
+                    end: CGPoint(x: rect.midX, y: rect.maxY),
+                    options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
+                )
+            } else {
+                context.setFillColor(accent.cgColor)
+                context.fill(rect)
+            }
+            context.restoreGState()
+
+            context.saveGState()
+            context.addPath(CGPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), cornerWidth: max(1, radius - 0.5), cornerHeight: max(1, radius - 0.5), transform: nil))
+            context.setStrokeColor(NSColor.white.withAlphaComponent(0.24).cgColor)
+            context.setLineWidth(0.75)
+            context.strokePath()
+            context.restoreGState()
+            return
+        }
+
+        if kind == .copy {
+            let color: NSColor
+            if isPressed {
+                color = palette.copyHoverFill.withAlphaComponent(min(1, palette.copyHoverFill.alphaComponent + 0.12))
+            } else if isHovered {
+                color = palette.copyHoverFill
+            } else {
+                color = palette.copyIdleFill
+            }
+            fillRoundedRect(rect, radius: radius, color: color, in: context)
+            return
+        }
+
+        guard isHovered || isPressed else { return }
+        let fill: NSColor
+        switch kind {
+        case .cancel, .deleteSelected:
+            fill = isPressed
+                ? palette.dangerHoverFill.withAlphaComponent(min(1, palette.dangerHoverFill.alphaComponent + 0.12))
+                : palette.dangerHoverFill
+        default:
+            fill = isPressed
+                ? palette.hoverFill.withAlphaComponent(min(1, palette.hoverFill.alphaComponent + 0.08))
+                : palette.hoverFill
+        }
+        fillRoundedRect(rect, radius: radius, color: fill, in: context)
     }
 
     func isSelected(_ kind: Kind) -> Bool {
         // 候选阶段不显示「哪个工具生效」（理由见 `showsToolSelection`）。
         if !showsToolSelection {
             switch kind {
-            case .family, .tool: return false
+            case .family, .tool, .moreTools: return false
             default: break
             }
         }
@@ -455,6 +810,8 @@ final class AnnotationToolbarRenderer {
             return tool.family == family
         case let .tool(candidate):
             return tool == candidate
+        case .moreTools:
+            return AnnotationToolbarLayout.isSecondaryTool(tool)
         case let .color(color):
             if tool == .pointer, let selectedAnnotationColor {
                 return selectedAnnotationColor == color
@@ -530,217 +887,6 @@ final class AnnotationToolbarRenderer {
     ///
     /// 手绘版本（机身圆角矩形 + 梯形镜头）在 18pt 的按钮里比例失控、看起来像两个
     /// 小方块，故改用系统符号：它在不同字号下都保持正确的光学比例与笔画粗细。
-    /// 固定图标：一枚图钉（系统符号 `pin.fill`）。
-    ///
-    /// 为什么这里不用手绘：宽顶窄底的纵向对称结构在 16pt 绘制区里只能二选一——
-    /// 肩部斜线拉得够长就读成漏斗，缩短到够短就读成 T 或伞。
-    /// 具体取舍的完整理由见 `drawSymbolGlyph`。
-    ///
-    /// 比例比默认值大一点（0.54 对 0.46）：`pin.fill` 的字形是高瘦型，
-    /// 同样字号下视觉高度只有宽扁的 `video.fill` 的七成，
-    /// 按默认值画出来会比旁边的图标瘦一圈、量不一致。
-    private func drawPinGlyph(rect: CGRect, alpha: CGFloat, in context: CGContext) {
-        drawSymbolGlyph("pin.fill", rect: rect, alpha: alpha, scale: 0.54, in: context)
-    }
-
-    /// OCR 图标：一个四角取景框，框内三条长度递减的文字行。
-    ///
-    /// 上一版只有**右下角**一段折线，四角不成对：它读起来更像画歪的一条线，
-    /// 而不是「取景」。四个角补齐之后，中间的文字行才落进一个明确的框里，
-    /// 「从画面里取字」这层意思才立得住。
-    ///
-    /// 文字行只画三条且长度递减——排满会糊成一团灰块，
-    /// 递减则一眼是「几行字」而不是「一个表格」。
-    private func drawRecognizeTextGlyph(rect: CGRect, alpha: CGFloat, in context: CGContext) {
-        let box = iconBox(in: rect)
-        let armLength: CGFloat = 4.5
-        let rowInset: CGFloat = 4
-
-        context.saveGState()
-        defer { context.restoreGState() }
-        context.setStrokeColor(NSColor.white.withAlphaComponent(alpha).cgColor)
-        context.setLineWidth(1.6)
-        context.setLineCap(.round)
-        context.setLineJoin(.round)
-
-        // 取景框：四个角各一段折线，拐点落在绘制区顶点上。
-        let corners: [(CGPoint, CGPoint, CGPoint)] = [
-            (CGPoint(x: box.minX, y: box.minY + armLength),
-             CGPoint(x: box.minX, y: box.minY),
-             CGPoint(x: box.minX + armLength, y: box.minY)),
-            (CGPoint(x: box.maxX - armLength, y: box.minY),
-             CGPoint(x: box.maxX, y: box.minY),
-             CGPoint(x: box.maxX, y: box.minY + armLength)),
-            (CGPoint(x: box.minX, y: box.maxY - armLength),
-             CGPoint(x: box.minX, y: box.maxY),
-             CGPoint(x: box.minX + armLength, y: box.maxY)),
-            (CGPoint(x: box.maxX - armLength, y: box.maxY),
-             CGPoint(x: box.maxX, y: box.maxY),
-             CGPoint(x: box.maxX, y: box.maxY - armLength)),
-        ]
-        for (start, corner, end) in corners {
-            context.beginPath()
-            context.move(to: start)
-            context.addLine(to: corner)
-            context.addLine(to: end)
-            context.strokePath()
-        }
-
-        // 文字行：三条，长度递减。
-        let rows: [(offset: CGFloat, ratio: CGFloat)] = [
-            (-4.0, 1.00), (0.0, 0.78), (4.0, 0.55),
-        ]
-        let rowWidth = box.width - rowInset * 2
-        for row in rows {
-            let y = box.midY + row.offset
-            context.beginPath()
-            context.move(to: CGPoint(x: box.minX + rowInset, y: y))
-            context.addLine(to: CGPoint(x: box.minX + rowInset + rowWidth * row.ratio, y: y))
-            context.strokePath()
-        }
-    }
-
-    /// 长截图图标：**上下开口**的竖框 + 向下的箭头。
-    ///
-    /// 演进过程（每一版都是按真实尺寸渲染后发现的）：
-    ///
-    /// 1. 最早是「两横线 + 向下箭头 + 两横线」，与紧邻的**保存**图标
-    ///    （向下箭头 + 托盘）几乎同形，只能靠数横线的根数分辨；
-    /// 2. 改成完整闭合的圆角竖框后，与保存分开了，但在 16pt 里它读起来
-    ///    像一台**手机**（竖长比例 + 圆角），而不是「一页很长的内容」；
-    /// 3. 现在把上下边留出开口：只有左右两条带圆角的边是完整的，
-    ///    「内容还在上下继续」这层意思才立得住——那正是长截图与
-    ///    普通截图的区别所在，也是这个按钮唯一要说清的事。
-    ///
-    /// 竖框宽 11pt（绘制区 16pt 的 0.69）：再宽就像平板，再窄就与箭头
-    /// 抢不出层次。开口宽度取 3.4pt（圆角 2.2 + 直线段 1.2）：
-    /// 再小就等于没开口，再大就退化成两个括号、看不出那是个「框」。
-    private func drawScrollshotGlyph(rect: CGRect, alpha: CGFloat, in context: CGContext) {
-        let box = iconBox(in: rect)
-        let midX = box.midX
-        let frameWidth: CGFloat = 11
-        let radius: CGFloat = 2.2
-        let opening: CGFloat = 3.4
-
-        let left = midX - frameWidth / 2
-        let right = midX + frameWidth / 2
-        // 上下各留 1pt：去掉的话描边外沿正好压在绘制区边界上，
-        // 与旁边图标相比会显得「胀出去」一截。
-        let top = box.minY + 1
-        let bottom = box.maxY - 1
-
-        context.saveGState()
-        defer { context.restoreGState() }
-        context.setStrokeColor(NSColor.white.withAlphaComponent(alpha).cgColor)
-        context.setLineWidth(1.6)
-        context.setLineCap(.round)
-        context.setLineJoin(.round)
-
-        // 左右两条边：各带上下两个圆角，并在上边/下边各伸出一小段。
-        // 两条边分开画（而不是一个闭合路径）正是「开口」的实现方式。
-        for side in [left, right] {
-            let inward: CGFloat = side == left ? 1 : -1
-            context.beginPath()
-            context.move(to: CGPoint(x: side + inward * opening, y: top))
-            context.addQuadCurve(
-                to: CGPoint(x: side, y: top + radius),
-                control: CGPoint(x: side, y: top)
-            )
-            context.addLine(to: CGPoint(x: side, y: bottom - radius))
-            context.addQuadCurve(
-                to: CGPoint(x: side + inward * opening, y: bottom),
-                control: CGPoint(x: side, y: bottom)
-            )
-            context.strokePath()
-        }
-
-        // 向下的箭头：表示「一路向下捕获」。
-        // 杆比箭头头部略长，头部的两翼比框宽的一半略窄，
-        // 这样箭头在框内仍有留白，不会看起来把框塞满。
-        let headLength: CGFloat = 3.4
-        let headHalfWidth: CGFloat = 2.3
-        let tip = CGPoint(x: midX, y: bottom - radius - 1.4)
-        context.beginPath()
-        context.move(to: CGPoint(x: midX, y: top + radius + 0.8))
-        context.addLine(to: CGPoint(x: midX, y: tip.y - headLength + 0.4))
-        context.move(to: CGPoint(x: midX - headHalfWidth, y: tip.y - headLength))
-        context.addLine(to: tip)
-        context.addLine(to: CGPoint(x: midX + headHalfWidth, y: tip.y - headLength))
-        context.strokePath()
-    }
-
-    private func drawRecordGlyph(rect: CGRect, alpha: CGFloat, in context: CGContext) {
-        drawSymbolGlyph("video.fill", rect: rect, alpha: alpha, in: context)
-    }
-
-    /// 用系统符号画一个按钮图标（模板图染白）。
-    ///
-    /// 工具栏里的图标绝大多数是自绘的：它们的笔画粗细、比例都能共享同一套
-    /// 常量，整排看起来才像一套东西。只有两个图标例外——录制（`video.fill`）
-    /// 与固定（`pin.fill`），两者都是**先试过手绘、按真实按钮尺寸渲染后发现站不住**：
-    ///
-    /// - 录制：机身圆角矩形 + 梯形镜头，在 18pt 按钮里比例失控，像两个小方块；
-    /// - 固定：宽顶窄底的纵向对称结构，无论帽线加粗到多少、肩部斜线收到多短，
-    ///   在 16pt 绘制区里都会糊成一个倒三角，读起来是漏斗或伞（前后试了二十多个变体）。
-    ///
-    /// 这里的关键是先例：判断「像不像」必须按**真实尺寸**看。
-    /// 放大到 5 倍时手绘版本都很好看，缩回 28pt 按钮里才暴露问题。
-    /// 系统符号在不同字号下都保持正确的光学比例与笔画粗细，因此这两个例外用它。
-    ///
-    /// - Parameters:
-    ///   - name: SF Symbol 名称。
-    ///   - rect: 按钮区域（不是绘制区）：符号按短边的 `scale` 倍确定字号。
-    ///   - alpha: 不透明度（禁用态用）。
-    ///   - scale: 符号字号相对按钮短边的比例。
-    private func drawSymbolGlyph(
-        _ name: String,
-        rect: CGRect,
-        alpha: CGFloat,
-        scale: CGFloat = 0.46,
-        in context: CGContext
-    ) {
-        guard let base = NSImage(systemSymbolName: name, accessibilityDescription: nil) else {
-            return
-        }
-        let pointSize = min(rect.width, rect.height) * scale
-        let configuration = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .medium)
-        guard let symbol = base.withSymbolConfiguration(configuration) else { return }
-
-        // 模板图像不会自带颜色：用 sourceAtop 把整幅符号染成白色。
-        let tinted = NSImage(size: symbol.size, flipped: false) { drawRect in
-            symbol.draw(in: drawRect)
-            NSColor.white.withAlphaComponent(alpha).set()
-            drawRect.fill(using: .sourceAtop)
-            return true
-        }
-
-        let target = CGRect(
-            x: rect.midX - symbol.size.width / 2,
-            y: rect.midY - symbol.size.height / 2,
-            width: symbol.size.width,
-            height: symbol.size.height
-        )
-        // 本视图的绘制走的是 CGContext，绘制 NSImage 需要临时桥接一个 NSGraphicsContext。
-        //
-        // ⚠️ `flipped:` 必须为 **true**，它描述的是「这个 CTM 已经翻了」，不是期望。
-        // `AnnotationToolbarView.isFlipped == true`，AppKit 交给 `draw(_:)` 的 CTM 就是
-        // 左上原点、y 向下；这里写 false 等于告诉 AppKit「没翻过」，它会再翻一次——
-        // 凡走 `NSImage.draw` 的符号全部上下颠倒。
-        //
-        // 实测（与本节同一条代码路径：flipped 视图 CTM + 本桥接方式，各自渲染成图）：
-        // `pin.fill` 在未翻转上下文里是「帽在上、针尖朝下」（卡片按钮上看到的就是它），
-        // 而本方法旧版（false）渲染出来针尖朝**上**——用户报告的「截图图钉方向反了」
-        // 就是它；改成 true 后与未翻转上下文逐行一致。
-        // `video.fill` 上下近似对称，肉眼与断言都看不出来，所以这条更得靠对照渲染看。
-        //
-        // 参照：`SettingsComponents` 里的 `drawSymbol` 直接用 AppKit 设好的
-        // `NSGraphicsContext.current`，不需要这个参数，也就不存在这个坑。
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
-        tinted.draw(in: target)
-        NSGraphicsContext.restoreGraphicsState()
-    }
-
     /// 图标的统一绘制区：按钮内居中的正方形。
     ///
     /// 不让每个图标各自 `insetBy`：图标的光学重心并不一样
@@ -755,20 +901,25 @@ final class AnnotationToolbarRenderer {
         )
     }
 
-    /// 主栏的颜色入口：一个圆形色块，与工具图标同一绘制区尺寸。
+    /// 主栏的颜色入口：精致双环圆形色球，与工具图标光学体量一致。
     private func drawColorButton(
         _ color: RGBAColor,
         rect: CGRect,
         alpha: CGFloat,
         in context: CGContext
     ) {
-        let box = iconBox(in: rect, size: 16)
+        let outer = iconBox(in: rect, size: 17)
+        let inner = iconBox(in: rect, size: 13.5)
 
         context.saveGState()
+        // 外细环：强化浅色/深色背景下的轮廓识别。
+        context.setStrokeColor(palette.primaryInk.withAlphaComponent(0.32 * alpha).cgColor)
+        context.setLineWidth(1.0)
+        context.strokeEllipse(in: outer.insetBy(dx: 0.5, dy: 0.5))
+
         if color.a < 0.99 {
-            // 半透明荧光色入口先垫浅灰底，体现半透明质感。
-            context.setFillColor(NSColor.white.withAlphaComponent(0.25 * alpha).cgColor)
-            context.fillEllipse(in: box)
+            context.setFillColor(palette.primaryInk.withAlphaComponent(0.18 * alpha).cgColor)
+            context.fillEllipse(in: inner)
         }
         context.setFillColor(NSColor(
             srgbRed: CGFloat(color.r),
@@ -776,43 +927,41 @@ final class AnnotationToolbarRenderer {
             blue: CGFloat(color.b),
             alpha: alpha * CGFloat(color.a)
         ).cgColor)
-        context.fillEllipse(in: box)
-        // 深色（尤其纯黑）在深色浮层上看不出来，统一描一圈浅边。
-        context.setStrokeColor(NSColor.white.withAlphaComponent(0.45 * alpha).cgColor)
-        context.setLineWidth(1)
-        context.strokeEllipse(in: box.insetBy(dx: 0.5, dy: 0.5))
+        context.fillEllipse(in: inner)
+
+        context.setStrokeColor(
+            (isDarkAppearance ? NSColor.white : NSColor.black).withAlphaComponent(0.22 * alpha).cgColor
+        )
+        context.setLineWidth(0.75)
+        context.strokeEllipse(in: inner.insetBy(dx: 0.375, dy: 0.375))
         context.restoreGState()
     }
 
-    /// 完整取色器入口：画成色相环。
-    ///
-    /// 用色相环而不是加号/省略号：它一眼表达「这里能选任意颜色」，
-    /// 与旁边的固定色卡形成明确区分。
+    /// 完整取色器入口：24 段平滑连续彩虹色环。
     private func drawColorPickerGlyph(rect: CGRect, alpha: CGFloat, in context: CGContext) {
-        let box = iconBox(in: rect, size: 15)
+        let box = iconBox(in: rect, size: 15.5)
         let center = CGPoint(x: box.midX, y: box.midY)
-        let radius = box.width / 2 - 1
+        let radius = box.width / 2 - 1.2
 
-        let segments = 12
+        let segments = 24
         context.saveGState()
-        context.setLineWidth(2.5)
+        context.setLineWidth(2.4)
         context.setLineCap(.butt)
         for index in 0 ..< segments {
             let start = CGFloat(index) / CGFloat(segments) * 2 * .pi
             let end = CGFloat(index + 1) / CGFloat(segments) * 2 * .pi
-            // 细分时略微重叠，避免扇段之间出现缝隙。
             let hue = (CGFloat(index) + 0.5) / CGFloat(segments)
             context.setStrokeColor(NSColor(
                 hue: hue,
-                saturation: 0.85,
-                brightness: 0.95,
+                saturation: 0.86,
+                brightness: 0.96,
                 alpha: alpha
             ).cgColor)
             context.addArc(
                 center: center,
                 radius: radius,
                 startAngle: start,
-                endAngle: end + 0.02,
+                endAngle: end + 0.04,
                 clockwise: false
             )
             context.strokePath()
@@ -820,6 +969,7 @@ final class AnnotationToolbarRenderer {
         context.restoreGState()
     }
 
+    /// 面板色卡圆点：内缩色心（13pt）+ 严格落在命中区内的通透选中外环，彻底消除与相邻色点碰撞。
     private func drawSwatch(
         _ color: RGBAColor,
         rect: CGRect,
@@ -834,34 +984,45 @@ final class AnnotationToolbarRenderer {
             blue: CGFloat(color.b),
             alpha: alpha * CGFloat(color.a)
         )
+        let coreDiameter: CGFloat = isSelected ? 12.6 : (isHovered ? 14.0 : 13.4)
+        let coreRect = CGRect(
+            x: rect.midX - coreDiameter / 2,
+            y: rect.midY - coreDiameter / 2,
+            width: coreDiameter,
+            height: coreDiameter
+        )
 
         context.saveGState()
         if color.a < 0.99 {
-            context.setFillColor(NSColor.white.withAlphaComponent(0.22 * alpha).cgColor)
-            context.fillEllipse(in: rect)
+            context.setFillColor(palette.primaryInk.withAlphaComponent(0.18 * alpha).cgColor)
+            context.fillEllipse(in: coreRect)
         }
         context.setFillColor(fill.cgColor)
-        context.fillEllipse(in: rect)
+        context.fillEllipse(in: coreRect)
+
+        // 统一细腻微描边，保证纯黑在深色底、纯白在浅色底均边界清晰。
+        let luminance = 0.299 * color.r + 0.587 * color.g + 0.114 * color.b
+        let strokeColor: NSColor
+        if isDarkAppearance && luminance < 0.22 {
+            strokeColor = NSColor.white.withAlphaComponent(0.38 * alpha)
+        } else if !isDarkAppearance && luminance > 0.82 {
+            strokeColor = NSColor.black.withAlphaComponent(0.24 * alpha)
+        } else {
+            strokeColor = (isDarkAppearance ? NSColor.white : NSColor.black).withAlphaComponent(0.14 * alpha)
+        }
+        context.setStrokeColor(strokeColor.cgColor)
+        context.setLineWidth(0.8)
+        context.strokeEllipse(in: coreRect.insetBy(dx: 0.4, dy: 0.4))
         context.restoreGState()
 
-        // 深色块（黑）在深色底上看不见，给一圈浅描边保证可辨识。
-        let needsOutline = color.r + color.g + color.b < 0.5
-        if needsOutline {
-            context.saveGState()
-            context.setStrokeColor(NSColor.white.withAlphaComponent(0.35 * alpha).cgColor)
-            context.setLineWidth(1)
-            context.strokeEllipse(in: rect.insetBy(dx: 0.5, dy: 0.5))
-            context.restoreGState()
-        }
-
-        // 选中态：外圈再描一道白环，不改尺寸。
+        // 选中/悬停外环：严格限制在 `rect`（18×18）内，与色心之间留出通透呼吸环，绝不撞隔壁。
         guard isSelected || isHovered else { return }
         context.saveGState()
         context.setStrokeColor(
-            (isSelected ? NSColor.white : NSColor.white.withAlphaComponent(0.4)).cgColor
+            (isSelected ? palette.swatchSelectedRing : palette.swatchHoverRing).cgColor
         )
-        context.setLineWidth(isSelected ? 2 : 1.5)
-        context.strokeEllipse(in: rect.insetBy(dx: -3, dy: -3))
+        context.setLineWidth(isSelected ? 1.65 : 1.15)
+        context.strokeEllipse(in: rect.insetBy(dx: 0.85, dy: 0.85))
         context.restoreGState()
     }
 
@@ -873,23 +1034,21 @@ final class AnnotationToolbarRenderer {
         alpha: CGFloat,
         in context: CGContext
     ) {
-        drawHighlight(rect, radius: 6, isSelected: isSelected, isHovered: isHovered, in: context)
+        drawHighlight(rect, radius: Self.itemCornerRadius, isInPanel: true, isSelected: isSelected, isHovered: isHovered, in: context)
 
-        // 与图标字形（「T」「1」）走**同一套**居中逻辑，只是字号与字重不同。
-        //
-        // 上一版自己按 `NSAttributedString.size.height` 居中，而那个高度含
-        // ascent / descent / leading，ascent 里又留着重音符号等大写字母用不到
-        // 的空间——结果是全部文字按钮**整体偏下**，实测 12pt 下偏 3.2pt。
-        // 在 26pt 高的按钮里这不是「差一点」，而是一眼就能看出没对齐：
-        // 「直」「25」「框选」以及号档数字都骑着按钮的下半部。
+        let savedInk = currentGlyphInkColor
+        if isSelected {
+            currentGlyphInkColor = isDarkAppearance ? .white : NSColor.controlAccentColor
+        }
         drawCenteredGlyphText(
             text,
             pointSize: 12,
-            weight: .medium,
+            weight: isSelected ? .semibold : .medium,
             center: CGPoint(x: rect.midX, y: rect.midY),
             alpha: alpha,
             in: context
         )
+        currentGlyphInkColor = savedInk
     }
 
     /// 滑块左端的标识图形。
@@ -922,75 +1081,21 @@ final class AnnotationToolbarRenderer {
         )
 
         context.saveGState()
-        context.setStrokeColor(NSColor.white.withAlphaComponent(alpha).cgColor)
-        context.setFillColor(NSColor.white.withAlphaComponent(alpha).cgColor)
+        context.setStrokeColor(ink(alpha).cgColor)
+        context.setFillColor(ink(alpha).cgColor)
         context.setLineCap(.round)
         context.setLineJoin(.round)
 
         switch glyph {
         case .lineWidth:
-            drawLineWidthGlyph(box: box, in: context)
+            AnnotationToolbarIcons.drawLineWidthSliderGlyph(in: box, style: iconStyle(alpha), context: context)
         case .arrowHeadScale:
-            drawArrowHeadScaleGlyph(box: box, in: context)
+            AnnotationToolbarIcons.drawArrowHeadSliderGlyph(in: box, style: iconStyle(alpha), context: context)
         case .mosaicBrush:
-            drawMosaicBrushGlyph(box: box, in: context)
+            AnnotationToolbarIcons.drawMosaicBrushSliderGlyph(in: box, style: iconStyle(alpha), context: context)
         }
 
         context.restoreGState()
-    }
-
-    /// 线宽标识：三条**等长、粗细递增**的横线。
-    ///
-    /// 不用「一条粗线」：单线看不出「可调粗细」这回事，与轨道本身也容易混。
-    /// 三条从细到粗的线一眼就是「粗细刻度」，正是滑块控制的那件事。
-    /// 也不做成长度递减：那会读成一个阶梯，反而看不出与粗细有关。
-    private func drawLineWidthGlyph(box: CGRect, in context: CGContext) {
-        let widths: [CGFloat] = [1.2, 2.4, 4] 
-        let step = box.height / CGFloat(widths.count)
-
-        for (index, width) in widths.enumerated() {
-            context.setLineWidth(width)
-            let y = box.minY + step * (CGFloat(index) + 0.5)
-            context.move(to: CGPoint(x: box.minX + 1, y: y))
-            context.addLine(to: CGPoint(x: box.maxX - 1, y: y))
-            context.strokePath()
-        }
-    }
-
-    /// 箭头大小标识：**头部占主导**加一小段短杆。
-    ///
-    /// 与工具栏的「箭头」工具图标刻意拉开：那个是 45° 斜线 + 头部，
-    /// 这里水平放置且杆故意画得很短，让头部占满绘制区——
-    /// 一眼是「头部尺寸」而不是「换成箭头工具」。
-    private func drawArrowHeadScaleGlyph(box: CGRect, in context: CGContext) {
-        let tip = CGPoint(x: box.maxX - 0.6, y: box.midY)
-        let baseX = box.minX + 5
-        let halfHeight: CGFloat = 5
-
-        // 杆：只到头部底边，避免线宽在三角形外露出一截。
-        context.setLineWidth(1.6)
-        context.move(to: CGPoint(x: box.minX + 0.6, y: box.midY))
-        context.addLine(to: CGPoint(x: baseX, y: box.midY))
-        context.strokePath()
-
-        // 头部：占绘制区右侧三分之二。
-        context.beginPath()
-        context.move(to: tip)
-        context.addLine(to: CGPoint(x: baseX, y: box.midY - halfHeight))
-        context.addLine(to: CGPoint(x: baseX, y: box.midY + halfHeight))
-        context.closePath()
-        context.fillPath()
-    }
-
-    /// 涂抹笔刷标识：一个圆环。
-    ///
-    /// 不用棋盘格（那是马赛克块大小的语义）：笔刷大小说的是**笔头多粗**，
-    /// 而「一个圆」正是笔刷在画面上的形状，与旁边的线宽（三条横线）、
-    /// 箭头大小（三角头部）三者形状互不重叠。
-    /// 画成空心环而不是实心圆：实心白圆与面板左侧的彩色色卡在轮廓上太像。
-    private func drawMosaicBrushGlyph(box: CGRect, in context: CGContext) {
-        context.setLineWidth(1.6)
-        context.strokeEllipse(in: box.insetBy(dx: 1.6, dy: 1.6))
     }
 
     /// 马赛克块大小的档位图标：块越粗，格子越大越少。
@@ -1012,25 +1117,23 @@ final class AnnotationToolbarRenderer {
         let cell = box.width / CGFloat(cells)
 
         context.saveGState()
-        context.setFillColor(NSColor.white.withAlphaComponent(alpha).cgColor)
+        context.setFillColor(ink(alpha).cgColor)
         for row in 0 ..< cells {
             for column in 0 ..< cells where (row + column) % 2 == 0 {
-                context.fill(CGRect(
-                    x: box.minX + CGFloat(column) * cell,
-                    y: box.minY + CGFloat(row) * cell,
-                    width: cell,
-                    height: cell
-                ))
+                let tile = CGRect(
+                    x: box.minX + CGFloat(column) * cell + 0.4,
+                    y: box.minY + CGFloat(row) * cell + 0.4,
+                    width: max(1, cell - 0.8),
+                    height: max(1, cell - 0.8)
+                )
+                context.addPath(CGPath(roundedRect: tile, cornerWidth: 1.0, cornerHeight: 1.0, transform: nil))
+                context.fillPath()
             }
         }
         context.restoreGState()
     }
 
     /// 编号半径的档位图标：三个直径的圆环 + 圆心一点。
-    ///
-    /// 数字（14 / 20 / 28）不告诉用户那是半径。圆环的大小直接就是
-    /// 「编号标记会画多大」。圆心那一点是为了与面板里的彩色色卡
-    ///（纯实心圆）区分开。
     private func drawNumberingRadiusGlyph(
         _ radius: Double,
         rect: CGRect,
@@ -1043,8 +1146,8 @@ final class AnnotationToolbarRenderer {
         let diameter = diameters[min(index, diameters.count - 1)]
 
         context.saveGState()
-        context.setStrokeColor(NSColor.white.withAlphaComponent(alpha).cgColor)
-        context.setFillColor(NSColor.white.withAlphaComponent(alpha).cgColor)
+        context.setStrokeColor(ink(alpha).cgColor)
+        context.setFillColor(ink(alpha).cgColor)
         context.setLineWidth(1.5)
 
         context.strokeEllipse(in: CGRect(
@@ -1093,9 +1196,9 @@ final class AnnotationToolbarRenderer {
         )
 
         context.saveGState()
-        context.setStrokeColor(NSColor.white.withAlphaComponent(alpha).cgColor)
-        context.setFillColor(NSColor.white.withAlphaComponent(alpha).cgColor)
-        context.setLineWidth(1.6)
+        context.setStrokeColor(ink(alpha).cgColor)
+        context.setFillColor(ink(alpha).cgColor)
+        context.setLineWidth(1.55)
         context.setLineCap(.round)
         context.setLineJoin(.round)
 
@@ -1180,14 +1283,7 @@ final class AnnotationToolbarRenderer {
         )
     }
 
-    /// 线宽滑块：轨道 + 已填充段 + 圆形手柄 + 右侧数值。
-    ///
-    /// 数值必须给：滑块只表达「在范围内的大致位置」，而线宽是**模型单位**
-    /// （底图像素），用户需要知道写进图里的到底是几像素。
-    ///
-    /// 手柄用固定半径的圆，而不是「按线宽变化的粗横线」：
-    /// 后者在 1~24 的范围里必须先压缩到一个能看到的最大粗细，
-    /// 压缩后相邻值（如 20 与 24）看起来一样粗，反而失去了表达力。
+    /// 现代 macOS 胶囊滑块：柔和轨道 + 强调色已填段 + 带软影白圆球手柄 + 等宽数值读数。
     private func drawSlider(
         value: Double,
         range: ClosedRange<Double>,
@@ -1206,10 +1302,9 @@ final class AnnotationToolbarRenderer {
         )
 
         context.saveGState()
-        context.setFillColor(NSColor.white.withAlphaComponent(alpha).cgColor)
 
         // 轨道底色：整条范围。
-        context.setFillColor(NSColor.white.withAlphaComponent(0.25 * alpha).cgColor)
+        context.setFillColor(palette.sliderTrack.withAlphaComponent(palette.sliderTrack.alphaComponent * alpha).cgColor)
         context.addPath(CGPath(
             roundedRect: track,
             cornerWidth: track.height / 2,
@@ -1218,7 +1313,7 @@ final class AnnotationToolbarRenderer {
         ))
         context.fillPath()
 
-        // 已填充段：左端到手柄，表达「当前值在范围里的位置」。
+        // 已填充段：采用系统强调色。
         let filled = CGRect(
             x: track.minX,
             y: track.minY,
@@ -1226,7 +1321,7 @@ final class AnnotationToolbarRenderer {
             height: track.height
         )
         if filled.width > 0 {
-            context.setFillColor(NSColor.white.withAlphaComponent(alpha).cgColor)
+            context.setFillColor(NSColor.controlAccentColor.withAlphaComponent(alpha).cgColor)
             context.addPath(CGPath(
                 roundedRect: filled,
                 cornerWidth: filled.height / 2,
@@ -1236,15 +1331,27 @@ final class AnnotationToolbarRenderer {
             context.fillPath()
         }
 
-        // 手柄：白色圆点。
-        let radius: CGFloat = isHovered ? 6 : 5
-        context.setFillColor(NSColor.white.withAlphaComponent(alpha).cgColor)
-        context.fillEllipse(in: CGRect(
+        // 手柄：精致纯白圆球 + 柔和微投影 + 细腻轮廓描边。
+        let radius: CGFloat = isHovered ? 6.0 : 5.2
+        let knobRect = CGRect(
             x: knobCenter.x - radius,
             y: knobCenter.y - radius,
             width: radius * 2,
             height: radius * 2
-        ))
+        )
+        context.saveGState()
+        context.setShadow(
+            offset: CGSize(width: 0, height: 1),
+            blur: 3,
+            color: NSColor.black.withAlphaComponent(0.32).cgColor
+        )
+        context.setFillColor(NSColor.white.withAlphaComponent(alpha).cgColor)
+        context.fillEllipse(in: knobRect)
+        context.restoreGState()
+
+        context.setStrokeColor(NSColor.black.withAlphaComponent(isDarkAppearance ? 0.14 : 0.22).cgColor)
+        context.setLineWidth(0.7)
+        context.strokeEllipse(in: knobRect.insetBy(dx: 0.35, dy: 0.35))
 
         drawRightAlignedText(
             label,
@@ -1278,7 +1385,7 @@ final class AnnotationToolbarRenderer {
             : String(format: "%.1f", value)
     }
 
-    /// 右对齐画一段小号数值文字（中点对齐到 `anchor` 的纵向位置）。
+    /// 右对齐画一段等宽小号数值文字（中点对齐到 `anchor` 的纵向位置，拖动时不抖动）。
     private func drawRightAlignedText(
         _ text: String,
         anchor: CGPoint,
@@ -1286,21 +1393,18 @@ final class AnnotationToolbarRenderer {
         in context: CGContext
     ) {
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
-            .foregroundColor: NSColor.white.withAlphaComponent(alpha),
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: palette.secondaryInk.withAlphaComponent(palette.secondaryInk.alphaComponent * alpha),
         ]
         let attributed = NSAttributedString(string: text, attributes: attributes)
         let size = attributed.size()
         let line = CTLineCreateWithAttributedString(attributed)
 
         context.saveGState()
-        // 视图是左上原点，文字绘制需要 y 轴向上。
         context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
         context.textPosition = CGPoint(
             x: anchor.x - size.width,
-            // 视图原点在左上，文字绘制按 y 向上：基线要下移半个行高，
-            // 视觉上（而不是几何上）才是与手柄同心。
-            y: anchor.y + size.height / 2
+            y: anchor.y + size.height / 2 - 1.0
         )
         CTLineDraw(line, context)
         context.restoreGState()
@@ -1313,454 +1417,42 @@ final class AnnotationToolbarRenderer {
         alpha: CGFloat,
         in context: CGContext
     ) {
+        let targetTool: AnnotationTool
         switch family {
         case .pointer:
-            drawPointerGlyph(rect: rect, alpha: alpha, in: context)
+            targetTool = .pointer
         case .shape:
-            // 形状组显示当前形状，用户一眼能看出选的是矩形还是箭头。
-            let shape: AnnotationTool
-            switch tool.family {
-            case .shape: shape = tool
-            default: shape = .rectangle
-            }
-            drawShapeGlyph(shape, rect: rect, alpha: alpha, in: context)
+            targetTool = tool.family == .shape ? tool : .rectangle
         case .text:
-            drawTextGlyph(rect: rect, alpha: alpha, in: context)
+            targetTool = .text
         case .mosaic:
-            // 与形状组同理：分组图标跟随组内当前工具。
-            // 否则用户用快捷键切到放大镜后，主栏还画着马赛克方块阵列，等于没有反馈。
-            if tool == .magnifier {
-                drawMagnifierGlyph(rect: rect, alpha: alpha, in: context)
-            } else {
-                drawMosaicGlyph(rect: rect, alpha: alpha, in: context)
-            }
+            targetTool = tool == .magnifier ? .magnifier : .mosaic
         }
+        AnnotationToolbarIcons.drawTool(targetTool, in: rect, style: iconStyle(alpha), context: context)
     }
 
-    /// 面板里的具体工具图标。
+    /// 主栏「更多工具」图标：激活次高频工具时展示对应双色图标 + 右下角展开微角标；否则展示三点图标。
+    private func drawMoreToolsGlyph(rect: CGRect, alpha: CGFloat, in context: CGContext) {
+        let activeSecondary = AnnotationToolbarLayout.isSecondaryTool(tool) ? tool : nil
+        AnnotationToolbarIcons.drawMoreTools(
+            activeSecondaryTool: activeSecondary,
+            in: rect,
+            style: iconStyle(alpha),
+            context: context
+        )
+    }
+
+    /// 面板里的具体工具图标：统一走精雕双色线性引擎。
     private func drawToolGlyph(
         _ tool: AnnotationTool,
         rect: CGRect,
         alpha: CGFloat,
         in context: CGContext
     ) {
-        switch tool.family {
-        case .shape:
-            drawShapeGlyph(tool, rect: rect, alpha: alpha, in: context)
-        case .text:
-            drawTextGlyph(rect: rect, alpha: alpha, in: context)
-        case .mosaic:
-            // 马赛克与放大镜同属一组，图标必须分开：两者都是像素处理，
-            // 画成同一个方块阵列就再也分不出选的是哪个。
-            if tool == .magnifier {
-                drawMagnifierGlyph(rect: rect, alpha: alpha, in: context)
-            } else {
-                drawMosaicGlyph(rect: rect, alpha: alpha, in: context)
-            }
-        case .pointer:
-            drawPointerGlyph(rect: rect, alpha: alpha, in: context)
-        }
+        AnnotationToolbarIcons.drawTool(tool, in: rect, style: iconStyle(alpha), context: context)
     }
 
-    private func drawPointerGlyph(rect: CGRect, alpha: CGFloat, in context: CGContext) {
-        // 先按单位坐标构造箭头，再整体缩放平移到绘制区中心。
-        // 直接按绘制区比例写死坐标的话，箭头自身的重心会把它带偏。
-        let box = iconBox(in: rect, size: 16)
-
-        // 单位坐标（y 向下）：经典的指针轮廓，尾部落在左上角。
-        let outline: [CGPoint] = [
-            CGPoint(x: 0.00, y: 0.00),
-            CGPoint(x: 0.00, y: 1.00),
-            CGPoint(x: 0.26, y: 0.72),
-            CGPoint(x: 0.45, y: 1.00),
-            CGPoint(x: 0.63, y: 0.90),
-            CGPoint(x: 0.44, y: 0.63),
-            CGPoint(x: 0.82, y: 0.62),
-        ]
-
-        let path = CGMutablePath()
-        for (index, point) in outline.enumerated() {
-            let mapped = CGPoint(
-                x: box.minX + point.x * box.width,
-                y: box.minY + point.y * box.height
-            )
-            if index == 0 {
-                path.move(to: mapped)
-            } else {
-                path.addLine(to: mapped)
-            }
-        }
-        path.closeSubpath()
-
-        context.saveGState()
-        context.setFillColor(NSColor.white.withAlphaComponent(alpha).cgColor)
-        context.addPath(path)
-        context.fillPath()
-        context.restoreGState()
-    }
-
-    /// 形状组工具的图标。
-    ///
-    /// 分派必须**穷尽到每个工具**，不能留宽泛的 `default`。
-    ///
-    /// 上一版只写了 `line` / `arrow` 两个分支，其余全部落进 `default` 画成同一个
-    /// 空心方框——于是编号、高亮、测量、手绘、曲线箭头五个工具在面板里长得一模一样，
-    /// 用户只能靠一个个试才知道哪个是哪个。这类「静默降级」不会编译报错，
-    /// 也不会让任何诊断失败，只能靠肉眼看出「好几个都没有图标」。
-    ///
-    /// 显式列出全部 case 之后，将来往 `AnnotationTool` 里新增形状工具会**编译不过**，
-    /// 强制补齐图标，而不是再退化成一个方框。
-    private func drawShapeGlyph(
-        _ shape: AnnotationTool,
-        rect: CGRect,
-        alpha: CGFloat,
-        in context: CGContext
-    ) {
-        let box = iconBox(in: rect)
-
-        context.saveGState()
-        context.setStrokeColor(NSColor.white.withAlphaComponent(alpha).cgColor)
-        context.setLineWidth(1.6)
-        context.setLineCap(.round)
-        context.setLineJoin(.round)
-
-        switch shape {
-        case .rectangle:
-            drawRectangleGlyph(box: box, in: context)
-
-        case .ellipse:
-            drawEllipseGlyph(box: box, in: context)
-
-        case .line:
-            drawLineGlyph(box: box, in: context)
-
-        case .arrow:
-            drawArrowGlyph(box: box, alpha: alpha, in: context)
-
-        case .numbering:
-            drawNumberingGlyph(box: box, alpha: alpha, in: context)
-
-        case .highlight:
-            drawHighlightGlyph(box: box, alpha: alpha, in: context)
-
-        case .measure:
-            drawMeasureGlyph(box: box, in: context)
-
-        case .freehand:
-            drawFreehandGlyph(box: box, in: context)
-
-        case .curvedArrow:
-            drawCurvedArrowGlyph(box: box, alpha: alpha, in: context)
-
-        case .spotlight:
-            drawSpotlightGlyph(box: box, alpha: alpha, in: context)
-
-        case .pointer, .text, .mosaic, .magnifier:
-            // 这四个不属于形状组，两个调用方都先按 family 分派，正常路径到不了这里。
-            // 仍然显式列出（而不是交给 `default`）的理由见方法头。
-            drawRectangleGlyph(box: box, in: context)
-        }
-
-        context.restoreGState()
-    }
-
-    /// 矩形：一个空心方框。
-    private func drawRectangleGlyph(box: CGRect, in context: CGContext) {
-        context.stroke(box)
-    }
-
-    /// 椭圆：一个水平微扁的空心椭圆（区别于编号的圆形外框）。
-    private func drawEllipseGlyph(box: CGRect, in context: CGContext) {
-        context.strokeEllipse(in: box.insetBy(dx: 0.4, dy: 2.2))
-    }
-
-    /// 聚光灯：外层柔和暗框 + 中央高亮聚焦圆角窗，清晰表达“焦点亮、四周暗”。
-    private func drawSpotlightGlyph(box: CGRect, alpha: CGFloat, in context: CGContext) {
-        let outer = CGPath(roundedRect: box, cornerWidth: 2.5, cornerHeight: 2.5, transform: nil)
-        let innerRect = box.insetBy(dx: 3.4, dy: 3.4)
-        let inner = CGPath(roundedRect: innerRect, cornerWidth: 2.0, cornerHeight: 2.0, transform: nil)
-
-        let maskPath = CGMutablePath()
-        maskPath.addPath(outer)
-        maskPath.addPath(inner)
-
-        context.saveGState()
-        context.setFillColor(NSColor.white.withAlphaComponent(alpha * 0.45).cgColor)
-        context.addPath(maskPath)
-        context.fillPath(using: .evenOdd)
-
-        context.setStrokeColor(NSColor.white.withAlphaComponent(alpha).cgColor)
-        context.setLineWidth(1.5)
-        context.addPath(inner)
-        context.strokePath()
-        context.restoreGState()
-    }
-
-    /// 填充开关：描边方框内带实心/半透明填充色块。
-    private func drawFillToggleGlyph(rect: CGRect, isFilled: Bool, alpha: CGFloat, in context: CGContext) {
-        let box = iconBox(in: rect).insetBy(dx: 1, dy: 1)
-        let path = CGPath(roundedRect: box, cornerWidth: 2.5, cornerHeight: 2.5, transform: nil)
-        context.saveGState()
-        context.addPath(path)
-        context.setFillColor(
-            NSColor.white.withAlphaComponent(isFilled ? alpha * 0.65 : alpha * 0.22).cgColor
-        )
-        context.fillPath()
-        context.addPath(path)
-        context.setStrokeColor(NSColor.white.withAlphaComponent(alpha).cgColor)
-        context.setLineWidth(1.5)
-        context.strokePath()
-        context.restoreGState()
-    }
-
-    /// 文字粗体 `B` / 斜体 `I` 紧凑字形按钮。
-    private func drawTypographicBadge(
-        _ symbol: String,
-        bold: Bool,
-        italic: Bool,
-        rect: CGRect,
-        alpha: CGFloat,
-        in context: CGContext
-    ) {
-        let baseFont: NSFont = bold
-            ? .systemFont(ofSize: 13.5, weight: .bold)
-            : .systemFont(ofSize: 13.5, weight: .medium)
-        let font: NSFont
-        if italic {
-            font = NSFontManager.shared.convert(baseFont, toHaveTrait: .italicFontMask)
-        } else {
-            font = baseFont
-        }
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor.white.withAlphaComponent(alpha),
-        ]
-        let attributed = NSAttributedString(string: symbol, attributes: attrs)
-        let size = attributed.size()
-        let drawOrigin = CGPoint(
-            x: rect.midX - size.width / 2,
-            y: rect.midY - size.height / 2
-        )
-        NSGraphicsContext.saveGraphicsState()
-        let nsContext = NSGraphicsContext(cgContext: context, flipped: true)
-        NSGraphicsContext.current = nsContext
-        attributed.draw(at: drawOrigin)
-        NSGraphicsContext.restoreGraphicsState()
-    }
-
-    /// 手绘风格开关：双描边微扰手绘方框，体现随手勾勒效果。
-    private func drawSketchyToggleGlyph(rect: CGRect, alpha: CGFloat, in context: CGContext) {
-        let box = iconBox(in: rect)
-        context.saveGState()
-        context.setStrokeColor(NSColor.white.withAlphaComponent(alpha).cgColor)
-        context.setLineCap(.round)
-        context.setLineJoin(.round)
-
-        // 第一遍微倾手绘外框
-        context.setLineWidth(1.4)
-        let first = CGMutablePath()
-        first.move(to: CGPoint(x: box.minX + 0.5, y: box.minY + 1.2))
-        first.addQuadCurve(
-            to: CGPoint(x: box.maxX - 0.6, y: box.minY + 0.5),
-            control: CGPoint(x: box.midX, y: box.minY - 0.8)
-        )
-        first.addQuadCurve(
-            to: CGPoint(x: box.maxX - 0.2, y: box.maxY - 0.8),
-            control: CGPoint(x: box.maxX + 0.9, y: box.midY)
-        )
-        first.addQuadCurve(
-            to: CGPoint(x: box.minX + 0.8, y: box.maxY - 0.3),
-            control: CGPoint(x: box.midX, y: box.maxY + 0.9)
-        )
-        first.addQuadCurve(
-            to: CGPoint(x: box.minX + 0.5, y: box.minY + 1.2),
-            control: CGPoint(x: box.minX - 0.7, y: box.midY)
-        )
-        context.addPath(first)
-        context.strokePath()
-
-        // 第二遍轻量错位复笔
-        context.setStrokeColor(NSColor.white.withAlphaComponent(alpha * 0.65).cgColor)
-        context.setLineWidth(1.0)
-        let second = CGMutablePath()
-        second.move(to: CGPoint(x: box.minX + 1.4, y: box.minY + 2.0))
-        second.addLine(to: CGPoint(x: box.maxX - 1.2, y: box.minY + 1.6))
-        second.addLine(to: CGPoint(x: box.maxX - 1.5, y: box.maxY - 1.5))
-        second.addLine(to: CGPoint(x: box.minX + 1.2, y: box.maxY - 1.2))
-        second.closeSubpath()
-        context.addPath(second)
-        context.strokePath()
-        context.restoreGState()
-    }
-
-    /// 直线：一条右下到左上的斜线。
-    private func drawLineGlyph(box: CGRect, in context: CGContext) {
-        context.move(to: CGPoint(x: box.minX, y: box.maxY))
-        context.addLine(to: CGPoint(x: box.maxX, y: box.minY))
-        context.strokePath()
-    }
-
-    /// 箭头：斜线 + 实心箭头头部。
-    private func drawArrowGlyph(box: CGRect, alpha: CGFloat, in context: CGContext) {
-        context.move(to: CGPoint(x: box.minX, y: box.maxY))
-        context.addLine(to: CGPoint(x: box.maxX, y: box.minY))
-        context.strokePath()
-
-        let head = CGMutablePath()
-        head.move(to: CGPoint(x: box.maxX, y: box.minY))
-        head.addLine(to: CGPoint(x: box.maxX - box.width * 0.38, y: box.minY + box.height * 0.10))
-        head.addLine(to: CGPoint(x: box.maxX - box.width * 0.10, y: box.minY + box.height * 0.38))
-        head.closeSubpath()
-        context.setFillColor(NSColor.white.withAlphaComponent(alpha).cgColor)
-        context.addPath(head)
-        context.fillPath()
-    }
-
-    /// 编号：圆圈 + 圈内的序号。
-    ///
-    /// 圈里的「1」走文字渲染而不是手绘折线：竖笔加起笔小撇在 12pt 的内径里，
-    /// 撇短了糊成一根「丨」，长了读成「7」，交给字体渲染才稳定。
-    private func drawNumberingGlyph(box: CGRect, alpha: CGFloat, in context: CGContext) {
-        context.strokeEllipse(in: box.insetBy(dx: 1, dy: 1))
-        drawCenteredGlyphText(
-            "1",
-            pointSize: 10,
-            center: CGPoint(x: box.midX, y: box.midY),
-            alpha: alpha,
-            in: context
-        )
-    }
-
-    /// 高亮：两行示意文字，下面一行被一条半透明色带盖住。
-    ///
-    /// 不用「一个半透明矩形」表示：那样与矩形图标只差填充方式，
-    /// 在 16pt 绘制区里几乎分不出来。高亮工具的作用是标出**已有内容**，
-    /// 画面上先有内容，这层意思才立得住。
-    private func drawHighlightGlyph(box: CGRect, alpha: CGFloat, in context: CGContext) {
-        // 色带先画，文字行压在它上面，才读得出「被盖住的是文字」。
-        context.saveGState()
-        context.setFillColor(NSColor.white.withAlphaComponent(alpha * 0.5).cgColor)
-        context.fill(CGRect(
-            x: box.minX,
-            y: box.minY + box.height * 0.52,
-            width: box.width,
-            height: box.height * 0.30
-        ))
-        context.restoreGState()
-
-        context.setLineWidth(1.4)
-        // 第一行：完整一行，落在色带上方。
-        context.move(to: CGPoint(x: box.minX + 0.6, y: box.minY + 3.4))
-        context.addLine(to: CGPoint(x: box.maxX - 0.6, y: box.minY + 3.4))
-        // 第二行：落在色带里，右侧短一截——等长会读成两条条纹而不是一行字。
-        context.move(to: CGPoint(x: box.minX + 0.6, y: box.minY + 10.2))
-        context.addLine(to: CGPoint(x: box.maxX - 4.4, y: box.minY + 10.2))
-        context.strokePath()
-    }
-
-    /// 测量：一把带刻度的尺子。
-    ///
-    /// 不用「两端带箭头的横线」：那与箭头图标的差别只剩多一个三角，
-    /// 而测量工具要表达的是「量出长度」，尺子的横边加刻度没有第二种读法。
-    private func drawMeasureGlyph(box: CGRect, in context: CGContext) {
-        let ruler = CGRect(
-            x: box.minX + 0.6,
-            y: box.midY - 3.4,
-            width: box.width - 1.2,
-            height: 6.8
-        )
-        context.stroke(ruler)
-
-        // 刻度自尺子上边缘向下，长短交替：等长会读成一排栅栏。
-        context.saveGState()
-        context.setLineWidth(1.2)
-        let ticks: [CGFloat] = [0.2, 0.4, 0.6, 0.8]
-        for (index, fraction) in ticks.enumerated() {
-            let x = ruler.minX + ruler.width * fraction
-            let length: CGFloat = index.isMultiple(of: 2) ? 1.8 : 2.8
-            context.move(to: CGPoint(x: x, y: ruler.minY))
-            context.addLine(to: CGPoint(x: x, y: ruler.minY + length))
-        }
-        context.strokePath()
-        context.restoreGState()
-    }
-
-    /// 手绘：一条 S 形自由笔迹。
-    ///
-    /// 必须与直线、曲线箭头同时拉开距离：直线不带弯，曲线箭头带头部，
-    /// 手绘是两端都不收口的连续波浪，三者摆在一起才不会互相冒充。
-    private func drawFreehandGlyph(box: CGRect, in context: CGContext) {
-        let path = CGMutablePath()
-        path.move(to: CGPoint(x: box.minX + 0.8, y: box.maxY - 2.4))
-        path.addCurve(
-            to: CGPoint(x: box.maxX - 0.8, y: box.minY + 2.4),
-            control1: CGPoint(x: box.minX + 4.6, y: box.minY + 0.4),
-            control2: CGPoint(x: box.maxX - 4.6, y: box.maxY - 0.4)
-        )
-        context.addPath(path)
-        context.strokePath()
-    }
-
-    /// 曲线箭头：一段弧 + 沿弧末端切线方向的实心箭头。
-    ///
-    /// 箭头头部不能照搬箭头图标的 45° 硬编码角度：弧线一弯，
-    /// 头部与笔迹就会差出一个折角，读起来像「两笔画错的线」。
-    /// 二次贝塞尔的终点切线方向就是 `end - control`，照它摆头部才对得齐。
-    private func drawCurvedArrowGlyph(box: CGRect, alpha: CGFloat, in context: CGContext) {
-        let start = CGPoint(x: box.minX + 1, y: box.maxY - 1.4)
-        let end = CGPoint(x: box.maxX - 1.6, y: box.minY + 3.6)
-        let control = CGPoint(x: box.minX + 1.4, y: box.minY + 1.4)
-
-        let path = CGMutablePath()
-        path.move(to: start)
-        path.addQuadCurve(to: end, control: control)
-        context.addPath(path)
-        context.strokePath()
-
-        let tangent = CGPoint(x: end.x - control.x, y: end.y - control.y)
-        let tangentLength = max(1, (tangent.x * tangent.x + tangent.y * tangent.y).squareRoot())
-        let unit = CGPoint(x: tangent.x / tangentLength, y: tangent.y / tangentLength)
-        let normal = CGPoint(x: -unit.y, y: unit.x)
-        let headLength: CGFloat = 4.6
-        let headHalfWidth: CGFloat = 2.3
-        let base = CGPoint(
-            x: end.x - unit.x * headLength,
-            y: end.y - unit.y * headLength
-        )
-
-        let head = CGMutablePath()
-        head.move(to: end)
-        head.addLine(to: CGPoint(
-            x: base.x + normal.x * headHalfWidth,
-            y: base.y + normal.y * headHalfWidth
-        ))
-        head.addLine(to: CGPoint(
-            x: base.x - normal.x * headHalfWidth,
-            y: base.y - normal.y * headHalfWidth
-        ))
-        head.closeSubpath()
-        context.setFillColor(NSColor.white.withAlphaComponent(alpha).cgColor)
-        context.addPath(head)
-        context.fillPath()
-    }
-
-    private func drawTextGlyph(rect: CGRect, alpha: CGFloat, in context: CGContext) {
-        let box = iconBox(in: rect)
-        drawCenteredGlyphText(
-            "T",
-            pointSize: 16,
-            center: CGPoint(x: box.midX, y: box.midY),
-            alpha: alpha,
-            in: context
-        )
-    }
-
-    /// 在指定中心画一段短文字（「T」「1」这类以字形充当图标的绘制区）。
-    ///
-    /// 垂直居中用 **capHeight** 而不是 (ascent - descent)/2：
-    /// ascent 里含了重音符号等大写字母用不到的空间，按它居中会让字形整体偏低；
-    /// 大写字母的视觉高度就是 capHeight，把它的中点对齐到绘制区中心，
-    /// 才对得齐旁边的矩形、马赛克这类几何图标。
+    /// 在指定中心画一段短文字（字号 A、倍率、模式等文字型控件）。
     private func drawCenteredGlyphText(
         _ text: String,
         pointSize: CGFloat,
@@ -1772,7 +1464,7 @@ final class AnnotationToolbarRenderer {
         let ctFont = NSFont.systemFont(ofSize: pointSize, weight: weight) as CTFont
         let attributes: [NSAttributedString.Key: Any] = [
             .font: ctFont,
-            .foregroundColor: NSColor.white.withAlphaComponent(alpha),
+            .foregroundColor: ink(alpha),
         ]
         let attributed = NSAttributedString(string: text, attributes: attributes)
         let line = CTLineCreateWithAttributedString(attributed)
@@ -1791,294 +1483,5 @@ final class AnnotationToolbarRenderer {
         )
         CTLineDraw(line, context)
         context.restoreGState()
-    }
-
-    private func drawMosaicGlyph(rect: CGRect, alpha: CGFloat, in context: CGContext) {
-        let box = iconBox(in: rect)
-        let cell = box.width / 3
-
-        context.saveGState()
-        context.setFillColor(NSColor.white.withAlphaComponent(alpha).cgColor)
-        for row in 0 ..< 3 {
-            for column in 0 ..< 3 where (row + column) % 2 == 0 {
-                context.fill(CGRect(
-                    x: box.minX + CGFloat(column) * cell,
-                    y: box.minY + CGFloat(row) * cell,
-                    width: cell,
-                    height: cell
-                ))
-            }
-        }
-        context.restoreGState()
-    }
-
-    /// 放大镜：一个镜片圆 + 一条 45° 手柄。
-    ///
-    /// 镜片里不再画任何东西（不画「+」、也不画被放大的内容）：
-    /// 内径只有 8pt 左右，多画一笔就糊成一团灰块，而圆加手柄本身已无歧义。
-    private func drawMagnifierGlyph(rect: CGRect, alpha: CGFloat, in context: CGContext) {
-        let box = iconBox(in: rect)
-        let diameter: CGFloat = 11
-        let lens = CGRect(x: box.minX, y: box.minY, width: diameter, height: diameter)
-
-        context.saveGState()
-        context.setStrokeColor(NSColor.white.withAlphaComponent(alpha).cgColor)
-        context.setLineWidth(1.6)
-        context.setLineCap(.round)
-        context.setLineJoin(.round)
-
-        context.strokeEllipse(in: lens)
-
-        // 手柄从圆周的右下 45° 处伸出，末端落在绘制区角上，
-        // 这样「一圆一笔」的总体量与其他图标一致。
-        let radius = diameter / 2
-        let diagonal = radius * CGFloat(2).squareRoot() / 2
-        context.move(to: CGPoint(x: lens.midX + diagonal, y: lens.midY + diagonal))
-        context.addLine(to: CGPoint(x: box.maxX - 0.4, y: box.maxY - 0.4))
-        context.strokePath()
-
-        context.restoreGState()
-    }
-
-    /// 拷贝图标：两张错位的圆角矩形。
-    private func drawCopyGlyph(rect: CGRect, alpha: CGFloat, in context: CGContext) {
-        let box = iconBox(in: rect)
-        let cardWidth = box.width * 0.62
-        let cardHeight = box.height * 0.70
-        let offset = box.width * 0.22
-
-        // 图形实际占用范围：宽 = 错位量 + 卡片宽，高 = 错位量 + 卡片高。
-        //
-        // 按**占用范围**居中，而不是让某一张卡片居中：两张卡片错开之后，
-        // 后卡比前卡向左上各多出一截，按单卡定位会让整体偏下、偏左
-        //（实测 dy=+1.12、dx=-1.25）。
-        let contentWidth = offset + cardWidth
-        let contentHeight = offset + cardHeight
-        let originX = box.minX + (box.width - contentWidth) / 2
-        let originY = box.minY + (box.height - contentHeight) / 2
-        let color = NSColor.white.withAlphaComponent(alpha)
-
-        context.saveGState()
-        context.setLineWidth(1.5)
-        context.setLineJoin(.round)
-
-        // 后面那张只画露出来的三条边（左、上、下），避免与前一张叠成一团。
-        // 它与前一张**等大**，只是向左上错开了 offset——等大才能让整体
-        // 包围盒仍是一个矩形，也才谈得上「居中」。
-        context.setStrokeColor(color.withAlphaComponent(alpha * 0.55).cgColor)
-        context.beginPath()
-        context.move(to: CGPoint(x: originX + offset, y: originY))
-        context.addLine(to: CGPoint(x: originX, y: originY))
-        context.addLine(to: CGPoint(x: originX, y: originY + cardHeight))
-        context.addLine(to: CGPoint(x: originX + offset, y: originY + cardHeight))
-        context.strokePath()
-
-        // 前面那张画完整轮廓。
-        context.setStrokeColor(color.cgColor)
-        context.addPath(CGPath(
-            roundedRect: CGRect(
-                x: originX + offset,
-                y: originY + offset,
-                width: cardWidth,
-                height: cardHeight
-            ),
-            cornerWidth: 2.5,
-            cornerHeight: 2.5,
-            transform: nil
-        ))
-        context.strokePath()
-
-        context.restoreGState()
-    }
-
-    /// 保存图标：向下的箭头落在托盘中。
-    private func drawSaveGlyph(rect: CGRect, alpha: CGFloat, in context: CGContext) {
-        let box = iconBox(in: rect)
-        let color = NSColor.white.withAlphaComponent(alpha)
-        let centerX = box.midX
-
-        context.saveGState()
-        context.setStrokeColor(color.cgColor)
-        context.setFillColor(color.cgColor)
-        context.setLineWidth(1.6)
-        context.setLineCap(.round)
-        context.setLineJoin(.round)
-
-        // 竖杆。
-        context.beginPath()
-        context.move(to: CGPoint(x: centerX, y: box.minY + 1))
-        context.addLine(to: CGPoint(x: centerX, y: box.midY + 2))
-        context.strokePath()
-
-        // 箭头（实心三角）。
-        let tip = CGPoint(x: centerX, y: box.midY + 4)
-        context.beginPath()
-        context.move(to: CGPoint(x: tip.x - 3.2, y: tip.y - 3.4))
-        context.addLine(to: CGPoint(x: tip.x + 3.2, y: tip.y - 3.4))
-        context.addLine(to: tip)
-        context.closePath()
-        context.fillPath()
-
-        // 托盘。
-        context.beginPath()
-        context.move(to: CGPoint(x: box.minX + 1, y: box.midY - 2.5))
-        context.addLine(to: CGPoint(x: box.minX + 1, y: box.maxY - 1))
-        context.addLine(to: CGPoint(x: box.maxX - 1, y: box.maxY - 1))
-        context.addLine(to: CGPoint(x: box.maxX - 1, y: box.midY - 2.5))
-        context.strokePath()
-
-        context.restoreGState()
-    }
-
-    /// 撤销/重做图标：一段留下缺口的圆弧，缺口一端接一个沿切线方向的箭头。
-    ///
-    /// 三个几何决定，都对应上一版的一处失效：
-    ///
-    /// - **弧用显式采样，不用 `CGContext.addArc`**。后者的 `clockwise`
-    ///   语义会随坐标系翻转而反号：上一版 undo 与 redo 只差这一个参数，
-    ///   结果一个画满 270°、另一个只剩 72°，退化成一小段钩子——
-    ///   两个本该成对的图标因此看起来像两个不相干的符号。
-    /// - **箭头沿切线摆放**。上一版把箭头三个顶点写成与端点无关的固定偏移，
-    ///   弧转了一圈箭头却始终朝着同一个方向，「回转」这层意思整个丢掉。
-    /// - **缺口朝正下方**。缺口留在上方时，弧的两肩被压扁，
-    ///   认起来更像「刷新」而不是「回退」；朝下时两侧弧肩最完整。
-    private func drawHistoryGlyph(
-        isUndo: Bool,
-        rect: CGRect,
-        alpha: CGFloat,
-        in context: CGContext
-    ) {
-        let box = iconBox(in: rect)
-        // 半径收到「绘制区一半再减半个线宽」，弧的外沿才刚好贴住绘制区。
-        let radius = box.width / 2 - 0.8
-
-        // 两个方向互为镜像：
-        // undo 从左下起、逆时针经上方绕到右下；redo 从右下起、顺时针经上方绕到左下。
-        let fromDegrees: CGFloat = isUndo ? 45 : 135
-        let sweepDegrees: CGFloat = isUndo ? -270 : 270
-
-        // 先按绘制区中心布置几何，再**整体平移到实际包围盒居中**。
-        //
-        // 这个图标按几何中心定位必然偏：弧缺一个 90° 扇区（右下方），
-        // 而箭头又伸向左上方，两侧的「最远点」并不对称——实测偏上 1.0pt、
-        // 横向偏 1.1pt。而且弧与箭头必须**一起**平移，各自居中会让他俩错位。
-        //
-        // 描边会把路径外扩半个线宽，所以参与测量的包围盒也要先外扩。
-        let center = CGPoint(x: box.midX, y: box.midY)
-        let strokeOutset: CGFloat = 0.8
-
-        let arc = CGMutablePath()
-        let points = arcPoints(
-            center: center,
-            radius: radius,
-            fromDegrees: fromDegrees,
-            sweepDegrees: sweepDegrees
-        )
-        arc.move(to: points[0])
-        for point in points.dropFirst() {
-            arc.addLine(to: point)
-        }
-
-        let head = CGMutablePath()
-        let headPoints = tangentArrowPoints(
-            center: center,
-            radius: radius,
-            endDegrees: fromDegrees + sweepDegrees,
-            sweepDegrees: sweepDegrees
-        )
-        head.move(to: headPoints[0])
-        head.addLine(to: headPoints[1])
-        head.addLine(to: headPoints[2])
-
-        let bounds = arc.boundingBoxOfPath
-            .insetBy(dx: -strokeOutset, dy: -strokeOutset)
-            .union(head.boundingBoxOfPath.insetBy(dx: -strokeOutset, dy: -strokeOutset))
-        var shift = CGAffineTransform(
-            translationX: box.midX - bounds.midX,
-            y: box.midY - bounds.midY
-        )
-
-        context.saveGState()
-        defer { context.restoreGState() }
-        context.setStrokeColor(NSColor.white.withAlphaComponent(alpha).cgColor)
-        context.setLineWidth(1.6)
-        context.setLineCap(.round)
-        context.setLineJoin(.round)
-
-        if let movedArc = arc.copy(using: &shift) {
-            context.addPath(movedArc)
-        }
-        context.strokePath()
-
-        if let movedHead = head.copy(using: &shift) {
-            context.addPath(movedHead)
-        }
-        context.strokePath()
-    }
-
-    /// 圆弧采样点。
-    ///
-    /// 角度用**视觉角度**：0° 指向右、90° 指向下（本视图 y 轴向下），
-    /// 角度增大对应屏幕上的顺时针。显式采样换来的确定性是值得的——
-    /// 端点角度与切线方向都能直接算出来，箭头才可能摆正。
-    private func arcPoints(
-        center: CGPoint,
-        radius: CGFloat,
-        fromDegrees: CGFloat,
-        sweepDegrees: CGFloat,
-        steps: Int = 48
-    ) -> [CGPoint] {
-        (0 ... steps).map { index in
-            let ratio = CGFloat(index) / CGFloat(steps)
-            let radian = (fromDegrees + sweepDegrees * ratio) * .pi / 180
-            return CGPoint(
-                x: center.x + radius * cos(radian),
-                y: center.y + radius * sin(radian)
-            )
-        }
-    }
-
-    /// 弧终点处切线箭头的三个顶点（左后、尖端、右后）。
-    ///
-    /// 与弧一样**先返回几何、由调用方统一平移**：两者必须一起居中，
-    /// 各自居中会让箭头脱离弧的端点。
-    ///
-    /// - Parameters:
-    ///   - center: 圆弧圆心。
-    ///   - radius: 圆弧半径。
-    ///   - endDegrees: 弧终点的视觉角度。
-    ///   - sweepDegrees: 弧的扫描方向；负值表示终点处的「前进方向」与角度增大方向相反。
-    private func tangentArrowPoints(
-        center: CGPoint,
-        radius: CGFloat,
-        endDegrees: CGFloat,
-        sweepDegrees: CGFloat,
-        length: CGFloat = 4,
-        halfWidth: CGFloat = 2
-    ) -> [CGPoint] {
-        let radian = endDegrees * .pi / 180
-        let tip = CGPoint(
-            x: center.x + radius * cos(radian),
-            y: center.y + radius * sin(radian)
-        )
-
-        // 角度增大方向的切线；再按扫描方向取反，得到弧真正的行进方向。
-        var direction = CGPoint(x: -sin(radian), y: cos(radian))
-        if sweepDegrees < 0 {
-            direction = CGPoint(x: -direction.x, y: -direction.y)
-        }
-        let normal = CGPoint(x: -direction.y, y: direction.x)
-
-        return [
-            CGPoint(
-                x: tip.x - direction.x * length + normal.x * halfWidth,
-                y: tip.y - direction.y * length + normal.y * halfWidth
-            ),
-            tip,
-            CGPoint(
-                x: tip.x - direction.x * length - normal.x * halfWidth,
-                y: tip.y - direction.y * length - normal.y * halfWidth
-            ),
-        ]
     }
 }

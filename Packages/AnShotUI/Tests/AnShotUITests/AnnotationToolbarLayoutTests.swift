@@ -110,48 +110,39 @@ struct AnnotationToolbarLayoutBarTests {
         #expect(size.height == AnnotationToolbarLayout.barHeight)
     }
 
-    @Test("首个条目左侧留出 padding")
+    @Test("首个条目左侧留出拖拽握把与留白（firstBarItemX）")
     func firstItemRespectsLeadingPadding() {
         let (items, _) = makeFullLayout()
         guard let first = items.min(by: { $0.rect.minX < $1.rect.minX }) else {
             Issue.record("布局不应为空")
             return
         }
-        #expect(first.rect.minX == AnnotationToolbarLayout.padding)
+        #expect(first.rect.minX == AnnotationToolbarLayout.firstBarItemX)
     }
 
-    @Test("四个工具家族按固定顺序排在最左")
-    func familiesLeadInFixedOrder() {
+    @Test("高频工具与更多工具槽按固定顺序排在最左，支持一次点击直达")
+    func primaryToolsLeadInFixedOrder() {
         let (items, _) = makeFullLayout()
         let sorted = items.sorted { $0.rect.minX < $1.rect.minX }
-        let families = sorted.prefix(4).map(\.kind)
-        #expect(families == [
-            .family(.pointer), .family(.shape), .family(.text), .family(.mosaic)
-        ])
+        let leading = Array(sorted.prefix(AnnotationToolbarLayout.primaryTools.count + 1).map(\.kind))
+        let expected = AnnotationToolbarLayout.primaryTools.map { AnnotationToolbarLayout.Kind.tool($0) } + [.moreTools]
+        #expect(leading == expected)
     }
 
-    @Test("颜色入口仅在该工具可取色时存在")
-    func colorButtonOnlyAppearsForColorCapableTools() {
+    @Test("自定义色轮入口仅在该工具可取色时出现在属性气泡中，主栏不重复冗余")
+    func colorPickerAppearsInPanelOnlyForColorCapableTools() {
         var layout = AnnotationToolbarLayout()
 
-        // 马赛克是像素处理，没有颜色槽（`AnnotationStyle.color(for:)` 返回 nil）
         layout.tool = .mosaic
-        let withoutColor = layout.layoutBar().items
-        #expect(
-            !withoutColor.contains { $0.kind == .colorButton },
-            "马赛克不应出现颜色入口"
-        )
+        #expect(!layout.layoutBar().items.contains { $0.kind == .colorButton })
+        #expect(!layout.layoutPanel().items.contains { $0.kind == .colorPicker })
+
+        layout.tool = .spotlight
+        #expect(!layout.layoutPanel().items.contains { $0.kind == .colorPicker })
 
         layout.tool = .rectangle
-        let withColor = layout.layoutBar().items
-        #expect(
-            withColor.contains { $0.kind == .colorButton },
-            "矩形应出现颜色入口"
-        )
-        #expect(
-            withColor.count == withoutColor.count + 1,
-            "颜色入口应恰好占一个条目"
-        )
+        #expect(!layout.layoutBar().items.contains { $0.kind == .colorButton })
+        #expect(layout.layoutPanel().items.contains { $0.kind == .colorPicker })
     }
 
     @Test("撤销 / 重做的可用性直接来自输入")
@@ -384,13 +375,14 @@ struct AnnotationToolbarPointerPanelTests {
         #expect(origin.y >= 38 + 8, "整屏选区工具栏顶部必须避开 38pt 刘海区域")
     }
 
-    @Test("形状面板包含椭圆与手绘开关，马赛克面板包含像素化与高斯模糊切换")
+    @Test("椭圆支持手绘开关，马赛克支持像素化与高斯模糊切换，且二级气泡远窄于主栏")
     func shapeAndMosaicPanelsExposeEllipseSketchyAndBlurControls() {
         var shapeLayout = AnnotationToolbarLayout()
         shapeLayout.tool = .ellipse
         let shapeKinds = shapeLayout.layoutPanel().items.map(\.kind)
-        #expect(shapeKinds.contains(.tool(.ellipse)))
+        #expect(shapeKinds.contains(.fillToggle))
         #expect(shapeKinds.contains(.sketchyToggle))
+        #expect(shapeLayout.panelSize.width < shapeLayout.barSize.width, "瘦身后的属性气泡必须比主栏更紧凑")
 
         var mosaicLayout = AnnotationToolbarLayout()
         mosaicLayout.tool = .mosaic
@@ -398,10 +390,11 @@ struct AnnotationToolbarPointerPanelTests {
         #expect(mosaicKinds.contains(.mosaicEffectMode(.pixelate)))
         #expect(mosaicKinds.contains(.mosaicEffectMode(.blur)))
 
-        // 放大镜工具不应显示像素化 / 高斯模糊切换
+        // 放大镜归属「更多工具」，不应显示像素化 / 高斯模糊切换
         mosaicLayout.tool = .magnifier
         let magnifierKinds = mosaicLayout.layoutPanel().items.map(\.kind)
         #expect(!magnifierKinds.contains(.mosaicEffectMode(.blur)))
+        #expect(magnifierKinds.contains(.tool(.magnifier)))
 
         // 指针选中马赛克时同样暴露模式切换与三档打码强度按钮
         var pointerLayout = AnnotationToolbarLayout()
