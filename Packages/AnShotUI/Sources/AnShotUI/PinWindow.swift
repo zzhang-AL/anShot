@@ -76,6 +76,17 @@ final class PinImageView: NSImageView {
 
     /// 鼠标移入/移出卡片区域回调（用于右上角按钮淡入淡出）。
     var onHoverChanged: ((Bool) -> Void)?
+    /// 双击贴图快速关闭回调。
+    var onDoubleClick: (() -> Void)?
+
+    /// 是否显示高对比双层细边框（外深内浅，保证纯白/纯黑背景下均清晰辨识边界）。
+    var showsBorder: Bool = true {
+        didSet {
+            guard showsBorder != oldValue else { return }
+            needsDisplay = true
+            updateLayer()
+        }
+    }
 
     private var hoverTrackingArea: NSTrackingArea?
     private let innerBorderLayer = CALayer()
@@ -96,11 +107,19 @@ final class PinImageView: NSImageView {
     override func updateLayer() {
         super.updateLayer()
         ensureBorderLayers()
-        // 外层深色细描边 + 内层浅色细描边，确保贴图在纯白或纯黑背景下均能清晰辨识边界。
-        layer?.borderWidth = 1
-        layer?.borderColor = NSColor.black.withAlphaComponent(0.28).cgColor
-        innerBorderLayer.borderWidth = 1
-        innerBorderLayer.borderColor = NSColor.white.withAlphaComponent(0.24).cgColor
+        if showsBorder {
+            // 外层深色细描边 + 内层浅色细描边，确保贴图在纯白或纯黑背景下均能清晰辨识边界。
+            layer?.borderWidth = 1
+            layer?.borderColor = NSColor.black.withAlphaComponent(0.28).cgColor
+            innerBorderLayer.borderWidth = 1
+            innerBorderLayer.borderColor = NSColor.white.withAlphaComponent(0.24).cgColor
+            innerBorderLayer.isHidden = false
+        } else {
+            layer?.borderWidth = 0
+            layer?.borderColor = nil
+            innerBorderLayer.borderWidth = 0
+            innerBorderLayer.isHidden = true
+        }
     }
 
     override func layout() {
@@ -144,6 +163,10 @@ final class PinImageView: NSImageView {
     /// 不能调用 `super`：`NSControl.mouseDown` 会把它当成一次控件跟踪消费掉，
     /// 事件到不了窗口的背景拖动逻辑。
     override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2 {
+            onDoubleClick?()
+            return
+        }
         window?.performDrag(with: event)
         // `performDrag` 在**拖动结束时才返回**（它内部跑一个事件跟踪循环），
         // 所以这一行就是「松手之后」。在这里检查最及时，
@@ -280,12 +303,16 @@ final class PinWindow: NSWindow {
 
     /// 用户关闭了这个 Pin（真正释放）。隐藏不触发它。
     var onClose: (() -> Void)?
-    /// 请求对当前贴图进行重新标注编辑。
+    /// 请求对当前贴图进入原地补画编辑（优先于 `onEdit`）。
+    var onInlineEdit: ((PinWindow) -> Void)?
+    /// 兼容回调：请求对当前贴图进行重新标注编辑。
     var onEdit: ((CGImage) -> Void)?
     /// 请求对当前贴图执行文字识别（OCR）。
     var onOCR: ((CGImage, CGRect) -> Void)?
     /// 请求关闭全部贴图。
     var onCloseAll: (() -> Void)?
+    /// 点击穿透状态改变回调（供菜单栏动态置顶显示恢复入口）。
+    var onClickThroughChanged: ((Bool) -> Void)?
 
     /// 当前缩放比例（1.0 = 原始像素 1:1，屏幕是 2x 时逻辑尺寸为像素的一半）。
     private(set) var scale: Double = 1
@@ -293,7 +320,19 @@ final class PinWindow: NSWindow {
     /// 用户主动隐藏（位图仍保留）。
     private(set) var isUserHidden = false
 
+    /// 鼠标点击穿透状态：开启时忽略鼠标事件并柔和压低透明度。
+    private(set) var isClickThrough = false
+    private var alphaBeforeClickThrough: CGFloat = 1.0
+
+    /// 是否显示高对比双层边框。
+    var showsBorder: Bool {
+        get { imageView.showsBorder }
+        set { imageView.showsBorder = newValue }
+    }
+
     private let imageView: PinImageView
+    private let hudView = PinHUDCapsuleView()
+    private var hudHideTask: Task<Void, Never>?
 
     /// 卡片右上角的一排控制按钮（从右到左：`✕` 关闭释放、`＋` 放大、`－` 缩小）。
     ///
@@ -314,9 +353,9 @@ final class PinWindow: NSWindow {
         toolTip: minusButtonTip
     )
 
-    /// 原始像素尺寸与所在屏幕缩放：缩放操作需要它们把「窗口逻辑尺寸」算回来。
-    private let pixelSize: CGSize
-    private let screenScale: CGFloat
+    /// 原始像素尺寸与所在屏幕缩放：缩放与原地更新图像时需要它们重算逻辑尺寸。
+    private(set) var pixelSize: CGSize
+    private(set) var screenScale: CGFloat
 
     init(
         pinID: Int,
@@ -324,13 +363,15 @@ final class PinWindow: NSWindow {
         logicalSize: CGSize,
         at origin: CGPoint,
         screenScale: CGFloat,
-        hasWindowShadow: Bool = true
+        hasWindowShadow: Bool = true,
+        showsBorder: Bool = true
     ) {
         self.pinID = pinID
         contentImage = image
         self.pixelSize = CGSize(width: image.width, height: image.height)
         self.screenScale = screenScale
         imageView = PinImageView(frame: CGRect(origin: .zero, size: logicalSize))
+        imageView.showsBorder = showsBorder
         imageView.image = NSImage(cgImage: image, size: logicalSize)
         imageView.imageScaling = .scaleProportionallyUpOrDown
 
@@ -347,9 +388,9 @@ final class PinWindow: NSWindow {
         isOpaque = false
         backgroundColor = .clear
         hasShadow = hasWindowShadow
-        // 浮动在普通窗口之上，但不进别人的全屏空间（契约 §6）。
+        // 浮动在普通窗口与全屏应用之上（支持全屏对照参考图）。
         level = .floating
-        collectionBehavior = [.canJoinAllSpaces, .stationary]
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         isMovableByWindowBackground = true
         // 无边框窗口默认不能成为 key window，改为可接受鼠标事件即可。
         acceptsMouseMovedEvents = true
@@ -360,6 +401,10 @@ final class PinWindow: NSWindow {
         imageView.onHoverChanged = { [weak self] hovered in
             self?.setCardButtonsVisible(hovered, animated: true)
         }
+        imageView.onDoubleClick = { [weak self] in
+            self?.performClose(from: "double click")
+        }
+        installHUDView()
         installCardButtons()
         // 常态淡出隐藏右上角控制按钮，避免遮挡小图文字；鼠标移入时淡入。
         setCardButtonsVisible(false, animated: false)
@@ -573,17 +618,142 @@ final class PinWindow: NSWindow {
         )
     }
 
-    /// 调整透明度（契约要求「可调透明度」）。
-    func setAlpha(_ alpha: Double) {
-        self.alphaValue = CGFloat(min(1, max(0.2, alpha)))
+    /// 安装左上角实时缩放/透明度百分比胶囊 HUD。
+    private func installHUDView() {
+        hudView.alphaValue = 0
+        hudView.isHidden = true
+        hudView.autoresizingMask = [.maxXMargin, .minYMargin]
+        imageView.addSubview(hudView)
+        layoutHUDView()
     }
 
-    /// 按比例缩放，支持指定归一化锚点（`(0.5, 0.5)` 为窗口中心，鼠标滚轮时取光标位置）。
+    private func layoutHUDView() {
+        let size = hudView.fittingCapsuleSize
+        let inset: CGFloat = 8
+        hudView.frame = CGRect(
+            x: inset,
+            y: max(inset, imageView.bounds.maxY - inset - size.height),
+            width: size.width,
+            height: size.height
+        )
+    }
+
+    /// 在卡片左上角展示实时百分比胶囊 HUD，停留 0.85 秒后平滑淡出。
+    func showHUD(_ text: String) {
+        hudView.setText(text)
+        layoutHUDView()
+        hudView.isHidden = false
+        hudView.alphaValue = 1
+        hudHideTask?.cancel()
+        hudHideTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(850))
+            guard let self, !Task.isCancelled else { return }
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.2
+                self.hudView.animator().alphaValue = 0
+            }, completionHandler: { [weak self] in
+                Task { @MainActor in
+                    guard let self, self.hudView.alphaValue <= 0.01 else { return }
+                    self.hudView.isHidden = true
+                }
+            })
+        }
+    }
+
+    /// 最近一次 HUD 文案（供单测校验）。
+    var hudTextForTesting: String { hudView.currentText }
+
+    /// 原地替换贴图位图（用于贴图原地补画完成后无损替换，不增加贴图计数且保持原屏幕位置）。
+    func updateImage(_ newImage: CGImage, screenScale newScale: CGFloat? = nil) {
+        let effectiveScale = max(1, newScale ?? screenScale)
+        self.contentImage = newImage
+        self.pixelSize = CGSize(width: newImage.width, height: newImage.height)
+        self.screenScale = effectiveScale
+
+        let clampedScale = min(
+            Self.maximumScale,
+            max(Self.minimumScale(pixelSize: pixelSize, screenScale: effectiveScale), scale)
+        )
+        scale = clampedScale
+        let logical = CGSize(
+            width: pixelSize.width / effectiveScale * CGFloat(clampedScale),
+            height: pixelSize.height / effectiveScale * CGFloat(clampedScale)
+        )
+        imageView.image = NSImage(cgImage: newImage, size: logical)
+
+        // 保持原窗口左上角不动，避免原地补画完成时窗口漂移。
+        let oldTopLeft = CGPoint(x: frame.minX, y: frame.maxY)
+        let targetOrigin = CGPoint(x: oldTopLeft.x, y: oldTopLeft.y - logical.height)
+        let screen = NSScreen.screens.first { $0.frame.intersects(frame) } ?? NSScreen.main
+        let visible = screen?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let clampedOrigin = PinManager.clampOrigin(targetOrigin, size: logical, into: visible)
+        setFrame(CGRect(origin: clampedOrigin, size: logical), display: true)
+        imageView.frame = CGRect(origin: .zero, size: logical)
+        layoutCardButtons()
+        layoutHUDView()
+        logger.notice("pin #\(self.pinID, privacy: .public) image updated in-place: \(newImage.width, privacy: .public)x\(newImage.height, privacy: .public)")
+    }
+
+    /// 开启或关闭鼠标点击穿透模式。
+    func setClickThrough(_ enabled: Bool, showToast: Bool = true) {
+        guard enabled != isClickThrough else { return }
+        isClickThrough = enabled
+        if enabled {
+            alphaBeforeClickThrough = alphaValue
+            ignoresMouseEvents = true
+            // 柔和压低透明度至 ≤ 0.82，提示用户该贴图正处于鼠标穿透态。
+            if alphaValue > 0.82 {
+                alphaValue = 0.82
+            }
+            setCardButtonsVisible(false, animated: true)
+            if showToast {
+                ToastPresenter.show("已开启鼠标穿透（点击菜单栏顶部「取消贴图穿透」恢复）")
+            }
+        } else {
+            ignoresMouseEvents = false
+            alphaValue = alphaBeforeClickThrough
+            if showToast {
+                ToastPresenter.show("已取消贴图鼠标穿透")
+            }
+        }
+        onClickThroughChanged?(enabled)
+    }
+
+    /// 切换高对比双层边框显隐。
+    @objc func toggleBorder() {
+        showsBorder.toggle()
+        showHUD(showsBorder ? "边框：开" : "边框：关")
+    }
+
+    /// 按屏幕逻辑点微调贴图位置（方向键 1pt / Shift+方向键 5pt）。
+    func nudgePosition(dx: CGFloat, dy: CGFloat) {
+        var origin = frame.origin
+        origin.x += dx
+        origin.y += dy
+        setFrameOrigin(origin)
+        pullBackIfFullyOffscreen()
+    }
+
+    /// 调整透明度（契约要求「可调透明度」），同时展示实时百分比胶囊 HUD。
+    func setAlpha(_ alpha: Double, showHUD shouldShowHUD: Bool = true) {
+        let clamped = min(1, max(0.2, alpha))
+        self.alphaValue = CGFloat(clamped)
+        if !isClickThrough {
+            alphaBeforeClickThrough = CGFloat(clamped)
+        }
+        if shouldShowHUD {
+            let percent = Int((clamped * 100).rounded())
+            showHUD("透明度 \(percent)%")
+        }
+    }
+
+    /// 按比例缩放，支持指定归一化锚点（`(0.5, 0.5)` 为窗口中心，鼠标滚轮/捏合时取光标位置）。
     func applyScale(
         _ newScale: Double,
         pixelSize: CGSize,
         screenScale: CGFloat,
-        anchor: CGPoint = CGPoint(x: 0.5, y: 0.5)
+        anchor: CGPoint = CGPoint(x: 0.5, y: 0.5),
+        showHUD shouldShowHUD: Bool = true
     ) {
         let lower = Self.minimumScale(pixelSize: pixelSize, screenScale: screenScale)
         let clamped = min(Self.maximumScale, max(lower, newScale))
@@ -611,6 +781,11 @@ final class PinWindow: NSWindow {
         )
         imageView.frame = CGRect(origin: .zero, size: logical)
         layoutCardButtons()
+        layoutHUDView()
+        if shouldShowHUD {
+            let percent = Int((clamped * 100).rounded())
+            showHUD("\(percent)%")
+        }
     }
 
     /// 最大缩放：再大只是把图变成马赛克，还占满屏幕。
@@ -735,9 +910,15 @@ final class PinWindow: NSWindow {
     /// 两条路径天然互斥：全局监视器收不到发给本进程的事件。
     override func magnify(with event: NSEvent) {
         notePinchBegan(source: "window", amount: Double(event.magnification))
+        let location = event.locationInWindow
+        let anchor = CGPoint(
+            x: min(max(0, location.x / max(1, frame.width)), 1),
+            y: min(max(0, location.y / max(1, frame.height)), 1)
+        )
         applyCardInput(
             .pinch(amount: Double(event.magnification)),
-            transparency: event.modifierFlags.contains(.control) || event.modifierFlags.contains(.option)
+            transparency: event.modifierFlags.contains(.control) || event.modifierFlags.contains(.option),
+            anchor: anchor
         )
     }
 
@@ -803,20 +984,47 @@ final class PinWindow: NSWindow {
         return super.performKeyEquivalent(with: event)
     }
 
-    /// 键盘：ESC 直接关闭贴图并释放配额；`+`/`-`/`0` 控制缩放。
+    /// 键盘：ESC 直接关闭、`Space` 原地补画、`T` 识字、`B` 边框切换、方向键 1px/Shift+5px 微调、`+`/`-`/`0` 缩放。
     override func keyDown(with event: NSEvent) {
         if event.keyCode == Self.escapeKeyCode {
             logger.notice("pin #\(self.pinID, privacy: .public) escape pressed")
             performClose(from: "escape key")
             return
         }
-        switch event.charactersIgnoringModifiers {
+        // Space：原地补画
+        if event.keyCode == 49 {
+            editPinImage()
+            return
+        }
+        // 方向键：1pt 微调，按住 Shift 为 5pt
+        let step: CGFloat = event.modifierFlags.contains(.shift) ? 5 : 1
+        switch event.keyCode {
+        case 123: // Left
+            nudgePosition(dx: -step, dy: 0)
+            return
+        case 124: // Right
+            nudgePosition(dx: step, dy: 0)
+            return
+        case 125: // Down（AppKit 屏幕坐标系向下为负）
+            nudgePosition(dx: 0, dy: -step)
+            return
+        case 126: // Up
+            nudgePosition(dx: 0, dy: step)
+            return
+        default:
+            break
+        }
+        switch event.charactersIgnoringModifiers?.lowercased() {
         case "+", "=":
             zoomInFromCard()
         case "-":
             zoomOutFromCard()
         case "0":
             resetScale()
+        case "t":
+            ocrPinImage()
+        case "b":
+            toggleBorder()
         default:
             super.keyDown(with: event)
         }
@@ -857,15 +1065,30 @@ final class PinWindow: NSWindow {
 
         let copyItem = NSMenuItem(title: "复制图片", action: #selector(copyPinImage), keyEquivalent: "c")
         let saveItem = NSMenuItem(title: "另存为…", action: #selector(savePinImageAs), keyEquivalent: "s")
-        let editItem = NSMenuItem(title: "重新标注编辑…", action: #selector(editPinImage), keyEquivalent: "e")
-        editItem.isEnabled = onEdit != nil
-        let ocrItem = NSMenuItem(title: "提取文字 (OCR)", action: #selector(ocrPinImage), keyEquivalent: "")
+        let editItem = NSMenuItem(title: "标注 / 原地补画…（空格）", action: #selector(editPinImage), keyEquivalent: "e")
+        editItem.isEnabled = onInlineEdit != nil || onEdit != nil
+        let ocrItem = NSMenuItem(title: "识别文字 (OCR)", action: #selector(ocrPinImage), keyEquivalent: "t")
+        ocrItem.keyEquivalentModifierMask = []
         ocrItem.isEnabled = onOCR != nil
 
         menu.addItem(copyItem)
         menu.addItem(saveItem)
         menu.addItem(editItem)
         menu.addItem(ocrItem)
+        menu.addItem(.separator())
+
+        let clickThroughItem = NSMenuItem(
+            title: isClickThrough ? "关闭鼠标穿透" : "鼠标穿透",
+            action: #selector(toggleClickThroughFromMenu),
+            keyEquivalent: ""
+        )
+        clickThroughItem.state = isClickThrough ? .on : .off
+        menu.addItem(clickThroughItem)
+
+        let borderItem = NSMenuItem(title: "显示高对比边框", action: #selector(toggleBorder), keyEquivalent: "b")
+        borderItem.keyEquivalentModifierMask = []
+        borderItem.state = showsBorder ? .on : .off
+        menu.addItem(borderItem)
         menu.addItem(.separator())
 
         // 透明度子菜单
@@ -951,8 +1174,16 @@ final class PinWindow: NSWindow {
     }
 
     @objc private func editPinImage() {
+        if let onInlineEdit {
+            onInlineEdit(self)
+            return
+        }
         guard let image = contentImage else { return }
         onEdit?(image)
+    }
+
+    @objc private func toggleClickThroughFromMenu() {
+        setClickThrough(!isClickThrough)
     }
 
     @objc private func ocrPinImage() {
@@ -999,13 +1230,75 @@ final class PinWindow: NSWindow {
 
     /// 关闭并**释放位图**。这是释放位图的唯一实现。
     func closeAndRelease() {
+        hudHideTask?.cancel()
+        hudHideTask = nil
         // 先置空位图：即使后续 AppKit 侧出现异常，内存也已经交还。
         contentImage = nil
         imageView.image = nil
         isUserHidden = false
+        if isClickThrough {
+            isClickThrough = false
+            ignoresMouseEvents = false
+            onClickThroughChanged?(false)
+        }
         orderOut(nil)
         close()
         onClose?()
+    }
+}
+
+/// 贴图左上角自适应浅/深色实时百分比胶囊 HUD。
+private final class PinHUDCapsuleView: NSView {
+    private let label = NSTextField(labelWithString: "")
+
+    var currentText: String { label.stringValue }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        label.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        label.textColor = .labelColor
+        label.alignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            label.topAnchor.constraint(equalTo: topAnchor, constant: 3),
+            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("不支持从 nib 构造")
+    }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.86).cgColor
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.separatorColor.cgColor
+        layer?.cornerRadius = bounds.height / 2
+    }
+
+    func setText(_ text: String) {
+        label.stringValue = text
+        needsLayout = true
+    }
+
+    var fittingCapsuleSize: CGSize {
+        let textSize = label.intrinsicContentSize
+        return CGSize(
+            width: ceil(textSize.width) + 16,
+            height: max(20, ceil(textSize.height) + 6)
+        )
+    }
+
+    override func layout() {
+        super.layout()
+        layer?.cornerRadius = bounds.height / 2
     }
 }
 
@@ -1058,10 +1351,14 @@ final class PinManager {
         didSet { updatePinchMonitor() }
     }
 
-    /// 请求对某张贴图重新标注编辑。
+    /// 请求对某张贴图进入原地补画编辑。
+    var onInlineEditPin: ((PinWindow) -> Void)?
+    /// 请求对某张贴图重新标注编辑（兼容回退）。
     var onEditPin: ((CGImage) -> Void)?
     /// 请求对某张贴图执行 OCR 文字识别。
     var onOCRPin: ((CGImage, CGRect) -> Void)?
+    /// 任意贴图穿透状态发生变化。
+    var onClickThroughChanged: (() -> Void)?
 
     /// Pin 序号的分配器。隐藏后重新显示不改变它，因此菜单项不会跳号。
     private var nextPinID = 1
@@ -1125,7 +1422,12 @@ final class PinManager {
     private func handlePinchFromMonitor(amount: Double, transparency: Bool, at location: CGPoint) {
         guard amount != 0, let target = pin(at: location) else { return }
         target.notePinchBegan(source: "global monitor", amount: amount)
-        target.applyCardInput(.pinch(amount: amount), transparency: transparency)
+        let frame = target.frame
+        let anchor = CGPoint(
+            x: min(max(0, (location.x - frame.minX) / max(1, frame.width)), 1),
+            y: min(max(0, (location.y - frame.minY) / max(1, frame.height)), 1)
+        )
+        target.applyCardInput(.pinch(amount: amount), transparency: transparency, anchor: anchor)
     }
 
     /// 捏合监视器是否已装上（诊断用：它是非活跃应用下捏合的唯一路径）。
@@ -1134,9 +1436,27 @@ final class PinManager {
     /// 屏幕坐标（左下原点，与 `NSWindow.frame` 同系）下指针所在的卡片。
     ///
     /// 从后往前找：后钉的在窗口层级上更新，重叠时命中的应该是用户看到的那一张。
-    /// 隐藏的卡片不参与——它们已从窗口层级移出，指针不可能在它们上面。
+    /// 隐藏或已开启鼠标穿透的卡片不参与命中。
     func pin(at location: CGPoint) -> PinWindow? {
-        pins.last { !$0.isUserHidden && $0.frame.contains(location) }
+        pins.last { !$0.isUserHidden && !$0.isClickThrough && $0.frame.contains(location) }
+    }
+
+    /// 当前处于鼠标穿透状态的贴图数量。
+    var clickThroughCount: Int { pins.filter(\.isClickThrough).count }
+
+    /// 是否存在任意开启了鼠标穿透的贴图。
+    var hasClickThroughPins: Bool { pins.contains(where: \.isClickThrough) }
+
+    /// 一键取消全部贴图的鼠标穿透并恢复原始透明度。
+    func disableAllClickThrough() {
+        var changed = false
+        for pin in pins where pin.isClickThrough {
+            pin.setClickThrough(false, showToast: false)
+            changed = true
+        }
+        if changed {
+            ToastPresenter.show("已取消全部贴图的鼠标穿透")
+        }
     }
 
     /// 当前显示中的 Pin 数量。
@@ -1190,18 +1510,25 @@ final class PinManager {
             logicalSize: logical,
             at: resolveOrigin(topLeft: topLeft, size: logical),
             screenScale: screenScale,
-            hasWindowShadow: hasWindowShadow
+            hasWindowShadow: hasWindowShadow,
+            showsBorder: settings?.pinShowBorder ?? true
         )
         nextPinID += 1
         window.onClose = { [weak self, weak window] in
             guard let self, let window else { return }
             self.pins.removeAll { $0 === window }
         }
+        window.onInlineEdit = { [weak self] targetPin in
+            self?.onInlineEditPin?(targetPin)
+        }
         window.onEdit = { [weak self] img in
             self?.onEditPin?(img)
         }
         window.onOCR = { [weak self] img, rect in
             self?.onOCRPin?(img, rect)
+        }
+        window.onClickThroughChanged = { [weak self] _ in
+            self?.onClickThroughChanged?()
         }
         window.onCloseAll = { [weak self] in
             self?.closeAll()

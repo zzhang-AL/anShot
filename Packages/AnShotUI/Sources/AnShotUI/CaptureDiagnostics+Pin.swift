@@ -114,9 +114,9 @@ extension CaptureDiagnostics {
         report("层级在普通窗口之上",
                "\(pin.level.rawValue) >= floating(\(NSWindow.Level.floating.rawValue))",
                "true", pin.level.rawValue >= NSWindow.Level.floating.rawValue)
-        report("不进全屏空间（不遮挡别人的全屏应用）",
-               "\(pin.collectionBehavior.contains(.fullScreenAuxiliary))", "false",
-               !pin.collectionBehavior.contains(.fullScreenAuxiliary))
+        report("支持在全屏应用前置顶（fullScreenAuxiliary）",
+               "\(pin.collectionBehavior.contains(.fullScreenAuxiliary))", "true",
+               pin.collectionBehavior.contains(.fullScreenAuxiliary))
         report("序号从 1 开始且写入描述", pin.descriptor, "含 #1", pin.descriptor.hasPrefix("#1"))
 
         // ─── ② 拖动：这是「Pin 拖不动」的根因所在 ───

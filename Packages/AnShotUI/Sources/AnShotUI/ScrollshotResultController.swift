@@ -53,6 +53,7 @@ final class ScrollshotResultController: NSObject, NSWindowDelegate {
         var onCopy: (CGImage) -> Void
         var onPin: (CGImage) -> Void
         var onEdit: ((CGImage) -> Void)?
+        var onOCR: ((CGImage, CGRect) -> Void)?
         var onClose: () -> Void
     }
 
@@ -60,8 +61,8 @@ final class ScrollshotResultController: NSObject, NSWindowDelegate {
     private enum Layout {
         /// 内容四周留白。
         static let margin: CGFloat = 18
-        /// 内容宽度的下限：按钮行需要约 330pt，太窄会把中文按钮挤成两行。
-        static let minimumWidth: CGFloat = 360
+        /// 内容宽度的下限：按钮行含保存/复制/钉住/编辑/识别文字/关闭，需足够舒展。
+        static let minimumWidth: CGFloat = 460
         /// 预览区上限（点）。再大就会在小屏上超出可见区。
         static let maximumPreviewWidth: CGFloat = 560
         static let maximumPreviewHeight: CGFloat = 420
@@ -143,12 +144,21 @@ final class ScrollshotResultController: NSObject, NSWindowDelegate {
         previewViewportSize = viewportSize
         let contentWidth = max(Layout.minimumWidth, viewportSize.width + Layout.margin * 2)
 
-        let panel = NSPanel(
+        let panel = ScrollshotResultPanel(
             contentRect: CGRect(x: 0, y: 0, width: contentWidth, height: 240),
             styleMask: [.titled, .closable, .nonactivatingPanel, .utilityWindow],
             backing: .buffered,
             defer: false
         )
+        panel.onShortcut = { [weak self] shortcut in
+            switch shortcut {
+            case .copy: self?.handleCopy()
+            case .save: self?.handleSave()
+            case .edit: self?.handleEdit()
+            case .ocr: self?.handleOCR()
+            case .close: self?.handleClose()
+            }
+        }
         self.panel = panel
         panel.title = "长截图结果"
         // ARC 下 `close()` 会因默认的 isReleasedWhenClosed 过度释放（项目内其它
@@ -269,6 +279,9 @@ final class ScrollshotResultController: NSObject, NSWindowDelegate {
         // 灰按钮，只会让用户反复点它来确认「为什么没用」。
         if actions?.onEdit != nil {
             buttons.append(Self.makeButton(title: "编辑", target: self, action: #selector(handleEdit)))
+        }
+        if actions?.onOCR != nil {
+            buttons.append(Self.makeButton(title: "识别文字", target: self, action: #selector(handleOCR)))
         }
         buttons.append(closeButton)
 
@@ -495,9 +508,57 @@ final class ScrollshotResultController: NSObject, NSWindowDelegate {
         onEdit(image)
     }
 
+    @objc private func handleOCR() {
+        guard let image, let actions, let onOCR = actions.onOCR else { return }
+        let frame = panel?.frame ?? CGRect(x: 200, y: 200, width: 400, height: 300)
+        onOCR(image, frame)
+    }
+
     /// 「关闭」是窗口自己的事：它必须真正关闭，且只触发一次 `onClose`。
     @objc private func handleClose() {
         close()
+    }
+}
+
+/// 支持长截图结果窗口常用快捷键（`⌘C`/`⌘S`/`⌘E`/`T`/`Esc`/`⌘W`）的面板子类。
+@MainActor
+private final class ScrollshotResultPanel: NSPanel {
+    enum ShortcutAction {
+        case copy
+        case save
+        case edit
+        case ocr
+        case close
+    }
+
+    var onShortcut: ((ShortcutAction) -> Void)?
+
+    override func cancelOperation(_ sender: Any?) {
+        onShortcut?(.close)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let key = event.charactersIgnoringModifiers?.lowercased()
+        if flags == .command {
+            switch key {
+            case "c": onShortcut?(.copy); return true
+            case "s": onShortcut?(.save); return true
+            case "e": onShortcut?(.edit); return true
+            case "w": onShortcut?(.close); return true
+            default: break
+            }
+        } else if flags.isEmpty {
+            if event.keyCode == 53 {
+                onShortcut?(.close)
+                return true
+            }
+            if key == "t" {
+                onShortcut?(.ocr)
+                return true
+            }
+        }
+        return super.performKeyEquivalent(with: event)
     }
 }
 

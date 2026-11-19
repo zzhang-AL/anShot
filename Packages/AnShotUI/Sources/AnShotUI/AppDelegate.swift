@@ -161,6 +161,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 固定截图的非模态提示（懒建：不用就不占窗口）。
     private lazy var pinNotice = PinNotice()
 
+    /// 划词翻译（`⌥D`）与可选悬浮「译」小按钮控制器。
+    private lazy var selectionTranslationController = SelectionTranslationController(
+        settings: settings,
+        onTranslateText: { [weak self] text, anchorRect in
+            self?.overlayController.presentTextTranslation(text, near: anchorRect)
+        },
+        onRequestAccessibilityPermission: { [weak self] in
+            self?.openAccessibilitySettings()
+        }
+    )
+
     /// 因录制而临时让出的快捷键。非 nil 表示热键当前处于「已让出」状态。
     ///
     /// 必须先记下来才能恢复：`GlobalHotKey.invalidate()` 会拆掉系统级注册，
@@ -233,7 +244,13 @@ private let recordingFrame = RecordingRegionFrame()
             self?.handleBackdropUnavailable()
         }
 
-        // 贴图右键/快捷键「重新标注编辑」与「提取文字 (OCR)」接线。
+        // 启动时即注册 macOS 15.0+ 本机翻译极薄 SwiftUI 桥接，使所有入口统一具备离线翻译能力。
+        AppleTranslationBridgeBootstrap.installIfSupported()
+
+        // 贴图右键/快捷键「原地补画编辑」与「识别文字 (OCR)」接线。
+        overlayController.pinManager.onInlineEditPin = { [weak self] pin in
+            self?.overlayController.presentInlinePinEdit(pin)
+        }
         overlayController.pinManager.onEditPin = { [weak self] image in
             guard let self else { return }
             guard !self.overlayController.isPresenting else {
@@ -242,9 +259,15 @@ private let recordingFrame = RecordingRegionFrame()
             }
             self.overlayController.present(image: image)
         }
-        overlayController.pinManager.onOCRPin = { [weak self] image, _ in
-            self?.recognizePinText(image)
+        overlayController.pinManager.onOCRPin = { [weak self] image, rect in
+            self?.overlayController.presentOCR(for: image, near: rect)
         }
+
+        settings.onSelectionTranslateFloatingButtonChanged = { [weak self] _ in
+            guard let self else { return }
+            self.selectionTranslationController.refreshFloatingMonitor(isDiagnosticRun: self.isDiagnosticRun)
+        }
+        selectionTranslationController.refreshFloatingMonitor(isDiagnosticRun: isDiagnosticRun)
 
         // 全局常驻安装标准 Edit 主菜单，确保 7 个独立窗口与输入框均可使用 ⌘C/⌘V/⌘X/⌘A。
         SettingsMainMenu.install()
@@ -545,6 +568,16 @@ private let recordingFrame = RecordingRegionFrame()
     private func rebuildMenu(_ menu: NSMenu) {
         menu.removeAllItems()
 
+        // 存在任意点击穿透贴图时，在菜单栏最顶部动态置顶一键恢复入口（契约 §5.2）。
+        if overlayController.pinManager.hasClickThroughPins {
+            let count = overlayController.pinManager.clickThroughCount
+            let restoreItem = makeAction(
+                "取消贴图穿透（\(count) 张）",
+                #selector(disableAllPinClickThrough)
+            )
+            append([restoreItem, .separator()], to: menu)
+        }
+
         let permission = permissionService.current()
 
         append(makeStatusSection(permission), to: menu)
@@ -684,6 +717,10 @@ private let recordingFrame = RecordingRegionFrame()
             makeAction("从剪贴板贴图", #selector(pinFromPasteboard)),
             makeAction("滚动长截图…", #selector(startLongScreenshotFlow)),
             makeAction("识别文字…", #selector(startOCRCaptureFlow)),
+            makeAction("框选翻译…", #selector(startOCRAutoTranslateFlow)),
+            makeAction("划词翻译", #selector(triggerSelectionTranslateFromMenu)),
+            makeAction("从剪贴板识别文字", #selector(ocrFromPasteboard)),
+            makeAction("识别图片文件文字…", #selector(ocrFromImageFile)),
             makeAction("开始录制…", #selector(startRecordingFlow)),
             makePinMenuItem(),
         ]
@@ -691,10 +728,14 @@ private let recordingFrame = RecordingRegionFrame()
         if let globalHotKeyError {
             items.append(makeStatus("截图快捷键不可用：\(globalHotKeyError)"))
         }
-        // 每个直达热键的失败单独说清：五个键位是五个独立事实，
-        // 把「录制键被占用」笼统写成「快捷键不可用」会让用户
-        // 去改截图快捷键，改完发现录制还是不工作。
-        for action in [GlobalShortcutAction.recording, .longScreenshot, .ocr] {
+        // 每个直达热键的失败单独说清：每个键位是独立的可用性事实。
+        for action in [
+            GlobalShortcutAction.recording,
+            .longScreenshot,
+            .ocr,
+            .ocrAutoTranslate,
+            .selectionTranslate,
+        ] {
             if let error = intentHotKeyErrors[action] {
                 items.append(makeStatus("\(action.displayName)快捷键不可用：\(error)"))
             }
@@ -855,6 +896,8 @@ private let recordingFrame = RecordingRegionFrame()
         installIntentHotKey(.recording, role: .recording)
         installIntentHotKey(.longScreenshot, role: .longScreenshot)
         installIntentHotKey(.ocr, role: .ocr)
+        installIntentHotKey(.ocrAutoTranslate, role: .ocrAutoTranslate)
+        installIntentHotKey(.selectionTranslate, role: .selectionTranslate)
     }
 
     /// 安装一个「直达动作」热键。
@@ -899,6 +942,10 @@ private let recordingFrame = RecordingRegionFrame()
                 self.overlayController.present(intent: .longScreenshot)
             case .ocr:
                 self.overlayController.present(intent: .ocr)
+            case .ocrAutoTranslate:
+                self.overlayController.present(intent: .ocrAutoTranslate)
+            case .selectionTranslate:
+                self.selectionTranslationController.triggerSelectionTranslate()
             case .capture, .pinToggle:
                 break
             }
@@ -1453,6 +1500,37 @@ private let recordingFrame = RecordingRegionFrame()
         overlayController.present(intent: .ocr, delayNanoseconds: Self.menuDismissDelayNanoseconds)
     }
 
+    /// 菜单入口：框选文字识别并自动翻译（对应 `⌥S`）。
+    @objc private func startOCRAutoTranslateFlow() {
+        overlayController.present(intent: .ocrAutoTranslate, delayNanoseconds: Self.menuDismissDelayNanoseconds)
+    }
+
+    /// 菜单入口：划词翻译当前选中文本（对应 `⌥D`）。
+    @objc private func triggerSelectionTranslateFromMenu() {
+        selectionTranslationController.triggerSelectionTranslate()
+    }
+
+    /// 菜单入口：从剪贴板识别图片文字并打开独立 OCR 浮窗。
+    @objc private func ocrFromPasteboard() {
+        guard let image = ImageSourceLauncher.imageFromPasteboard() else {
+            NSSound.beep()
+            ToastPresenter.show("剪贴板中没有可识别的图片")
+            return
+        }
+        overlayController.presentOCR(for: image)
+    }
+
+    /// 菜单入口：选取本地图片文件执行 OCR 并打开独立浮窗。
+    @objc private func ocrFromImageFile() {
+        guard let choice = ImageSourceLauncher.chooseImage() else { return }
+        overlayController.presentOCR(for: choice.image)
+    }
+
+    /// 菜单入口：一键取消全部贴图的鼠标点击穿透。
+    @objc private func disableAllPinClickThrough() {
+        overlayController.pinManager.disableAllClickThrough()
+    }
+
     /// 菜单入口：直接进入录制准备，选区确定即弹面板（录制进行中则前置拦截提示）。
     @objc private func startRecordingFlow() {
         guard !recordingController.isActive else {
@@ -1476,28 +1554,6 @@ private let recordingFrame = RecordingRegionFrame()
         case .limitReached(let limit):
             NSSound.beep()
             showPinLimitNotice(limit: limit)
-        }
-    }
-
-    /// 贴图浮窗触发的文字识别（OCR）：识别完成后自动复制到剪贴板并弹轻提示。
-    private func recognizePinText(_ image: CGImage) {
-        ToastPresenter.show("正在识别贴图文字…", duration: 10)
-        Task { @MainActor in
-            do {
-                let result = try await OCRService().recognize(in: image)
-                let text = result.lines.map(\.text).joined(separator: "\n")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !text.isEmpty else {
-                    ToastPresenter.show("贴图中未识别到文字")
-                    return
-                }
-                let pasteboard = NSPasteboard.general
-                pasteboard.clearContents()
-                pasteboard.setString(text, forType: .string)
-                ToastPresenter.show("已识别并复制 \(result.lines.count) 行文字")
-            } catch {
-                ToastPresenter.show("识别失败：\(error.localizedDescription)")
-            }
         }
     }
 
@@ -1987,7 +2043,7 @@ extension AppDelegate: ShortcutHosting {
             return applyCaptureShortcut(shortcut)
         case .pinToggle:
             return applyPinToggleShortcut(shortcut)
-        case .recording, .longScreenshot, .ocr:
+        case .recording, .longScreenshot, .ocr, .ocrAutoTranslate, .selectionTranslate:
             if let conflict = internalConflictMessage(for: shortcut, excluding: action) {
                 return conflict
             }
@@ -2031,7 +2087,7 @@ extension AppDelegate: ShortcutHosting {
             return suspendCaptureShortcut()
         case .pinToggle:
             return suspendPinToggleShortcut()
-        case .recording, .longScreenshot, .ocr:
+        case .recording, .longScreenshot, .ocr, .ocrAutoTranslate, .selectionTranslate:
             guard suspendedIntentShortcuts[action] == nil else { return true }
             guard let hotKey = intentHotKeys[action] else {
                 // 启动期就注册失败：没有可让出的热键，但设置必须仍可改。
@@ -2054,7 +2110,7 @@ extension AppDelegate: ShortcutHosting {
             return resumeCaptureShortcut()
         case .pinToggle:
             return resumePinToggleShortcut()
-        case .recording, .longScreenshot, .ocr:
+        case .recording, .longScreenshot, .ocr, .ocrAutoTranslate, .selectionTranslate:
             guard let shortcut = suspendedIntentShortcuts[action] else { return nil }
             suspendedIntentShortcuts[action] = nil
             if let reason = applyGlobalShortcut(shortcut, for: action) {
@@ -2074,6 +2130,8 @@ extension AppDelegate: ShortcutHosting {
         case .recording: return .recording
         case .longScreenshot: return .longScreenshot
         case .ocr: return .ocr
+        case .ocrAutoTranslate: return .ocrAutoTranslate
+        case .selectionTranslate: return .selectionTranslate
         case .capture: return .capture
         case .pinToggle: return .pinToggle
         }

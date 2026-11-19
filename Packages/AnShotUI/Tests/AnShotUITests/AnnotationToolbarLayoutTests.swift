@@ -199,7 +199,7 @@ struct AnnotationToolbarLayoutBarTests {
         }
     }
 
-    @Test("关闭抓屏动作后，录制 / 长截图 / OCR 从主栏消失且工具栏变窄")
+    @Test("关闭动态抓屏动作后，录制 / 长截图从主栏消失但保留 OCR 且工具栏变窄")
     func captureActionsCanBeHidden() {
         var enabled = AnnotationToolbarLayout()
         enabled.tool = .rectangle
@@ -209,24 +209,26 @@ struct AnnotationToolbarLayoutBarTests {
         let full = enabled.layoutBar()
         let reduced = disabled.layoutBar()
 
-        let captureKinds: Set<AnnotationToolbarLayout.Kind> = [
-            .record, .longScreenshot, .recognizeText
+        let liveCaptureKinds: Set<AnnotationToolbarLayout.Kind> = [
+            .record, .longScreenshot
         ]
         #expect(
-            full.items.contains { captureKinds.contains($0.kind) },
-            "默认应显示三个抓屏动作"
+            full.items.contains { liveCaptureKinds.contains($0.kind) },
+            "默认应显示录制与长截图动作"
         )
         #expect(
-            !reduced.items.contains { captureKinds.contains($0.kind) },
-            "关闭后不应再出现抓屏动作"
+            !reduced.items.contains { liveCaptureKinds.contains($0.kind) },
+            "关闭动态抓屏后不应再出现录制与长截图"
         )
-        // 其余导出项仍在：隐藏的是「抓屏」，不是整组导出。
+        // OCR 直接作用于当前底图，在图片编辑/窗体截图/历史重编下始终保留。
+        #expect(reduced.items.contains { $0.kind == .recognizeText })
+        // 其余导出项仍在：隐藏的是「动态抓屏」，不是整组导出。
         #expect(reduced.items.contains { $0.kind == .pin })
         #expect(reduced.items.contains { $0.kind == .copy })
         #expect(reduced.items.contains { $0.kind == .save })
         #expect(
             reduced.size.width < full.size.width,
-            "移除三个按钮后工具栏必须收窄（\(reduced.size.width) 应小于 \(full.size.width)）"
+            "移除录制与长截图按钮后工具栏必须收窄（\(reduced.size.width) 应小于 \(full.size.width)）"
         )
 
         // 原有的结构性不变量在收窄后仍然成立。

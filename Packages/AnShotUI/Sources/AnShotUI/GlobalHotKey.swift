@@ -69,6 +69,10 @@ public final class GlobalHotKey {
         case recording = 3
         case longScreenshot = 4
         case ocr = 5
+        /// 框选 OCR 后立即自动翻译（默认 ⌥S）。
+        case ocrAutoTranslate = 6
+        /// 划词翻译当前选中文本（默认 ⌥D）。
+        case selectionTranslate = 7
     }
 
     private let action: () -> Void

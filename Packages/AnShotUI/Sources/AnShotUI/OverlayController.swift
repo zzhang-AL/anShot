@@ -36,6 +36,8 @@ public enum OverlaySessionIntent: String, Sendable {
     case recording
     case longScreenshot
     case ocr
+    /// 框选文字识别后自动触发翻译（默认 ⌥S）。
+    case ocrAutoTranslate
 }
 
 @MainActor
@@ -68,6 +70,9 @@ public final class OverlayController {
 
     /// 当前编辑图像是否已内置独立窗体柔和外阴影（贴图时用于避免叠加双阴影）。
     private var sessionImageHasEmbeddedShadow = false
+
+    /// 贴图原地补画模式所绑定的目标贴图（导出完成原地替换，取消则无损恢复显示）。
+    private weak var inlineEditingPin: PinWindow?
 
     /// 正在后台抓取一个窗口。防止连点菜单叠出多个会话。
     private var pendingWindowCapture = false
@@ -124,6 +129,7 @@ public final class OverlayController {
         self.capturer = capturer
         self.settings = settings
         self.pinManager = PinManager(settings: settings)
+        AppleTranslationBridgeBootstrap.installIfSupported()
         self.ocrPanel.onClose = { [weak self] in self?.cancelTextRequests() }
     }
 
@@ -231,13 +237,17 @@ public final class OverlayController {
         image: CGImage,
         sourceURL: URL? = nil,
         scaleFactor: CGFloat? = nil,
-        hasEmbeddedShadow: Bool = false
+        hasEmbeddedShadow: Bool = false,
+        preferredCenter: CGPoint? = nil
     ) {
         guard !isPresenting else {
             logger.debug("present(image:) ignored: a session is already presenting")
             return
         }
-        guard let screen = NSScreen.main ?? NSScreen.screens.first,
+        let targetScreen: NSScreen? = preferredCenter.flatMap { point in
+            NSScreen.screens.first { $0.frame.contains(point) }
+        } ?? NSScreen.main ?? NSScreen.screens.first
+        guard let screen = targetScreen,
               let displayID = screen.displayID else { return }
 
         let effectiveScale = max(1, scaleFactor ?? screen.backingScaleFactor)
@@ -251,12 +261,13 @@ public final class OverlayController {
             backingScale: effectiveScale,
             visibleFrame: visible
         )
-        let frame = CGRect(
-            x: visible.midX - layout.windowSize.width / 2,
-            y: visible.midY - layout.windowSize.height / 2,
-            width: layout.windowSize.width,
-            height: layout.windowSize.height
+        let center = preferredCenter ?? CGPoint(x: visible.midX, y: visible.midY)
+        let rawOrigin = CGPoint(
+            x: center.x - layout.windowSize.width / 2,
+            y: center.y - layout.windowSize.height / 2
         )
+        let clampedOrigin = PinManager.clampOrigin(rawOrigin, size: layout.windowSize, into: visible)
+        let frame = CGRect(origin: clampedOrigin, size: layout.windowSize)
 
         let window = OverlayWindow(
             imageFrame: frame,
@@ -285,13 +296,20 @@ public final class OverlayController {
         window.overlayView.appSettings = settings
         window.overlayView.backdrop = image
         window.overlayView.hidesToolbarForIntent = false
-        // 图片编辑器不提供录制/长截图/OCR：它们都要求「当前屏幕上有一块可抓取
-        // 的区域」，而这里的底图是磁盘上的文件，不是屏幕。隐藏而不是让按钮
-        // 点了没反应——后者会被当成 bug。
+        // 图片编辑器不提供录制与长截图（需要实时屏幕流），但保留 OCR 直接作用于当前画布位图。
         window.overlayView.allowsCaptureActions = false
         window.overlayView.onCancel = { [weak self] in self?.dismiss() }
         window.overlayView.onExport = { [weak self, weak window] image, action in
             self?.handleExport(image, action: action, in: window)
+        }
+        window.overlayView.onRecognizeText = { [weak self, weak window] rect in
+            guard let self, let window else { return }
+            self.handleRecognizeTextRequest(
+                rect,
+                displayID: displayID,
+                overlayWindow: window,
+                autoTranslate: false
+            )
         }
         window.overlayView.onUndoRequested = { [weak self] in self?.undoEditing() }
         window.overlayView.onRedoRequested = { [weak self] in self?.redoEditing() }
@@ -398,6 +416,31 @@ public final class OverlayController {
             windowTitle: title,
             applyShadow: applyShadow
         )
+    }
+
+    /// 进入贴图原地补画模式：先隐藏原贴图并在其屏幕坐标展开编辑画布，
+    /// 完成时原地替换原贴图位图且不增加贴图计数，取消时无损恢复原贴图显示。
+    func presentInlinePinEdit(_ pin: PinWindow) {
+        guard !isPresenting else {
+            ToastPresenter.show("请先完成或关闭当前标注窗口")
+            return
+        }
+        guard let image = pin.contentImage else { return }
+        let center = CGPoint(x: pin.frame.midX, y: pin.frame.midY)
+        inlineEditingPin = pin
+        pin.hidePin()
+        present(
+            image: image,
+            sourceURL: nil,
+            scaleFactor: pin.screenScale,
+            hasEmbeddedShadow: !pin.hasShadow,
+            preferredCenter: center
+        )
+        // 若打开编辑窗口失败（例如屏幕不可用），立刻恢复原贴图防止丢失。
+        if !isPresenting {
+            inlineEditingPin = nil
+            pin.showPin()
+        }
     }
 
     /// 关闭覆盖层并立即释放全部底图。未在展示时调用是安全的空操作。
@@ -713,7 +756,15 @@ public final class OverlayController {
             handleRecognizeTextRequest(
                 logical,
                 displayID: displayID,
-                overlayWindow: window
+                overlayWindow: window,
+                autoTranslate: false
+            )
+        case .ocrAutoTranslate:
+            handleRecognizeTextRequest(
+                logical,
+                displayID: displayID,
+                overlayWindow: window,
+                autoTranslate: true
             )
         }
     }
@@ -839,7 +890,8 @@ public final class OverlayController {
                 self.handleRecognizeTextRequest(
                     rect,
                     displayID: target.displayID,
-                    overlayWindow: window
+                    overlayWindow: window,
+                    autoTranslate: false
                 )
             }
             window.overlayView.onLongScreenshot = { [weak self, weak window] rect in
@@ -1170,9 +1222,12 @@ public final class OverlayController {
             """)
     }
 
-    // MARK: - OCR（M3-2）
+    // MARK: - OCR 与翻译（独立浮窗，脱离覆盖层生命周期）
 
     private let ocrPanel = OCRResultPanel()
+
+    /// 供测试与诊断读取的独立 OCR 浮窗实例。
+    var ocrPanelForTesting: OCRResultPanel { ocrPanel }
 
     /// 识别入口。它只负责选中 provider 并把活交出去（没有回退，理由见 `OCRService`）。
     private let ocrService = OCRService()
@@ -1180,26 +1235,24 @@ public final class OverlayController {
     /// 翻译入口。与 `ocrService` 一样只持有配置读取器，可安全地在任务里使用。
     private let translationService = TranslationService()
 
-    /// 最近一次 OCR 结果：翻译需要它（面板只显示文本，不持有模型）。
+    /// 最近一次 OCR 结果：保留行结构与识别元数据。
     private var lastOCRResult: OCRResult?
 
-    /// 正在进行的 OCR 请求。
-    ///
-    /// 用来挡掉重复点击：识别期间面板上写着「正在识别文字…」，
-    /// 再点一次只会再排一个请求，两段等待叠在一起，看起来反而更慢。
+    /// 当前 OCR 浮窗绑定的源图与定位矩形（供浮窗内切换 OCR 语言即时重识别；面板关闭时立刻置空释放）。
+    private var lastOCRSourceImage: CGImage?
+    private var lastOCRAnchorRect: CGRect = CGRect(x: 200, y: 200, width: 320, height: 180)
+
+    /// 正在进行的 OCR / 翻译请求。
     private var ocrTask: Task<Void, Never>?
     private var ocrRequestID: UUID?
     private var translationTask: Task<Void, Never>?
     private var translationRequestID: UUID?
 
     /// 正在进行的翻译可用性查询。
-    ///
-    /// 用户可能连续改目标语言，每次都要重新判定；旧判定必须能被取消，
-    /// 否则先到的旧结论会盖掉后到的新结论，按钮状态就会与下拉框说的不一致。
     private var translationAvailabilityTask: Task<Void, Never>?
 
-    /// 面板关闭、会话结束或开始新识别时，使未完成的文字请求失效。
-    private func cancelTextRequests() {
+    /// 面板关闭或发起新识别时，使未完成的文字请求失效并释放源图引用。
+    private func cancelTextRequests(releaseSourceImage: Bool = true) {
         ocrRequestID = nil
         translationRequestID = nil
         ocrTask?.cancel()
@@ -1209,9 +1262,14 @@ public final class OverlayController {
         translationAvailabilityTask?.cancel()
         translationAvailabilityTask = nil
         lastOCRResult = nil
+        if releaseSourceImage {
+            lastOCRSourceImage = nil
+        }
         ocrPanel.onCopyAll = nil
         ocrPanel.onTranslate = nil
         ocrPanel.onTargetLanguageChanged = nil
+        ocrPanel.onOCRLanguageChanged = nil
+        ocrPanel.onMergeLineBreaksChanged = nil
     }
 
     /// 固定截图（Pin）：它是全尺寸位图的唯一合法长驻点，因此由控制器统一持有，
@@ -1240,27 +1298,20 @@ public final class OverlayController {
     /// 长截图结果窗口另存为文件后，将此前已写入历史缓存的条目原地升级为永久文件路径。
     var onPromoteLongScreenshotHistory: ((URL) -> Void)?
 
-    /// 识别当前选区里的文字并展示结果。
-    ///
-    /// 不结束截图会话：用户常要对着原文核对，且识别后往往还要接着标注。
-    ///
-    /// 顺序上有一处硬要求：**先把面板摆出来，再去捕获与识别**。
-    /// 识别能力首次加载要十几秒（见 `TextRecognizer.prewarm` 的实测），
-    /// 之前是等结果回来才显示面板，于是这段等待在界面上没有任何痕迹——
-    /// 用户看到的就是「按了没反应」，还会因为不确定而反复点。
+    /// 覆盖层/图片编辑器内触发 OCR：先同步取出目标位图，若来自全屏覆盖层则立即 `dismiss()`
+    /// 收起全屏暗罩并释放所有显示器底图，随后在独立悬浮 `OCRResultPanel` 中展示与交互。
     private func handleRecognizeTextRequest(
         _ rect: CGRect?,
         displayID: CGDirectDisplayID,
-        overlayWindow: OverlayWindow
+        overlayWindow: OverlayWindow,
+        autoTranslate: Bool
     ) {
         guard let rect, rect.width >= 8, rect.height >= 8 else {
-            // 静默返回等于「点了没反应」：选区太小时也必须出个声。
             NSSound.beep()
             return
         }
-        guard ocrTask == nil else { return }
 
-        // 选区在屏幕上的位置（AppKit 坐标）——面板要避开它。
+        // 选区在屏幕上的位置（AppKit 坐标）——独立浮窗据此避让选区。
         let windowFrame = overlayWindow.frame
         let selectionScreenRect = CGRect(
             x: windowFrame.minX + rect.minX,
@@ -1269,20 +1320,52 @@ public final class OverlayController {
             height: rect.height
         )
 
-        // 识别对象取自冻结底图（理由见 `OverlayView.recognitionImage`）。
-        // 必须在这里同步取出：会话结束时底图会被显式释放，任务里再取可能已经没了。
+        // 必须在收起全屏覆盖层前同步裁出目标位图。
         guard let image = overlayWindow.overlayView.recognitionImage(for: rect) else {
             NSSound.beep()
             return
         }
 
-        cancelTextRequests()
+        // 全屏覆盖层点击 OCR 后立即收起暗罩释放内存，不锁死整个桌面；
+        // 独立图片编辑窗口保留开启以便用户继续对照标注。
+        if !overlayWindow.styleMask.contains(.titled) {
+            dismiss()
+        }
+
+        presentOCR(for: image, near: selectionScreenRect, autoTranslate: autoTranslate)
+    }
+
+    /// 全场景统一的独立 OCR 入口（覆盖层、图片编辑、贴图、长截图结果、剪贴板/图片文件共用）。
+    public func presentOCR(
+        for image: CGImage,
+        near anchorScreenRect: CGRect? = nil,
+        autoTranslate: Bool = false
+    ) {
+        let anchor = anchorScreenRect ?? Self.defaultOCRAnchorRect()
+        cancelTextRequests(releaseSourceImage: true)
+        lastOCRSourceImage = image
+        lastOCRAnchorRect = anchor
+
         let requestID = UUID()
         ocrRequestID = requestID
-        ocrPanel.showLoading(near: selectionScreenRect)
+        bindOCRPanelCallbacks()
+        ocrPanel.applyPreferences(
+            ocrLanguage: settings.ocrLanguage,
+            mergeLineBreaks: settings.ocrMergeLineBreaks,
+            targetLanguage: settings.translationTargetLanguage
+        )
+        ocrPanel.showLoading(
+            near: anchor,
+            message: autoTranslate ? "正在识别文字并准备翻译…" : "正在识别文字…"
+        )
         logger.notice("""
-            OCR 开始：选区 \(Int(rect.width), privacy: .public)x\(Int(rect.height), privacy: .public)
+            OCR 开始：\(image.width, privacy: .public)x\(image.height, privacy: .public) \
+            lang=\(self.settings.ocrLanguage.rawValue, privacy: .public) \
+            autoTranslate=\(autoTranslate, privacy: .public)
             """)
+
+        let languagePref = settings.ocrLanguage
+        let detectBarcodes = settings.ocrDetectBarcodes
 
         ocrTask = Task { [weak self] in
             guard let self else { return }
@@ -1292,66 +1375,120 @@ public final class OverlayController {
 
             let startedAt = Date()
             do {
-                let result = try await self.ocrService.recognize(in: image)
+                let result = try await self.ocrService.recognize(
+                    in: image,
+                    languagePreference: languagePref,
+                    detectBarcodes: detectBarcodes
+                )
                 guard !Task.isCancelled, self.ocrRequestID == requestID else { return }
                 let recognizedAt = Date()
 
                 self.lastOCRResult = result
-                self.ocrPanel.onCopyAll = { [weak self] text in
-                    self?.copyRecognizedText(text)
-                }
-                self.ocrPanel.onTranslate = { [weak self] target in
-                    self?.translateRecognizedText(to: target)
-                }
-                self.ocrPanel.onTargetLanguageChanged = { [weak self] target in
-                    self?.refreshTranslationAvailability(target: target)
-                }
+                self.bindOCRPanelCallbacks()
                 self.ocrPanel.applyTranslationAvailability(
                     TranslationSupport.availability(
                         for: self.translationService.selectedStrategy,
                         isCloudConfigured: self.translationService.isCloudConfigured
                     )
                 )
-                self.ocrPanel.show(result: result, near: selectionScreenRect)
+                self.ocrPanel.show(result: result, near: anchor)
 
-                // 识别对象来自内存中的底图，耗时即识别本身（首次加载识别能力也计在内）。
                 logger.notice("""
                     OCR 完成：\(result.lines.count, privacy: .public) 行 \
+                    barcodes=\(result.barcodes.count, privacy: .public) \
                     \(Int(result.imagePixelSize.width), privacy: .public)x\(Int(result.imagePixelSize.height), privacy: .public) \
                     provider=\(self.ocrService.selectedKind.rawValue, privacy: .public) \
-                    坐标=\(result.coordinateCapability.rawValue, privacy: .public) \
                     识别=\(Int(recognizedAt.timeIntervalSince(startedAt) * 1000), privacy: .public)ms
                     """)
+
+                if autoTranslate, !result.lines.isEmpty {
+                    self.translateRecognizedText(
+                        sourceOverride: self.ocrPanel.selectedSourceLanguage,
+                        to: self.ocrPanel.selectedTargetLanguage
+                    )
+                }
             } catch {
                 guard !Task.isCancelled, self.ocrRequestID == requestID else { return }
                 logger.error("OCR 失败：\(String(describing: error), privacy: .public)")
                 self.ocrPanel.showError(
                     "文字识别失败：\(error.localizedDescription)",
-                    near: selectionScreenRect
+                    near: anchor
                 )
                 NSSound.beep()
             }
         }
     }
 
-    /// 把识别结果整段写入剪贴板。
-    /// 翻译已识别的文字。
-    ///
-    /// 可用性在真正发起前**再查一次**：面板打开与用户点按钮之间可能过了很久，
-    /// 而且语言对是否受支持只有真实查询才知道。
-    private func translateRecognizedText(to target: String) {
-        guard let result = lastOCRResult, !result.lines.isEmpty else {
+    /// 划词翻译入口（`⌥D` 或悬浮「译」按钮）：直接打开独立浮窗预填文本并自动翻译。
+    public func presentTextTranslation(
+        _ text: String,
+        near anchorScreenRect: CGRect? = nil
+    ) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
             NSSound.beep()
             return
         }
-        let lines = result.lines
-        // 源语言在本机判定（`NLLanguageRecognizer`，快且不联网、不限系统版本）。
-        // 判不出来时传 nil 而不是空串：空串会被 `LanguageAvailability` 当成一个
-        // 真实的语言标识去查，然后得到「不支持」——那是我们自己的检测失败，
-        // 不应该被伪装成系统的能力结论（实测 `"" → en-US` 就是 unsupported）。
-        let source = SourceLanguageDetector.detect(in: lines)
+        let anchor = anchorScreenRect ?? Self.defaultOCRAnchorRect()
+        cancelTextRequests(releaseSourceImage: true)
+        bindOCRPanelCallbacks()
+        ocrPanel.applyPreferences(
+            ocrLanguage: settings.ocrLanguage,
+            mergeLineBreaks: settings.ocrMergeLineBreaks,
+            targetLanguage: settings.translationTargetLanguage
+        )
+        ocrPanel.applyTranslationAvailability(
+            TranslationSupport.availability(
+                for: translationService.selectedStrategy,
+                isCloudConfigured: translationService.isCloudConfigured
+            )
+        )
+        ocrPanel.showSourceText(trimmed, near: anchor)
+        translateRecognizedText(
+            sourceOverride: ocrPanel.selectedSourceLanguage,
+            to: ocrPanel.selectedTargetLanguage
+        )
+    }
 
-        // 旧的语言切换判定已经没有意义了，取消掉，免得它稍后回来改按钮状态。
+    private func bindOCRPanelCallbacks() {
+        ocrPanel.onCopyAll = { [weak self] text in
+            self?.copyRecognizedText(text)
+        }
+        ocrPanel.onTranslate = { [weak self] sourceOverride, target in
+            self?.settings.setTranslationTargetLanguage(target)
+            self?.translateRecognizedText(sourceOverride: sourceOverride, to: target)
+        }
+        ocrPanel.onTargetLanguageChanged = { [weak self] sourceOverride, target in
+            self?.settings.setTranslationTargetLanguage(target)
+            self?.refreshTranslationAvailability(sourceOverride: sourceOverride, target: target)
+        }
+        ocrPanel.onOCRLanguageChanged = { [weak self] language in
+            guard let self else { return }
+            self.settings.setOCRLanguage(language)
+            if let sourceImage = self.lastOCRSourceImage {
+                self.presentOCR(for: sourceImage, near: self.lastOCRAnchorRect, autoTranslate: false)
+            }
+        }
+        ocrPanel.onMergeLineBreaksChanged = { [weak self] enabled in
+            self?.settings.setOCRMergeLineBreaks(enabled)
+        }
+    }
+
+    private static func defaultOCRAnchorRect() -> CGRect {
+        let mouse = NSEvent.mouseLocation
+        return CGRect(x: mouse.x - 16, y: mouse.y - 16, width: 32, height: 32)
+    }
+
+    /// 翻译当前浮窗中的文字（支持编辑后重译与手动指定源语言）。
+    private func translateRecognizedText(sourceOverride: String?, to target: String) {
+        let lines = ocrPanel.linesForTranslation()
+        guard !lines.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        // 用户未手动指定源语言时，先由本机 NLLanguageRecognizer 检测（零联网、不限系统版本）。
+        let source = sourceOverride ?? SourceLanguageDetector.detect(in: lines)
+
         translationAvailabilityTask?.cancel()
         translationTask?.cancel()
         let requestID = UUID()
@@ -1373,7 +1510,6 @@ public final class OverlayController {
             guard !Task.isCancelled, self.translationRequestID == requestID else { return }
             guard availability.isAvailable else {
                 logger.notice("translation: 不可用 → \(availability.explanation, privacy: .public)")
-                // 原因必须落在面板上：只 beep 一声，用户只会以为功能坏了。
                 self.ocrPanel.showTranslationUnavailable(availability)
                 NSSound.beep()
                 return
@@ -1388,13 +1524,11 @@ public final class OverlayController {
         }
     }
 
-    /// 目标语言改变后重新判定翻译入口。
-    ///
-    /// 可用性是「源语言 → 目标语言」的函数，换了目标就得重算：
-    /// 「原文已经是英文」与「英文 → 中文」是同一次识别结果下的两种不同结论。
-    private func refreshTranslationAvailability(target: String) {
-        guard let result = lastOCRResult, !result.lines.isEmpty else { return }
-        let source = SourceLanguageDetector.detect(in: result.lines)
+    /// 源语言或目标语言改变后重新判定翻译入口可用性。
+    private func refreshTranslationAvailability(sourceOverride: String?, target: String) {
+        let lines = ocrPanel.linesForTranslation()
+        guard !lines.isEmpty else { return }
+        let source = sourceOverride ?? SourceLanguageDetector.detect(in: lines)
 
         translationRequestID = nil
         translationTask?.cancel()
@@ -1548,6 +1682,9 @@ public final class OverlayController {
                     self?.scrollshotResult?.close()
                     self?.present(image: image, scaleFactor: scale)
                 },
+                onOCR: { [weak self] image, anchorRect in
+                    self?.presentOCR(for: image, near: anchorRect, autoTranslate: false)
+                },
                 onClose: { [weak self] in
                     self?.scrollshotResult = nil
                 }
@@ -1672,6 +1809,55 @@ public final class OverlayController {
            let pixel = selection {
             performPendingIntent(pixel, displayID: overlay.displayID, window: overlay)
             return
+        }
+
+        // 贴图原地补画模式：完成导出直接原地替换目标贴图位图并恢复可见，绝不增加贴图计数。
+        if let editingPin = inlineEditingPin {
+            let scale = exportBackingScale(in: window)
+            switch action {
+            case .pin:
+                inlineEditingPin = nil
+                editingPin.updateImage(image, screenScale: scale)
+                editingPin.showPin()
+                ToastPresenter.show("已原地更新贴图")
+                dismiss()
+                return
+            case .copy:
+                let copyResult = SessionExporter.copyToPasteboardWithPNG(image, backingScale: scale)
+                inlineEditingPin = nil
+                editingPin.updateImage(image, screenScale: scale)
+                editingPin.showPin()
+                ToastPresenter.show((copyResult?.didCopy == true) ? "已原地更新贴图并复制到剪贴板" : "已原地更新贴图")
+                dismiss()
+                return
+            case .save:
+                let destination = settings.saveDestination
+                let outcome = SessionExporter.save(
+                    image,
+                    suggestedName: Exporter.defaultFileName(),
+                    destination: destination,
+                    backingScale: scale
+                )
+                switch outcome {
+                case .saved(let url):
+                    inlineEditingPin = nil
+                    editingPin.updateImage(image, screenScale: scale)
+                    editingPin.showPin()
+                    onArtifact?(CaptureArtifact(
+                        kind: .screenshot,
+                        source: currentSource(mode: "pin"),
+                        image: image,
+                        fileURL: url,
+                        delivery: .saved
+                    ))
+                    dismiss()
+                case .cancelled:
+                    break
+                case .failed(let reason):
+                    presentSaveFailure(reason, image: image, in: window)
+                }
+                return
+            }
         }
 
         switch action {
@@ -2254,11 +2440,14 @@ public final class OverlayController {
 
         sessionID = nil
         sessionImageHasEmbeddedShadow = false
-        // 显式取消未完成的 OCR/翻译和长截图任务，防止退出会话后弹出幽灵面板或后台空转。
-        cancelTextRequests()
+        // 若处于贴图原地补画态且用户取消/关闭窗口，无损恢复原贴图显示。
+        if let editingPin = inlineEditingPin {
+            inlineEditingPin = nil
+            editingPin.showPin()
+        }
+        // OCR 浮窗与覆盖层生命周期解耦：覆盖层退出不关闭独立 OCR 面板，仅终止长截图会话。
         scrollshot?.cancel()
         scrollshot = nil
-        ocrPanel.hide()
         // 准备面板与预览框是**跨会话**存在的实例（不是每个会话新建的），
         // 因此会话结束时必须显式收起：用户完全可能在正在选取录制目标时
         // 直接按 ESC 退出会话，那时面板还开着。

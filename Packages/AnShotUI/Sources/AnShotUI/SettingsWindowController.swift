@@ -407,18 +407,22 @@ private final class SettingsViewController: NSViewController {
     private var pinLimitValueLabel: NSTextField!
     private var pinLimitStepper: NSStepper!
     private var pinToggleRecorder: ShortcutRecorderView!
+    private var pinShowBorderRow: SettingsToggleRow!
     private var pinMessageLabel: NSTextField!
 
-    /// 录制 / 长截图 / OCR 三个直达入口的录制控件。
-    ///
-    /// 用字典而不是三个字段：新增动作时卡片生成、reload、reset 三处
-    /// 都只遍历 `GlobalShortcutAction` 的子集，不会再漏一条。
+    // 文字识别与翻译扩展偏好控件
+    private var ocrLanguagePrefPopUp: NSPopUpButton!
+    private var ocrDetectBarcodesRow: SettingsToggleRow!
+    private var translationTargetPrefPopUp: NSPopUpButton!
+    private var selectionFloatingButtonRow: SettingsToggleRow!
+
+    /// 录制 / 长截图 / OCR / 框选翻译 / 划词翻译直达入口的录制控件。
     private var intentRecorders: [GlobalShortcutAction: ShortcutRecorderView] = [:]
     private var intentMessageLabel: NSTextField!
 
     /// 直达动作的显示顺序（也是重置按钮 tag 的序号来源）。
     private static let intentShortcutActions: [GlobalShortcutAction] = [
-        .recording, .longScreenshot, .ocr
+        .recording, .longScreenshot, .ocr, .ocrAutoTranslate, .selectionTranslate
     ]
 
     // MARK: 关于页的状态
@@ -879,8 +883,17 @@ private final class SettingsViewController: NSViewController {
     /// 两件事放同一个卡片，因为它们是同一个动作的两半（管住屏幕上贴着的那些图）；
     /// 拆成两张卡片会让这一页出现两个都叫「固定截图」的标题。
     private func makePinCard() -> SettingsCardView {
-        // 两个区块各自组装，本方法只负责拼装与统一约束。
-        let rows = makePinLimitViews() + makePinToggleViews()
+        // 三个区块各自组装，本方法只负责拼装与统一约束。
+        let borderRow = SettingsToggleRow(
+            title: "新建贴图默认显示高对比边框",
+            subtitle: "开启后绘制外深内浅双层细边，贴图上按 B 键或右键可单独切换"
+        )
+        borderRow.isOn = settings.pinShowBorder
+        borderRow.toggle.target = self
+        borderRow.toggle.action = #selector(pinShowBorderChanged(_:))
+        pinShowBorderRow = borderRow
+
+        let rows = makePinLimitViews() + [borderRow] + makePinToggleViews()
 
         let content = NSStackView(views: rows)
         content.orientation = .vertical
@@ -1239,6 +1252,27 @@ private final class SettingsViewController: NSViewController {
 
         let providerRow = SettingsControlRow(label: "识别方式", control: popUp)
 
+        let langPopUp = NSPopUpButton(frame: .zero, pullsDown: false)
+        for pref in OCRLanguagePreference.allCases {
+            langPopUp.addItem(withTitle: pref.displayName)
+        }
+        langPopUp.target = self
+        langPopUp.action = #selector(ocrLanguagePrefChanged)
+        langPopUp.isBordered = false
+        langPopUp.bezelStyle = .inline
+        langPopUp.font = .systemFont(ofSize: 13)
+        ocrLanguagePrefPopUp = langPopUp
+        let ocrLanguageRow = SettingsControlRow(label: "默认识别语言", control: langPopUp)
+
+        let barcodeRow = SettingsToggleRow(
+            title: "识别文字时同步扫描二维码 / 条形码",
+            subtitle: "在独立 OCR 浮窗顶部展示识别出的二维码卡片，支持一键复制或打开链接"
+        )
+        barcodeRow.isOn = settings.ocrDetectBarcodes
+        barcodeRow.toggle.target = self
+        barcodeRow.toggle.action = #selector(ocrDetectBarcodesChanged(_:))
+        ocrDetectBarcodesRow = barcodeRow
+
         let endpointRow = SettingsFieldRow(label: "Endpoint", placeholder: "留空则用默认地址")
         let modelRow = SettingsFieldRow(label: "模型", placeholder: "留空则用默认模型")
         let keyRow = SettingsFieldRow(label: "API Key", placeholder: "只保存在本机，不会上传", isSecure: true)
@@ -1282,7 +1316,17 @@ private final class SettingsViewController: NSViewController {
         actionRow.spacing = 10
         actionRow.translatesAutoresizingMaskIntoConstraints = false
 
-        let rows: [NSView] = [providerRow, endpointRow, modelRow, keyRow, secretRow, privacy, actionRow]
+        let rows: [NSView] = [
+            providerRow,
+            ocrLanguageRow,
+            barcodeRow,
+            endpointRow,
+            modelRow,
+            keyRow,
+            secretRow,
+            privacy,
+            actionRow,
+        ]
         let content = NSStackView(views: rows)
         content.orientation = .vertical
         content.alignment = .leading
@@ -1310,6 +1354,10 @@ private final class SettingsViewController: NSViewController {
         if let index = OCRProviderKind.allCases.firstIndex(of: kind) {
             ocrProviderPopUp.selectItem(at: index)
         }
+        if let langIndex = OCRLanguagePreference.allCases.firstIndex(of: settings.ocrLanguage) {
+            ocrLanguagePrefPopUp?.selectItem(at: langIndex)
+        }
+        ocrDetectBarcodesRow?.isOn = settings.ocrDetectBarcodes
 
         let config = ocrSettings.config(for: kind)
         ocrEndpointRow.field.stringValue = config.endpoint
@@ -1375,9 +1423,29 @@ private final class SettingsViewController: NSViewController {
     /// 与识别卡片同构（provider 选择 + endpoint / 模型 / 密钥 + 测试 + 隐私提示），
     /// 但隐私提示说的是**文本**外发：翻译只把文字发出去，不发图。
     private func makeTranslationCard() -> SettingsCardView {
-        // 四个区块各自组装，本方法只负责拼装与统一约束。
+        let targetPopUp = NSPopUpButton(frame: .zero, pullsDown: false)
+        for item in TranslationLanguage.commonTargetLanguages {
+            targetPopUp.addItem(withTitle: item.name)
+        }
+        targetPopUp.target = self
+        targetPopUp.action = #selector(translationTargetPrefChanged)
+        targetPopUp.isBordered = false
+        targetPopUp.bezelStyle = .inline
+        targetPopUp.font = .systemFont(ofSize: 13)
+        translationTargetPrefPopUp = targetPopUp
+        let targetRow = SettingsControlRow(label: "默认目标语言", control: targetPopUp)
+
+        let floatingRow = SettingsToggleRow(
+            title: "划词后显示悬浮「译」按钮",
+            subtitle: "默认关闭；开启后在任意应用中拖选文本即可于光标旁快捷点击翻译（需辅助功能权限，绝不触碰剪贴板）"
+        )
+        floatingRow.isOn = settings.selectionTranslateFloatingButton
+        floatingRow.toggle.target = self
+        floatingRow.toggle.action = #selector(selectionFloatingButtonChanged(_:))
+        selectionFloatingButtonRow = floatingRow
+
         let rows: [NSView] =
-            [makeTranslationStrategyRow(), makeTranslationCloudRow()]
+            [makeTranslationStrategyRow(), targetRow, floatingRow, makeTranslationCloudRow()]
             + makeTranslationFieldRows()
             + [makeTranslationPrivacyLabel(), makeTranslationActionRow()]
 
@@ -1507,6 +1575,13 @@ private final class SettingsViewController: NSViewController {
         if let index = TranslationStrategy.allCases.firstIndex(of: strategy) {
             translationProviderPopUp.selectItem(at: index)
         }
+        if let targetIndex = TranslationLanguage.commonTargetLanguages.firstIndex(where: {
+            $0.id.caseInsensitiveCompare(settings.translationTargetLanguage) == .orderedSame
+                || TranslationLanguage.isSameLanguage($0.id, settings.translationTargetLanguage)
+        }) {
+            translationTargetPrefPopUp?.selectItem(at: targetIndex)
+        }
+        selectionFloatingButtonRow?.isOn = settings.selectionTranslateFloatingButton
         let cloudKind = translationSettings.preferredCloudKind
         if let index = TranslationStrategy.cloudKinds.firstIndex(of: cloudKind) {
             translationCloudPopUp.selectItem(at: index)
@@ -1701,6 +1776,31 @@ private final class SettingsViewController: NSViewController {
         persistOCRFields()
         ocrSettings.selectedKind = OCRProviderKind.allCases[index]
         refreshOCRControls()
+    }
+
+    @objc private func ocrLanguagePrefChanged() {
+        let index = ocrLanguagePrefPopUp.indexOfSelectedItem
+        guard index >= 0, index < OCRLanguagePreference.allCases.count else { return }
+        settings.setOCRLanguage(OCRLanguagePreference.allCases[index])
+    }
+
+    @objc private func ocrDetectBarcodesChanged(_ sender: NSSwitch) {
+        settings.setOCRDetectBarcodes(sender.state == .on)
+    }
+
+    @objc private func translationTargetPrefChanged() {
+        let index = translationTargetPrefPopUp.indexOfSelectedItem
+        let list = TranslationLanguage.commonTargetLanguages
+        guard index >= 0, index < list.count else { return }
+        settings.setTranslationTargetLanguage(list[index].id)
+    }
+
+    @objc private func selectionFloatingButtonChanged(_ sender: NSSwitch) {
+        settings.setSelectionTranslateFloatingButton(sender.state == .on)
+    }
+
+    @objc private func pinShowBorderChanged(_ sender: NSSwitch) {
+        settings.setPinShowBorder(sender.state == .on)
     }
 
     /// 对当前 provider 发一次真实识别，验证密钥 / 地址 / 模型。
@@ -2308,11 +2408,13 @@ private final class SettingsViewController: NSViewController {
         pinLimitStepper.integerValue = settings.pinMaximumCount
         pinLimitValueLabel.stringValue = Self.pinLimitText(settings.pinMaximumCount)
         pinToggleRecorder.shortcut = settings.pinToggleShortcut
+        pinShowBorderRow?.isOn = settings.pinShowBorder
         for action in Self.intentShortcutActions {
             intentRecorders[action]?.shortcut = settings.shortcut(for: action)
         }
         refreshSaveControls()
         refreshOCRControls()
+        refreshTranslationControls()
         // 登录项的状态在系统手里，重新同步必须**重新问系统**一次，
         // 不能沿用上次读到的值——用户在系统设置里改过之后，
         // 缓存下来的那个值已经过期了。

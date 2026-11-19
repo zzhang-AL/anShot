@@ -85,19 +85,13 @@ extension CaptureDiagnostics {
         report("OCR 得到用于翻译的行", "\(lines.count) 行", ">= 1", !lines.isEmpty)
 
         // ③ 源语言检测（契约要求优先用识别结果，避免二次检测分歧）。
-        var source: String?
-        if #available(macOS 26.0, *) {
-            source = TextTranslator.detectSourceLanguage(of: lines)
-        } else {
-            // 低版本下也要能检测语言：这段逻辑只依赖 NaturalLanguage。
-            source = nil
-        }
+        let source = SourceLanguageDetector.detect(in: lines)
         report("检测出源语言", "\(source ?? "nil")", "zh 系", source?.hasPrefix("zh") == true)
 
         // ④ 真实翻译。
-        guard #available(macOS 26.0, *) else {
+        guard #available(macOS 15.0, *) else {
             // 能力降级路径：必须明确报告，而不是静默跳过。
-            report("低于 macOS 26.0 时降级",
+            report("低于 macOS 15.0 时降级",
                    gate.explanation, "含「不可用」", gate.explanation.contains("不可用"))
             logger.notice("""
                 [translate] 汇总: 全部通过（能力降级路径）exitCode=0
@@ -110,17 +104,27 @@ extension CaptureDiagnostics {
             exit(1)
         }
 
-        let availability = await TextTranslator.availability(source: detected, target: "en-US")
+        let availability: TranslationAvailability
+        if #available(macOS 26.0, *) {
+            availability = await TextTranslator.availability(source: detected, target: "en-US")
+        } else {
+            availability = .available
+        }
         report("语言对可用性可查询",
                "\(availability.isAvailable ? "可用" : availability.explanation)",
                "给出结论",
                availability.isAvailable || !availability.explanation.isEmpty)
 
-        let result = await TextTranslator.translate(
-            lines: lines,
-            source: detected,
-            target: "en-US"
-        )
+        let result: TranslationResult
+        if #available(macOS 26.0, *) {
+            result = await TextTranslator.translate(
+                lines: lines,
+                source: detected,
+                target: "en-US"
+            )
+        } else {
+            result = await AppleTranslationProvider().translate(lines, from: detected, to: "en-US")
+        }
 
         // **核心契约**：逐行一一对应。
         report("译文行数与 OCR 行数一致",
@@ -170,16 +174,18 @@ extension CaptureDiagnostics {
         // ⑥ 本次修复的核心：源语言**未判定**不能被报成「语言对不支持」。
         //    实测 `"" → en-US` 就是 unsupported，而空串来自我们自己的检测失败，
         //    把它当成系统结论会让「英文截图 + 译成英文」直接点不动。
-        let blankSource = await TextTranslator.availability(source: nil, target: "en-US")
-        report("源语言未判定时不判为不支持",
-               "\(blankSource.isAvailable ? "可用" : blankSource.explanation)",
-               "可用",
-               blankSource.isAvailable)
-        let blankStringSource = await TextTranslator.availability(source: "", target: "en-US")
-        report("源语言为空串时不判为不支持",
-               "\(blankStringSource.isAvailable ? "可用" : blankStringSource.explanation)",
-               "可用",
-               blankStringSource.isAvailable)
+        if #available(macOS 26.0, *) {
+            let blankSource = await TextTranslator.availability(source: nil, target: "en-US")
+            report("源语言未判定时不判为不支持",
+                   "\(blankSource.isAvailable ? "可用" : blankSource.explanation)",
+                   "可用",
+                   blankSource.isAvailable)
+            let blankStringSource = await TextTranslator.availability(source: "", target: "en-US")
+            report("源语言为空串时不判为不支持",
+                   "\(blankStringSource.isAvailable ? "可用" : blankStringSource.explanation)",
+                   "可用",
+                   blankStringSource.isAvailable)
+        }
 
         // ⑥ 面板状态：入口的可点性由「系统可用」与「有内容可翻」共同决定，
         //    两者缺一都该置灰——「可点但点了没反应」比置灰更糟。
@@ -225,8 +231,8 @@ extension CaptureDiagnostics {
                !TranslationProviderKind.appleTranslation.sendsTextOffDevice)
         report("本机翻译标注了系统台阶",
                TranslationProviderKind.appleTranslation.requiredSystemVersion ?? "nil",
-               "macOS 26.0",
-               TranslationProviderKind.appleTranslation.requiredSystemVersion == "macOS 26.0")
+               "macOS 15.0",
+               TranslationProviderKind.appleTranslation.requiredSystemVersion == "macOS 15.0")
 
         // 语言名映射：BCP-47 → 提示词里用的语言名。
         report("语言名 · 简体中文",

@@ -267,6 +267,8 @@ public enum GlobalShortcutAction: String, CaseIterable, Sendable {
     case recording
     case longScreenshot
     case ocr
+    case ocrAutoTranslate
+    case selectionTranslate
     case pinToggle
 
     public var displayName: String {
@@ -275,6 +277,8 @@ public enum GlobalShortcutAction: String, CaseIterable, Sendable {
         case .recording: return "开始录制"
         case .longScreenshot: return "滚动长截图"
         case .ocr: return "识别文字"
+        case .ocrAutoTranslate: return "框选翻译"
+        case .selectionTranslate: return "划词翻译"
         case .pinToggle: return "收起 / 展开全部固定截图"
         }
     }
@@ -285,6 +289,8 @@ public enum GlobalShortcutAction: String, CaseIterable, Sendable {
         case .recording: return "直接打开准备面板"
         case .longScreenshot: return "框选后开始拼接"
         case .ocr: return "框选后识别文字"
+        case .ocrAutoTranslate: return "框选文字后立即自动翻译"
+        case .selectionTranslate: return "读取选中文字并弹出翻译浮窗"
         case .pinToggle: return "收起或展开全部贴图"
         }
     }
@@ -295,6 +301,8 @@ public enum GlobalShortcutAction: String, CaseIterable, Sendable {
         case .recording: return AppSettings.defaultRecordingShortcut
         case .longScreenshot: return AppSettings.defaultLongScreenshotShortcut
         case .ocr: return AppSettings.defaultOCRShortcut
+        case .ocrAutoTranslate: return AppSettings.defaultOCRAutoTranslateShortcut
+        case .selectionTranslate: return AppSettings.defaultSelectionTranslateShortcut
         case .pinToggle: return AppSettings.defaultPinToggleShortcut
         }
     }
@@ -307,6 +315,8 @@ public enum GlobalShortcutAction: String, CaseIterable, Sendable {
         case .recording: return "settings.recording"
         case .longScreenshot: return "settings.scrollshot"
         case .ocr: return "settings.ocr"
+        case .ocrAutoTranslate: return "settings.ocrAutoTranslate"
+        case .selectionTranslate: return "settings.selectionTranslate"
         case .pinToggle: return "settings.pin"
         }
     }
@@ -349,6 +359,18 @@ public final class AppSettings {
     nonisolated public static let defaultOCRShortcut = Shortcut(
         keyCode: UInt32(kVK_ANSI_4),
         modifiers: UInt32(controlKey)
+    )
+
+    /// 默认「框选翻译」快捷键 `⌥S`（框选 OCR 后立即自动翻译）。
+    nonisolated public static let defaultOCRAutoTranslateShortcut = Shortcut(
+        keyCode: UInt32(kVK_ANSI_S),
+        modifiers: UInt32(optionKey)
+    )
+
+    /// 默认「划词翻译」快捷键 `⌥D`（读取选中文本并弹出独立翻译浮窗）。
+    nonisolated public static let defaultSelectionTranslateShortcut = Shortcut(
+        keyCode: UInt32(kVK_ANSI_D),
+        modifiers: UInt32(optionKey)
     )
 
     /// 默认「隐藏/显示全部固定截图」快捷键 `⌃5`。
@@ -403,6 +425,16 @@ public final class AppSettings {
         self.windowCaptureShadow = store.object(forKey: Key.windowCaptureShadow) as? Bool ?? true
         self.confirmCancelWithAnnotations = store.object(forKey: Key.confirmCancelWithAnnotations) as? Bool ?? true
         self.toolbarHiddenSlots = Set(store.stringArray(forKey: Key.toolbarHiddenSlots) ?? [])
+        self.ocrLanguage = store.string(forKey: Key.ocrLanguage)
+            .flatMap(OCRLanguagePreference.init(rawValue:)) ?? .auto
+        self.ocrMergeLineBreaks = store.object(forKey: Key.ocrMergeLineBreaks) as? Bool ?? false
+        self.ocrDetectBarcodes = store.object(forKey: Key.ocrDetectBarcodes) as? Bool ?? true
+        let savedTarget = store.string(forKey: Key.translationTargetLanguage) ?? "zh-Hans"
+        self.translationTargetLanguage = TranslationLanguage.commonTargetLanguages.contains(where: { $0.id == savedTarget })
+            ? savedTarget
+            : "zh-Hans"
+        self.selectionTranslateFloatingButton = store.object(forKey: Key.selectionTranslateFloatingButton) as? Bool ?? false
+        self.pinShowBorder = store.object(forKey: Key.pinShowBorder) as? Bool ?? true
     }
 
     /// 读文件夹。路径缺失或为空时返回 `nil`。
@@ -485,6 +517,8 @@ public final class AppSettings {
     public var recordingShortcut: Shortcut { shortcut(for: .recording) }
     public var longScreenshotShortcut: Shortcut { shortcut(for: .longScreenshot) }
     public var ocrShortcut: Shortcut { shortcut(for: .ocr) }
+    public var ocrAutoTranslateShortcut: Shortcut { shortcut(for: .ocrAutoTranslate) }
+    public var selectionTranslateShortcut: Shortcut { shortcut(for: .selectionTranslate) }
 
     public func setCaptureShortcut(_ shortcut: Shortcut) {
         setShortcut(shortcut, for: .capture)
@@ -594,6 +628,66 @@ public final class AppSettings {
         setToolbarHiddenSlots(next)
     }
 
+    // MARK: OCR、翻译与贴图外观偏好
+
+    /// OCR 首选识别语言（默认自动多语）。
+    public private(set) var ocrLanguage: OCRLanguagePreference
+
+    public func setOCRLanguage(_ language: OCRLanguagePreference) {
+        guard language != ocrLanguage else { return }
+        ocrLanguage = language
+        store.set(language.rawValue, forKey: Key.ocrLanguage)
+    }
+
+    /// OCR 面板是否默认合并段内软换行（默认关闭，保持逐行）。
+    public private(set) var ocrMergeLineBreaks: Bool
+
+    public func setOCRMergeLineBreaks(_ enabled: Bool) {
+        guard enabled != ocrMergeLineBreaks else { return }
+        ocrMergeLineBreaks = enabled
+        store.set(enabled, forKey: Key.ocrMergeLineBreaks)
+    }
+
+    /// OCR 时是否同步检测二维码与条形码（默认开启）。
+    public private(set) var ocrDetectBarcodes: Bool
+
+    public func setOCRDetectBarcodes(_ enabled: Bool) {
+        guard enabled != ocrDetectBarcodes else { return }
+        ocrDetectBarcodes = enabled
+        store.set(enabled, forKey: Key.ocrDetectBarcodes)
+    }
+
+    /// 翻译面板记忆的目标语种（默认简体中文 `zh-Hans`）。
+    public private(set) var translationTargetLanguage: String
+
+    public func setTranslationTargetLanguage(_ identifier: String) {
+        guard !identifier.isEmpty, identifier != translationTargetLanguage else { return }
+        translationTargetLanguage = identifier
+        store.set(identifier, forKey: Key.translationTargetLanguage)
+    }
+
+    /// 划词后是否在光标附近展示悬浮「译」按钮（默认关闭，开启需辅助功能权限）。
+    public private(set) var selectionTranslateFloatingButton: Bool
+
+    /// 划词悬浮按钮开关变化时的回调（供 `AppDelegate` 即时启停全局鼠标拖选监听）。
+    public var onSelectionTranslateFloatingButtonChanged: ((Bool) -> Void)?
+
+    public func setSelectionTranslateFloatingButton(_ enabled: Bool) {
+        guard enabled != selectionTranslateFloatingButton else { return }
+        selectionTranslateFloatingButton = enabled
+        store.set(enabled, forKey: Key.selectionTranslateFloatingButton)
+        onSelectionTranslateFloatingButtonChanged?(enabled)
+    }
+
+    /// 新建贴图默认是否显示高对比双层边框（默认开启）。
+    public private(set) var pinShowBorder: Bool
+
+    public func setPinShowBorder(_ enabled: Bool) {
+        guard enabled != pinShowBorder else { return }
+        pinShowBorder = enabled
+        store.set(enabled, forKey: Key.pinShowBorder)
+    }
+
     // MARK: 键名
 
     private enum Key {
@@ -603,6 +697,12 @@ public final class AppSettings {
         static let windowCaptureShadow = "settings.windowCaptureShadow"
         static let confirmCancelWithAnnotations = "settings.confirmCancelWithAnnotations"
         static let toolbarHiddenSlots = "settings.toolbarHiddenSlots"
+        static let ocrLanguage = "settings.ocrLanguage"
+        static let ocrMergeLineBreaks = "settings.ocrMergeLineBreaks"
+        static let ocrDetectBarcodes = "settings.ocrDetectBarcodes"
+        static let translationTargetLanguage = "settings.translationTargetLanguage"
+        static let selectionTranslateFloatingButton = "settings.selectionTranslateFloatingButton"
+        static let pinShowBorder = "settings.pinShowBorder"
     }
 
     private enum Mode {

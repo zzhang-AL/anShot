@@ -195,10 +195,10 @@ struct AnnotationToolbarLayout {
     var canRedo = false
     /// 面板是否展开。点当前分组会收起，再点展开。
     var isPanelExpanded = true
-    /// 是否显示「录制 / 长截图 / OCR」三个抓屏动作。
+    /// 是否显示「录制 / 长截图」两个动态抓屏动作。
     ///
-    /// 编辑磁盘图片时它们没有意义（底图不是屏幕），但按钮若只是点了没反应，
-    /// 用户会当成 bug；因此从布局里移除，连带工具栏宽度也一起收窄。
+    /// 编辑磁盘图片、独立窗体截图或历史图片时，动态录制与长截图没有意义，但 OCR 识别文字
+    /// 直接作用于当前画布位图，因此 OCR 独立保留并始终可用。
     var allowsCaptureActions = true
     /// 指针工具下是否有被选中的标注。
     ///
@@ -435,13 +435,13 @@ struct AnnotationToolbarLayout {
             place(.redo, leading: showUndo ? Self.itemSpacing : Self.groupSpacing, isEnabled: canRedo)
         }
 
-        // 抓屏与输出组：按需过滤用户隐藏的可选槽位。
+        // 抓屏与输出组：录制/长截图仅在实时屏幕捕获下显示；OCR 始终保留，支持全场景识别。
         var exportKinds: [Kind] = []
         if allowsCaptureActions {
             if isVisible(.record) { exportKinds.append(.record) }
             if isVisible(.longScreenshot) { exportKinds.append(.longScreenshot) }
-            if isVisible(.recognizeText) { exportKinds.append(.recognizeText) }
         }
+        if isVisible(.recognizeText) { exportKinds.append(.recognizeText) }
         if isVisible(.pin) { exportKinds.append(.pin) }
         exportKinds.append(.copy)
         exportKinds.append(.save)
