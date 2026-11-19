@@ -80,6 +80,7 @@ public enum AnShotLocalization {
         "menu.ocr": "Recognize Text (OCR)…",
         "menu.ocrTranslate": "Capture & Translate…",
         "menu.selectionTranslate": "Translate Selection",
+        "menu.selectionTranslateFloating": "Show Floating Translate Button",
         "menu.recording": "Record Screen…",
         "menu.recordingFullScreen": "Record Full Screen",
         "menu.pin": "Pinned Screenshots",

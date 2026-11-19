@@ -2,17 +2,19 @@
 //  OCRResultPanel.swift
 //  AnShotUI
 //
-//  独立的 OCR 与翻译悬浮面板：
-//    - 脱离截图覆盖层生命周期，支持缩放（≥ 400×300）、跟随系统浅/深主题、置顶切换；
-//    - 顶部集成 OCR 语言即时切换、无损段落软换行合并与二维码/条码结果卡片；
-//    - 原文区支持直接编辑与 `⌘Enter` 重译、`⇧⌘C` 智能复制、`Esc`/`⌘W` 关闭；
-//    - 支持自动/手动源语言与 7 语种目标语言持久化记忆。
+//  独立的现代 OCR 与翻译悬浮卡片：
+//    - 无红绿灯通透圆角浮窗，支持自由缩放、背景拖拽、跟随系统浅/深语义主题与置顶图钉；
+//    - 场景化顶栏（「文字识别」/「截图翻译」/「划词翻译」）与彩色微光泽语义徽章；
+//    - 单卡自适应布局：纯 OCR 态单区大字舒展排版；翻译态自动在同卡内展开「可编辑原文 → 语种流向条 → 高对比译文」上下对照；
+//    - 原文区支持直接编辑与 `⌘Enter` 重译、无损「合并换行」胶囊切换、二维码/条码内嵌操作卡、`⇧⌘C` 智能复制与原地「✓ 已复制」反馈。
 //
 
 import AnShotCore
 import AppKit
 
-/// 支持 `Esc`/`⌘W`/`⌘Enter`/`⇧⌘C` 快捷键的独立悬浮面板。
+// MARK: - 独立悬浮面板窗口
+
+/// 支持 `Esc` / `⌘W` / `⌘Enter` / `⇧⌘C` 快捷键且隐藏系统红绿灯的现代独立悬浮面板。
 @MainActor
 private final class OCRFloatingPanel: NSPanel {
 
@@ -33,7 +35,7 @@ private final class OCRFloatingPanel: NSPanel {
             onCloseShortcut?()
             return true
         }
-        // ⌘Enter 立即重译当前文本
+        // ⌘Enter 立即翻译 / 重新翻译
         if flags == .command, (event.keyCode == 36 || event.keyCode == 76) {
             onRetranslateShortcut?()
             return true
@@ -52,22 +54,186 @@ private final class OCRFloatingPanel: NSPanel {
     }
 }
 
-/// 跟随系统明暗语义色动态刷新的纯色背景视图。
-private final class OCRDynamicSurfaceView: NSView {
-    private let colorProvider: () -> NSColor
-    private let cornerRadius: CGFloat
-    private let borderColorProvider: (() -> NSColor)?
+// MARK: - 现代微控件组件
 
-    init(
-        cornerRadius: CGFloat = 0,
-        borderColor: (() -> NSColor)? = nil,
-        backgroundColor: @escaping () -> NSColor
-    ) {
-        self.cornerRadius = cornerRadius
-        self.borderColorProvider = borderColor
-        self.colorProvider = backgroundColor
+/// 顶栏 22×22 彩色微光泽圆角语义徽章（与设置侧栏共享 `AnShotTheme.drawBadgeTile` 视觉语言）。
+private final class OCRHeaderBadgeView: NSView {
+
+    var symbolName: String {
+        didSet { if oldValue != symbolName { needsDisplay = true } }
+    }
+
+    var badgeColor: NSColor {
+        didSet { needsDisplay = true }
+    }
+
+    init(symbolName: String, badgeColor: NSColor) {
+        self.symbolName = symbolName
+        self.badgeColor = badgeColor
         super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 22),
+            heightAnchor.constraint(equalToConstant: 22),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("不支持从 nib 构造")
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        AnShotTheme.drawBadgeTile(
+            in: bounds,
+            radius: 6,
+            baseColor: badgeColor,
+            symbolName: symbolName,
+            symbolPointSize: 11,
+            symbolWeight: .semibold,
+            in: ctx
+        )
+    }
+}
+
+/// 顶栏置顶图钉按钮：激活态自动呈现强调色柔和圆角底 + 填充图钉。
+private final class OCRPinToggleButton: NSButton {
+
+    var isPinned: Bool = true {
+        didSet {
+            if oldValue != isPinned { needsDisplay = true }
+        }
+    }
+
+    private var isHovered = false {
+        didSet { if oldValue != isHovered { needsDisplay = true } }
+    }
+
+    init(target: AnyObject?, action: Selector?) {
+        super.init(frame: .zero)
+        self.target = target
+        self.action = action
+        isBordered = false
+        bezelStyle = .regularSquare
+        setButtonType(.momentaryChange)
+        focusRingType = .default
+        translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 26),
+            heightAnchor.constraint(equalToConstant: 26),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("不支持从 nib 构造")
+    }
+
+    override var focusRingMaskBounds: NSRect { bounds }
+
+    override func drawFocusRingMask() {
+        NSBezierPath(roundedRect: bounds, xRadius: 6.5, yRadius: 6.5).fill()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self
+        ))
+    }
+
+    override func mouseEntered(with event: NSEvent) { isHovered = true }
+    override func mouseExited(with event: NSEvent) { isHovered = false }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        if isPinned {
+            AnShotTheme.fillRoundedRect(
+                bounds,
+                radius: 6.5,
+                color: isHovered ? AnShotTheme.accent.withAlphaComponent(0.22) : AnShotTheme.accentSoft,
+                in: ctx
+            )
+        } else if isHovered || isHighlighted {
+            AnShotTheme.fillRoundedRect(
+                bounds,
+                radius: 6.5,
+                color: AnShotTheme.hoverSurface,
+                in: ctx
+            )
+        }
+
+        let symbolName = isPinned ? "pin.fill" : "pin"
+        let tint: NSColor = isPinned
+            ? AnShotTheme.accent
+            : (isHovered ? .labelColor : .secondaryLabelColor)
+        let config = NSImage.SymbolConfiguration(pointSize: 11.5, weight: .semibold)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [tint]))
+        guard let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: toolTip)?
+            .withSymbolConfiguration(config) else { return }
+        let s = image.size
+        image.draw(in: CGRect(
+            x: bounds.midX - s.width / 2,
+            y: bounds.midY - s.height / 2,
+            width: s.width,
+            height: s.height
+        ))
+    }
+}
+
+/// 精致内嵌胶囊外壳，用于包裹无边框 `NSPopUpButton`，消除旧式灰凹凸下拉框的陈旧感。
+private final class OCRCompactPopUpContainer: NSView {
+
+    let popUp: NSPopUpButton
+
+    init(popUp: NSPopUpButton, leadingSymbol: String? = nil, minWidth: CGFloat = 78) {
+        self.popUp = popUp
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
+
+        popUp.isBordered = false
+        popUp.bezelStyle = .inline
+        popUp.controlSize = .small
+        popUp.font = .systemFont(ofSize: 12, weight: .medium)
+        popUp.setContentHuggingPriority(.required, for: .horizontal)
+        popUp.translatesAutoresizingMaskIntoConstraints = false
+
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        if let leadingSymbol {
+            let icon = NSImageView()
+            let config = NSImage.SymbolConfiguration(pointSize: 10.5, weight: .medium)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [.secondaryLabelColor]))
+            icon.image = NSImage(systemSymbolName: leadingSymbol, accessibilityDescription: nil)?
+                .withSymbolConfiguration(config)
+            icon.translatesAutoresizingMaskIntoConstraints = false
+            stack.addArrangedSubview(icon)
+        }
+        stack.addArrangedSubview(popUp)
+        addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 25),
+            widthAnchor.constraint(greaterThanOrEqualToConstant: minWidth),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: leadingSymbol == nil ? 7 : 8),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -5),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
     }
 
     @available(*, unavailable)
@@ -78,254 +244,975 @@ private final class OCRDynamicSurfaceView: NSView {
     override var wantsUpdateLayer: Bool { true }
 
     override func updateLayer() {
-        layer?.backgroundColor = colorProvider().cgColor
-        layer?.cornerRadius = cornerRadius
-        if let borderColorProvider {
-            layer?.borderWidth = 1
-            layer?.borderColor = borderColorProvider().cgColor
-        } else {
-            layer?.borderWidth = 0
-            layer?.borderColor = nil
-        }
+        layer?.backgroundColor = AnShotTheme.insetBackground.cgColor
+        layer?.cornerRadius = 7
+        layer?.cornerCurve = .continuous
+        layer?.borderWidth = 1
+        layer?.borderColor = AnShotTheme.cardBorder.cgColor
     }
 }
 
-/// 独立的 OCR 识别与翻译浮窗。
+/// 轻量胶囊切换按钮（用于「合并换行」无损切换，取代原生复选框）。
+private final class OCRPillToggleButton: NSButton {
+
+    var isActive: Bool {
+        get { state == .on }
+        set {
+            let next: NSControl.StateValue = newValue ? .on : .off
+            if state != next {
+                state = next
+                needsDisplay = true
+            }
+        }
+    }
+
+    private let symbolName: String
+    private var isHovered = false {
+        didSet { if oldValue != isHovered { needsDisplay = true } }
+    }
+
+    private static let height: CGFloat = 22
+    private static let radius: CGFloat = 6
+
+    init(title: String, symbolName: String, target: AnyObject?, action: Selector?) {
+        self.symbolName = symbolName
+        super.init(frame: .zero)
+        self.title = title
+        self.target = target
+        self.action = action
+        isBordered = false
+        bezelStyle = .regularSquare
+        setButtonType(.toggle)
+        focusRingType = .default
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: Self.height).isActive = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("不支持从 nib 构造")
+    }
+
+    override var isFlipped: Bool { true }
+
+    override var intrinsicContentSize: NSSize {
+        let font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        let textW = (title as NSString).size(withAttributes: [.font: font]).width
+        return NSSize(width: ceil(textW) + 28, height: Self.height)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self
+        ))
+    }
+
+    override func mouseEntered(with event: NSEvent) { isHovered = true }
+    override func mouseExited(with event: NSEvent) { isHovered = false }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let active = state == .on
+
+        let bg: NSColor
+        let border: NSColor?
+        if active {
+            bg = isHovered ? AnShotTheme.accent.withAlphaComponent(0.20) : AnShotTheme.accentSoft
+            border = AnShotTheme.accent.withAlphaComponent(0.32)
+        } else {
+            bg = isHovered ? AnShotTheme.hoverSurface : AnShotTheme.insetBackground.withAlphaComponent(0.75)
+            border = AnShotTheme.cardBorder
+        }
+
+        AnShotTheme.fillRoundedRect(bounds, radius: Self.radius, color: bg, in: ctx)
+        if let border {
+            AnShotTheme.strokeRoundedRect(bounds, radius: Self.radius, color: border, lineWidth: 1, in: ctx)
+        }
+
+        let fg: NSColor = active ? AnShotTheme.accent : (isHovered ? .labelColor : .secondaryLabelColor)
+        let font = NSFont.systemFont(ofSize: 11, weight: active ? .semibold : .medium)
+        let textAttr = NSAttributedString(string: title, attributes: [
+            .font: font,
+            .foregroundColor: fg,
+        ])
+        let textSize = textAttr.size()
+
+        let symConfig = NSImage.SymbolConfiguration(pointSize: 10, weight: .semibold)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [fg]))
+        let icon = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
+            .withSymbolConfiguration(symConfig)
+        let iconW = icon?.size.width ?? 0
+        let gap: CGFloat = icon == nil ? 0 : 4
+        let totalW = iconW + gap + textSize.width
+        var x = bounds.midX - totalW / 2
+
+        if let icon {
+            let s = icon.size
+            icon.draw(in: CGRect(
+                x: x,
+                y: bounds.midY - s.height / 2,
+                width: s.width,
+                height: s.height
+            ))
+            x += s.width + gap
+        }
+        textAttr.draw(at: CGPoint(x: x, y: bounds.midY - textSize.height / 2))
+    }
+}
+
+/// 轻量化无框微操作按钮（用于「复制原文」、「复制双语」及二维码行操作），支持原地瞬态成功反馈。
+private final class OCRGhostActionButton: NSButton {
+
+    enum Style {
+        case neutral
+        case accent
+    }
+
+    private let style: Style
+    private var defaultSymbolName: String?
+    private var defaultTitle: String
+    private var isShowingSuccess = false
+    private var resetTask: Task<Void, Never>?
+
+    private var isHovered = false {
+        didSet { if oldValue != isHovered { needsDisplay = true } }
+    }
+
+    private static let height: CGFloat = 22
+    private static let radius: CGFloat = 6
+
+    init(
+        title: String,
+        symbolName: String? = nil,
+        style: Style = .neutral,
+        target: AnyObject?,
+        action: Selector?
+    ) {
+        self.defaultTitle = title
+        self.defaultSymbolName = symbolName
+        self.style = style
+        super.init(frame: .zero)
+        self.title = title
+        self.target = target
+        self.action = action
+        isBordered = false
+        bezelStyle = .regularSquare
+        setButtonType(.momentaryChange)
+        focusRingType = .default
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: Self.height).isActive = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("不支持从 nib 构造")
+    }
+
+    override var isFlipped: Bool { true }
+
+    /// 触发原地「已复制」微反馈，1.2 秒后自动恢复默认态。
+    func flashCopiedFeedback() {
+        resetTask?.cancel()
+        isShowingSuccess = true
+        invalidateIntrinsicContentSize()
+        needsDisplay = true
+        resetTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(1200))
+            guard !Task.isCancelled, let self else { return }
+            self.isShowingSuccess = false
+            self.invalidateIntrinsicContentSize()
+            self.needsDisplay = true
+        }
+    }
+
+    func resetFeedback() {
+        resetTask?.cancel()
+        resetTask = nil
+        if isShowingSuccess {
+            isShowingSuccess = false
+            invalidateIntrinsicContentSize()
+            needsDisplay = true
+        }
+    }
+
+    private var activeTitle: String {
+        isShowingSuccess ? "已复制" : defaultTitle
+    }
+
+    private var activeSymbol: String? {
+        isShowingSuccess ? "checkmark" : defaultSymbolName
+    }
+
+    override var intrinsicContentSize: NSSize {
+        let font = NSFont.systemFont(ofSize: 11.5, weight: style == .accent ? .semibold : .medium)
+        let w = (activeTitle as NSString).size(withAttributes: [.font: font]).width
+        let iconExtra: CGFloat = activeSymbol == nil ? 0 : 15
+        return NSSize(width: ceil(w) + iconExtra + 14, height: Self.height)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self
+        ))
+    }
+
+    override func mouseEntered(with event: NSEvent) { isHovered = true }
+    override func mouseExited(with event: NSEvent) { isHovered = false }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+
+        let bg: NSColor?
+        let fg: NSColor
+        if isShowingSuccess {
+            bg = AnShotTheme.success.withAlphaComponent(0.14)
+            fg = AnShotTheme.dynamic(
+                light: NSColor(srgbRed: 0.08, green: 0.50, blue: 0.28, alpha: 1),
+                dark: NSColor(srgbRed: 0.36, green: 0.88, blue: 0.56, alpha: 1)
+            )
+        } else {
+            switch style {
+            case .neutral:
+                bg = (isHovered || isHighlighted) ? AnShotTheme.hoverSurface : nil
+                fg = isHovered ? .labelColor : .secondaryLabelColor
+            case .accent:
+                bg = isHovered
+                    ? AnShotTheme.accent.withAlphaComponent(0.20)
+                    : AnShotTheme.accentSoft
+                fg = AnShotTheme.accent
+            }
+        }
+
+        if let bg {
+            AnShotTheme.fillRoundedRect(bounds, radius: Self.radius, color: bg, in: ctx)
+        }
+
+        let font = NSFont.systemFont(ofSize: 11.5, weight: (style == .accent || isShowingSuccess) ? .semibold : .medium)
+        let attr = NSAttributedString(string: activeTitle, attributes: [
+            .font: font,
+            .foregroundColor: fg,
+        ])
+        let textSize = attr.size()
+
+        var icon: NSImage?
+        if let sym = activeSymbol {
+            let cfg = NSImage.SymbolConfiguration(pointSize: 10.5, weight: .semibold)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [fg]))
+            icon = NSImage(systemSymbolName: sym, accessibilityDescription: nil)?
+                .withSymbolConfiguration(cfg)
+        }
+
+        let iconW = icon?.size.width ?? 0
+        let gap: CGFloat = icon == nil ? 0 : 4
+        let totalW = iconW + gap + textSize.width
+        var x = bounds.midX - totalW / 2
+
+        if let icon {
+            let s = icon.size
+            icon.draw(in: CGRect(
+                x: x,
+                y: bounds.midY - s.height / 2,
+                width: s.width,
+                height: s.height
+            ))
+            x += s.width + gap
+        }
+        attr.draw(at: CGPoint(x: x, y: bounds.midY - textSize.height / 2))
+    }
+}
+
+/// 底栏主操作按钮：支持带图标的强调色主按钮、次要按钮，以及原地「✓ 已复制」绿色瞬态反馈。
+private final class OCRFooterButton: NSButton {
+
+    enum Emphasis {
+        case primary
+        case secondary
+    }
+
+    private let emphasis: Emphasis
+    private var defaultSymbolName: String?
+    private var isShowingSuccess = false
+    private var resetTask: Task<Void, Never>?
+
+    private var isHovered = false {
+        didSet { if oldValue != isHovered { needsDisplay = true } }
+    }
+
+    static let height: CGFloat = 30
+    private static let radius: CGFloat = 8
+    private static let horizontalPadding: CGFloat = 14
+
+    init(
+        title: String,
+        symbolName: String? = nil,
+        emphasis: Emphasis,
+        target: AnyObject?,
+        action: Selector?
+    ) {
+        self.emphasis = emphasis
+        self.defaultSymbolName = symbolName
+        super.init(frame: .zero)
+        self.title = title
+        self.target = target
+        self.action = action
+        isBordered = false
+        bezelStyle = .regularSquare
+        setButtonType(.momentaryChange)
+        focusRingType = .default
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: Self.height).isActive = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("不支持从 nib 构造")
+    }
+
+    override var isFlipped: Bool { true }
+
+    override var title: String {
+        didSet {
+            if oldValue != title {
+                invalidateIntrinsicContentSize()
+                needsDisplay = true
+            }
+        }
+    }
+
+    override var isEnabled: Bool {
+        didSet { if oldValue != isEnabled { needsDisplay = true } }
+    }
+
+    override var isHighlighted: Bool {
+        didSet { if oldValue != isHighlighted { needsDisplay = true } }
+    }
+
+    func setSymbolName(_ symbol: String?) {
+        guard defaultSymbolName != symbol else { return }
+        defaultSymbolName = symbol
+        invalidateIntrinsicContentSize()
+        needsDisplay = true
+    }
+
+    func flashCopiedFeedback() {
+        resetTask?.cancel()
+        isShowingSuccess = true
+        invalidateIntrinsicContentSize()
+        needsDisplay = true
+        resetTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(1200))
+            guard !Task.isCancelled, let self else { return }
+            self.isShowingSuccess = false
+            self.invalidateIntrinsicContentSize()
+            self.needsDisplay = true
+        }
+    }
+
+    func resetFeedback() {
+        resetTask?.cancel()
+        resetTask = nil
+        if isShowingSuccess {
+            isShowingSuccess = false
+            invalidateIntrinsicContentSize()
+            needsDisplay = true
+        }
+    }
+
+    private var displayTitle: String {
+        isShowingSuccess ? "已复制" : title
+    }
+
+    private var displaySymbol: String? {
+        isShowingSuccess ? "checkmark" : defaultSymbolName
+    }
+
+    private var textFont: NSFont {
+        .systemFont(ofSize: 12.5, weight: emphasis == .primary ? .semibold : .medium)
+    }
+
+    override var intrinsicContentSize: NSSize {
+        let textW = (displayTitle as NSString).size(withAttributes: [.font: textFont]).width
+        let symW: CGFloat = displaySymbol == nil ? 0 : 17
+        return NSSize(width: max(76, ceil(textW) + symW + Self.horizontalPadding * 2), height: Self.height)
+    }
+
+    override var focusRingMaskBounds: NSRect { bounds }
+
+    override func drawFocusRingMask() {
+        NSBezierPath(roundedRect: bounds, xRadius: Self.radius, yRadius: Self.radius).fill()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self
+        ))
+    }
+
+    override func mouseEntered(with event: NSEvent) { isHovered = true }
+    override func mouseExited(with event: NSEvent) { isHovered = false }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let stateAlpha: CGFloat = isEnabled ? (isHighlighted ? 0.78 : 1.0) : 0.42
+
+        let bg: NSColor
+        let border: NSColor?
+        let fg: NSColor
+
+        if isShowingSuccess {
+            bg = AnShotTheme.success
+            border = nil
+            fg = .white
+        } else {
+            switch emphasis {
+            case .primary:
+                bg = AnShotTheme.accent.withAlphaComponent(isHovered ? 0.90 : 1.0)
+                border = nil
+                fg = AnShotTheme.onAccent
+            case .secondary:
+                bg = isHovered ? AnShotTheme.hoverSurface : AnShotTheme.cardBackground
+                border = AnShotTheme.cardBorder
+                fg = .labelColor
+            }
+        }
+
+        AnShotTheme.fillRoundedRect(
+            bounds,
+            radius: Self.radius,
+            color: bg.withAlphaComponent(bg.alphaComponent * stateAlpha),
+            in: ctx
+        )
+        if let border {
+            AnShotTheme.strokeRoundedRect(
+                bounds,
+                radius: Self.radius,
+                color: border.withAlphaComponent(border.alphaComponent * (isEnabled ? 1 : 0.45)),
+                lineWidth: 1,
+                in: ctx
+            )
+        }
+
+        let textColor = isEnabled ? fg : fg.withAlphaComponent(0.48)
+        let attr = NSAttributedString(string: displayTitle, attributes: [
+            .font: textFont,
+            .foregroundColor: textColor,
+        ])
+        let textSize = attr.size()
+
+        var icon: NSImage?
+        if let sym = displaySymbol {
+            let cfg = NSImage.SymbolConfiguration(pointSize: 11.5, weight: .semibold)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [textColor]))
+            icon = NSImage(systemSymbolName: sym, accessibilityDescription: nil)?
+                .withSymbolConfiguration(cfg)
+        }
+
+        let iconW = icon?.size.width ?? 0
+        let gap: CGFloat = icon == nil ? 0 : 5
+        let totalW = iconW + gap + textSize.width
+        var x = bounds.midX - totalW / 2
+
+        if let icon {
+            let s = icon.size
+            icon.draw(in: CGRect(
+                x: x,
+                y: bounds.midY - s.height / 2,
+                width: s.width,
+                height: s.height
+            ))
+            x += s.width + gap
+        }
+        attr.draw(at: CGPoint(x: x, y: bounds.midY - textSize.height / 2))
+    }
+}
+
+/// 软着陆中腰语种桥梁表面（跟随系统明暗主题动态刷新）。
+private final class OCRBridgeSurfaceView: NSView {
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        layer?.backgroundColor = AnShotTheme.insetBackground.withAlphaComponent(0.68).cgColor
+    }
+}
+
+// MARK: - OCR / 翻译悬浮卡片控制器
+
+/// 独立的现代 OCR 识别与翻译浮窗。
 @MainActor
 final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
 
-    /// 文本展示模式。
+    /// 文本展示模式（兼容诊断与单元测试契约）。
     enum DisplayMode: Int, CaseIterable {
         case original = 0
         case translation = 1
         case bilingual = 2
     }
 
+    /// 浮窗默认初始尺寸（纯 OCR 态清爽紧凑，翻译展开态自动适度拉高）。
+    static let defaultSize = CGSize(width: 480, height: 396)
+    /// 浮窗允许缩放的最小尺寸。
+    static let minimumSize = CGSize(width: 390, height: 270)
+    private static let margin: CGFloat = 14
+
+    /// 语义徽章配色：OCR 青碧、翻译珊瑚粉（与设置页导航语义色严格一致）。
+    private static let ocrBadgeColor = NSColor(srgbRed: 0.08, green: 0.64, blue: 0.60, alpha: 1)
+    private static let translationBadgeColor = NSColor(srgbRed: 0.94, green: 0.34, blue: 0.42, alpha: 1)
+
+    /// 源语言选项：`id == nil` 表示自动检测。
+    static let sourceLanguages: [(id: String?, name: String)] =
+        [(nil, "自动检测")] + TranslationLanguage.commonTargetLanguages.map { ($0.id, $0.name) }
+
+    /// 目标语言选项（7 语种，由 `TranslationLanguage.commonTargetLanguages` 统一维护）。
+    static let targetLanguages: [(id: String, name: String)] = TranslationLanguage.commonTargetLanguages
+
+    // MARK: - 回调
+
+    var onCopyAll: ((String) -> Void)?
+    /// 请求翻译：`(源语言覆盖 nil=自动, 目标语言 BCP-47)`。
+    var onTranslate: ((String?, String) -> Void)?
+    /// 源或目标语种变化：`(源语言覆盖 nil=自动, 目标语言 BCP-47)`。
+    var onTargetLanguageChanged: ((String?, String) -> Void)?
+    /// OCR 识别语言偏好切换（仅在持有原图时由调用方触发重识别）。
+    var onOCRLanguageChanged: ((OCRLanguagePreference) -> Void)?
+    /// 「合并换行」切换通知（用于持久化偏好）。
+    var onMergeLineBreaksChanged: ((Bool) -> Void)?
+    var onClose: (() -> Void)?
+
+    // MARK: - 视图与控件
+
     private let panel: OCRFloatingPanel
-    private let textView: NSTextView
-    private let statusLabel: NSTextField
 
-    // 顶部工具条控件
-    private let ocrLanguageLabel = NSTextField(labelWithString: "识别语言")
+    // 顶栏
+    private let headerBadgeView = OCRHeaderBadgeView(symbolName: "text.viewfinder", badgeColor: ocrBadgeColor)
+    private let headerTitleLabel = NSTextField(labelWithString: "文字识别")
     private let ocrLanguagePopUp = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let mergeLineBreaksButton = NSButton(checkboxWithTitle: "合并换行", target: nil, action: nil)
-    private let pinOnTopButton = NSButton(frame: .zero)
+    private var ocrLanguageContainer: OCRCompactPopUpContainer!
+    private var pinOnTopButton: OCRPinToggleButton!
+    private var closeHeaderButton: SettingsIconButton!
 
-    // 二维码 / 条码卡片容器
+    // 二维码卡片容器
     private let barcodeStackView = NSStackView()
-    private var displayedBarcodes: [BarcodeItem] = []
 
-    // 中下部展示模式与翻译控制
-    private let modeControl = NSSegmentedControl(
-        labels: ["原文", "译文", "双语"],
-        trackingMode: .selectOne,
-        target: nil,
-        action: nil
-    )
+    // 主统一卡片内部
+    private let mainCard = ThemedSurfaceView(kind: .card, cornerRadius: AnShotTheme.cardRadius)
+
+    // 原文区（上半区）
+    private let sourceHeaderLabel = NSTextField(labelWithString: "原文")
+    private var mergeLineBreaksButton: OCRPillToggleButton!
+    private var copyOriginalButton: OCRGhostActionButton!
+    private let sourceScrollView = NSScrollView()
+    private let sourceTextView = NSTextView()
+    private var sourceScrollMinHeightConstraint: NSLayoutConstraint!
+    private var sourceScrollMaxHeightConstraint: NSLayoutConstraint!
+
+    // 中腰语种桥梁条（仅翻译展开态可见）
+    private let bridgeTopDivider = SettingsRowDivider()
+    private let translationBridgeView = OCRBridgeSurfaceView()
+    private let bridgeBottomDivider = SettingsRowDivider()
+    private let bridgeLanguageStack = NSStackView()
     private let sourceLanguagePopUp = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let arrowLabel = NSTextField(labelWithString: "→")
+    private var sourceLanguageContainer: OCRCompactPopUpContainer!
+    private let bridgeArrowIcon = NSImageView()
     private let languagePopUp = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let translateButton = NSButton(title: "翻译", target: nil, action: nil)
-    private let copyButton = NSButton(title: "复制全部", target: nil, action: nil)
+    private var targetLanguageContainer: OCRCompactPopUpContainer!
+    private let bridgeStatusLabel = NSTextField(labelWithString: "")
 
-    /// 最近一次完整 OCR 结果（用于无损切换逐行 / 合并换行与保留行结构）。
-    private var lastOCRResult: OCRResult?
-    /// 纯文本划词输入或原始逐行文本。
-    private var rawOriginalText = ""
-    /// 用户手工修订后的原文；未编辑时为 `nil`。
-    private var editedOriginalText: String?
-    private var translationResult: TranslationResult?
-    private var displayMode: DisplayMode = .original
-    /// 是否正在以代码更新 `textView.string`，避免把程序写入误记为用户编辑。
-    private var isProgrammaticallyUpdatingText = false
-    /// 是否处于纯文本模式（如 `⌥D` 划词翻译），纯文本模式隐藏 OCR 识别语言下拉。
-    private var isTextOnlyMode = false
+    // 译文区（下半区，翻译展开态主角）
+    private let translationSectionView = NSView()
+    private let translationHeaderLabel = NSTextField(labelWithString: "译文")
+    private let translationSpinner = NSProgressIndicator()
+    private var copyBilingualButton: OCRGhostActionButton!
+    private let translationScrollView = NSScrollView()
+    private let translationTextView = NSTextView()
 
-    /// 浮窗是否置顶（默认开启 `.floating`，点击右上角图钉可降为 `.normal`）。
-    private(set) var isAlwaysOnTop = true
-
-    /// 进行中 / 出错时的遮罩浮层。
-    private let statusOverlay = OCRDynamicSurfaceView(cornerRadius: 6) { .textBackgroundColor }
+    // 识别中 / 失败遮罩（覆盖主卡片）
+    private let statusOverlay = ThemedSurfaceView(kind: .card, cornerRadius: AnShotTheme.cardRadius)
     private let progressIndicator = NSProgressIndicator()
     private let overlayLabel = NSTextField(labelWithString: "")
 
-    /// 源语言候选（自动检测 + 7 语种）。
-    private static var sourceLanguages: [(id: String?, name: String)] {
-        TranslationLanguage.commonSourceLanguages
-    }
+    // 底部动作条
+    private let footerRow = NSStackView()
+    private var copyButton: OCRFooterButton!
+    private let footerRightStack = NSStackView()
+    private var translateButton: OCRFooterButton!
 
-    /// 目标语言候选（7 语种）。
-    private static var targetLanguages: [(id: String, name: String)] {
-        TranslationLanguage.commonTargetLanguages
-    }
+    // MARK: - 状态模型
 
-    /// 用户点击「复制全部」或触发 `⇧⌘C`。
-    var onCopyAll: ((String) -> Void)?
-    /// 用户点击「翻译」或按 `⌘Enter`。参数为（源语言可选、目标语言）。
-    var onTranslate: ((String?, String) -> Void)?
-    /// 用户切换目标语言或源语言。
-    var onTargetLanguageChanged: ((String?, String) -> Void)?
-    /// 用户在浮窗内切换 OCR 识别语言（由控制器按缓存源图即时重识别）。
-    var onOCRLanguageChanged: ((OCRLanguagePreference) -> Void)?
-    /// 用户切换「合并换行」状态。
-    var onMergeLineBreaksChanged: ((Bool) -> Void)?
-    /// 面板关闭。
-    var onClose: (() -> Void)?
+    private var lastOCRResult: OCRResult?
+    private var rawOriginalText = ""
+    private var editedOriginalText: String?
+    private var translationResult: TranslationResult?
+    private var displayMode: DisplayMode = .original
+    private var displayedBarcodes: [BarcodeItem] = []
+    private var isProgrammaticallyUpdatingText = false
+    private var isTextOnlyMode = false
+    private var isTranslationSectionExpanded = false
+    private var translationErrorMessage: String?
+
+    private var translationAvailability: TranslationAvailability = .unknown
+    private var isTranslating = false
+
+    /// 浮窗是否处于置顶模式（默认置顶，可随时切换）。
+    private(set) var isAlwaysOnTop = true
+
+    // MARK: - 只读状态属性（对外及单测契约）
 
     var isVisible: Bool { panel.isVisible }
 
-    /// 面板当前显示的文字（诊断与测试读取）。
-    var text: String { textView.string }
-
-    /// 当前是否开启「合并换行」。
-    var isMergeLineBreaksEnabled: Bool { mergeLineBreaksButton.state == .on }
-
-    /// 当前识别到的二维码/条码列表（供测试与外部校验）。
-    var currentBarcodes: [BarcodeItem] { displayedBarcodes }
-
-    /// 是否正在显示「识别中」（诊断读取）。
-    var isLoadingForDiagnostics: Bool {
-        !statusOverlay.isHidden && !progressIndicator.isHidden
+    /// 当前逻辑展示文本（严格兼容 `.original` / `.translation` / `.bilingual` 三态契约）。
+    var text: String {
+        switch displayMode {
+        case .original:
+            return currentEditableOriginalText
+        case .translation:
+            guard let result = translationResult else {
+                return currentEditableOriginalText
+            }
+            return result.segments.map(\.displayText).joined(separator: "\n")
+        case .bilingual:
+            guard let result = translationResult else {
+                return currentEditableOriginalText
+            }
+            return Self.bilingualText(for: result)
+        }
     }
 
-    /// 默认初始窗口尺寸与最小可缩放尺寸。
-    static let defaultSize = CGSize(width: 460, height: 340)
-    static let minimumSize = CGSize(width: 400, height: 300)
-    private static let margin: CGFloat = 12
+    var isLoadingForDiagnostics: Bool { !statusOverlay.isHidden }
+    var isMergeLineBreaksEnabled: Bool { mergeLineBreaksButton.isActive }
+    var currentBarcodes: [BarcodeItem] { displayedBarcodes }
+
+    // MARK: - 初始化
 
     override init() {
         panel = OCRFloatingPanel(
-            contentRect: CGRect(origin: .zero, size: Self.defaultSize),
-            styleMask: [.titled, .closable, .resizable, .utilityWindow],
+            contentRect: NSRect(origin: .zero, size: Self.defaultSize),
+            styleMask: [.titled, .fullSizeContentView, .resizable],
             backing: .buffered,
-            defer: false
+            defer: true
         )
-        panel.title = "识别与翻译"
+        super.init()
+
+        // 透明隐藏标题栏与系统红绿灯，保留原生阴影、现代圆角与自由拖拽缩放。
+        panel.title = "文字识别"
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isMovableByWindowBackground = true
         panel.isFloatingPanel = true
-        panel.hidesOnDeactivate = false
-        panel.minSize = Self.minimumSize
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-
-        textView = NSTextView(frame: .zero)
-        textView.isEditable = true
-        textView.isSelectable = true
-        textView.drawsBackground = true
-        textView.backgroundColor = .textBackgroundColor
-        textView.textColor = .labelColor
-        textView.insertionPointColor = .controlAccentColor
-        textView.font = .systemFont(ofSize: 13)
-        textView.isRichText = false
-        textView.allowsUndo = true
-        textView.minSize = NSSize(width: 0, height: 0)
-        textView.maxSize = NSSize(
-            width: CGFloat.greatestFiniteMagnitude,
-            height: CGFloat.greatestFiniteMagnitude
-        )
-        textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = false
-        textView.autoresizingMask = [.width]
-        textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.containerSize = NSSize(
-            width: 0,
-            height: CGFloat.greatestFiniteMagnitude
-        )
-        textView.textContainerInset = NSSize(width: 6, height: 8)
-
-        statusLabel = NSTextField(labelWithString: "")
-        statusLabel.font = .systemFont(ofSize: 11)
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.lineBreakMode = .byTruncatingTail
-
-        super.init()
-        panel.delegate = self
         panel.isReleasedWhenClosed = false
-        textView.delegate = self
+        panel.minSize = Self.minimumSize
+        panel.hidesOnDeactivate = false
+        panel.hasShadow = true
+        // 跟随系统与用户设置的全局浅/深外观。
+        panel.appearance = nil
+        panel.backgroundColor = .clear
+        panel.delegate = self
+
+        for buttonType: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
+            panel.standardWindowButton(buttonType)?.isHidden = true
+        }
 
         panel.onCloseShortcut = { [weak self] in self?.hide() }
         panel.onRetranslateShortcut = { [weak self] in self?.triggerRetranslateShortcut() }
         panel.onSmartCopyShortcut = { [weak self] in self?.triggerSmartCopy() }
 
-        buildContentView()
+        buildUI()
     }
 
-    private func buildContentView() {
-        let content = NSView(frame: CGRect(origin: .zero, size: Self.defaultSize))
+    // MARK: - 构建界面
 
-        // ── 顶部工具条：OCR 语言 + 合并换行 + 置顶切换 ─────────
-        ocrLanguageLabel.font = .systemFont(ofSize: 11)
-        ocrLanguageLabel.textColor = .secondaryLabelColor
-        ocrLanguageLabel.translatesAutoresizingMaskIntoConstraints = false
+    private func buildUI() {
+        let content = ThemedSurfaceView(kind: .windowBackground)
 
-        ocrLanguagePopUp.controlSize = .small
-        ocrLanguagePopUp.addItems(withTitles: OCRLanguagePreference.allCases.map(\.displayName))
+        // ── 1. 场景化顶栏 ──────────────────────────────────────
+        headerTitleLabel.font = .systemFont(ofSize: 13.5, weight: .semibold)
+        headerTitleLabel.textColor = .labelColor
+        headerTitleLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        for lang in OCRLanguagePreference.allCases {
+            ocrLanguagePopUp.addItem(withTitle: lang.displayName)
+        }
         ocrLanguagePopUp.target = self
         ocrLanguagePopUp.action = #selector(handleOCRLanguageChanged)
-        ocrLanguagePopUp.translatesAutoresizingMaskIntoConstraints = false
+        ocrLanguagePopUp.toolTip = "切换 OCR 识别语言（持有原图时立即重新识别）"
+        ocrLanguageContainer = OCRCompactPopUpContainer(
+            popUp: ocrLanguagePopUp,
+            leadingSymbol: "globe",
+            minWidth: 92
+        )
 
-        mergeLineBreaksButton.controlSize = .small
-        mergeLineBreaksButton.font = .systemFont(ofSize: 11)
-        mergeLineBreaksButton.target = self
-        mergeLineBreaksButton.action = #selector(handleMergeLineBreaksToggled)
-        mergeLineBreaksButton.toolTip = "无损合并段内软换行（再点恢复逐行）"
-        mergeLineBreaksButton.translatesAutoresizingMaskIntoConstraints = false
-
-        pinOnTopButton.bezelStyle = .recessed
-        pinOnTopButton.isBordered = true
-        pinOnTopButton.controlSize = .small
-        pinOnTopButton.target = self
-        pinOnTopButton.action = #selector(handleToggleAlwaysOnTop)
-        pinOnTopButton.translatesAutoresizingMaskIntoConstraints = false
+        pinOnTopButton = OCRPinToggleButton(target: self, action: #selector(handleToggleAlwaysOnTop))
         refreshPinOnTopButton()
 
-        let topSpacer = NSView()
-        topSpacer.translatesAutoresizingMaskIntoConstraints = false
-        topSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        closeHeaderButton = SettingsIconButton(
+            symbolName: "xmark",
+            toolTip: "关闭（Esc / ⌘W）",
+            target: self,
+            action: #selector(handleCloseButton)
+        )
+
+        let headerSpacer = NSView()
+        headerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         let topBar = NSStackView(views: [
-            ocrLanguageLabel,
-            ocrLanguagePopUp,
-            mergeLineBreaksButton,
-            topSpacer,
+            headerBadgeView,
+            headerTitleLabel,
+            headerSpacer,
+            ocrLanguageContainer,
             pinOnTopButton,
+            closeHeaderButton,
         ])
         topBar.orientation = .horizontal
         topBar.alignment = .centerY
-        topBar.spacing = 8
+        topBar.spacing = 7
+        topBar.setCustomSpacing(8, after: headerBadgeView)
         topBar.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(topBar)
 
-        // ── 二维码 / 条码卡片栈（有码时自动展开） ─────────────
+        // ── 2. 二维码 / 条码内嵌卡片栈 ─────────────────────────
         barcodeStackView.orientation = .vertical
         barcodeStackView.alignment = .leading
         barcodeStackView.spacing = 6
         barcodeStackView.isHidden = true
         barcodeStackView.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(barcodeStackView)
 
-        // ── 正文文本滚动容器 ─────────────────────────────────
-        let scrollContainer = OCRDynamicSurfaceView(
-            cornerRadius: 6,
-            borderColor: { .separatorColor },
-            backgroundColor: { .textBackgroundColor }
+        // ── 3. 主统一卡片（单卡上下对照容器） ──────────────────
+        mainCard.translatesAutoresizingMaskIntoConstraints = false
+        mainCard.setContentHuggingPriority(.defaultLow, for: .vertical)
+        mainCard.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+
+        // 3a. 原文区（上半区）
+        sourceHeaderLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        sourceHeaderLabel.textColor = .secondaryLabelColor
+        sourceHeaderLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        mergeLineBreaksButton = OCRPillToggleButton(
+            title: "合并换行",
+            symbolName: "text.alignleft",
+            target: self,
+            action: #selector(handleMergeLineBreaksToggled)
         )
-        scrollContainer.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(scrollContainer)
+        mergeLineBreaksButton.toolTip = "无损合并段内硬换行，保留空行与原文结构"
 
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.drawsBackground = false
-        scroll.borderType = .noBorder
-        scroll.documentView = textView
-        scroll.automaticallyAdjustsContentInsets = false
-        scroll.contentInsets = NSEdgeInsetsZero
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scrollContainer.addSubview(scroll)
+        copyOriginalButton = OCRGhostActionButton(
+            title: "复制原文",
+            symbolName: "doc.on.doc",
+            style: .neutral,
+            target: self,
+            action: #selector(handleCopyOriginal)
+        )
+        copyOriginalButton.toolTip = "复制原文内容"
+        copyOriginalButton.isHidden = true
 
-        // 状态遮罩浮层覆盖在文本区之上
+        let sourceHeaderSpacer = NSView()
+        sourceHeaderSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let sourceHeaderRow = NSStackView(views: [
+            sourceHeaderLabel,
+            sourceHeaderSpacer,
+            mergeLineBreaksButton,
+            copyOriginalButton,
+        ])
+        sourceHeaderRow.orientation = .horizontal
+        sourceHeaderRow.alignment = .centerY
+        sourceHeaderRow.spacing = 6
+        sourceHeaderRow.translatesAutoresizingMaskIntoConstraints = false
+
+        configureTextView(sourceTextView, editable: true, fontSize: 14, lineHeightMultiple: 1.44)
+        sourceTextView.delegate = self
+
+        sourceScrollView.hasVerticalScroller = true
+        sourceScrollView.autohidesScrollers = true
+        sourceScrollView.drawsBackground = false
+        sourceScrollView.borderType = .noBorder
+        sourceScrollView.documentView = sourceTextView
+        sourceScrollView.automaticallyAdjustsContentInsets = false
+        sourceScrollView.contentInsets = NSEdgeInsetsZero
+        sourceScrollView.translatesAutoresizingMaskIntoConstraints = false
+
+        let sourceSection = NSView()
+        sourceSection.translatesAutoresizingMaskIntoConstraints = false
+        sourceSection.addSubview(sourceHeaderRow)
+        sourceSection.addSubview(sourceScrollView)
+
+        sourceScrollMinHeightConstraint = sourceScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 120)
+        sourceScrollMaxHeightConstraint = sourceScrollView.heightAnchor.constraint(lessThanOrEqualToConstant: 118)
+        sourceScrollMaxHeightConstraint.isActive = false
+
+        NSLayoutConstraint.activate([
+            sourceHeaderRow.topAnchor.constraint(equalTo: sourceSection.topAnchor, constant: 10),
+            sourceHeaderRow.leadingAnchor.constraint(equalTo: sourceSection.leadingAnchor, constant: 13),
+            sourceHeaderRow.trailingAnchor.constraint(equalTo: sourceSection.trailingAnchor, constant: -11),
+
+            sourceScrollView.topAnchor.constraint(equalTo: sourceHeaderRow.bottomAnchor, constant: 4),
+            sourceScrollView.leadingAnchor.constraint(equalTo: sourceSection.leadingAnchor, constant: 6),
+            sourceScrollView.trailingAnchor.constraint(equalTo: sourceSection.trailingAnchor, constant: -6),
+            sourceScrollView.bottomAnchor.constraint(equalTo: sourceSection.bottomAnchor, constant: -8),
+            sourceScrollMinHeightConstraint,
+        ])
+
+        // 3b. 中腰语种流向桥梁条（自动检测 → 简体中文 + 状态）
+        sourceLanguagePopUp.addItems(withTitles: Self.sourceLanguages.map(\.name))
+        sourceLanguagePopUp.target = self
+        sourceLanguagePopUp.action = #selector(handleTranslationLanguageChanged)
+        sourceLanguagePopUp.toolTip = "源语言（默认自动检测）"
+        sourceLanguageContainer = OCRCompactPopUpContainer(popUp: sourceLanguagePopUp, minWidth: 74)
+
+        let arrowConfig = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [.secondaryLabelColor]))
+        bridgeArrowIcon.image = NSImage(systemSymbolName: "arrow.right", accessibilityDescription: "翻译为")?
+            .withSymbolConfiguration(arrowConfig)
+        bridgeArrowIcon.setContentHuggingPriority(.required, for: .horizontal)
+        bridgeArrowIcon.translatesAutoresizingMaskIntoConstraints = false
+
+        languagePopUp.addItems(withTitles: Self.targetLanguages.map(\.name))
+        languagePopUp.target = self
+        languagePopUp.action = #selector(handleTranslationLanguageChanged)
+        languagePopUp.toolTip = "目标语言"
+        targetLanguageContainer = OCRCompactPopUpContainer(popUp: languagePopUp, minWidth: 80)
+
+        bridgeStatusLabel.font = .systemFont(ofSize: 11.5)
+        bridgeStatusLabel.textColor = .secondaryLabelColor
+        bridgeStatusLabel.lineBreakMode = .byTruncatingTail
+        bridgeStatusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        bridgeStatusLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        bridgeStatusLabel.alignment = .right
+
+        bridgeLanguageStack.orientation = .horizontal
+        bridgeLanguageStack.alignment = .centerY
+        bridgeLanguageStack.spacing = 6
+        bridgeLanguageStack.setContentHuggingPriority(.required, for: .horizontal)
+        bridgeLanguageStack.translatesAutoresizingMaskIntoConstraints = false
+        bridgeLanguageStack.addArrangedSubview(sourceLanguageContainer)
+        bridgeLanguageStack.addArrangedSubview(bridgeArrowIcon)
+
+        let bridgeSpacer = NSView()
+        bridgeSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        bridgeSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let bridgeRow = NSStackView(views: [bridgeLanguageStack, bridgeSpacer, bridgeStatusLabel])
+        bridgeRow.orientation = .horizontal
+        bridgeRow.alignment = .centerY
+        bridgeRow.spacing = 8
+        bridgeRow.translatesAutoresizingMaskIntoConstraints = false
+
+        translationBridgeView.translatesAutoresizingMaskIntoConstraints = false
+        translationBridgeView.wantsLayer = true
+        translationBridgeView.addSubview(bridgeRow)
+        NSLayoutConstraint.activate([
+            translationBridgeView.heightAnchor.constraint(equalToConstant: 36),
+            bridgeRow.leadingAnchor.constraint(equalTo: translationBridgeView.leadingAnchor, constant: 12),
+            bridgeRow.trailingAnchor.constraint(equalTo: translationBridgeView.trailingAnchor, constant: -12),
+            bridgeRow.centerYAnchor.constraint(equalTo: translationBridgeView.centerYAnchor),
+        ])
+
+        // 3c. 译文区（下半区，视觉主角）
+        translationHeaderLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        translationHeaderLabel.textColor = AnShotTheme.accent
+        translationHeaderLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        translationSpinner.style = .spinning
+        translationSpinner.controlSize = .mini
+        translationSpinner.isIndeterminate = true
+        translationSpinner.isHidden = true
+        translationSpinner.translatesAutoresizingMaskIntoConstraints = false
+
+        copyBilingualButton = OCRGhostActionButton(
+            title: "复制双语",
+            symbolName: "text.justify.left",
+            style: .neutral,
+            target: self,
+            action: #selector(handleCopyBilingual)
+        )
+        copyBilingualButton.toolTip = "复制逐段原文与译文对照"
+        copyBilingualButton.isHidden = true
+
+        let transHeaderSpacer = NSView()
+        transHeaderSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let transHeaderRow = NSStackView(views: [
+            translationHeaderLabel,
+            translationSpinner,
+            transHeaderSpacer,
+            copyBilingualButton,
+        ])
+        transHeaderRow.orientation = .horizontal
+        transHeaderRow.alignment = .centerY
+        transHeaderRow.spacing = 6
+        transHeaderRow.translatesAutoresizingMaskIntoConstraints = false
+
+        configureTextView(translationTextView, editable: false, fontSize: 15, lineHeightMultiple: 1.48)
+
+        translationScrollView.hasVerticalScroller = true
+        translationScrollView.autohidesScrollers = true
+        translationScrollView.drawsBackground = false
+        translationScrollView.borderType = .noBorder
+        translationScrollView.documentView = translationTextView
+        translationScrollView.automaticallyAdjustsContentInsets = false
+        translationScrollView.contentInsets = NSEdgeInsetsZero
+        translationScrollView.translatesAutoresizingMaskIntoConstraints = false
+
+        translationSectionView.translatesAutoresizingMaskIntoConstraints = false
+        translationSectionView.setContentHuggingPriority(.defaultLow, for: .vertical)
+        translationSectionView.addSubview(transHeaderRow)
+        translationSectionView.addSubview(translationScrollView)
+
+        NSLayoutConstraint.activate([
+            transHeaderRow.topAnchor.constraint(equalTo: translationSectionView.topAnchor, constant: 10),
+            transHeaderRow.leadingAnchor.constraint(equalTo: translationSectionView.leadingAnchor, constant: 13),
+            transHeaderRow.trailingAnchor.constraint(equalTo: translationSectionView.trailingAnchor, constant: -11),
+
+            translationScrollView.topAnchor.constraint(equalTo: transHeaderRow.bottomAnchor, constant: 4),
+            translationScrollView.leadingAnchor.constraint(equalTo: translationSectionView.leadingAnchor, constant: 6),
+            translationScrollView.trailingAnchor.constraint(equalTo: translationSectionView.trailingAnchor, constant: -6),
+            translationScrollView.bottomAnchor.constraint(equalTo: translationSectionView.bottomAnchor, constant: -10),
+            translationScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 96),
+        ])
+
+        // 主卡片内部纵栈
+        let cardStack = NSStackView(views: [
+            sourceSection,
+            bridgeTopDivider,
+            translationBridgeView,
+            bridgeBottomDivider,
+            translationSectionView,
+        ])
+        cardStack.orientation = .vertical
+        cardStack.alignment = .leading
+        cardStack.spacing = 0
+        cardStack.translatesAutoresizingMaskIntoConstraints = false
+        mainCard.addSubview(cardStack)
+
+        NSLayoutConstraint.activate([
+            cardStack.topAnchor.constraint(equalTo: mainCard.topAnchor, constant: 1),
+            cardStack.leadingAnchor.constraint(equalTo: mainCard.leadingAnchor, constant: 1),
+            cardStack.trailingAnchor.constraint(equalTo: mainCard.trailingAnchor, constant: -1),
+            cardStack.bottomAnchor.constraint(equalTo: mainCard.bottomAnchor, constant: -1),
+
+            sourceSection.widthAnchor.constraint(equalTo: cardStack.widthAnchor),
+            bridgeTopDivider.widthAnchor.constraint(equalTo: cardStack.widthAnchor),
+            translationBridgeView.widthAnchor.constraint(equalTo: cardStack.widthAnchor),
+            bridgeBottomDivider.widthAnchor.constraint(equalTo: cardStack.widthAnchor),
+            translationSectionView.widthAnchor.constraint(equalTo: cardStack.widthAnchor),
+        ])
+
+        // 加载/错误遮罩覆盖整个主卡片
         statusOverlay.isHidden = true
         statusOverlay.translatesAutoresizingMaskIntoConstraints = false
-        scrollContainer.addSubview(statusOverlay)
+        mainCard.addSubview(statusOverlay)
 
         progressIndicator.style = .spinning
         progressIndicator.controlSize = .small
@@ -334,146 +1221,208 @@ final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
         statusOverlay.addSubview(progressIndicator)
 
         overlayLabel.alignment = .center
-        overlayLabel.font = .systemFont(ofSize: 12)
+        overlayLabel.font = .systemFont(ofSize: 12.5, weight: .medium)
         overlayLabel.textColor = .secondaryLabelColor
         overlayLabel.lineBreakMode = .byWordWrapping
         overlayLabel.maximumNumberOfLines = 0
-        overlayLabel.preferredMaxLayoutWidth = Self.minimumSize.width - Self.margin * 2 - 32
+        overlayLabel.preferredMaxLayoutWidth = Self.minimumSize.width - Self.margin * 2 - 48
         overlayLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         overlayLabel.translatesAutoresizingMaskIntoConstraints = false
         statusOverlay.addSubview(overlayLabel)
 
-        // ── 状态栏 + 原文/译文/双语模式切换 ───────────────────
-        statusLabel.translatesAutoresizingMaskIntoConstraints = false
-        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        NSLayoutConstraint.activate([
+            statusOverlay.topAnchor.constraint(equalTo: mainCard.topAnchor),
+            statusOverlay.leadingAnchor.constraint(equalTo: mainCard.leadingAnchor),
+            statusOverlay.trailingAnchor.constraint(equalTo: mainCard.trailingAnchor),
+            statusOverlay.bottomAnchor.constraint(equalTo: mainCard.bottomAnchor),
 
-        modeControl.controlSize = .mini
-        modeControl.selectedSegment = DisplayMode.original.rawValue
-        modeControl.setEnabled(false, forSegment: DisplayMode.translation.rawValue)
-        modeControl.setEnabled(false, forSegment: DisplayMode.bilingual.rawValue)
-        modeControl.target = self
-        modeControl.action = #selector(handleDisplayModeChanged(_:))
-        modeControl.translatesAutoresizingMaskIntoConstraints = false
+            overlayLabel.centerXAnchor.constraint(equalTo: statusOverlay.centerXAnchor),
+            overlayLabel.centerYAnchor.constraint(equalTo: statusOverlay.centerYAnchor, constant: 10),
+            overlayLabel.leadingAnchor.constraint(equalTo: statusOverlay.leadingAnchor, constant: 24),
+            overlayLabel.trailingAnchor.constraint(equalTo: statusOverlay.trailingAnchor, constant: -24),
 
-        let statusSpacer = NSView()
-        statusSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let statusRow = NSStackView(views: [statusLabel, statusSpacer, modeControl])
-        statusRow.orientation = .horizontal
-        statusRow.alignment = .centerY
-        statusRow.spacing = 8
-        statusRow.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(statusRow)
-
-        // ── 底部翻译与复制控制行 ─────────────────────────────
-        sourceLanguagePopUp.controlSize = .small
-        sourceLanguagePopUp.addItems(withTitles: Self.sourceLanguages.map(\.name))
-        sourceLanguagePopUp.target = self
-        sourceLanguagePopUp.action = #selector(handleTranslationLanguageChanged)
-        sourceLanguagePopUp.toolTip = "源语言（默认自动检测）"
-        sourceLanguagePopUp.translatesAutoresizingMaskIntoConstraints = false
-
-        arrowLabel.font = .systemFont(ofSize: 11, weight: .medium)
-        arrowLabel.textColor = .secondaryLabelColor
-        arrowLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        languagePopUp.controlSize = .small
-        languagePopUp.addItems(withTitles: Self.targetLanguages.map(\.name))
-        languagePopUp.target = self
-        languagePopUp.action = #selector(handleTranslationLanguageChanged)
-        languagePopUp.toolTip = "目标语言"
-        languagePopUp.translatesAutoresizingMaskIntoConstraints = false
-
-        translateButton.bezelStyle = .rounded
-        translateButton.controlSize = .small
-        translateButton.keyEquivalent = ""
-        translateButton.target = self
-        translateButton.action = #selector(handleTranslate)
-        translateButton.toolTip = "翻译当前文本（⌘↩）"
-        translateButton.translatesAutoresizingMaskIntoConstraints = false
-
-        copyButton.bezelStyle = .rounded
-        copyButton.controlSize = .small
-        copyButton.target = self
-        copyButton.action = #selector(handleCopy)
-        copyButton.toolTip = "复制当前展示文本（⇧⌘C 智能复制译文优先）"
-        copyButton.translatesAutoresizingMaskIntoConstraints = false
-
-        let bottomSpacer = NSView()
-        bottomSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-
-        let controlRow = NSStackView(views: [
-            sourceLanguagePopUp,
-            arrowLabel,
-            languagePopUp,
-            bottomSpacer,
-            translateButton,
-            copyButton,
+            progressIndicator.centerXAnchor.constraint(equalTo: statusOverlay.centerXAnchor),
+            progressIndicator.bottomAnchor.constraint(equalTo: overlayLabel.topAnchor, constant: -12),
         ])
-        controlRow.orientation = .horizontal
-        controlRow.alignment = .centerY
-        controlRow.spacing = 6
-        controlRow.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(controlRow)
 
-        // 主纵栈：顶部工具条 → 二维码卡片（隐藏时自动折叠不占位） → 正文区 → 状态栏 → 控制行
+        // ── 4. 聚焦底栏 ────────────────────────────────────────
+        copyButton = OCRFooterButton(
+            title: "复制原文",
+            symbolName: "doc.on.doc",
+            emphasis: .primary,
+            target: self,
+            action: #selector(handleCopy)
+        )
+        copyButton.toolTip = "智能复制（⇧⌘C，翻译后优先复制译文）"
+
+        translateButton = OCRFooterButton(
+            title: "翻译",
+            symbolName: "character.book.closed",
+            emphasis: .secondary,
+            target: self,
+            action: #selector(handleTranslate)
+        )
+        translateButton.toolTip = "翻译当前文本（⌘↩）"
+
+        footerRightStack.orientation = .horizontal
+        footerRightStack.alignment = .centerY
+        footerRightStack.spacing = 8
+        footerRightStack.translatesAutoresizingMaskIntoConstraints = false
+        footerRightStack.addArrangedSubview(translateButton)
+
+        let footerSpacer = NSView()
+        footerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        footerRow.orientation = .horizontal
+        footerRow.alignment = .centerY
+        footerRow.spacing = 8
+        footerRow.translatesAutoresizingMaskIntoConstraints = false
+        footerRow.addArrangedSubview(copyButton)
+        footerRow.addArrangedSubview(footerSpacer)
+        footerRow.addArrangedSubview(footerRightStack)
+
+        // ── 5. 顶层主纵栈 ──────────────────────────────────────
         let mainStack = NSStackView(views: [
             topBar,
             barcodeStackView,
-            scrollContainer,
-            statusRow,
-            controlRow,
+            mainCard,
+            footerRow,
         ])
         mainStack.orientation = .vertical
         mainStack.alignment = .leading
-        mainStack.spacing = 8
+        mainStack.spacing = 10
         mainStack.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(mainStack)
 
-        scrollContainer.setContentHuggingPriority(.defaultLow, for: .vertical)
-        scrollContainer.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-
         NSLayoutConstraint.activate([
-            mainStack.topAnchor.constraint(equalTo: content.topAnchor, constant: Self.margin),
+            mainStack.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
             mainStack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: Self.margin),
             mainStack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -Self.margin),
             mainStack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -Self.margin),
 
             topBar.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
             barcodeStackView.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            scrollContainer.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            scrollContainer.heightAnchor.constraint(greaterThanOrEqualToConstant: 120),
-            statusRow.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-            controlRow.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
-
-            ocrLanguagePopUp.widthAnchor.constraint(greaterThanOrEqualToConstant: 88),
-            pinOnTopButton.widthAnchor.constraint(equalToConstant: 26),
-            pinOnTopButton.heightAnchor.constraint(equalToConstant: 22),
-
-            sourceLanguagePopUp.widthAnchor.constraint(lessThanOrEqualToConstant: 96),
-            languagePopUp.widthAnchor.constraint(lessThanOrEqualToConstant: 96),
-            translateButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 56),
-            copyButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 74),
-
-            scroll.leadingAnchor.constraint(equalTo: scrollContainer.leadingAnchor, constant: 1),
-            scroll.trailingAnchor.constraint(equalTo: scrollContainer.trailingAnchor, constant: -1),
-            scroll.topAnchor.constraint(equalTo: scrollContainer.topAnchor, constant: 1),
-            scroll.bottomAnchor.constraint(equalTo: scrollContainer.bottomAnchor, constant: -1),
-
-            statusOverlay.leadingAnchor.constraint(equalTo: scrollContainer.leadingAnchor, constant: 1),
-            statusOverlay.trailingAnchor.constraint(equalTo: scrollContainer.trailingAnchor, constant: -1),
-            statusOverlay.topAnchor.constraint(equalTo: scrollContainer.topAnchor, constant: 1),
-            statusOverlay.bottomAnchor.constraint(equalTo: scrollContainer.bottomAnchor, constant: -1),
-
-            overlayLabel.centerXAnchor.constraint(equalTo: statusOverlay.centerXAnchor),
-            overlayLabel.centerYAnchor.constraint(equalTo: statusOverlay.centerYAnchor),
-            overlayLabel.leadingAnchor.constraint(equalTo: statusOverlay.leadingAnchor, constant: 16),
-            overlayLabel.trailingAnchor.constraint(equalTo: statusOverlay.trailingAnchor, constant: -16),
-
-            progressIndicator.centerXAnchor.constraint(equalTo: statusOverlay.centerXAnchor),
-            progressIndicator.bottomAnchor.constraint(equalTo: overlayLabel.topAnchor, constant: -12),
+            mainCard.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
+            footerRow.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
         ])
 
         panel.contentView = content
+
+        // 初始落入纯 OCR 单区态
+        setTranslationSectionExpanded(false)
+    }
+
+    private func configureTextView(
+        _ textView: NSTextView,
+        editable: Bool,
+        fontSize: CGFloat,
+        lineHeightMultiple: CGFloat
+    ) {
+        textView.isEditable = editable
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.importsGraphics = false
+        textView.allowsUndo = editable
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 7, height: 4)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(
+            width: Self.defaultSize.width - Self.margin * 2 - 28,
+            height: .greatestFiniteMagnitude
+        )
+
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineHeightMultiple = lineHeightMultiple
+        paragraph.paragraphSpacing = 3
+        textView.defaultParagraphStyle = paragraph
+        textView.typingAttributes = [
+            .font: NSFont.systemFont(ofSize: fontSize),
+            .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: paragraph,
+        ]
+        textView.font = .systemFont(ofSize: fontSize)
+        textView.textColor = .labelColor
+    }
+
+    // MARK: - 布局形态切换（纯 OCR 单区 ↔ 翻译双栏上下对照）
+
+    private func setTranslationSectionExpanded(_ expanded: Bool) {
+        isTranslationSectionExpanded = expanded
+
+        bridgeTopDivider.isHidden = !expanded
+        translationBridgeView.isHidden = !expanded
+        bridgeBottomDivider.isHidden = !expanded
+        translationSectionView.isHidden = !expanded
+        copyOriginalButton.isHidden = !expanded
+
+        // 将目标语言下拉容器平滑摆放到当前形态最自然的位置（唯一实例，零状态失同步）
+        targetLanguageContainer.removeFromSuperview()
+        if expanded {
+            bridgeLanguageStack.addArrangedSubview(targetLanguageContainer)
+            sourceScrollMinHeightConstraint.constant = 64
+            sourceScrollMaxHeightConstraint.isActive = true
+        } else {
+            footerRightStack.insertArrangedSubview(targetLanguageContainer, at: 0)
+            sourceScrollMaxHeightConstraint.isActive = false
+            sourceScrollMinHeightConstraint.constant = 160
+        }
+
+        refreshHeaderAppearance()
+        refreshFooterAppearance()
+        refreshSourceTypography()
+    }
+
+    private func refreshHeaderAppearance() {
+        if isTextOnlyMode {
+            headerBadgeView.symbolName = "character.book.closed.fill"
+            headerBadgeView.badgeColor = Self.translationBadgeColor
+            headerTitleLabel.stringValue = "划词翻译"
+            panel.title = "划词翻译"
+        } else if isTranslationSectionExpanded {
+            headerBadgeView.symbolName = "character.book.closed.fill"
+            headerBadgeView.badgeColor = Self.translationBadgeColor
+            headerTitleLabel.stringValue = "截图翻译"
+            panel.title = "截图翻译"
+        } else {
+            headerBadgeView.symbolName = "text.viewfinder"
+            headerBadgeView.badgeColor = Self.ocrBadgeColor
+            headerTitleLabel.stringValue = "文字识别"
+            panel.title = "文字识别"
+        }
+        ocrLanguageContainer.isHidden = isTextOnlyMode
+        mergeLineBreaksButton.isHidden = isTextOnlyMode
+    }
+
+    private func refreshFooterAppearance() {
+        let hasValidTranslation = (translationResult?.isEntirelyUntranslated == false)
+        copyButton.title = hasValidTranslation ? "复制译文" : "复制原文"
+        copyButton.setSymbolName("doc.on.doc")
+
+        if isTranslating {
+            translateButton.title = "翻译中…"
+            translateButton.setSymbolName("hourglass")
+        } else if isTranslationSectionExpanded {
+            translateButton.title = "重新翻译"
+            translateButton.setSymbolName("arrow.clockwise")
+        } else {
+            translateButton.title = "翻译"
+            translateButton.setSymbolName("character.book.closed")
+        }
+    }
+
+    private func refreshSourceTypography() {
+        let size: CGFloat = isTranslationSectionExpanded ? 13 : 14
+        let lineHeight: CGFloat = isTranslationSectionExpanded ? 1.40 : 1.46
+        applyStyledText(
+            sourceTextView.string,
+            to: sourceTextView,
+            fontSize: size,
+            lineHeightMultiple: lineHeight,
+            color: .labelColor
+        )
     }
 
     // MARK: - 配置同步
@@ -487,7 +1436,7 @@ final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
         if let index = OCRLanguagePreference.allCases.firstIndex(of: ocrLanguage) {
             ocrLanguagePopUp.selectItem(at: index)
         }
-        mergeLineBreaksButton.state = mergeLineBreaks ? .on : .off
+        mergeLineBreaksButton.isActive = mergeLineBreaks
         selectTargetLanguage(identifier: targetLanguage)
     }
 
@@ -509,36 +1458,32 @@ final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
     }
 
     private func refreshPinOnTopButton() {
-        let symbol = isAlwaysOnTop ? "pin.fill" : "pin"
-        let tip = isAlwaysOnTop ? "已置顶（点击取消置顶）" : "未置顶（点击置顶）"
-        pinOnTopButton.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tip)
-        pinOnTopButton.imagePosition = .imageOnly
-        pinOnTopButton.state = isAlwaysOnTop ? .on : .off
-        pinOnTopButton.toolTip = tip
-        pinOnTopButton.contentTintColor = isAlwaysOnTop ? .controlAccentColor : .secondaryLabelColor
-    }
-
-    private func setTextOnlyMode(_ textOnly: Bool) {
-        isTextOnlyMode = textOnly
-        ocrLanguageLabel.isHidden = textOnly
-        ocrLanguagePopUp.isHidden = textOnly
-        panel.title = textOnly ? "划词翻译" : "识别与翻译"
+        pinOnTopButton.isPinned = isAlwaysOnTop
+        pinOnTopButton.toolTip = isAlwaysOnTop ? "已置顶（点击取消置顶）" : "未置顶（点击置顶）"
     }
 
     // MARK: - 展示入口
 
     /// 识别中：立即弹出独立浮窗并展示加载状态。
     func showLoading(near selectionScreenRect: CGRect, message: String = "正在识别文字…") {
-        setTextOnlyMode(false)
+        isTextOnlyMode = false
         isTranslating = false
         lastOCRResult = nil
         rawOriginalText = ""
         editedOriginalText = nil
         translationResult = nil
+        translationErrorMessage = nil
+        displayMode = .original
+        copyButton.resetFeedback()
+        copyOriginalButton.resetFeedback()
+        copyBilingualButton.resetFeedback()
+
         updateBarcodeCards([])
-        resetDisplayModeControl()
-        setText("")
-        statusLabel.stringValue = ""
+        setTranslationSectionExpanded(false)
+        setSourceText("")
+        setTranslationPlaceholder("")
+        sourceHeaderLabel.stringValue = "原文"
+        bridgeStatusLabel.stringValue = ""
         setOverlay(message: message, spinning: true)
         copyButton.isEnabled = false
         refreshTranslationControls(hasLines: false)
@@ -552,47 +1497,71 @@ final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
         rawOriginalText = ""
         editedOriginalText = nil
         translationResult = nil
+        translationErrorMessage = nil
+        displayMode = .original
+        copyButton.resetFeedback()
+
         updateBarcodeCards([])
-        resetDisplayModeControl()
-        setText("")
-        statusLabel.stringValue = ""
+        setTranslationSectionExpanded(false)
+        setSourceText("")
+        setTranslationPlaceholder("")
+        sourceHeaderLabel.stringValue = "原文"
+        bridgeStatusLabel.stringValue = ""
         setOverlay(message: message, spinning: false)
         copyButton.isEnabled = false
         refreshTranslationControls(hasLines: false)
         present(near: selectionScreenRect)
     }
 
-    /// 展示完整 OCR 识别结果（含二维码/条码卡片与可编辑文本）。
+    /// 展示完整 OCR 识别结果（含二维码/条码卡片与可编辑原文）。
     func show(result: OCRResult, near selectionScreenRect: CGRect) {
-        setTextOnlyMode(false)
+        isTextOnlyMode = false
         setOverlay(message: nil, spinning: false)
         lastOCRResult = result
         rawOriginalText = result.plainText
         editedOriginalText = nil
         translationResult = nil
+        translationErrorMessage = nil
+        displayMode = .original
+        copyButton.resetFeedback()
+        copyOriginalButton.resetFeedback()
+        copyBilingualButton.resetFeedback()
+        copyBilingualButton.isHidden = true
+
         updateBarcodeCards(result.barcodes)
-        resetDisplayModeControl()
-        refreshDisplayedText()
-        statusLabel.stringValue = Self.statusText(for: result)
+        setTranslationSectionExpanded(false)
+        refreshSourceTextView()
+        sourceHeaderLabel.stringValue = Self.sourceHeaderText(for: result)
+        bridgeStatusLabel.stringValue = ""
+
         let hasText = !currentEditableOriginalText.isEmpty
         copyButton.isEnabled = hasText
         refreshTranslationControls(hasLines: hasText)
         present(near: selectionScreenRect)
     }
 
-    /// 展示纯文本划词输入（例如 `⌥D` 划词翻译），预填原文并准备翻译。
+    /// 展示纯文本划词输入（例如 `⌥D` 划词翻译或悬浮胶囊点击），直接展开上下对照准备翻译。
     func showSourceText(_ text: String, near anchorScreenRect: CGRect) {
-        setTextOnlyMode(true)
+        isTextOnlyMode = true
         setOverlay(message: nil, spinning: false)
         lastOCRResult = nil
         rawOriginalText = text
         editedOriginalText = nil
         translationResult = nil
+        translationErrorMessage = nil
+        displayMode = .original
+        copyButton.resetFeedback()
+        copyOriginalButton.resetFeedback()
+        copyBilingualButton.resetFeedback()
+        copyBilingualButton.isHidden = true
+
         updateBarcodeCards([])
-        resetDisplayModeControl()
-        refreshDisplayedText()
-        let lineCount = text.components(separatedBy: .newlines).filter { !$0.isEmpty }.count
-        statusLabel.stringValue = lineCount > 0 ? "已选取 \(lineCount) 行 · 可编辑后按 ⌘↩ 重译" : ""
+        setTranslationSectionExpanded(true)
+        refreshSourceTextView()
+        sourceHeaderLabel.stringValue = "原文 · 可编辑后按 ⌘↩ 重译"
+        setTranslationPlaceholder("准备翻译…")
+        bridgeStatusLabel.stringValue = ""
+
         let hasText = !currentEditableOriginalText.isEmpty
         copyButton.isEnabled = hasText
         refreshTranslationControls(hasLines: hasText)
@@ -605,7 +1574,6 @@ final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
         guard !activeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return []
         }
-        // 未编辑且未合并换行且持有原始 OCRResult：原样沿用保留包围盒信息。
         if editedOriginalText == nil, !isMergeLineBreaksEnabled, let result = lastOCRResult, !result.lines.isEmpty {
             return result.lines
         }
@@ -634,37 +1602,47 @@ final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
 
     /// 无损切换「合并换行」状态（供单元测试与外部调用）。
     func setMergeLineBreaks(_ enabled: Bool, notify: Bool = false) {
-        mergeLineBreaksButton.state = enabled ? .on : .off
-        // 若用户未手动改动文本，切换时立刻无损重排展示。
-        if editedOriginalText == nil, displayMode == .original {
-            refreshDisplayedText()
+        mergeLineBreaksButton.isActive = enabled
+        if editedOriginalText == nil {
+            refreshSourceTextView()
         }
         if notify {
             onMergeLineBreaksChanged?(enabled)
         }
     }
 
-    /// 智能复制文本：译文存在时优先返回译文，否则返回当前展示文本。
+    /// 智能复制文本：译文存在时优先返回译文，否则返回当前原文。
     var smartCopyText: String {
         if let result = translationResult, !result.isEntirelyUntranslated {
             return result.segments.map(\.displayText).joined(separator: "\n")
         }
-        return textView.string
+        return currentEditableOriginalText
     }
 
-    private static func statusText(for result: OCRResult) -> String {
+    private static func sourceHeaderText(for result: OCRResult) -> String {
         let lineCount = result.lines.count
         let codeCount = result.barcodes.count
         if lineCount == 0 && codeCount == 0 {
             return "未识别到文字或二维码"
         }
         var parts: [String] = []
-        if lineCount > 0 { parts.append("\(lineCount) 行文字") }
-        if codeCount > 0 { parts.append("\(codeCount) 个二维码/条码") }
+        if lineCount > 0 { parts.append("原文 · \(lineCount) 行") }
+        if codeCount > 0 { parts.append("\(codeCount) 个码") }
         return parts.joined(separator: " · ")
     }
 
-    // MARK: - 二维码 / 条码卡片
+    private static func bilingualText(for result: TranslationResult) -> String {
+        result.segments.map { segment in
+            if let translated = segment.translatedText,
+               !translated.isEmpty,
+               translated != segment.sourceText {
+                return "\(segment.sourceText)\n\(translated)"
+            }
+            return segment.sourceText
+        }.joined(separator: "\n\n")
+    }
+
+    // MARK: - 二维码 / 条码内嵌卡片
 
     private func updateBarcodeCards(_ barcodes: [BarcodeItem]) {
         displayedBarcodes = barcodes
@@ -685,37 +1663,69 @@ final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
     }
 
     private func makeBarcodeCard(_ item: BarcodeItem, index: Int) -> NSView {
-        let card = OCRDynamicSurfaceView(
-            cornerRadius: 6,
-            borderColor: { .separatorColor },
-            backgroundColor: { .controlBackgroundColor }
-        )
+        let card = ThemedSurfaceView(kind: .card, cornerRadius: 10)
         card.translatesAutoresizingMaskIntoConstraints = false
 
-        let badge = NSTextField(labelWithString: Self.symbologyDisplayName(item.symbology))
-        badge.font = .systemFont(ofSize: 10, weight: .semibold)
-        badge.textColor = .controlAccentColor
-        badge.setContentHuggingPriority(.required, for: .horizontal)
-        badge.setContentCompressionResistancePriority(.required, for: .horizontal)
+        // 左侧二维码柔和圆角图标徽章
+        let iconTile = NSView()
+        iconTile.wantsLayer = true
+        iconTile.layer?.cornerRadius = 7
+        iconTile.layer?.cornerCurve = .continuous
+        iconTile.layer?.backgroundColor = Self.ocrBadgeColor.withAlphaComponent(0.14).cgColor
+        iconTile.translatesAutoresizingMaskIntoConstraints = false
+
+        let iconView = NSImageView()
+        let symName = item.symbology.lowercased().contains("qr") ? "qrcode" : "barcode"
+        let cfg = NSImage.SymbolConfiguration(pointSize: 12.5, weight: .semibold)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [Self.ocrBadgeColor]))
+        iconView.image = NSImage(systemSymbolName: symName, accessibilityDescription: nil)?
+            .withSymbolConfiguration(cfg)
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconTile.addSubview(iconView)
+        NSLayoutConstraint.activate([
+            iconTile.widthAnchor.constraint(equalToConstant: 26),
+            iconTile.heightAnchor.constraint(equalToConstant: 26),
+            iconView.centerXAnchor.constraint(equalTo: iconTile.centerXAnchor),
+            iconView.centerYAnchor.constraint(equalTo: iconTile.centerYAnchor),
+        ])
+
+        let kindLabel = NSTextField(labelWithString: Self.symbologyDisplayName(item.symbology))
+        kindLabel.font = .systemFont(ofSize: 10.5, weight: .semibold)
+        kindLabel.textColor = Self.ocrBadgeColor
+        kindLabel.setContentHuggingPriority(.required, for: .horizontal)
 
         let payloadLabel = NSTextField(labelWithString: item.payload)
-        payloadLabel.font = .systemFont(ofSize: 12)
+        payloadLabel.font = .monospacedSystemFont(ofSize: 11.5, weight: .regular)
         payloadLabel.textColor = .labelColor
         payloadLabel.lineBreakMode = .byTruncatingMiddle
         payloadLabel.toolTip = item.payload
         payloadLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         payloadLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let copyBtn = NSButton(title: "复制", target: self, action: #selector(handleCopyBarcode(_:)))
-        copyBtn.bezelStyle = .rounded
-        copyBtn.controlSize = .mini
+        let textStack = NSStackView(views: [kindLabel, payloadLabel])
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 1
+        textStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let copyBtn = OCRGhostActionButton(
+            title: "复制",
+            symbolName: "doc.on.doc",
+            style: .neutral,
+            target: self,
+            action: #selector(handleCopyBarcode(_:))
+        )
         copyBtn.tag = index
 
-        var views: [NSView] = [badge, payloadLabel, copyBtn]
+        var views: [NSView] = [iconTile, textStack, copyBtn]
         if item.isWebURL {
-            let openBtn = NSButton(title: "打开链接", target: self, action: #selector(handleOpenBarcodeURL(_:)))
-            openBtn.bezelStyle = .rounded
-            openBtn.controlSize = .mini
+            let openBtn = OCRGhostActionButton(
+                title: "打开",
+                symbolName: "arrow.up.right",
+                style: .accent,
+                target: self,
+                action: #selector(handleOpenBarcodeURL(_:))
+            )
             openBtn.tag = index
             views.append(openBtn)
         }
@@ -723,15 +1733,15 @@ final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
         let row = NSStackView(views: views)
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 6
+        row.spacing = 8
         row.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(row)
 
         NSLayoutConstraint.activate([
-            row.topAnchor.constraint(equalTo: card.topAnchor, constant: 6),
-            row.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -6),
-            row.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 8),
-            row.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -8),
+            row.topAnchor.constraint(equalTo: card.topAnchor, constant: 7),
+            row.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -7),
+            row.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 9),
+            row.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -9),
         ])
         return card
     }
@@ -748,6 +1758,7 @@ final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
     @objc private func handleCopyBarcode(_ sender: NSButton) {
         guard sender.tag >= 0, sender.tag < displayedBarcodes.count else { return }
         onCopyAll?(displayedBarcodes[sender.tag].payload)
+        (sender as? OCRGhostActionButton)?.flashCopiedFeedback()
     }
 
     @objc private func handleOpenBarcodeURL(_ sender: NSButton) {
@@ -817,13 +1828,13 @@ final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
     }
 
     private func present(near selectionScreenRect: CGRect) {
-        // 如果窗口已可见且用户可能已拖动过它，仅刷新内容，避免把窗口强行拉回旧位置。
         if !panel.isVisible {
             let screen = NSScreen.screens.first { $0.frame.intersects(selectionScreenRect) } ?? NSScreen.main
             let visible = screen?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+            let targetHeight: CGFloat = isTranslationSectionExpanded ? 430 : 350
             let desiredSize = CGSize(
                 width: max(Self.defaultSize.width, panel.frame.width),
-                height: max(Self.defaultSize.height, panel.frame.height)
+                height: max(targetHeight, panel.frame.height)
             )
             let frame = Self.preferredFrame(
                 near: selectionScreenRect,
@@ -836,11 +1847,45 @@ final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
         panel.makeKey()
     }
 
-    private func setText(_ text: String) {
+    private func setSourceText(_ text: String) {
         isProgrammaticallyUpdatingText = true
-        textView.string = text
+        let size: CGFloat = isTranslationSectionExpanded ? 13 : 14
+        let lineHeight: CGFloat = isTranslationSectionExpanded ? 1.40 : 1.46
+        applyStyledText(text, to: sourceTextView, fontSize: size, lineHeightMultiple: lineHeight, color: .labelColor)
         isProgrammaticallyUpdatingText = false
-        textView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+        sourceTextView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+    }
+
+    private func setTranslationText(_ text: String, color: NSColor = .labelColor) {
+        applyStyledText(text, to: translationTextView, fontSize: 15, lineHeightMultiple: 1.48, color: color)
+        translationTextView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+    }
+
+    private func setTranslationPlaceholder(_ text: String) {
+        applyStyledText(text, to: translationTextView, fontSize: 13.5, lineHeightMultiple: 1.44, color: .secondaryLabelColor)
+    }
+
+    private func applyStyledText(
+        _ text: String,
+        to textView: NSTextView,
+        fontSize: CGFloat,
+        lineHeightMultiple: CGFloat,
+        color: NSColor
+    ) {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineHeightMultiple = lineHeightMultiple
+        paragraph.paragraphSpacing = 3
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: fontSize),
+            .foregroundColor: color,
+            .paragraphStyle: paragraph,
+        ]
+        textView.typingAttributes = attributes
+        textView.textStorage?.setAttributedString(NSAttributedString(string: text, attributes: attributes))
+    }
+
+    private func refreshSourceTextView() {
+        setSourceText(currentEditableOriginalText)
     }
 
     private func setOverlay(message: String?, spinning: Bool) {
@@ -859,91 +1904,101 @@ final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
         }
     }
 
-    // MARK: - 译文与模式切换
+    // MARK: - 译文与状态更新
 
-    /// 展示译文。
+    /// 展示译文（自动展开上下对照单卡，将译文作为视觉主角呈现）。
     func showTranslation(_ result: TranslationResult, diagnosticMessage: String? = nil) {
         translationResult = result
-        modeControl.setEnabled(true, forSegment: DisplayMode.translation.rawValue)
-        modeControl.setEnabled(true, forSegment: DisplayMode.bilingual.rawValue)
         displayMode = .translation
-        modeControl.selectedSegment = DisplayMode.translation.rawValue
-        refreshDisplayedText()
+        translationSpinner.stopAnimation(nil)
+        translationSpinner.isHidden = true
+
+        if !isTranslationSectionExpanded {
+            setTranslationSectionExpanded(true)
+            expandPanelHeightIfNeeded()
+        } else {
+            refreshHeaderAppearance()
+            refreshFooterAppearance()
+        }
 
         let detail = diagnosticMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
         if result.isEntirelyUntranslated {
-            if let detail, !detail.isEmpty {
-                statusLabel.stringValue = "翻译失败：\(detail)"
-            } else {
-                statusLabel.stringValue = "翻译不可用，已保留原文"
-            }
+            let reason = (detail?.isEmpty == false) ? "翻译失败：\(detail!)" : "翻译不可用，已保留原文"
+            translationErrorMessage = reason
+            setStatusText(reason, tone: .warning)
+            setTranslationText(reason, color: AnShotTheme.warning)
+            copyBilingualButton.isHidden = true
         } else if result.isPartiallyTranslated {
-            if let detail, !detail.isEmpty {
-                statusLabel.stringValue = "已翻译 \(result.translatedCount)/\(result.segments.count) 行（\(detail)）"
-            } else {
-                statusLabel.stringValue = "已翻译 \(result.translatedCount)/\(result.segments.count) 行 · 未翻译的行保留原文"
-            }
+            translationErrorMessage = nil
+            let summary = (detail?.isEmpty == false)
+                ? "已译 \(result.translatedCount)/\(result.segments.count) 行（\(detail!)）"
+                : "已译 \(result.translatedCount)/\(result.segments.count) 行 · 部分保留原文"
+            setStatusText(summary, tone: .neutral)
+            setTranslationText(result.segments.map(\.displayText).joined(separator: "\n"))
+            copyBilingualButton.isHidden = false
         } else {
-            statusLabel.stringValue = "已翻译 \(result.translatedCount) 行"
+            translationErrorMessage = nil
+            setStatusText("已译 \(result.translatedCount) 行", tone: .neutral)
+            setTranslationText(result.segments.map(\.displayText).joined(separator: "\n"))
+            copyBilingualButton.isHidden = false
         }
+
+        copyButton.isEnabled = !smartCopyText.isEmpty
         refreshTranslationControls(hasLines: !currentEditableOriginalText.isEmpty)
     }
 
-    private func resetDisplayModeControl() {
-        displayMode = .original
-        modeControl.selectedSegment = DisplayMode.original.rawValue
-        modeControl.setEnabled(false, forSegment: DisplayMode.translation.rawValue)
-        modeControl.setEnabled(false, forSegment: DisplayMode.bilingual.rawValue)
-        textView.isEditable = true
+    /// 面板从纯 OCR 单区态切入翻译双栏态时，如当前高度偏矮则柔和扩展到舒适双栏高度。
+    private func expandPanelHeightIfNeeded() {
+        let minDualHeight: CGFloat = 430
+        guard panel.frame.height < minDualHeight else { return }
+        var next = panel.frame
+        let delta = minDualHeight - next.height
+        next.size.height = minDualHeight
+        next.origin.y -= delta
+        if let visible = panel.screen?.visibleFrame {
+            if next.minY < visible.minY + 12 {
+                next.origin.y = visible.minY + 12
+            }
+            if next.maxY > visible.maxY - 12 {
+                next.size.height = min(next.size.height, visible.height - 24)
+                next.origin.y = visible.maxY - 12 - next.size.height
+            }
+        }
+        panel.setFrame(next, display: true, animate: panel.isVisible)
     }
 
-    private func refreshDisplayedText() {
-        switch displayMode {
-        case .original:
-            textView.isEditable = true
-            setText(currentEditableOriginalText)
-        case .translation:
-            textView.isEditable = false
-            guard let result = translationResult else {
-                setText(currentEditableOriginalText)
-                return
-            }
-            setText(result.segments.map(\.displayText).joined(separator: "\n"))
-        case .bilingual:
-            textView.isEditable = false
-            guard let result = translationResult else {
-                setText(currentEditableOriginalText)
-                return
-            }
-            let combined = result.segments.map { segment in
-                if let translated = segment.translatedText,
-                   !translated.isEmpty,
-                   translated != segment.sourceText {
-                    return "\(segment.sourceText)\n\(translated)"
-                }
-                return segment.sourceText
-            }.joined(separator: "\n\n")
-            setText(combined)
-        }
+    private enum StatusTone {
+        case neutral
+        case warning
+    }
+
+    private func setStatusText(_ text: String, tone: StatusTone) {
+        bridgeStatusLabel.stringValue = text
+        bridgeStatusLabel.toolTip = text.isEmpty ? nil : text
+        bridgeStatusLabel.textColor = (tone == .warning) ? AnShotTheme.warning : .secondaryLabelColor
     }
 
     // MARK: - NSTextViewDelegate
 
     func textDidChange(_ notification: Notification) {
-        guard !isProgrammaticallyUpdatingText, displayMode == .original else { return }
-        editedOriginalText = textView.string
-        let hasText = !textView.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        copyButton.isEnabled = hasText
+        guard !isProgrammaticallyUpdatingText else { return }
+        editedOriginalText = sourceTextView.string
+        let hasText = !sourceTextView.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        copyButton.isEnabled = hasText || (translationResult?.isEntirelyUntranslated == false)
         refreshTranslationControls(hasLines: hasText)
     }
 
     // MARK: - 状态控制
 
-    private var translationAvailability: TranslationAvailability = .unknown
-    private var isTranslating = false
-
     func showTranslationUnavailable(_ availability: TranslationAvailability) {
-        statusLabel.stringValue = availability.explanation
+        if !isTranslationSectionExpanded {
+            setTranslationSectionExpanded(true)
+            expandPanelHeightIfNeeded()
+        }
+        translationSpinner.stopAnimation(nil)
+        translationSpinner.isHidden = true
+        setStatusText(availability.explanation, tone: .warning)
+        setTranslationText(availability.explanation, color: AnShotTheme.warning)
         applyTranslationAvailability(availability)
     }
 
@@ -955,16 +2010,34 @@ final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
     func setTranslating(_ translating: Bool) {
         isTranslating = translating
         if translating {
-            statusLabel.stringValue = "正在翻译…"
-        } else if statusLabel.stringValue == "正在翻译…" {
-            statusLabel.stringValue = "翻译已取消，已保留当前文字"
+            if !isTranslationSectionExpanded {
+                setTranslationSectionExpanded(true)
+                expandPanelHeightIfNeeded()
+            }
+            translationSpinner.isHidden = false
+            translationSpinner.startAnimation(nil)
+            setStatusText("正在翻译…", tone: .neutral)
+            if translationResult == nil {
+                setTranslationPlaceholder("正在翻译中…")
+            }
+        } else {
+            translationSpinner.stopAnimation(nil)
+            translationSpinner.isHidden = true
+            if bridgeStatusLabel.stringValue == "正在翻译…" {
+                setStatusText("翻译已取消", tone: .neutral)
+            }
         }
+        refreshFooterAppearance()
         refreshTranslationControls(hasLines: !currentEditableOriginalText.isEmpty)
     }
 
     func hide() {
         statusOverlay.isHidden = true
         progressIndicator.stopAnimation(nil)
+        translationSpinner.stopAnimation(nil)
+        copyButton.resetFeedback()
+        copyOriginalButton.resetFeedback()
+        copyBilingualButton.resetFeedback()
         panel.orderOut(nil)
         onClose?()
     }
@@ -1001,13 +2074,12 @@ final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
     var debugTranslateEnabledForDiagnostics: Bool { translateButton.isEnabled }
     var debugLanguagePopUpEnabledForDiagnostics: Bool { languagePopUp.isEnabled }
     var debugDisplayModeForDiagnostics: DisplayMode { displayMode }
+    var debugIsTranslationExpandedForDiagnostics: Bool { isTranslationSectionExpanded }
     var windowForDiagnostics: NSWindow { panel }
 
     func selectDisplayModeForDiagnostics(_ mode: DisplayMode) {
         guard mode == .original || translationResult != nil else { return }
         displayMode = mode
-        modeControl.selectedSegment = mode.rawValue
-        refreshDisplayedText()
     }
 
     private func refreshTranslationControls(hasLines: Bool) {
@@ -1023,26 +2095,24 @@ final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
 
     // MARK: - 动作
 
-    @objc private func handleDisplayModeChanged(_ sender: NSSegmentedControl) {
-        guard let mode = DisplayMode(rawValue: sender.selectedSegment) else { return }
-        displayMode = mode
-        refreshDisplayedText()
-    }
-
     @objc private func handleOCRLanguageChanged() {
         onOCRLanguageChanged?(selectedOCRLanguage)
     }
 
     @objc private func handleMergeLineBreaksToggled() {
-        let enabled = mergeLineBreaksButton.state == .on
-        if editedOriginalText == nil, displayMode == .original {
-            refreshDisplayedText()
+        let enabled = mergeLineBreaksButton.isActive
+        if editedOriginalText == nil {
+            refreshSourceTextView()
         }
         onMergeLineBreaksChanged?(enabled)
     }
 
     @objc private func handleToggleAlwaysOnTop() {
         setAlwaysOnTop(!isAlwaysOnTop)
+    }
+
+    @objc private func handleCloseButton() {
+        hide()
     }
 
     @objc private func handleTranslate() {
@@ -1054,11 +2124,36 @@ final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
     }
 
     @objc private func handleCopy() {
-        onCopyAll?(textView.string)
+        let payload = smartCopyText
+        guard !payload.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        onCopyAll?(payload)
+        copyButton.flashCopiedFeedback()
+    }
+
+    @objc private func handleCopyOriginal() {
+        let payload = currentEditableOriginalText
+        guard !payload.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        onCopyAll?(payload)
+        copyOriginalButton.flashCopiedFeedback()
+    }
+
+    @objc private func handleCopyBilingual() {
+        guard let result = translationResult else { return }
+        let payload = Self.bilingualText(for: result)
+        guard !payload.isEmpty else { return }
+        onCopyAll?(payload)
+        copyBilingualButton.flashCopiedFeedback()
     }
 
     private func triggerRetranslateShortcut() {
-        guard !isTranslating, !currentEditableOriginalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard !isTranslating,
+              !currentEditableOriginalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             NSSound.beep()
             return
         }
@@ -1066,12 +2161,7 @@ final class OCRResultPanel: NSObject, NSWindowDelegate, NSTextViewDelegate {
     }
 
     private func triggerSmartCopy() {
-        let content = smartCopyText
-        guard !content.isEmpty else {
-            NSSound.beep()
-            return
-        }
-        onCopyAll?(content)
+        handleCopy()
     }
 }
 

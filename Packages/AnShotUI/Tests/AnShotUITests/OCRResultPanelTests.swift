@@ -21,7 +21,7 @@ struct OCRResultPanelTests {
         ))
         var copied: String?
         panel.onCopyAll = { copied = $0 }
-        let copyButton = try #require(button(title: "复制全部", in: panel.windowForDiagnostics.contentView))
+        let copyButton = try #require(button(title: "复制译文", in: panel.windowForDiagnostics.contentView))
         let action = try #require(copyButton.action)
         NSApplication.shared.sendAction(action, to: copyButton.target, from: copyButton)
 
@@ -87,6 +87,55 @@ struct OCRResultPanelTests {
 
         panel.selectDisplayModeForDiagnostics(.original)
         #expect(panel.text == "hello\nworld")
+    }
+
+    @Test("纯 OCR 单区态与翻译上下对照态自动切换，并采用无红绿灯现代浮窗")
+    func modernCardLayoutTransitions() throws {
+        _ = NSApplication.shared
+        let panel = OCRResultPanel()
+        defer { panel.hide() }
+
+        let win = panel.windowForDiagnostics
+        #expect(win.styleMask.contains(.fullSizeContentView))
+        #expect(win.titlebarAppearsTransparent)
+        #expect(win.standardWindowButton(.closeButton)?.isHidden == true)
+
+        let line = OCRTextLine(text: "Hello anShot", candidates: [], confidence: 1, boundingBox: .zero)
+        panel.show(result: OCRResult(lines: [line], imagePixelSize: .zero), near: .zero)
+        #expect(!panel.debugIsTranslationExpandedForDiagnostics)
+        #expect(button(title: "复制原文", in: win.contentView) != nil)
+        #expect(button(title: "翻译", in: win.contentView) != nil)
+
+        panel.showTranslation(TranslationAligner.align(
+            lines: [line],
+            translations: ["你好 anShot"],
+            sourceLanguage: "en",
+            targetLanguage: "zh-Hans"
+        ))
+        #expect(panel.debugIsTranslationExpandedForDiagnostics)
+        #expect(button(title: "复制译文", in: win.contentView) != nil)
+        #expect(button(title: "重新翻译", in: win.contentView) != nil)
+
+        // 划词翻译入口默认直接展开上下对照态
+        panel.showSourceText("Quick translate", near: .zero)
+        #expect(panel.debugIsTranslationExpandedForDiagnostics)
+        #expect(win.title == "划词翻译")
+    }
+
+    @Test("划词文本清洗与现代悬浮翻译胶囊保持无焦点且支持首击触发")
+    func selectionNormalizationAndBubblePanel() {
+        #expect(SelectionTextReader.normalizeSelectedText("   \n\t  ") == nil)
+        #expect(SelectionTextReader.normalizeSelectedText("  Hello World \n") == "Hello World")
+        let huge = String(repeating: "A", count: 5000)
+        #expect(SelectionTextReader.normalizeSelectedText(huge)?.count == 4000)
+
+        let bubble = SelectionTranslateBubblePanel()
+        defer { bubble.hide() }
+        #expect(!bubble.canBecomeKey)
+        #expect(!bubble.canBecomeMain)
+        #expect(bubble.styleMask.contains(.nonactivatingPanel))
+        #expect(bubble.frame.size == SelectionTranslateBubblePanel.bubbleSize)
+        #expect(bubble.contentView?.acceptsFirstMouse(for: nil) == true)
     }
 
     private func button(title: String, in view: NSView?) -> NSButton? {

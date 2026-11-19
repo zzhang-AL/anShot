@@ -780,6 +780,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             symbol: "character.book.closed",
             shortcutAction: .selectionTranslate
         ))
+        translateMenu.addItem(.separator())
+        let floatingItem = makeAction(
+            L("menu.selectionTranslateFloating", fallback: "划词时显示悬浮「翻译」按钮"),
+            #selector(toggleSelectionTranslateFloatingButton),
+            symbol: "sparkles.rectangle.stack"
+        )
+        floatingItem.state = settings.selectionTranslateFloatingButton ? .on : .off
+        translateMenu.addItem(floatingItem)
         translateRoot.submenu = translateMenu
 
         // 「录制屏幕」合并区域/窗口/应用准备入口与全屏快录入口
@@ -1584,6 +1592,26 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 菜单入口：划词翻译当前选中文本（对应 `⌥D`）。
     @objc private func triggerSelectionTranslateFromMenu() {
         selectionTranslationController.triggerSelectionTranslate()
+    }
+
+    /// 菜单快捷开关：开启/关闭「划词时显示悬浮翻译按钮」，未授辅助功能权限时主动引导直达授权。
+    @objc private func toggleSelectionTranslateFloatingButton() {
+        let next = !settings.selectionTranslateFloatingButton
+        settings.setSelectionTranslateFloatingButton(next)
+        if next {
+            if !SystemElementDetector().hasAccessibilityPermission {
+                ToastPresenter.show(
+                    "划词悬浮按钮需要辅助功能权限",
+                    actionTitle: "去授权"
+                ) { [weak self] in
+                    self?.openAccessibilitySettings()
+                }
+            } else {
+                ToastPresenter.show("已开启划词悬浮翻译，选中文字后自动浮现")
+            }
+        } else {
+            ToastPresenter.show("已关闭划词悬浮翻译，仍可按 \(settings.selectionTranslateShortcut.displayName) 翻译")
+        }
     }
 
     /// 菜单入口：从剪贴板识别图片文字并打开独立 OCR 浮窗。

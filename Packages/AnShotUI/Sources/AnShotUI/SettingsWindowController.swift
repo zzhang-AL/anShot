@@ -1969,8 +1969,8 @@ private final class SettingsViewController: NSViewController {
         let targetRow = SettingsControlRow(label: "默认目标语言", control: targetPopUp)
 
         let floatingRow = SettingsToggleRow(
-            title: "划词后显示悬浮「译」按钮",
-            subtitle: "默认关闭；开启后在任意应用中拖选文本即可于光标旁快捷点击翻译（需辅助功能权限，绝不触碰剪贴板）"
+            title: "划词后显示悬浮「翻译」按钮",
+            subtitle: "默认关闭；开启后在任意应用中拖选或双击文本即浮现翻译胶囊，也可随时按 ⌥D 触发（需辅助功能权限，绝不触碰剪贴板）"
         )
         floatingRow.isOn = settings.selectionTranslateFloatingButton
         floatingRow.toggle.target = self
@@ -2330,7 +2330,16 @@ private final class SettingsViewController: NSViewController {
     }
 
     @objc private func selectionFloatingButtonChanged(_ sender: NSSwitch) {
-        settings.setSelectionTranslateFloatingButton(sender.state == .on)
+        let enabled = sender.state == .on
+        settings.setSelectionTranslateFloatingButton(enabled)
+        if enabled && !SystemElementDetector().hasAccessibilityPermission {
+            ToastPresenter.show(
+                "划词悬浮按钮需要辅助功能权限",
+                actionTitle: "去授权"
+            ) {
+                SystemElementDetector.openAccessibilitySettings()
+            }
+        }
     }
 
     @objc private func pinShowBorderChanged(_ sender: NSSwitch) {
