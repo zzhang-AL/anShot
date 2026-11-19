@@ -14,17 +14,19 @@ import ImageIO
 import UniformTypeIdentifiers
 
 /// 支持的图像输出格式。
-public enum ImageFormat: Sendable {
+public enum ImageFormat: Sendable, Equatable {
     case png
     case jpeg(quality: CGFloat)
     case heic(quality: CGFloat)
+    case webpLossless
 
     /// 对应的 UTType 标识符。
-    var utType: UTType {
+    public var utType: UTType {
         switch self {
         case .png:            return .png
         case .jpeg:           return .jpeg
         case .heic:           return .heic
+        case .webpLossless:   return .webP
         }
     }
 
@@ -34,6 +36,7 @@ public enum ImageFormat: Sendable {
         case .png:            return "png"
         case .jpeg:           return "jpg"
         case .heic:           return "heic"
+        case .webpLossless:   return "webp"
         }
     }
 
@@ -48,7 +51,7 @@ public enum ImageFormat: Sendable {
             kCGImagePropertyTIFFResolutionUnit: 2,
         ]
         switch self {
-        case .png:
+        case .png, .webpLossless:
             return [
                 kCGImagePropertyDPIWidth: dpi,
                 kCGImagePropertyDPIHeight: dpi,
@@ -108,12 +111,19 @@ public enum ImageEncoding {
     ///   - image: 待编码图像。
     ///   - format: 输出格式。
     ///   - backingScale: 屏幕物理缩放系数（2x Retina 屏写入 144 DPI）。
-    /// - Returns: 编码后的数据。
+    /// - Returns: 编码后的数据。若选择 `.webpLossless` 但任一边超过 `16384px` 规格上限，自动降级为 PNG 保留 DPI。
     public static func data(
         from image: CGImage,
         format: ImageFormat,
         backingScale: CGFloat = 1.0
     ) throws -> Data {
+        if case .webpLossless = format {
+            if image.width <= WebPEncoder.maximumDimension && image.height <= WebPEncoder.maximumDimension {
+                return try WebPEncoder.encodeLossless(image, backingScale: backingScale)
+            }
+            // 超出 WebP 16384px 规格上限时安全降级 PNG（契约 `ux-polish/model.md` §1.2）。
+            return try data(from: image, format: .png, backingScale: backingScale)
+        }
         let buffer = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
             buffer,
@@ -133,7 +143,7 @@ public enum ImageEncoding {
         return buffer as Data
     }
 
-    /// 把 `CGImage` 写入文件。
+    /// 把 `CGImage` 写入文件，并返回实际落盘的格式（WebP 超限时会自动降级为 `.png`）。
     ///
     /// 采用「先编码到内存再整体写入」还是「直接写入 URL」取决于是否有后续用途：
     /// 需要同时复制到剪贴板时用 `data(from:format:)` 复用同一份编码结果，
@@ -144,6 +154,11 @@ public enum ImageEncoding {
         format: ImageFormat,
         backingScale: CGFloat = 1.0
     ) throws {
+        if case .webpLossless = format {
+            let encoded = try data(from: image, format: .webpLossless, backingScale: backingScale)
+            try encoded.write(to: url, options: .atomic)
+            return
+        }
         guard let destination = CGImageDestinationCreateWithURL(
             url as CFURL,
             format.utType.identifier as CFString,
@@ -158,5 +173,17 @@ public enum ImageEncoding {
         guard CGImageDestinationFinalize(destination) else {
             throw ImageEncodingError.finalizeFailed
         }
+    }
+
+    /// 解析实际可落盘的图像格式（用于超 16384px 长图在保存前把 `.webp` 扩展名降级为 `.png`）。
+    public static func effectiveFormat(
+        for image: CGImage,
+        requested: ImageFormat
+    ) -> ImageFormat {
+        if case .webpLossless = requested,
+           (image.width > WebPEncoder.maximumDimension || image.height > WebPEncoder.maximumDimension) {
+            return .png
+        }
+        return requested
     }
 }

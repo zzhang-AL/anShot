@@ -128,6 +128,28 @@ if [[ ! -d "${APP_PATH}" ]]; then
     exit 1
 fi
 
+# ── 2.5 可选嵌入 MIT 许可 oxipng Helper（无损 PNG 后台精压）
+# 若仓库内 App/Helpers/oxipng 或环境变量 OXIPNG_BIN 提供了 MIT oxipng 二进制，
+# 则随包放入 Contents/Helpers/oxipng，执行架构与同身份 Hardened Runtime 签名并重签主包；
+# 未提供时正常继续打包，运行时自动静默降级为原生 ImageIO 编码。
+OXIPNG_SOURCE="${OXIPNG_BIN:-${ROOT}/App/Helpers/oxipng}"
+if [[ -f "${OXIPNG_SOURCE}" && -x "${OXIPNG_SOURCE}" ]]; then
+    echo "── 2.5/7 嵌入并签名 MIT oxipng Helper"
+    HELPERS_DIR="${APP_PATH}/Contents/Helpers"
+    mkdir -p "${HELPERS_DIR}"
+    cp -f "${OXIPNG_SOURCE}" "${HELPERS_DIR}/oxipng"
+    chmod 755 "${HELPERS_DIR}/oxipng"
+    OXI_LIPO="$(lipo -info "${HELPERS_DIR}/oxipng")"
+    echo "   oxipng: ${OXI_LIPO}"
+    SIGN_ID="$(codesign -dvvv "${APP_PATH}" 2>&1 | sed -n 's/^Authority=//p' | head -1 || true)"
+    if [[ -n "${SIGN_ID}" ]]; then
+        codesign --force --options runtime --sign "${SIGN_ID}" "${HELPERS_DIR}/oxipng"
+        codesign --force --options runtime --entitlements "${ROOT}/App/anShot.entitlements" --sign "${SIGN_ID}" "${APP_PATH}"
+    fi
+else
+    echo "── 2.5/7 未提供随包 oxipng（跳过嵌入，运行时将自动探测本机路径或静默降级）"
+fi
+
 # ── 3. 产物校验：双架构、版本号、签名
 echo "── 3/7 校验产物"
 LIPO="$(lipo -info "${APP_PATH}/Contents/MacOS/${APP_NAME}")"
