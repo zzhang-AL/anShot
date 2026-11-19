@@ -91,7 +91,29 @@ public enum AnnotationRenderer {
             canvasHeight: canvasHeight
         )
 
+        // 预先聚合全部聚光灯焦点：在首条聚光灯所处 z-order 统一绘制一次 evenOdd 压暗遮罩，
+        // 确保同时存在多个聚光灯时各焦点区域彼此保持 100% 原亮度而不相互压黑。
+        let spotlights: [(rect: PixelRect, cornerRadius: Double, dimOpacity: Double)] = annotations.compactMap {
+            guard case let .spotlight(rect, cornerRadius, dimOpacity) = $0.kind else { return nil }
+            return (rect, cornerRadius, dimOpacity)
+        }
+        var didDrawSpotlights = false
+
         for annotation in annotations {
+            if case .spotlight = annotation.kind {
+                if !didDrawSpotlights {
+                    drawSpotlights(
+                        spotlights,
+                        canvasOrigin: canvasOrigin,
+                        canvasWidth: canvasWidth,
+                        canvasHeight: canvasHeight,
+                        in: context
+                    )
+                    didDrawSpotlights = true
+                }
+                continue
+            }
+
             apply(
                 annotation,
                 in: context,
@@ -100,6 +122,94 @@ public enum AnnotationRenderer {
                 canvasHeight: canvasHeight
             )
         }
+    }
+
+    /// 独立窗体柔和投影外扩边距（像素单位）。
+    public struct WindowDropShadowInsets: Equatable, Sendable {
+        public let left: Int
+        public let right: Int
+        public let top: Int
+        public let bottom: Int
+
+        public init(left: Int, right: Int, top: Int, bottom: Int) {
+            self.left = left
+            self.right = right
+            self.top = top
+            self.bottom = bottom
+        }
+    }
+
+    /// 计算给定缩放因子下独立窗体投影所需的透明外扩像素边距。
+    public static func windowDropShadowInsets(backingScale: CGFloat) -> WindowDropShadowInsets {
+        let scale = max(1.0, backingScale)
+        let horizontal = Int((30.0 * scale).rounded())
+        let top = Int((22.0 * scale).rounded())
+        let bottom = Int((42.0 * scale).rounded())
+        return WindowDropShadowInsets(left: horizontal, right: horizontal, top: top, bottom: bottom)
+    }
+
+    /// 为独立捕获的透明圆角窗体合成 macOS 风格柔和外投影。
+    ///
+    /// 采用单次 `setShadow` + `draw` 沿原图 Alpha 轮廓投射软影，避免二次叠绘导致半透明毛玻璃窗体失真。
+    public static func applyWindowDropShadow(
+        _ image: CGImage,
+        backingScale: CGFloat = 1.0
+    ) -> CGImage? {
+        guard image.width > 0, image.height > 0 else {
+            return nil
+        }
+
+        let scale = max(1.0, backingScale)
+        let insets = windowDropShadowInsets(backingScale: scale)
+        let outWidth = image.width + insets.left + insets.right
+        let outHeight = image.height + insets.top + insets.bottom
+
+        let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue
+            | CGBitmapInfo.byteOrder32Little.rawValue
+        let preferredSpace = ImageColorSpace.canvasColorSpace(for: image)
+        let context = CGContext(
+            data: nil,
+            width: outWidth,
+            height: outHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: preferredSpace,
+            bitmapInfo: bitmapInfo
+        ) ?? (preferredSpace !== fallbackColorSpace ? CGContext(
+            data: nil,
+            width: outWidth,
+            height: outHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: fallbackColorSpace,
+            bitmapInfo: bitmapInfo
+        ) : nil)
+
+        guard let context else {
+            return nil
+        }
+
+        context.clear(CGRect(x: 0, y: 0, width: outWidth, height: outHeight))
+        context.interpolationQuality = .none
+        context.setAllowsAntialiasing(true)
+
+        let drawRect = CGRect(
+            x: CGFloat(insets.left),
+            y: CGFloat(insets.bottom),
+            width: CGFloat(image.width),
+            height: CGFloat(image.height)
+        )
+
+        context.saveGState()
+        context.setShadow(
+            offset: CGSize(width: 0, height: -8.0 * scale),
+            blur: 20.0 * scale,
+            color: CGColor(gray: 0, alpha: 0.34)
+        )
+        context.draw(image, in: drawRect)
+        context.restoreGState()
+
+        return context.makeImage()
     }
 
     /// 只裁剪、不应用标注。
@@ -333,9 +443,9 @@ public enum AnnotationRenderer {
                 in: context
             )
 
-        case let .mosaic(rect, mode, intensity):
+        case let .mosaic(rect, mode, intensity, cornerRadius):
             applyMosaic(
-                coverage: .rect(rect),
+                coverage: .rect(rect, cornerRadius: cornerRadius),
                 mode: mode,
                 intensity: intensity,
                 in: context,
@@ -343,6 +453,10 @@ public enum AnnotationRenderer {
                 canvasWidth: canvasWidth,
                 canvasHeight: canvasHeight
             )
+
+        case .spotlight:
+            // 聚光灯已在 `applyAnnotations` 中按多焦点协调方式统一绘制。
+            break
 
         case let .numbering(center, radius, index, stroke, fill, textColor):
             drawNumbering(
@@ -747,6 +861,47 @@ public enum AnnotationRenderer {
         context.setBlendMode(.multiply)
         context.setFillColor(color.cgColor)
         context.fill(cgRect)
+    }
+
+    /// 聚光灯：协调绘制画布压暗层，并将全部聚光灯焦点矩形以 `evenOdd` 规则镂空保留原亮度。
+    private static func drawSpotlights(
+        _ spotlights: [(rect: PixelRect, cornerRadius: Double, dimOpacity: Double)],
+        canvasOrigin: PixelPoint,
+        canvasWidth: Int,
+        canvasHeight: Int,
+        in context: CGContext
+    ) {
+        let validSpotlights = spotlights.filter { $0.rect.size.width > 0 && $0.rect.size.height > 0 }
+        guard !validSpotlights.isEmpty, canvasWidth > 0, canvasHeight > 0 else {
+            return
+        }
+
+        // 采用最顶层（最后一条）聚光灯的压暗强度，确保用户调整最新聚光灯压暗度时立即直观生效。
+        let dimOpacity = min(max(validSpotlights.last?.dimOpacity ?? 0.55, 0.1), 0.85)
+        let canvasRect = CGRect(
+            x: canvasOrigin.x,
+            y: canvasOrigin.y,
+            width: Double(canvasWidth),
+            height: Double(canvasHeight)
+        )
+
+        let path = CGMutablePath()
+        path.addRect(canvasRect)
+        for item in validSpotlights {
+            let cgRect = item.rect.cgRect
+            let clampedRadius = min(max(0, item.cornerRadius), min(cgRect.width, cgRect.height) / 2)
+            if clampedRadius > 0 {
+                path.addRoundedRect(in: cgRect, cornerWidth: clampedRadius, cornerHeight: clampedRadius)
+            } else {
+                path.addRect(cgRect)
+            }
+        }
+
+        context.saveGState()
+        defer { context.restoreGState() }
+        context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: CGFloat(dimOpacity)))
+        context.addPath(path)
+        context.fillPath(using: .evenOdd)
     }
 
     /// 测量：两点连线 + 沿法向量偏移的圆角半透明读数底板。
@@ -1174,13 +1329,13 @@ public enum AnnotationRenderer {
     /// 框选是矩形；涂抹是带半径的路径。两者共用同一套像素化实现，
     /// 差别只在「这个像素是否被覆盖」的判定上。
     private enum MosaicCoverage {
-        case rect(PixelRect)
+        case rect(PixelRect, cornerRadius: Double)
         case stroke(points: [PixelPoint], radius: Double)
 
         /// 覆盖区域在**底图坐标**里的包围盒。
         var backdropBounds: PixelRect {
             switch self {
-            case let .rect(rect):
+            case let .rect(rect, _):
                 return rect
 
             case let .stroke(points, radius):
@@ -1209,7 +1364,7 @@ public enum AnnotationRenderer {
         /// 某个底图像素是否落在覆盖区内。
         func covers(backdropX x: Double, backdropY y: Double) -> Bool {
             switch self {
-            case let .rect(rect):
+            case let .rect(rect, _):
                 return x >= rect.origin.x && x < rect.origin.x + rect.size.width
                     && y >= rect.origin.y && y < rect.origin.y + rect.size.height
 
@@ -1324,13 +1479,14 @@ public enum AnnotationRenderer {
             return
         }
 
-        // 涂抹模式统一构建「局部包围盒尺寸」的 8-bit 灰度掩码，
-        // 相比分配整幅画布可将大图涂抹内存降低百倍。
+        // 涂抹模式与圆角矩形打码统一构建「局部包围盒尺寸」的 8-bit 灰度掩码，
+        // 相比分配整幅画布可将大图涂抹内存降低百倍，同时让圆角边缘获得平滑抗锯齿。
         var maskContext: CGContext?
         var maskBuffer: UnsafeMutablePointer<UInt8>?
         let maskWidth = canvasX1 - canvasX0
         let maskHeight = canvasY1 - canvasY0
-        if case let .stroke(points, radius) = coverage {
+        switch coverage {
+        case let .stroke(points, radius):
             maskContext = makeStrokeMask(
                 points: points,
                 radius: radius,
@@ -1342,6 +1498,20 @@ public enum AnnotationRenderer {
                 maskHeight: maskHeight
             )
             maskBuffer = maskContext?.data?.assumingMemoryBound(to: UInt8.self)
+        case let .rect(rect, cornerRadius) where cornerRadius > 0:
+            maskContext = makeRoundedRectMask(
+                rect: rect,
+                cornerRadius: cornerRadius,
+                originX: originX,
+                originY: originY,
+                maskOriginX: canvasX0,
+                maskOriginY: canvasY0,
+                maskWidth: maskWidth,
+                maskHeight: maskHeight
+            )
+            maskBuffer = maskContext?.data?.assumingMemoryBound(to: UInt8.self)
+        default:
+            break
         }
         let maskBytesPerRow = maskContext?.bytesPerRow ?? 0
 
@@ -1763,6 +1933,60 @@ public enum AnnotationRenderer {
             mask.addLine(to: localPoint(first))
         }
         mask.strokePath()
+
+        return mask
+    }
+
+    /// 为圆角矩形马赛克构建局部 8-bit 抗锯齿灰度掩码。
+    private static func makeRoundedRectMask(
+        rect: PixelRect,
+        cornerRadius: Double,
+        originX: Int,
+        originY: Int,
+        maskOriginX: Int,
+        maskOriginY: Int,
+        maskWidth: Int,
+        maskHeight: Int
+    ) -> CGContext? {
+        guard maskWidth > 0, maskHeight > 0, rect.isNonEmpty else {
+            return nil
+        }
+        guard let mask = CGContext(
+            data: nil,
+            width: maskWidth,
+            height: maskHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: maskWidth,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else {
+            return nil
+        }
+
+        mask.setFillColor(gray: 0, alpha: 1)
+        mask.fill(CGRect(x: 0, y: 0, width: maskWidth, height: maskHeight))
+        mask.setAllowsAntialiasing(true)
+        mask.setShouldAntialias(true)
+
+        mask.translateBy(x: 0, y: CGFloat(maskHeight))
+        mask.scaleBy(x: 1, y: -1)
+
+        let localRect = CGRect(
+            x: CGFloat(rect.origin.x) - CGFloat(originX + maskOriginX),
+            y: CGFloat(rect.origin.y) - CGFloat(originY + maskOriginY),
+            width: CGFloat(rect.size.width),
+            height: CGFloat(rect.size.height)
+        )
+        let clampedRadius = min(CGFloat(max(0, cornerRadius)), min(localRect.width, localRect.height) / 2)
+        let path = CGPath(
+            roundedRect: localRect,
+            cornerWidth: clampedRadius,
+            cornerHeight: clampedRadius,
+            transform: nil
+        )
+        mask.addPath(path)
+        mask.setFillColor(gray: 1, alpha: 1)
+        mask.fillPath()
 
         return mask
     }

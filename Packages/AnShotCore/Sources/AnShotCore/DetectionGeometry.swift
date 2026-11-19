@@ -65,6 +65,9 @@ public struct DetectionTarget: Equatable, Sendable {
     /// `SCContentFilter(display:including:)`。
     public let processID: pid_t?
 
+    /// 所属应用名称（用于独立窗体选择提示条与历史记录展示）。
+    public let applicationName: String?
+
     public init(
         layer: Layer,
         rect: CGRect,
@@ -72,7 +75,8 @@ public struct DetectionTarget: Equatable, Sendable {
         title: String?,
         windowID: CGWindowID? = nil,
         processID: pid_t? = nil,
-        globalRect: CGRect? = nil
+        globalRect: CGRect? = nil,
+        applicationName: String? = nil
     ) {
         self.layer = layer
         self.rect = rect
@@ -81,6 +85,7 @@ public struct DetectionTarget: Equatable, Sendable {
         self.windowID = windowID
         self.processID = processID
         self.globalRect = globalRect
+        self.applicationName = applicationName
     }
 }
 

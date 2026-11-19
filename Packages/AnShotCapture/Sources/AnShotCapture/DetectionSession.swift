@@ -87,6 +87,51 @@ public final class DetectionSession {
         isLoaded = true
     }
 
+    /// 在普通区域截图模式下是否抑制最大化窗口（宽 ≥ 92%、高 ≥ 82% 且面积 ≥ 78%）的自动吸附。
+    ///
+    /// 开启后，当光标下最顶层窗口近似全屏/最大化时，既不误吸附整屏、也不穿透吸附底层半屏窗口；
+    /// 同时不再退回整屏 `displayTarget()`，保持 100% 原始亮度的干净画面供用户直接拖拽框选。
+    /// 独立窗体模式与录制取目标模式关闭此开关，确保所有窗口均可被点选。
+    public var suppressesMaximizedWindow: Bool = false
+
+    /// 判定一个窗口在当前显示器内是否近似最大化/全屏。
+    ///
+    /// 阈值依据：`width >= 92%`、`height >= 82%` 且面积 `>= 78%`。
+    nonisolated public static func isMaximizedLike(_ windowFrame: CGRect, in displayBounds: CGRect) -> Bool {
+        guard displayBounds.width > 0, displayBounds.height > 0 else { return false }
+        let clipped = windowFrame.intersection(displayBounds)
+        guard !clipped.isNull, clipped.width > 0, clipped.height > 0 else { return false }
+        let widthRatio = clipped.width / displayBounds.width
+        let heightRatio = clipped.height / displayBounds.height
+        let areaRatio = (clipped.width * clipped.height) / (displayBounds.width * displayBounds.height)
+        return widthRatio >= 0.92 && heightRatio >= 0.82 && areaRatio >= 0.78
+    }
+
+    /// 返回光标下方按权威 Z-order（前到后）排列的全部可见窗口候选，供窗体模式 `Tab` 穿透切换。
+    public func windowCandidates(atGlobalPoint point: CGPoint) -> [DetectionTarget] {
+        guard isLoaded else { return [] }
+        var targets: [DetectionTarget] = []
+        for window in windows where window.frame.contains(point) {
+            guard let local = DetectionGeometry.clampedLocalBounds(
+                ofGlobalRects: [window.frame],
+                displayBounds: displayBounds
+            ) else {
+                continue
+            }
+            targets.append(DetectionTarget(
+                layer: .window,
+                rect: local,
+                displayID: displayID,
+                title: window.title ?? window.applicationName,
+                windowID: window.windowID,
+                processID: window.processID,
+                globalRect: window.frame,
+                applicationName: window.applicationName
+            ))
+        }
+        return targets
+    }
+
     /// 同步识别指定全局点应当选中的区域（保留旧有调用契约）。
     ///
     /// - Parameters:
@@ -106,22 +151,25 @@ public final class DetectionSession {
             return nil
 
         case .automatic:
-            // 由内到外：控件 → 窗口 → 显示器。
+            // 由内到外：控件 → 窗口 → 显示器（抑制最大化模式下不回退整屏显示器）。
             if let control = controlTarget(atGlobalPoint: point) {
                 return control
             }
             if let window = windowTarget(atGlobalPoint: point) {
                 return window
             }
-            return displayTarget()
+            return suppressesMaximizedWindow ? nil : displayTarget()
 
         case .window:
-            return windowTarget(atGlobalPoint: point) ?? displayTarget()
+            if let window = windowTarget(atGlobalPoint: point) {
+                return window
+            }
+            return suppressesMaximizedWindow ? nil : displayTarget()
 
         case .application:
             return applicationTarget(atGlobalPoint: point)
                 ?? windowTarget(atGlobalPoint: point)
-                ?? displayTarget()
+                ?? (suppressesMaximizedWindow ? nil : displayTarget())
         }
     }
 
@@ -137,11 +185,14 @@ public final class DetectionSession {
         case .disabled:
             return nil
         case .automatic, .window:
-            return windowTarget(atGlobalPoint: point) ?? displayTarget()
+            if let window = windowTarget(atGlobalPoint: point) {
+                return window
+            }
+            return suppressesMaximizedWindow ? nil : displayTarget()
         case .application:
             return applicationTarget(atGlobalPoint: point)
                 ?? windowTarget(atGlobalPoint: point)
-                ?? displayTarget()
+                ?? (suppressesMaximizedWindow ? nil : displayTarget())
         }
     }
 
@@ -158,7 +209,10 @@ public final class DetectionSession {
         }
         guard cachedAccessibilityPermission,
               let window = windows.first(where: { $0.frame.contains(point) }) else {
-            return windowTarget(atGlobalPoint: point) ?? displayTarget()
+            if let target = windowTarget(atGlobalPoint: point) {
+                return target
+            }
+            return suppressesMaximizedWindow ? nil : displayTarget()
         }
 
         let detector = self.detector
@@ -170,7 +224,10 @@ public final class DetectionSession {
         if let hit, let control = makeControlTarget(from: hit, in: window) {
             return control
         }
-        return windowTarget(atGlobalPoint: point) ?? displayTarget()
+        if let target = windowTarget(atGlobalPoint: point) {
+            return target
+        }
+        return suppressesMaximizedWindow ? nil : displayTarget()
     }
 
     /// 阶段二后台去抖查询控件：主线程可先用 `immediateTarget` 瞬时响应，再由本方法异步收窄到控件框。
@@ -267,6 +324,11 @@ public final class DetectionSession {
     /// `CGWindowListCopyWindowInfo` 的语义一致。命中测试取第一个包含该点的窗口。
     private func windowTarget(atGlobalPoint point: CGPoint) -> DetectionTarget? {
         for window in windows where window.frame.contains(point) {
+            // 普通区域截图模式下，若最顶层命中窗口本身已近似最大化/全屏，
+            // 直接停止并返回 nil：既不误吸全屏，也绝不穿透去吸附其背后的半屏窗口。
+            if suppressesMaximizedWindow, Self.isMaximizedLike(window.frame, in: displayBounds) {
+                return nil
+            }
             guard let local = DetectionGeometry.clampedLocalBounds(
                 ofGlobalRects: [window.frame],
                 displayBounds: displayBounds
@@ -283,7 +345,8 @@ public final class DetectionSession {
                 processID: window.processID,
                 // 捕获范围用**未裁剪**的窗口 frame：窗口录制录的是整个窗口（可跨屏），
                 // 而 `local` 已裁进本屏。两者必须都带出去，不能相互替代。
-                globalRect: window.frame
+                globalRect: window.frame,
+                applicationName: window.applicationName
             )
         }
         return nil

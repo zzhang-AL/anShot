@@ -175,4 +175,45 @@ struct DetectionSessionAsyncTests {
         #expect(resolved?.layer == .window)
         #expect(detector.controlLookupPoints.count == 1)
     }
+
+    @MainActor
+    @Test("普通区域模式抑制最大化窗口吸附且不穿透底层半屏窗口，窗体候选栈按 Z-order 完整返回")
+    func suppressesMaximizedWindowAndReturnsOrderedWindowCandidates() async {
+        let displayBounds = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        // 顶层最大化窗口：占满 96% 宽、94% 高、90% 面积
+        let maximized = DetectedWindow(
+            windowID: 100,
+            frame: CGRect(x: 20, y: 30, width: 1380, height: 850),
+            layer: 0,
+            title: "Safari",
+            processID: 100,
+            applicationName: "Safari"
+        )
+        // 底层半屏窗口：被最大化窗口完全遮挡
+        let behind = DetectedWindow(
+            windowID: 200,
+            frame: CGRect(x: 100, y: 100, width: 600, height: 500),
+            layer: 0,
+            title: "Notes",
+            processID: 200,
+            applicationName: "Notes"
+        )
+        let detector = MockDetector(permission: false, windows: [maximized, behind])
+        let session = DetectionSession(detector: detector, displayID: 1, displayBounds: displayBounds)
+        session.suppressesMaximizedWindow = true
+        await session.load()
+
+        #expect(DetectionSession.isMaximizedLike(maximized.frame, in: displayBounds))
+        #expect(!DetectionSession.isMaximizedLike(behind.frame, in: displayBounds))
+
+        // 光标在重叠点：抑制最大化窗口后应返回 nil，既不吸附 Safari 也不穿透吸附 Notes。
+        let hit = session.immediateTarget(atGlobalPoint: CGPoint(x: 300, y: 300), preference: .automatic)
+        #expect(hit == nil)
+
+        // 独立窗体模式下 `windowCandidates` 按 Z-order 完整返回所有叠放窗口。
+        let candidates = session.windowCandidates(atGlobalPoint: CGPoint(x: 300, y: 300))
+        #expect(candidates.map(\.windowID) == [100, 200])
+        #expect(candidates.first?.applicationName == "Safari")
+        #expect(candidates.last?.applicationName == "Notes")
+    }
 }

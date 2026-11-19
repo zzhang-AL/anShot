@@ -82,7 +82,9 @@ extension Annotation {
             guard box.isNonEmpty else { return false }
             return Self.contains(box, point, slack: slack)
 
-        case let .mosaic(rect, _, _), let .highlight(rect, _):
+        case let .mosaic(rect, _, _, _),
+             let .highlight(rect, _),
+             let .spotlight(rect, _, _):
             return Self.contains(rect, point, slack: slack)
 
         case let .mosaicStroke(points, radius, _, _):
@@ -241,8 +243,11 @@ extension Annotation.Kind {
                 maxWidth: maxWidth
             )
 
-        case let .mosaic(rect, mode, intensity):
-            return .mosaic(rect: moved(rect), mode: mode, intensity: intensity)
+        case let .mosaic(rect, mode, intensity, cornerRadius):
+            return .mosaic(rect: moved(rect), mode: mode, intensity: intensity, cornerRadius: cornerRadius)
+
+        case let .spotlight(rect, cornerRadius, dimOpacity):
+            return .spotlight(rect: moved(rect), cornerRadius: cornerRadius, dimOpacity: dimOpacity)
 
         case let .mosaicStroke(points, radius, mode, intensity):
             return .mosaicStroke(points: points.map { moved($0) }, radius: radius, mode: mode, intensity: intensity)

@@ -60,11 +60,12 @@ public struct CaptureSession: Codable, Equatable, Sendable {
     /// - 版本 2：新增 `mosaicStroke`（涂抹马赛克）。
     /// - 版本 3：M3-0 新增 `numbering` / `highlight` / `measure` / `magnifier` /
     ///   `freehand` / `curvedArrow` 六种标注，`StrokeStyle` 增加 `isSketchy`。
+    /// - 版本 4：ux-polish 新增 `spotlight`（聚光灯）标注，`mosaic` 增加可选 `cornerRadius`。
     ///
     /// 新增枚举 case 并不保证源码兼容：读文件的一方必须能跳过未知类型，
-    /// 详见 model.md §10 的兼容策略。`StrokeStyle.isSketchy` 走
-    /// `decodeIfPresent` 兜底，因此 v1/v2 文件仍能正常读取。
-    public static let currentSchemaVersion = 3
+    /// 详见 model.md §10 的兼容策略。`StrokeStyle.isSketchy` 与 `mosaic.cornerRadius`
+    /// 均走 `decodeIfPresent` 兜底，因此 v1/v2/v3 文件仍能正常读取。
+    public static let currentSchemaVersion = 4
 
     public var schemaVersion: Int
     public var id: UUID
@@ -204,7 +205,7 @@ extension CaptureSession {
 
             // 两种马赛克共用同一套像素化判定，模式校验也要覆盖到涂抹。
             switch annotation.kind {
-            case let .mosaic(_, mode, _), let .mosaicStroke(_, _, mode, _):
+            case let .mosaic(_, mode, _, _), let .mosaicStroke(_, _, mode, _):
                 if !mode.isRenderable {
                     throw SessionInvariantError.unsupportedMosaicMode(mode)
                 }

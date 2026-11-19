@@ -287,8 +287,8 @@ struct CaptureSessionTests {
         let decoded = try JSONDecoder().decode(CaptureSession.self, from: data)
 
         #expect(decoded == original)
-        // 版本 2 起加入 mosaicStroke（涂抹马赛克）。
-        #expect(decoded.schemaVersion == 3)
+        // 版本 4 起加入 spotlight（聚光灯）与 mosaic.cornerRadius。
+        #expect(decoded.schemaVersion == 4)
         #expect(decoded.backdrop.imageRef == nil)
     }
 
@@ -299,7 +299,7 @@ struct CaptureSessionTests {
             try JSONSerialization.jsonObject(with: data) as? [String: Any]
         )
 
-        #expect(object["schemaVersion"] as? Int == 3)
+        #expect(object["schemaVersion"] as? Int == 4)
         #expect(object["id"] != nil)
         #expect(object["createdAt"] as? String == "2026-09-12T13:45:00Z")
         #expect(object["selection"] != nil)

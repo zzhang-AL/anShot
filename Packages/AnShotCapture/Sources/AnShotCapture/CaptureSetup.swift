@@ -220,9 +220,12 @@ enum CaptureSetup {
         // 显式指定 32BGRA 像素格式，避免默认 YCbCr 4:2:0 导致彩色细字色度抽样发虚。
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
 
-        // captureResolution 为 macOS 14.0+，13.0 上不存在此属性。
+        // captureResolution / shouldBeOpaque / ignoreShadowsSingleWindow 为 macOS 14.0+。
         if #available(macOS 14.0, *) {
             configuration.captureResolution = .best
+            // 保留独立窗口圆角透明背景并去掉系统大尺寸阴影，阴影改由渲染层统一可控合成。
+            configuration.shouldBeOpaque = false
+            configuration.ignoreShadowsSingleWindow = true
         }
         configuration.scalesToFit = false
         configuration.queueDepth = 1

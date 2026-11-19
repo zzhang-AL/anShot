@@ -136,9 +136,9 @@ struct M3AnnotationModelTests {
 @Suite("M3 版本兼容")
 struct M3SchemaCompatibilityTests {
 
-    @Test("当前契约版本为 3")
+    @Test("当前契约版本为 4")
     func currentVersion() {
-        #expect(CaptureSession.currentSchemaVersion == 3)
+        #expect(CaptureSession.currentSchemaVersion == 4)
     }
 
     @Test("v2 的 StrokeStyle（无 isSketchy）仍可解码")
@@ -327,5 +327,175 @@ struct M3AnnotationRendererTests {
                 expectColor(pixels.rgb(x: x, y: y), (0, 0, 0), "\(annotation.kind.typeName) 在 (\(x),\(y)) 越界")
             }
         }
+    }
+}
+
+// MARK: - v4 聚光灯、圆角马赛克与独立窗体阴影
+
+@Suite("v4 聚光灯、圆角马赛克与窗体阴影")
+struct V4AnnotationAndWindowShadowTests {
+    @Test("聚光灯 JSON 往返编解码与缺省值兜底")
+    func spotlightJSONRoundTripAndDefaults() throws {
+        let spotlight = Annotation(kind: .spotlight(
+            rect: PixelRect(origin: PixelPoint(x: 20, y: 30), size: PixelSize(width: 120, height: 80)),
+            cornerRadius: 12,
+            dimOpacity: 0.6
+        ))
+        let data = try JSONEncoder().encode(spotlight)
+        let decoded = try JSONDecoder().decode(Annotation.self, from: data)
+        #expect(decoded == spotlight)
+        #expect(decoded.kind.typeName == "spotlight")
+
+        // 缺省 cornerRadius / dimOpacity 时按契约兜底为 8 / 0.55。
+        let minimalJSON = """
+        {"id":"00000000-0000-0000-0000-000000000010","type":"spotlight",
+         "rect":{"origin":{"x":10,"y":10},"size":{"width":40,"height":30}}}
+        """
+        let fallback = try JSONDecoder().decode(Annotation.self, from: Data(minimalJSON.utf8))
+        guard case let .spotlight(rect, radius, opacity) = fallback.kind else {
+            Issue.record("应解码为聚光灯")
+            return
+        }
+        #expect(rect.size.width == 40)
+        #expect(radius == 8)
+        #expect(abs(opacity - 0.55) < 1e-9)
+    }
+
+    @Test("v1/v2/v3 旧版 mosaic 无 cornerRadius 字段可无损解码且 v4 圆角可往返")
+    func mosaicCornerRadiusCompatibility() throws {
+        let legacyJSON = """
+        {"id":"00000000-0000-0000-0000-000000000011","type":"mosaic",
+         "rect":{"origin":{"x":0,"y":0},"size":{"width":40,"height":40}},
+         "mode":"pixelate","intensity":8}
+        """
+        let legacyDecoded = try JSONDecoder().decode(Annotation.self, from: Data(legacyJSON.utf8))
+        guard case let .mosaic(_, mode, intensity, cornerRadius) = legacyDecoded.kind else {
+            Issue.record("应解码为马赛克")
+            return
+        }
+        #expect(mode == .pixelate)
+        #expect(intensity == 8)
+        #expect(cornerRadius == 0)
+
+        let rounded = Annotation(kind: .mosaic(
+            rect: PixelRect(origin: PixelPoint(x: 10, y: 10), size: PixelSize(width: 60, height: 60)),
+            mode: .solid,
+            intensity: 12,
+            cornerRadius: 16
+        ))
+        let data = try JSONEncoder().encode(rounded)
+        let roundTripped = try JSONDecoder().decode(Annotation.self, from: data)
+        #expect(roundTripped == rounded)
+    }
+
+    @Test("多聚光灯协调渲染：焦点区全亮不相互压暗，焦点外柔和压暗")
+    func multiSpotlightRendering() throws {
+        let whiteBackdrop = solidImage(
+            width: 200,
+            height: 200,
+            color: RGBAColor(r: 1, g: 1, b: 1, a: 1)
+        )
+        let selection = PixelRect(origin: .zero, size: PixelSize(width: 200, height: 200))
+        let first = Annotation(kind: .spotlight(
+            rect: PixelRect(origin: PixelPoint(x: 20, y: 20), size: PixelSize(width: 50, height: 50)),
+            cornerRadius: 6,
+            dimOpacity: 0.5
+        ))
+        let second = Annotation(kind: .spotlight(
+            rect: PixelRect(origin: PixelPoint(x: 120, y: 120), size: PixelSize(width: 50, height: 50)),
+            cornerRadius: 6,
+            dimOpacity: 0.5
+        ))
+
+        let rendered = try #require(
+            AnnotationRenderer.render(
+                backdrop: whiteBackdrop,
+                selection: selection,
+                annotations: [first, second]
+            )
+        )
+        let pixels = PixelBuffer(rendered)
+
+        // 两个焦点中心均应保持 100% 原始纯白，不互相压暗。
+        expectColor(pixels.rgb(x: 45, y: 45), (255, 255, 255), "第一个聚光灯焦点中心应保持原亮度")
+        expectColor(pixels.rgb(x: 145, y: 145), (255, 255, 255), "第二个聚光灯焦点中心应保持原亮度")
+
+        // 焦点外区域按 0.5 压暗，纯白变灰（约 127）。
+        let dimmed = pixels.rgb(x: 5, y: 5)
+        #expect(dimmed.r >= 115 && dimmed.r <= 140, "焦点外区域应柔和压暗，实际 r=\(dimmed.r)")
+        #expect(dimmed.g >= 115 && dimmed.g <= 140)
+        #expect(dimmed.b >= 115 && dimmed.b <= 140)
+    }
+
+    @Test("聚光灯命中测试与平移")
+    func spotlightHitTestAndTranslate() {
+        let spotlight = Annotation(kind: .spotlight(
+            rect: PixelRect(origin: PixelPoint(x: 40, y: 40), size: PixelSize(width: 60, height: 40)),
+            cornerRadius: 8,
+            dimOpacity: 0.55
+        ))
+        #expect(spotlight.hitTest(PixelPoint(x: 70, y: 60), tolerance: 2))
+        #expect(!spotlight.hitTest(PixelPoint(x: 10, y: 10), tolerance: 2))
+
+        let moved = spotlight.translated(by: PixelPoint(x: 15, y: -10))
+        #expect(moved.boundingRect.origin == PixelPoint(x: 55, y: 30))
+    }
+
+    @Test("圆角矩形纯色马赛克保留外角原像素并覆盖中心")
+    func roundedMosaicPreservesCorners() throws {
+        let whiteBackdrop = solidImage(
+            width: 100,
+            height: 100,
+            color: RGBAColor(r: 1, g: 1, b: 1, a: 1)
+        )
+        let selection = PixelRect(origin: .zero, size: PixelSize(width: 100, height: 100))
+        let roundedSolid = Annotation(kind: .mosaic(
+            rect: PixelRect(origin: PixelPoint(x: 20, y: 20), size: PixelSize(width: 60, height: 60)),
+            mode: .solid,
+            intensity: 10,
+            cornerRadius: 24
+        ))
+
+        let rendered = try #require(
+            AnnotationRenderer.render(
+                backdrop: whiteBackdrop,
+                selection: selection,
+                annotations: [roundedSolid]
+            )
+        )
+        let pixels = PixelBuffer(rendered)
+        // 中心被纯黑遮盖，但大圆角裁切掉的矩形最尖角像素 (21, 21) 仍应保留白色原图。
+        expectColor(pixels.rgb(x: 50, y: 50), (0, 0, 0), "圆角马赛克中心应被遮盖")
+        let corner = pixels.rgb(x: 21, y: 21)
+        #expect(corner.r > 240 && corner.g > 240 && corner.b > 240, "圆角外尖角应保持原底图白色")
+    }
+
+    @Test("独立窗体阴影外扩尺寸正确且四周边缘透明、底部生成柔和阴影")
+    func applyWindowDropShadowGeneratesSoftShadow() throws {
+        let solidWindow = solidImage(
+            width: 80,
+            height: 60,
+            color: RGBAColor(r: 1, g: 1, b: 1, a: 1)
+        )
+        let insets = AnnotationRenderer.windowDropShadowInsets(backingScale: 2.0)
+        let shadowed = try #require(
+            AnnotationRenderer.applyWindowDropShadow(solidWindow, backingScale: 2.0)
+        )
+
+        #expect(shadowed.width == 80 + insets.left + insets.right)
+        #expect(shadowed.height == 60 + insets.top + insets.bottom)
+
+        let pixels = PixelBuffer(shadowed)
+        // 最左上角极远端仍应为透明（a == 0 或极低）。
+        let outerCorner = pixels.rgba(x: 0, y: 0)
+        #expect(outerCorner.a == 0, "阴影外扩最外角应保持透明，实际 a=\(outerCorner.a)")
+
+        // 窗体中心应为纯白不透明。
+        let center = pixels.rgba(x: insets.left + 40, y: insets.top + 30)
+        #expect(center.r == 255 && center.g == 255 && center.b == 255 && center.a == 255)
+
+        // 窗体底边下方紧邻区域应存在非零半透明阴影（rgb 为黑/暗，0 < a < 200）。
+        let beneath = pixels.rgba(x: insets.left + 40, y: insets.top + 60 + 8)
+        #expect(beneath.a > 10 && beneath.a < 200, "窗体下方应生成柔和半透明阴影，实际 a=\(beneath.a)")
     }
 }

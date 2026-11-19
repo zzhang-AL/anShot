@@ -91,9 +91,12 @@ public struct FontDescriptor: Codable, Equatable, Sendable {
         self.italic = italic
     }
 
+    /// 系统默认无衬线字体族名。
+    public static let systemFamily = ".AppleSystemUIFont"
+
     /// 系统字体描述。
     public static func system(size: Double, weight: Int = 400, italic: Bool = false) -> FontDescriptor {
-        FontDescriptor(family: ".AppleSystemUIFont", size: size, weight: weight, italic: italic)
+        FontDescriptor(family: Self.systemFamily, size: size, weight: weight, italic: italic)
     }
 }
 
@@ -164,7 +167,10 @@ public struct Annotation: Equatable, Sendable, Identifiable {
         )
 
         /// 马赛克（矩形框选）。渲染时依赖底图（或当前画布）像素。
-        case mosaic(rect: PixelRect, mode: MosaicMode, intensity: Double)
+        case mosaic(rect: PixelRect, mode: MosaicMode, intensity: Double, cornerRadius: Double = 0)
+
+        /// 聚光灯：保持焦点矩形区域原亮度，柔和压暗画布中焦点以外区域。
+        case spotlight(rect: PixelRect, cornerRadius: Double = 8, dimOpacity: Double = 0.55)
 
         /// 涂抹马赛克：沿路径刷出的像素化区域。
         ///
@@ -231,6 +237,7 @@ public struct Annotation: Equatable, Sendable, Identifiable {
             case .arrow: "arrow"
             case .text: "text"
             case .mosaic: "mosaic"
+            case .spotlight: "spotlight"
             case .mosaicStroke: "mosaicStroke"
             case .numbering: "numbering"
             case .highlight: "highlight"
@@ -250,7 +257,8 @@ public struct Annotation: Equatable, Sendable, Identifiable {
         switch kind {
         case let .rectangle(rect, _, _, _),
              let .ellipse(rect, _, _),
-             let .mosaic(rect, _, _):
+             let .mosaic(rect, _, _, _),
+             let .spotlight(rect, _, _):
             return rect
         case let .line(start, end, _), let .arrow(start, end, _, _, _):
             return PixelRect(
@@ -452,6 +460,7 @@ extension Annotation: Codable {
         case zoom
         case border
         case control
+        case dimOpacity
     }
 
     public init(from decoder: Decoder) throws {
@@ -503,7 +512,15 @@ extension Annotation: Codable {
             kind = try .mosaic(
                 rect: container.decode(PixelRect.self, forKey: .rect),
                 mode: container.decode(MosaicMode.self, forKey: .mode),
-                intensity: container.decode(Double.self, forKey: .intensity)
+                intensity: container.decode(Double.self, forKey: .intensity),
+                cornerRadius: max(0, container.decodeIfPresent(Double.self, forKey: .cornerRadius) ?? 0)
+            )
+        case "spotlight":
+            let rawOpacity = try container.decodeIfPresent(Double.self, forKey: .dimOpacity) ?? 0.55
+            kind = try .spotlight(
+                rect: container.decode(PixelRect.self, forKey: .rect),
+                cornerRadius: max(0, container.decodeIfPresent(Double.self, forKey: .cornerRadius) ?? 8),
+                dimOpacity: min(max(rawOpacity, 0.1), 0.85)
             )
         case "mosaicStroke":
             kind = try .mosaicStroke(
@@ -597,10 +614,18 @@ extension Annotation: Codable {
             try container.encode(background, forKey: .background)
             try container.encode(maxWidth, forKey: .maxWidth)
 
-        case let .mosaic(rect, mode, intensity):
+        case let .mosaic(rect, mode, intensity, cornerRadius):
             try container.encode(rect, forKey: .rect)
             try container.encode(mode, forKey: .mode)
             try container.encode(intensity, forKey: .intensity)
+            if cornerRadius > 0 {
+                try container.encode(cornerRadius, forKey: .cornerRadius)
+            }
+
+        case let .spotlight(rect, cornerRadius, dimOpacity):
+            try container.encode(rect, forKey: .rect)
+            try container.encode(max(0, cornerRadius), forKey: .cornerRadius)
+            try container.encode(min(max(dimOpacity, 0.1), 0.85), forKey: .dimOpacity)
 
         case let .numbering(center, radius, index, stroke, fill, textColor):
             try container.encode(center, forKey: .center)
