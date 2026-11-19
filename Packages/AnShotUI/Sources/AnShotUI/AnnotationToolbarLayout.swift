@@ -25,6 +25,9 @@ struct AnnotationToolbarLayout {
 
     static let barHeight: CGFloat = 36
     static let panelHeight: CGFloat = 32
+    static let panelGap: CGFloat = 7
+    static let panelArrowHeight: CGFloat = 5
+    static let panelArrowWidth: CGFloat = 10
     static let padding: CGFloat = 8
     static let itemSpacing: CGFloat = 2
     static let groupSpacing: CGFloat = 6
@@ -33,6 +36,14 @@ struct AnnotationToolbarLayout {
     static let swatchSize: CGFloat = 19
     static let swatchSpacing: CGFloat = 4
     static let textButtonMinWidth: CGFloat = 34
+
+    /// 二级气泡面板相对主栏的展开方向。
+    enum PanelPlacement: Equatable, Sendable {
+        /// 面板位于主栏下方，顶部绘制向上尖角 `▲` 指向激活工具。
+        case below
+        /// 面板位于主栏上方，底部绘制向下尖角 `▼` 指向激活工具。
+        case above
+    }
 
     // MARK: - 滑块几何
 
@@ -119,6 +130,16 @@ struct AnnotationToolbarLayout {
         case mosaicBrushDiameterSlider
         /// 形状工具的手绘风格开关。
         case sketchyToggle
+        /// 矩形/椭圆的填充开关。
+        case fillToggle
+        /// 文字粗体开关。
+        case textBoldToggle
+        /// 文字斜体开关。
+        case textItalicToggle
+        /// 文字字体族循环切换按钮。
+        case textFontFamily
+        /// 聚光灯压暗透明度档位。
+        case spotlightDimOpacity(Double)
         /// 编号圆的半径（仅编号工具）。
         case numberingRadius(Double)
         /// 放大镜倍率（仅放大镜工具）。
@@ -131,6 +152,8 @@ struct AnnotationToolbarLayout {
         case redo
         case copy
         case save
+        /// 一键取消并退出覆盖层（等价于 `Esc`）。
+        case cancel
         /// 以当前选区直接开始录制（不做标注，直接进入录制流程）。
         case record
         /// 以当前选区开始滚动截图（长截图）。
@@ -141,6 +164,20 @@ struct AnnotationToolbarLayout {
         case pin
         /// 删除当前选中的标注。只在指针工具 + 有选中时出现。
         case deleteSelected
+
+        /// 对应可隐藏主栏槽位的持久化标识（用于设置页按槽位显隐工具栏项）。
+        var customizableSlotID: String? {
+            switch self {
+            case .record: return "record"
+            case .longScreenshot: return "longScreenshot"
+            case .recognizeText: return "recognizeText"
+            case .pin: return "pin"
+            case .undo: return "undo"
+            case .redo: return "redo"
+            case .cancel: return "cancel"
+            default: return nil
+            }
+        }
     }
 
     /// 一个已布局的条目。
@@ -184,10 +221,28 @@ struct AnnotationToolbarLayout {
     var selectedAnnotationSupportsLineWidth = true
     /// 选中的标注是否支持手绘风格开关。
     var selectedAnnotationSupportsSketchy = false
+    /// 选中的标注是否支持填充切换（矩形 / 椭圆）。
+    var selectedAnnotationSupportsFill = false
+    /// 选中的标注是否为聚光灯。
+    var selectedAnnotationIsSpotlight = false
     /// 选中的标注是否支持马赛克打码效果切换（像素化 / 高斯模糊）。
     var selectedAnnotationSupportsMosaicEffect = false
+    /// 二级面板相对主栏的展开方向（由外层根据选区剩余空间决定）。
+    var panelPlacement: PanelPlacement = .below
+    /// 用户隐藏的主工具栏槽位集合（隐藏按钮但保留快捷键）。
+    var hiddenSlots: Set<String> = []
 
-    // MARK: - 查询
+    /// 供用户定制显隐的主工具栏可选槽位元数据列表。
+    static let customizableSlotCatalog: [(id: String, title: String)] = [
+        ("record", "录制选区"),
+        ("longScreenshot", "滚动长截图"),
+        ("recognizeText", "识别文字 (OCR)"),
+        ("pin", "钉在屏幕上 (⌘P)"),
+        ("undo", "撤销 / 重做"),
+        ("cancel", "取消按钮 (✕)"),
+    ]
+
+    // MARK: - 查询与尺寸
 
     /// 某个可点击项的中心点（本视图坐标）；不存在或不可用时为 nil。
     func itemCenter(_ kind: Kind) -> CGPoint? {
@@ -212,8 +267,6 @@ struct AnnotationToolbarLayout {
         return result
     }
 
-    // MARK: - 尺寸
-
     /// 主栏尺寸。
     var barSize: CGSize {
         layoutBar().size
@@ -222,7 +275,22 @@ struct AnnotationToolbarLayout {
     /// 当前分组的面板尺寸；该组没有设置项时为 `.zero`。
     var panelSize: CGSize {
         guard isPanelExpanded else { return .zero }
-        return layoutPanel().size
+        return rawPanelContent().size
+    }
+
+    /// 计算二级面板尖角相对工具栏局部坐标系的锚点横坐标（对准激活工具家族图标中心）。
+    func panelAnchorX() -> CGFloat {
+        let bar = layoutBar()
+        let panel = layoutPanel()
+        let panelWidth = panel.size.width
+        guard panelWidth > 0 else { return 0 }
+        let targetFamily = tool.family
+        let familyCenterX = bar.items
+            .first(where: { $0.kind == .family(targetFamily) })?
+            .rect.midX ?? (Self.padding + Self.iconButtonSize / 2)
+        let minAnchor = min(panelWidth / 2, 16)
+        let maxAnchor = max(minAnchor, panelWidth - 16)
+        return min(max(familyCenterX, minAnchor), maxAnchor)
     }
 
     /// 整个工具栏（主栏 + 面板）的尺寸。
@@ -232,8 +300,46 @@ struct AnnotationToolbarLayout {
         guard panel.height > 0 else { return bar }
         return CGSize(
             width: max(bar.width, panel.width),
-            height: bar.height + Self.itemSpacing + panel.height
+            height: bar.height + Self.panelGap + panel.height
         )
+    }
+
+    /// 主栏在工具栏局部坐标系中的纵向原点（`.below` 为 0，`.above` 时让出上方二级气泡高度）。
+    var barOriginY: CGFloat {
+        let panel = panelSize
+        guard panel.height > 0, panelPlacement == .above else { return 0 }
+        return panel.height + Self.panelGap
+    }
+
+    /// 二级气泡面板在工具栏局部坐标系中的纵向原点。
+    var panelOriginY: CGFloat {
+        guard panelSize.height > 0 else { return 0 }
+        return panelPlacement == .above ? 0 : (Self.barHeight + Self.panelGap)
+    }
+
+    /// 根据选区在视口中的位置决定二级面板是向下展开还是向上翻转展开。
+    static func preferredPanelPlacement(
+        selection: CGRect,
+        toolbarSize: CGSize,
+        labelReserve: CGFloat,
+        viewBounds: CGRect,
+        gap: CGFloat,
+        safeInsets: NSEdgeInsets = NSEdgeInsetsZero
+    ) -> PanelPlacement {
+        let topMargin = max(gap, safeInsets.top + gap)
+        let bottomMargin = max(gap, safeInsets.bottom + gap)
+        let minYBound = viewBounds.minY + topMargin
+        let maxYBound = viewBounds.maxY - bottomMargin
+
+        let below = selection.maxY + labelReserve + gap
+        if below + toolbarSize.height <= maxYBound && below >= minYBound {
+            return .below
+        }
+        let above = selection.minY - labelReserve - gap - toolbarSize.height
+        if above >= minYBound && above + toolbarSize.height <= maxYBound {
+            return .above
+        }
+        return .below
     }
 
     /// 工具栏相对选区的落点（本视图坐标）。
@@ -288,9 +394,20 @@ struct AnnotationToolbarLayout {
     // MARK: - 布局
 
     func layoutBar() -> (items: [Item], size: CGSize) {
-        let centerY = (Self.barHeight - Self.iconButtonSize) / 2
+        let baseY = barOriginY
+        let centerY = baseY + (Self.barHeight - Self.iconButtonSize) / 2
         let iconSize = CGSize(width: Self.iconButtonSize, height: Self.iconButtonSize)
         var cursor = ItemRowCursor(x: Self.padding)
+
+        func isVisible(_ kind: Kind) -> Bool {
+            guard let slot = kind.customizableSlotID else { return true }
+            // 「撤销 / 重做」合并在单一 `undo` 槽位里同时显隐。
+            if slot == "redo" {
+                return !hiddenSlots.contains("undo") && !hiddenSlots.contains("redo")
+            }
+            return !hiddenSlots.contains(slot)
+        }
+
         // 本函数的条目**全部**是等尺寸图标按钮，故把 size 与 y 收敛进这个局部简写，
         // 免得每一行都重复传同样的两个值。
         func place(_ kind: Kind, leading: CGFloat, isEnabled: Bool = true) {
@@ -304,34 +421,35 @@ struct AnnotationToolbarLayout {
         }
 
         // 颜色入口：仅在当前工具取色时才存在。
-        // 不取色的工具（马赛克）连位置都不占——布局、命中、诊断三者
-        // 读的都是这份结果，所以「不存在」在任何一侧都成立。
         if style.color(for: tool) != nil {
             place(.colorButton, leading: Self.groupSpacing)
         }
 
-        // 历史组。与工具组之间留一条空隙而不是画线：工具条很小，竖线反而显脏。
-        place(.undo, leading: Self.groupSpacing, isEnabled: canUndo)
-        // 撤销与重做是同一组内的两个按钮，故用 itemSpacing 而非 groupSpacing。
-        place(.redo, leading: Self.itemSpacing, isEnabled: canRedo)
-
-        // 导出组：拷贝与保存。
-        // 放在最右侧：它们是「结束本次会话」的动作，与左侧的编辑动作
-        // 在语义上不同，位置上分开可以避免误点。
-        // 录制放在导出组最前：它与拷贝/保存同属「结束本次会话的动作」，
-        // 但语义是「改用另一种方式捕获同一区域」。
-        if allowsCaptureActions {
-            place(.record, leading: Self.groupSpacing)
-            place(.longScreenshot, leading: Self.itemSpacing)
-            place(.recognizeText, leading: Self.itemSpacing)
-            place(.pin, leading: Self.itemSpacing)
-        } else {
-            // 图片编辑：三个抓屏动作不存在，导出组从「钉住」开始。
-            // 这里仍留 groupSpacing，保证与撤销/重做之间保持同一段空隙。
-            place(.pin, leading: Self.groupSpacing)
+        // 历史组。
+        let showUndo = isVisible(.undo)
+        let showRedo = isVisible(.redo)
+        if showUndo {
+            place(.undo, leading: Self.groupSpacing, isEnabled: canUndo)
         }
-        place(.copy, leading: Self.itemSpacing)
-        place(.save, leading: Self.itemSpacing)
+        if showRedo {
+            place(.redo, leading: showUndo ? Self.itemSpacing : Self.groupSpacing, isEnabled: canRedo)
+        }
+
+        // 抓屏与输出组：按需过滤用户隐藏的可选槽位。
+        var exportKinds: [Kind] = []
+        if allowsCaptureActions {
+            if isVisible(.record) { exportKinds.append(.record) }
+            if isVisible(.longScreenshot) { exportKinds.append(.longScreenshot) }
+            if isVisible(.recognizeText) { exportKinds.append(.recognizeText) }
+        }
+        if isVisible(.pin) { exportKinds.append(.pin) }
+        exportKinds.append(.copy)
+        exportKinds.append(.save)
+        if isVisible(.cancel) { exportKinds.append(.cancel) }
+
+        for (index, kind) in exportKinds.enumerated() {
+            place(kind, leading: index == 0 ? Self.groupSpacing : Self.itemSpacing)
+        }
 
         // 右侧留白
         cursor.advance(Self.padding)
@@ -381,34 +499,34 @@ struct AnnotationToolbarLayout {
         }
     }
 
-    func layoutPanel() -> (items: [Item], size: CGSize) {
+    private func rawPanelContent() -> (items: [Item], size: CGSize) {
         guard isPanelExpanded else {
             return ([], .zero)
         }
-
-        let content: (items: [Item], size: CGSize)
         switch tool.family {
         case .pointer:
-            // 指针分组平时没有可调项；只有选中了标注，面板才提供
-            // 颜色 / 线宽（文字为字号）与删除。
+            // 指针分组平时没有可调项；只有选中了标注，面板才按需展开。
             guard hasSelectedAnnotation else {
                 return ([], .zero)
             }
-            content = layoutPointerSelectionPanel()
+            return layoutPointerSelectionPanel()
         case .shape:
-            content = layoutShapePanel()
+            return layoutShapePanel()
         case .text:
-            content = layoutTextPanel()
+            return layoutTextPanel()
         case .mosaic:
-            content = layoutMosaicPanel()
+            return layoutMosaicPanel()
+        }
+    }
+
+    func layoutPanel() -> (items: [Item], size: CGSize) {
+        let content = rawPanelContent()
+        guard content.size.height > 0 else {
+            return ([], .zero)
         }
 
-        // 面板项一律返回**含纵向偏移的绝对坐标**。
-        //
-        // 绘制、命中判定、诊断取坐标三者共用这一份结果；
-        // 任何一处自己再加一次偏移都会错位——首版就是绘制时忘了加偏移，
-        // 于是按钮画在主栏位置、可点击区域在下方，整个面板看起来完全错乱。
-        let offsetY = Self.barHeight + Self.itemSpacing
+        // 面板项一律返回**含纵向偏移的绝对坐标**，随 `panelPlacement` 自动向上或向下翻转。
+        let offsetY = panelOriginY
         let shifted = content.items.map { item in
             Item(
                 kind: item.kind,
@@ -460,7 +578,7 @@ struct AnnotationToolbarLayout {
             x += Self.swatchSize
         }
 
-        // 文字的样式槽是字号，其余标注是线宽（高亮/马赛克没有线宽）。
+        // 文字的样式槽是字号 + 粗斜体/字体，其余标注是线宽（高亮/马赛克/聚光灯没有线宽）。
         if selectedAnnotationIsText {
             if selectedAnnotationSupportsColor {
                 x += Self.groupSpacing
@@ -481,6 +599,40 @@ struct AnnotationToolbarLayout {
                 ))
                 x += Self.iconButtonSize
             }
+            x += Self.groupSpacing
+            items.append(Item(
+                kind: .textBoldToggle,
+                rect: CGRect(x: x, y: iconY, width: Self.iconButtonSize, height: Self.iconButtonSize),
+                isEnabled: true
+            ))
+            x += Self.iconButtonSize + Self.itemSpacing
+            items.append(Item(
+                kind: .textItalicToggle,
+                rect: CGRect(x: x, y: iconY, width: Self.iconButtonSize, height: Self.iconButtonSize),
+                isEnabled: true
+            ))
+            x += Self.iconButtonSize + Self.itemSpacing
+            let familyLabel = Self.fontFamilyLabel(style.textFontFamily)
+            let familyWidth = textButtonWidth(for: familyLabel)
+            items.append(Item(
+                kind: .textFontFamily,
+                rect: CGRect(x: x, y: buttonY, width: familyWidth, height: buttonHeight),
+                isEnabled: true
+            ))
+            x += familyWidth
+        } else if selectedAnnotationIsSpotlight {
+            for (index, opacity) in AnnotationStyle.spotlightDimOpacities.enumerated() {
+                if index > 0 {
+                    x += Self.itemSpacing
+                }
+                let width = textButtonWidth(for: Self.spotlightOpacityLabel(opacity))
+                items.append(Item(
+                    kind: .spotlightDimOpacity(opacity),
+                    rect: CGRect(x: x, y: buttonY, width: width, height: buttonHeight),
+                    isEnabled: true
+                ))
+                x += width
+            }
         } else if selectedAnnotationSupportsLineWidth {
             if selectedAnnotationSupportsColor {
                 x += Self.groupSpacing
@@ -491,6 +643,16 @@ struct AnnotationToolbarLayout {
                 isEnabled: true
             ))
             x += Self.sliderWidth
+        }
+
+        if selectedAnnotationSupportsFill {
+            x += Self.groupSpacing
+            items.append(Item(
+                kind: .fillToggle,
+                rect: CGRect(x: x, y: iconY, width: Self.iconButtonSize, height: Self.iconButtonSize),
+                isEnabled: true
+            ))
+            x += Self.iconButtonSize
         }
 
         if selectedAnnotationSupportsSketchy {
@@ -573,32 +735,44 @@ struct AnnotationToolbarLayout {
             )
         }
 
-        // 颜色（荧光笔高亮工具展示半透明荧光色板，防止误选不透明黑色块遮死底图文字）
-        let swatches = tool == .highlight
-            ? AnnotationStyle.highlightColors
-            : AnnotationStyle.palette
-        for (index, color) in swatches.enumerated() {
+        // 颜色（聚光灯不取前景色；荧光笔展示半透明荧光色板）
+        if tool != .spotlight {
+            let swatches = tool == .highlight
+                ? AnnotationStyle.highlightColors
+                : AnnotationStyle.palette
+            for (index, color) in swatches.enumerated() {
+                cursor.append(
+                    .color(color),
+                    leading: index == 0 ? Self.groupSpacing : Self.swatchSpacing,
+                    size: swatchSize,
+                    y: swatchY
+                )
+            }
+
+            // 完整取色器入口：色卡只是高频色的快捷方式，
+            // 选任意颜色必须能从面板里直接进系统取色器。
             cursor.append(
-                .color(color),
-                leading: index == 0 ? Self.groupSpacing : Self.swatchSpacing,
+                .colorPicker,
+                leading: Self.groupSpacing + Self.swatchSpacing,
                 size: swatchSize,
                 y: swatchY
             )
         }
 
-        // 完整取色器入口：色卡只是高频色的快捷方式，
-        // 选任意颜色必须能从面板里直接进系统取色器。
-        cursor.append(
-            .colorPicker,
-            leading: Self.groupSpacing + Self.swatchSpacing,
-            size: swatchSize,
-            y: swatchY
-        )
+        // 聚光灯压暗透明度三档：只在聚光灯工具下出现。
+        if tool == .spotlight {
+            for (index, opacity) in AnnotationStyle.spotlightDimOpacities.enumerated() {
+                let width = textButtonWidth(for: Self.spotlightOpacityLabel(opacity))
+                cursor.append(
+                    .spotlightDimOpacity(opacity),
+                    leading: index == 0 ? Self.groupSpacing : Self.itemSpacing,
+                    size: CGSize(width: width, height: buttonHeight),
+                    y: buttonY
+                )
+            }
+        }
 
         // 编号半径：只在编号工具下出现。按工具条件显示，面板不会为其它工具变长。
-        //
-        // 宽度与位置跟形状图标按钮一致（28pt、垂直居中）：这几个档位现在画的是
-        // 图标而不是数字，用文字按钮的尺寸会让它们比旁边的图标偏下半个行高。
         if tool == .numbering {
             for (index, radius) in AnnotationStyle.numberingRadii.enumerated() {
                 cursor.append(
@@ -623,8 +797,6 @@ struct AnnotationToolbarLayout {
         }
 
         // 箭头大小：只在箭头与曲线箭头下出现。
-        // 与弯度档位同一套条件显示的做法：其余工具根本没有箭头头部，
-        // 给它们一个无效的滑块只会把面板白白撑宽。
         if tool == .arrow || tool == .curvedArrow {
             cursor.append(
                 .arrowHeadScaleSlider,
@@ -634,12 +806,19 @@ struct AnnotationToolbarLayout {
             )
         }
 
-        // 线宽：一个连续滑块（取代原来的三档按钮）。
-        cursor.append(.lineWidthSlider, leading: Self.groupSpacing, size: sliderSize, y: buttonY)
+        // 线宽：仅对真正拥有描边线宽的形状工具展示（荧光笔与聚光灯不显示无效滑块）。
+        if tool.supportsLineWidth {
+            cursor.append(.lineWidthSlider, leading: Self.groupSpacing, size: sliderSize, y: buttonY)
+        }
+
+        // 填充开关：矩形与椭圆可切换空心描边 / 半透明填充。
+        if tool.supportsFill {
+            cursor.append(.fillToggle, leading: Self.groupSpacing, size: iconSize, y: iconY)
+        }
 
         // 手绘风格开关：支持手绘的线框工具（矩形/椭圆/直线/箭头/手绘/曲线箭头）可切换。
         if tool.supportsSketchy {
-            cursor.append(.sketchyToggle, leading: Self.groupSpacing, size: iconSize, y: iconY)
+            cursor.append(.sketchyToggle, leading: Self.itemSpacing, size: iconSize, y: iconY)
         }
 
         // 右侧留白
@@ -653,6 +832,8 @@ struct AnnotationToolbarLayout {
         var x = Self.padding
         let swatchY = (Self.panelHeight - Self.swatchSize) / 2
         let iconY = (Self.panelHeight - Self.iconButtonSize) / 2
+        let buttonY: CGFloat = 3
+        let buttonHeight = Self.panelHeight - buttonY * 2
 
         // 字号：档位画的是逐档变大的字母，用图标按钮尺寸。
         for (index, size) in AnnotationStyle.fontSizes.enumerated() {
@@ -666,6 +847,29 @@ struct AnnotationToolbarLayout {
             ))
             x += Self.iconButtonSize
         }
+
+        // 粗体 / 斜体 / 字体族
+        x += Self.groupSpacing
+        items.append(Item(
+            kind: .textBoldToggle,
+            rect: CGRect(x: x, y: iconY, width: Self.iconButtonSize, height: Self.iconButtonSize),
+            isEnabled: true
+        ))
+        x += Self.iconButtonSize + Self.itemSpacing
+        items.append(Item(
+            kind: .textItalicToggle,
+            rect: CGRect(x: x, y: iconY, width: Self.iconButtonSize, height: Self.iconButtonSize),
+            isEnabled: true
+        ))
+        x += Self.iconButtonSize + Self.itemSpacing
+        let familyLabel = Self.fontFamilyLabel(style.textFontFamily)
+        let familyWidth = textButtonWidth(for: familyLabel)
+        items.append(Item(
+            kind: .textFontFamily,
+            rect: CGRect(x: x, y: buttonY, width: familyWidth, height: buttonHeight),
+            isEnabled: true
+        ))
+        x += familyWidth
 
         x += Self.groupSpacing
 
@@ -799,6 +1003,16 @@ struct AnnotationToolbarLayout {
         case .blur: return "高斯模糊"
         case .solid: return "纯色"
         }
+    }
+
+    /// 聚光灯压暗透明度的展示文案（例如 `55%`）。
+    static func spotlightOpacityLabel(_ opacity: Double) -> String {
+        "\(Int((opacity * 100).rounded()))%"
+    }
+
+    /// 字体族按钮的短中文标签。
+    static func fontFamilyLabel(_ family: String) -> String {
+        AnnotationStyle.textFontFamilies.first(where: { $0.id == family })?.label ?? "系统"
     }
 
     private func textButtonWidth(for text: String) -> CGFloat {

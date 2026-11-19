@@ -32,6 +32,7 @@ private let logger = AnShotLog.overlay
 /// 会话创建代码：三套代码一旦分叉，选区吸附、坐标换算、多屏同步就会各自漂移。
 public enum OverlaySessionIntent: String, Sendable {
     case capture
+    case windowCapture
     case recording
     case longScreenshot
     case ocr
@@ -64,6 +65,9 @@ public final class OverlayController {
 
     /// 独立图片编辑会话绑定的物理缩放系数（用于导出与剪贴板写入 Retina DPI）。
     private var sessionBackingScale: CGFloat?
+
+    /// 当前编辑图像是否已内置独立窗体柔和外阴影（贴图时用于避免叠加双阴影）。
+    private var sessionImageHasEmbeddedShadow = false
 
     /// 正在后台抓取一个窗口。防止连点菜单叠出多个会话。
     private var pendingWindowCapture = false
@@ -223,7 +227,12 @@ public final class OverlayController {
     /// 复用截图覆盖层的选区/标注/导出，只是窗口改成围着图片本身：
     /// 用户已经有一张图时，不该为了加一个箭头再截一次屏。
     /// 源文件只读载入，导出仍走保存/复制/钉住，绝不写回原文件。
-    public func present(image: CGImage, sourceURL: URL? = nil, scaleFactor: CGFloat? = nil) {
+    public func present(
+        image: CGImage,
+        sourceURL: URL? = nil,
+        scaleFactor: CGFloat? = nil,
+        hasEmbeddedShadow: Bool = false
+    ) {
         guard !isPresenting else {
             logger.debug("present(image:) ignored: a session is already presenting")
             return
@@ -233,6 +242,7 @@ public final class OverlayController {
 
         let effectiveScale = max(1, scaleFactor ?? screen.backingScaleFactor)
         sessionBackingScale = effectiveScale
+        sessionImageHasEmbeddedShadow = hasEmbeddedShadow
 
         let visible = screen.visibleFrame
         let layout = Self.imageEditorLayout(
@@ -272,6 +282,7 @@ public final class OverlayController {
         }
 
         window.overlayView.editorState = editor
+        window.overlayView.appSettings = settings
         window.overlayView.backdrop = image
         window.overlayView.hidesToolbarForIntent = false
         // 图片编辑器不提供录制/长截图/OCR：它们都要求「当前屏幕上有一块可抓取
@@ -324,30 +335,69 @@ public final class OverlayController {
     public func present(
         windowID: CGWindowID,
         appName: String? = nil,
-        windowTitle: String? = nil
+        windowTitle: String? = nil,
+        applyShadow: Bool? = nil
     ) {
         guard !isPresenting, !pendingWindowCapture else {
             logger.debug("present(windowID:) ignored: session or capture already active")
             return
         }
         pendingWindowCapture = true
+        let shouldApplyShadow = applyShadow ?? settings.windowCaptureShadow
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.pendingWindowCapture = false }
             do {
                 let frame = try await self.capturer.captureFrame(scope: .window(windowID))
-                self.present(image: frame.image, scaleFactor: frame.scaleFactor)
+                let outputImage: CGImage
+                let hasShadow: Bool
+                if shouldApplyShadow,
+                   let shadowed = AnnotationRenderer.applyWindowDropShadow(
+                       frame.image,
+                       backingScale: frame.scaleFactor
+                   ) {
+                    outputImage = shadowed
+                    hasShadow = true
+                } else {
+                    outputImage = frame.image
+                    hasShadow = false
+                }
+                self.present(
+                    image: outputImage,
+                    scaleFactor: frame.scaleFactor,
+                    hasEmbeddedShadow: hasShadow
+                )
                 self.documentSource = HistorySource(
                     appName: appName,
                     windowTitle: windowTitle,
                     mode: "window"
                 )
-                logger.notice("window capture opened in editor; id=\(windowID, privacy: .public)")
+                logger.notice("window capture opened in editor; id=\(windowID, privacy: .public) shadow=\(hasShadow, privacy: .public)")
             } catch {
                 logger.error("window capture failed: \(String(describing: error), privacy: .public)")
                 ToastPresenter.show("窗口截图失败：\(error.localizedDescription)")
             }
         }
+    }
+
+    /// 覆盖层独立窗体模式下单击某个候选窗口：收起全屏覆盖层，按 `desktopIndependentWindow`
+    /// 抓取透明圆角窗口并根据设置（及 `⌥` 临时反转）合成阴影，无缝进入可标注编辑舞台。
+    private func handleWindowPickerCommit(_ target: DetectionTarget, toggleNoShadow: Bool) {
+        guard let windowID = target.windowID else {
+            NSSound.beep()
+            return
+        }
+        let applyShadow = toggleNoShadow ? !settings.windowCaptureShadow : settings.windowCaptureShadow
+        let appName = target.applicationName ?? target.title
+        let title = target.title
+        // 先收起当前全屏覆盖层释放内存，再立刻抓取无遮挡独立窗体并切入编辑舞台。
+        dismiss()
+        present(
+            windowID: windowID,
+            appName: appName,
+            windowTitle: title,
+            applyShadow: applyShadow
+        )
     }
 
     /// 关闭覆盖层并立即释放全部底图。未在展示时调用是安全的空操作。
@@ -643,7 +693,7 @@ public final class OverlayController {
             """)
 
         switch intent {
-        case .capture:
+        case .capture, .windowCapture:
             break
         case .recording:
             handleRecordRequest(
@@ -728,25 +778,13 @@ public final class OverlayController {
             clock: clock
         )
 
-        // 默认选区 = 鼠标所在显示器的整屏。
-        //
-        // 做成初始状态而不是「创建后再 commit 一次」：后者会往历史里塞一个
-        // 用户没做过的操作，"撤销"一下就回到了无选区，语义不对。
-        // 常用场景「截全屏」由此变成 ⌃1 → 回车。
-        let defaultSelection = Self.defaultSelectionPixelRect(in: targets)
-
-        // 标注编辑器：会话级存在，随 teardown 释放。
-        // 视图不订阅它的回调（多窗口会重复持有），由控制器统一扇出重绘。
-        let editor = AnnotationEditorState(selection: defaultSelection)
+        // 静默首帧不变量：初始选区为 nil，底图保持 100% 原亮度且工具栏隐藏，
+        // 避免呼出瞬间全屏闪暗或弹出整屏虚线框与工具栏。
+        // 仍保留「未框选直接按 Enter 截全屏」兜底（见 OverlayView.performExport）。
+        let editor = AnnotationEditorState(selection: nil)
         // 恢复上一次会话的样式：颜色/线宽/字号每次重选是纯重复劳动，
         // 而工具栏面板本身就展示当前值，持久化不会制造看不见的隐状态。
         editor.style = EditorStyleStore.shared.load()
-        // 默认选区也要记录归属，否则它同样同步不到视图上。
-        if let defaultSelection, let displayID = Self.defaultSelectionDisplayID(in: targets) {
-            selectionDisplayID = displayID
-            // 默认整屏选区是历史的初始快照，撤销回到它时同样要回到这块屏。
-            rememberSelectionDisplay(defaultSelection, displayID: displayID)
-        }
         editor.onChange = { [weak self] in
             self?.refreshAnnotationDisplay()
         }
@@ -762,19 +800,34 @@ public final class OverlayController {
 
         // 元素识别器：会话级一个实例，各屏共用。
         let detector = SystemElementDetector()
+        let startsInWindowPickerMode = (pendingIntent == .windowCapture)
 
         var created: [OverlayWindow] = []
         for target in targets {
             let window = OverlayWindow(screen: target.screen, displayID: target.displayID)
-            window.overlayView.hidesToolbarForIntent = pendingIntent != .capture
+            window.overlayView.hidesToolbarForIntent = (pendingIntent != .capture && pendingIntent != .windowCapture)
             window.overlayView.editorState = editor
+            window.overlayView.appSettings = settings
+            window.overlayView.isWindowPickerMode = startsInWindowPickerMode
             // 每屏一个识别会话：窗口列表按显示器裁剪，坐标也各按各的屏换算。
+            // 普通区域模式下抑制最大化窗口误吸附；窗体选择模式允许选择任意窗口。
             let detection = DetectionSession(
                 detector: detector,
                 displayID: target.displayID,
                 displayBounds: DisplayGeometry.bounds(for: target.displayID)
             )
+            detection.suppressesMaximizedWindow = !startsInWindowPickerMode
             window.overlayView.detectionSession = detection
+            window.overlayView.onWindowPickerModeChanged = { [weak self] enabled in
+                guard let self else { return }
+                for item in self.windows {
+                    item.overlayView.isWindowPickerMode = enabled
+                    item.overlayView.detectionSession?.suppressesMaximizedWindow = !enabled
+                }
+            }
+            window.overlayView.onWindowPickerCommit = { [weak self] pickedTarget, toggleNoShadow in
+                self?.handleWindowPickerCommit(pickedTarget, toggleNoShadow: toggleNoShadow)
+            }
             window.overlayView.onCancel = { [weak self] in
                 self?.dismiss()
             }
@@ -913,10 +966,13 @@ public final class OverlayController {
 
         // 识别用不到底图，但与展示同样要在用户开始移动鼠标前就绪。
         // 放在展示之后异步载入：窗口枚举约 10ms，不阻塞覆盖层出现。
-        let sessions = created.map(\.overlayView.detectionSession)
+        let createdWindows = created
         Task { @MainActor in
-            for session in sessions.compactMap({ $0 }) {
-                await session.load()
+            for window in createdWindows {
+                if let session = window.overlayView.detectionSession {
+                    await session.load()
+                    window.overlayView.refreshWindowPickerAfterDetectionLoad()
+                }
             }
         }
         // 让鼠标所在显示器的窗口成为 key window，使 ESC 与后续键盘交互生效。
@@ -924,6 +980,8 @@ public final class OverlayController {
         if let keyWindow = keyWindowCandidate(in: created) {
             keyWindow.makeKey()
             let accepted = keyWindow.makeFirstResponder(keyWindow.overlayView)
+            // 首帧即按光标当前位置显示像素放大镜（窗体模式则显示候选提示），无需先晃动鼠标。
+            keyWindow.overlayView.presentInitialLoupeAndHint()
             logger.notice("""
                 key window setup: isKey=\(keyWindow.isKeyWindow, privacy: .public) \
                 makeFirstResponder=\(accepted, privacy: .public) \
@@ -933,10 +991,6 @@ public final class OverlayController {
         let showEnd = clock.now
         windows = created
 
-        // 默认选区（整屏）是在构造 `AnnotationEditorState` 时就写进去的，
-        // 不会触发 `onChange`，因此必须在这里主动同步一次。
-        // 漏掉它的后果：按 Control+1 后画面上没有框，
-        // 而且「直接回车截全屏」也没有选区可用。
         syncSelectionFromEditor()
 
         // ── 分阶段耗时 ──
@@ -1623,11 +1677,12 @@ public final class OverlayController {
         switch action {
         case .pin:
             // 窗口尺寸要按图像所在屏幕的缩放换算，否则 Pin 会大一倍或小一半。
-            let scale = selectionDisplayID.map { DisplayGeometry.scaleFactor(for: $0) } ?? 1
+            let scale = exportBackingScale(in: window)
             let result = pinManager.pin(
                 image: image,
                 screenScale: scale,
-                topLeft: pinTopLeft(in: window)
+                topLeft: pinTopLeft(in: window),
+                hasWindowShadow: !sessionImageHasEmbeddedShadow
             )
             // 在闭包外取值：多行日志里的属性访问会触发「显式 self」的编译要求，
             // 提前算好既避免它，也让这行日志更短。
@@ -2198,6 +2253,7 @@ public final class OverlayController {
         defer { isTearingDown = false }
 
         sessionID = nil
+        sessionImageHasEmbeddedShadow = false
         // 显式取消未完成的 OCR/翻译和长截图任务，防止退出会话后弹出幽灵面板或后台空转。
         cancelTextRequests()
         scrollshot?.cancel()

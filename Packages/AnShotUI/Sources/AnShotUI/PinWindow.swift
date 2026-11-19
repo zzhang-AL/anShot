@@ -323,7 +323,8 @@ final class PinWindow: NSWindow {
         image: CGImage,
         logicalSize: CGSize,
         at origin: CGPoint,
-        screenScale: CGFloat
+        screenScale: CGFloat,
+        hasWindowShadow: Bool = true
     ) {
         self.pinID = pinID
         contentImage = image
@@ -345,7 +346,7 @@ final class PinWindow: NSWindow {
         isReleasedWhenClosed = false
         isOpaque = false
         backgroundColor = .clear
-        hasShadow = true
+        hasShadow = hasWindowShadow
         // 浮动在普通窗口之上，但不进别人的全屏空间（契约 §6）。
         level = .floating
         collectionBehavior = [.canJoinAllSpaces, .stationary]
@@ -1170,7 +1171,8 @@ final class PinManager {
     func pin(
         image: CGImage,
         screenScale: CGFloat,
-        topLeft: CGPoint? = nil
+        topLeft: CGPoint? = nil,
+        hasWindowShadow: Bool = true
     ) -> PinResult {
         let limit = maximumPins
         guard pins.count < limit else {
@@ -1187,7 +1189,8 @@ final class PinManager {
             image: image,
             logicalSize: logical,
             at: resolveOrigin(topLeft: topLeft, size: logical),
-            screenScale: screenScale
+            screenScale: screenScale,
+            hasWindowShadow: hasWindowShadow
         )
         nextPinID += 1
         window.onClose = { [weak self, weak window] in

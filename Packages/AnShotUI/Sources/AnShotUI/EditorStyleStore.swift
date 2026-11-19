@@ -84,12 +84,20 @@ private struct EditorStyleRecord: Codable {
     var shapeColor: RGBAColor?
     var shapeLineWidth: Double?
     var shapeIsSketchy: Bool?
+    var shapeFilled: Bool?
+    var shapeCornerRadius: Double?
     var textColor: RGBAColor?
     var textFontSize: Double?
+    var textBold: Bool?
+    var textItalic: Bool?
+    var textFontFamily: String?
     var mosaicMode: String?
     var mosaicEffectMode: String?
     var mosaicBlockSize: Double?
     var mosaicBrushRadius: Double?
+    var mosaicCornerRadius: Double?
+    var spotlightCornerRadius: Double?
+    var spotlightDimOpacity: Double?
     var highlightColor: RGBAColor?
     var numberingRadius: Double?
     var magnifierZoom: Double?
@@ -101,14 +109,22 @@ private struct EditorStyleRecord: Codable {
         shapeColor = style.shapeColor
         shapeLineWidth = style.shapeLineWidth
         shapeIsSketchy = style.shapeIsSketchy
+        shapeFilled = style.shapeFilled
+        shapeCornerRadius = style.shapeCornerRadius
         textColor = style.textColor
         textFontSize = style.textFontSize
+        textBold = style.textBold
+        textItalic = style.textItalic
+        textFontFamily = style.textFontFamily
         // 枚举存 rawValue：落盘的是字符串，读回时按当前枚举定义解释，
         // 未来增删子模式也不会让整份记录解不出来。
         mosaicMode = style.mosaicMode.rawValue
         mosaicEffectMode = style.mosaicEffectMode.rawValue
         mosaicBlockSize = style.mosaicBlockSize
         mosaicBrushRadius = style.mosaicBrushRadius
+        mosaicCornerRadius = style.mosaicCornerRadius
+        spotlightCornerRadius = style.spotlightCornerRadius
+        spotlightDimOpacity = style.spotlightDimOpacity
         highlightColor = style.highlightColor
         numberingRadius = style.numberingRadius
         magnifierZoom = style.magnifierZoom
@@ -127,22 +143,40 @@ private struct EditorStyleRecord: Codable {
             }
             return mode
         }()
+        let validFamilies = Set(AnnotationStyle.textFontFamilies.map(\.id))
+        let resolvedFontFamily = textFontFamily.flatMap { validFamilies.contains($0) ? $0 : nil } ?? fallback.textFontFamily
         return AnnotationStyle(
             shapeColor: shapeColor?.clamped() ?? fallback.shapeColor,
             shapeLineWidth: shapeLineWidth.map {
                 Self.continuous($0, in: AnnotationStyle.lineWidthRange)
             } ?? fallback.shapeLineWidth,
             shapeIsSketchy: shapeIsSketchy ?? fallback.shapeIsSketchy,
+            shapeFilled: shapeFilled ?? fallback.shapeFilled,
+            shapeCornerRadius: shapeCornerRadius.map {
+                min(max($0.rounded(), AnnotationStyle.cornerRadiusRange.lowerBound), AnnotationStyle.cornerRadiusRange.upperBound)
+            } ?? fallback.shapeCornerRadius,
             textColor: textColor?.clamped() ?? fallback.textColor,
             textFontSize: textFontSize.flatMap {
                 Self.option($0, in: AnnotationStyle.fontSizes)
             } ?? fallback.textFontSize,
+            textBold: textBold ?? fallback.textBold,
+            textItalic: textItalic ?? fallback.textItalic,
+            textFontFamily: resolvedFontFamily,
             mosaicMode: mosaicMode.flatMap { MosaicToolMode(rawValue: $0) } ?? fallback.mosaicMode,
             mosaicEffectMode: resolvedEffectMode,
             mosaicBlockSize: mosaicBlockSize.flatMap {
                 Self.option($0, in: AnnotationStyle.mosaicBlockSizes)
             } ?? fallback.mosaicBlockSize,
             mosaicBrushRadius: mosaicBrushRadius.map(Self.brushRadius) ?? fallback.mosaicBrushRadius,
+            mosaicCornerRadius: mosaicCornerRadius.map {
+                min(max($0.rounded(), AnnotationStyle.cornerRadiusRange.lowerBound), AnnotationStyle.cornerRadiusRange.upperBound)
+            } ?? fallback.mosaicCornerRadius,
+            spotlightCornerRadius: spotlightCornerRadius.map {
+                min(max($0.rounded(), AnnotationStyle.cornerRadiusRange.lowerBound), AnnotationStyle.cornerRadiusRange.upperBound)
+            } ?? fallback.spotlightCornerRadius,
+            spotlightDimOpacity: spotlightDimOpacity.map {
+                Self.continuous($0, in: AnnotationStyle.spotlightDimOpacityRange)
+            } ?? fallback.spotlightDimOpacity,
             highlightColor: highlightColor?.clamped() ?? fallback.highlightColor,
             numberingRadius: numberingRadius.flatMap {
                 Self.option($0, in: AnnotationStyle.numberingRadii)

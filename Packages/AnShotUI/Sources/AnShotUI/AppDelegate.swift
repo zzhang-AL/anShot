@@ -678,6 +678,7 @@ private let recordingFrame = RecordingRegionFrame()
         // 本应用无 Dock 图标也无应用菜单，菜单栏是唯一能常驻的管理入口。
         var items: [NSMenuItem] = [
             makeAction("截图", #selector(startCapture)),
+            makeAction("独立窗体截图", #selector(startWindowCaptureFlow)),
             makeAction("选择窗口…", #selector(chooseWindow)),
             makeAction("打开图片…", #selector(openImageFile)),
             makeAction("从剪贴板贴图", #selector(pinFromPasteboard)),
@@ -1413,6 +1414,11 @@ private let recordingFrame = RecordingRegionFrame()
     @objc private func openImageFile() {
         guard let choice = ImageSourceLauncher.chooseImage() else { return }
         overlayController.present(image: choice.image, sourceURL: choice.url)
+    }
+
+    /// 菜单入口：直接进入覆盖层独立窗体捕获模式（支持 Tab 穿透叠放窗口与 ⌥ 切换无阴影）。
+    @objc private func startWindowCaptureFlow() {
+        overlayController.present(intent: .windowCapture, delayNanoseconds: Self.menuDismissDelayNanoseconds)
     }
 
     /// 菜单入口：从窗口列表选一个窗口截图（含被遮挡/其它桌面）。

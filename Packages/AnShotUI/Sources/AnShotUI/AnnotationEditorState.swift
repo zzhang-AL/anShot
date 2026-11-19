@@ -46,6 +46,8 @@ enum AnnotationTool: String, CaseIterable, Sendable {
     case freehand
     /// 弯曲箭头：二次贝塞尔 + 箭头头部。
     case curvedArrow
+    /// 聚光灯：保持焦点区域原亮度，柔和压暗焦点外画布。
+    case spotlight
 
     /// 主工具栏上的分组。
     ///
@@ -62,9 +64,9 @@ enum AnnotationTool: String, CaseIterable, Sendable {
     var family: Family {
         switch self {
         case .pointer: return .pointer
-        // 标注增强里的形状与标记都归 `.shape`：它们共用「颜色 + 线宽」这一组样式，
+        // 标注增强里的形状与标记都归 `.shape`：它们共用一套几何与标记面板，
         // 单独开一个 family 只会让工具栏多一层没有区分度的分组。
-        case .rectangle, .ellipse, .line, .arrow, .numbering, .highlight, .measure, .freehand, .curvedArrow:
+        case .rectangle, .ellipse, .line, .arrow, .numbering, .highlight, .measure, .freehand, .curvedArrow, .spotlight:
             return .shape
         case .text: return .text
         // 放大镜与马赛克同类：都要读取底图像素做重采样，因此放在同一分组。
@@ -93,6 +95,7 @@ enum AnnotationTool: String, CaseIterable, Sendable {
         case .magnifier: return "放大镜"
         case .freehand: return "手绘"
         case .curvedArrow: return "曲线箭头"
+        case .spotlight: return "聚光灯"
         }
     }
 
@@ -107,6 +110,9 @@ enum AnnotationTool: String, CaseIterable, Sendable {
     }
 
     /// 应用内快捷键（覆盖层为 key window 时生效）。
+    ///
+    /// 保留 `C`/`⇧C` 专职取色（复制 `#HEX` / `RGB`），曲线箭头改用 `U`，聚光灯使用 `S`，
+    /// 彻底消除候选态与确认态下的单键语义冲突。
     var keyCharacter: Character {
         switch self {
         case .pointer: return "v"
@@ -122,7 +128,8 @@ enum AnnotationTool: String, CaseIterable, Sendable {
         case .measure: return "d"
         case .magnifier: return "g"
         case .freehand: return "f"
-        case .curvedArrow: return "c"
+        case .curvedArrow: return "u"
+        case .spotlight: return "s"
         }
     }
 
@@ -149,6 +156,21 @@ enum AnnotationTool: String, CaseIterable, Sendable {
         default:
             return false
         }
+    }
+
+    /// 是否使用线宽参数（荧光笔与聚光灯没有描边线宽，工具栏不摆无效滑块）。
+    var supportsLineWidth: Bool {
+        switch self {
+        case .rectangle, .ellipse, .line, .arrow, .numbering, .measure, .freehand, .curvedArrow:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 是否支持填充切换（矩形与椭圆）。
+    var supportsFill: Bool {
+        self == .rectangle || self == .ellipse
     }
 }
 
@@ -177,10 +199,17 @@ struct AnnotationStyle: Equatable, Sendable {
     var shapeLineWidth: Double
     /// 形状线框类标注是否启用手绘微扰风格。
     var shapeIsSketchy: Bool = false
+    /// 矩形/椭圆是否开启半透明颜色填充。
+    var shapeFilled: Bool = false
+    /// 矩形圆角半径（底图像素）。
+    var shapeCornerRadius: Double = 0
 
     // 文字组。字号单位是**点**（界面单位），写入模型时按 scaleFactor 换算为像素。
     var textColor: RGBAColor
     var textFontSize: Double
+    var textBold: Bool = false
+    var textItalic: Bool = false
+    var textFontFamily: String = FontDescriptor.systemFamily
 
     // 马赛克组
     var mosaicMode: MosaicToolMode
@@ -189,6 +218,12 @@ struct AnnotationStyle: Equatable, Sendable {
     var mosaicBlockSize: Double
     /// 涂抹笔刷半径（**点**，界面单位），写入模型时同样换算为像素。
     var mosaicBrushRadius: Double
+    /// 矩形马赛克圆角半径（底图像素）。
+    var mosaicCornerRadius: Double = 0
+
+    /// 聚光灯焦点圆角与焦点外压暗透明度。
+    var spotlightCornerRadius: Double = 8
+    var spotlightDimOpacity: Double = 0.55
 
     /// 高亮颜色（**带透明度**：用途是标出来但仍看得见底下的内容）。
     var highlightColor: RGBAColor
@@ -283,17 +318,42 @@ struct AnnotationStyle: Equatable, Sendable {
     /// 箭头大小倍率区间。下限 0.5 时头部约为线宽的两倍，仍能认成箭头；
     /// 上限 3 时头部长度达线宽的 12 倍，已经是很重的标记。
     static let arrowHeadScaleRange: ClosedRange<Double> = 0.5 ... 3
+    /// 聚光灯焦点外压暗透明度档位。
+    static let spotlightDimOpacities: [Double] = [0.35, 0.55, 0.75]
+    /// 聚光灯压暗透明度连续范围。
+    static let spotlightDimOpacityRange: ClosedRange<Double> = 0.15 ... 0.85
+    /// 矩形/马赛克/聚光灯圆角区间（像素）。
+    static let cornerRadiusRange: ClosedRange<Double> = 0 ... 64
+    /// 文字可选字体族列表（系统无衬线 / 等宽代码体 / 衬线体）。
+    static let textFontFamilies: [(id: String, label: String)] = [
+        (FontDescriptor.systemFamily, "系统"),
+        ("Menlo", "等宽"),
+        ("Georgia", "衬线"),
+    ]
+
+    /// 填充色默认透明度（矩形/椭圆开启填充时叠加半透明色底，兼顾强调与保留底图可读性）。
+    static func fillColor(from strokeColor: RGBAColor) -> RGBAColor {
+        RGBAColor(r: strokeColor.r, g: strokeColor.g, b: strokeColor.b, a: 0.22)
+    }
 
     static let `default` = AnnotationStyle(
         shapeColor: palette[0],
         shapeLineWidth: 4,
         shapeIsSketchy: false,
+        shapeFilled: false,
+        shapeCornerRadius: 0,
         textColor: palette[0],
         textFontSize: fontSizes[2],
+        textBold: false,
+        textItalic: false,
+        textFontFamily: FontDescriptor.systemFamily,
         mosaicMode: .rectangle,
         mosaicEffectMode: .pixelate,
         mosaicBlockSize: mosaicBlockSizes[1],
         mosaicBrushRadius: defaultMosaicBrushDiameter / 2,
+        mosaicCornerRadius: 0,
+        spotlightCornerRadius: 8,
+        spotlightDimOpacity: 0.55,
         highlightColor: highlightColors[0],
         numberingRadius: numberingRadii[1],
         magnifierZoom: magnifierZooms[1],
@@ -316,24 +376,25 @@ struct AnnotationStyle: Equatable, Sendable {
     ///
     /// 返回 `nil` 的两种情形：
     /// - **指针**：它不创建标注，没有颜色可言；
-    /// - **马赛克**：它是像素化处理而不是绘制颜色，
-    ///   显示「当前颜色」会误导用户（改完色，画出来的马赛克毫无变化）。
+    /// - **马赛克 / 放大镜 / 聚光灯**：不绘制前景色，显示「当前颜色」会误导用户。
     func color(for tool: AnnotationTool) -> RGBAColor? {
         switch tool {
         case .text: return textColor
         case .rectangle, .ellipse, .line, .arrow: return shapeColor
-        // 放大镜与马赛克同理：改「颜色」不会让放大出来的像素变色，显示它只会误导。
+        // 放大镜、马赛克与聚光灯不取前景色，显示它只会误导。
         case .numbering, .measure, .freehand, .curvedArrow: return shapeColor
         case .highlight: return highlightColor
-        case .pointer, .mosaic, .magnifier: return nil
+        case .pointer, .mosaic, .magnifier, .spotlight: return nil
         }
     }
 }
 
-/// 指针选中标注的几何控制手柄。
+/// 选中标注的几何控制手柄。
 enum AnnotationControlHandle: Equatable, Hashable {
-    /// 矩形类（矩形 / 高亮 / 框选马赛克）的八点缩放手柄。
+    /// 矩形类（矩形 / 椭圆 / 高亮 / 框选马赛克 / 聚光灯）的八点缩放手柄。
     case rect(SelectionHandle)
+    /// 矩形 / 框选马赛克 / 聚光灯的圆角调节手柄。
+    case cornerRadius
     /// 线段 / 箭头 / 测量 / 弯曲箭头的起点。
     case start
     /// 弯曲箭头的中间控制点。
@@ -347,7 +408,7 @@ enum AnnotationControlHandle: Equatable, Hashable {
 /// 正在编辑的一段文字。
 ///
 /// 放在编辑器状态里而不是留在视图上：
-/// 输入过程中用户可能改字号或改颜色，改完必须同步到输入控件；
+/// 输入过程中用户可能改字号、颜色、粗斜体或字体族，改完必须同步到输入控件；
 /// 提交时也要保证「看到的」与「写进模型的」是同一份内容。
 struct TextEditDraft: Equatable {
     /// 正在重新编辑的已有标注 ID；新建文字为 nil。
@@ -360,10 +421,19 @@ struct TextEditDraft: Equatable {
     var color: RGBAColor
     /// 自动折行最大宽度（底图像素）；nil 表示仅在显式换行符处换行。
     var maxWidth: Double? = nil
+    /// 字体族与粗体/斜体样式。
+    var fontFamily: String = FontDescriptor.systemFamily
+    var isBold: Bool = false
+    var isItalic: Bool = false
 
     /// 该文字使用的字体描述（模型单位：像素）。
     func font(scaleFactor: CGFloat) -> FontDescriptor {
-        FontDescriptor.system(size: fontSize * Double(scaleFactor))
+        FontDescriptor(
+            family: fontFamily,
+            size: fontSize * Double(scaleFactor),
+            weight: isBold ? 700 : 400,
+            italic: isItalic
+        )
     }
 }
 
@@ -382,6 +452,9 @@ final class AnnotationEditorState {
             if textDraft != nil {
                 textDraft?.color = style.textColor
                 textDraft?.fontSize = style.textFontSize
+                textDraft?.isBold = style.textBold
+                textDraft?.isItalic = style.textItalic
+                textDraft?.fontFamily = style.textFontFamily
             }
             notifyChange()
         }
@@ -492,9 +565,59 @@ final class AnnotationEditorState {
             return color
         case let .magnifier(_, _, _, border):
             return border.color
-        case .mosaic, .mosaicStroke:
+        case .mosaic, .mosaicStroke, .spotlight:
             return nil
         }
+    }
+
+    /// 当前选中的标注是否支持填充切换（矩形 / 椭圆）。
+    var selectedAnnotationSupportsFill: Bool {
+        guard let kind = selectedAnnotation?.kind else { return false }
+        switch kind {
+        case .rectangle, .ellipse: return true
+        default: return false
+        }
+    }
+
+    /// 当前选中的标注是否已开启填充。
+    var selectedAnnotationIsFilled: Bool {
+        guard let kind = selectedAnnotation?.kind else { return false }
+        switch kind {
+        case let .rectangle(_, _, fill, _), let .ellipse(_, _, fill):
+            return fill != nil
+        default:
+            return false
+        }
+    }
+
+    /// 当前选中的文字是否粗体。
+    var selectedAnnotationIsBold: Bool {
+        guard case let .text(_, _, font, _, _, _) = selectedAnnotation?.kind else { return false }
+        return font.weight >= 600
+    }
+
+    /// 当前选中的文字是否斜体。
+    var selectedAnnotationIsItalic: Bool {
+        guard case let .text(_, _, font, _, _, _) = selectedAnnotation?.kind else { return false }
+        return font.italic
+    }
+
+    /// 当前选中的文字字体族。
+    var selectedAnnotationFontFamily: String? {
+        guard case let .text(_, _, font, _, _, _) = selectedAnnotation?.kind else { return nil }
+        return font.family
+    }
+
+    /// 当前选中的标注是否为聚光灯。
+    var selectedAnnotationIsSpotlight: Bool {
+        guard case .spotlight = selectedAnnotation?.kind else { return false }
+        return true
+    }
+
+    /// 当前选中聚光灯的压暗透明度。
+    var selectedAnnotationSpotlightDimOpacity: Double? {
+        guard case let .spotlight(_, _, dimOpacity) = selectedAnnotation?.kind else { return nil }
+        return dimOpacity
     }
 
     /// 当前选中的标注是否支持手绘风格切换。
@@ -539,7 +662,7 @@ final class AnnotationEditorState {
     var selectedAnnotationMosaicMode: MosaicMode? {
         guard let kind = selectedAnnotation?.kind else { return nil }
         switch kind {
-        case let .mosaic(_, mode, _),
+        case let .mosaic(_, mode, _, _),
              let .mosaicStroke(_, _, mode, _):
             return mode
         default:
@@ -551,7 +674,7 @@ final class AnnotationEditorState {
     var selectedAnnotationMosaicIntensity: Double? {
         guard let kind = selectedAnnotation?.kind else { return nil }
         switch kind {
-        case let .mosaic(_, _, intensity),
+        case let .mosaic(_, _, intensity, _),
              let .mosaicStroke(_, _, _, intensity):
             return intensity
         default:
@@ -685,27 +808,241 @@ final class AnnotationEditorState {
             } else {
                 style.shapeColor = color
             }
-        // 放大镜与马赛克是像素处理，没有颜色槽（面板也不会显示颜色）。
+        // 放大镜、马赛克与聚光灯不取前景色（面板也不会显示颜色）。
         case .rectangle, .ellipse, .line, .arrow, .mosaic, .magnifier,
-             .numbering, .measure, .freehand, .curvedArrow:
+             .numbering, .measure, .freehand, .curvedArrow, .spotlight:
             style.shapeColor = color
         }
         // 有选中标注时，颜色按钮的作用对象是**当前选中的那一条**：
-        // 用户是在指针工具下点开编辑控件的，此时改的是既有内容而不是下一笔。
-        // 样式槽也一并更新，撤销/取消选中之后接着画，用的就是刚选的颜色。
+        // 无论是在指针模式还是刚画完的绘制优先模式，修改颜色都即时作用于选中标注并同步样式槽。
         updateSelectedColor(color)
     }
 
     func selectNumberingRadius(_ radius: Double) {
         style.numberingRadius = radius
+        if case .numbering = selectedAnnotation?.kind, let index = selectedAnnotationIndex {
+            let updated = Self.restyled(annotations[index], numberingRadius: radius)
+            commitSelectedChange(updated, at: index)
+        }
     }
 
     func selectMagnifierZoom(_ zoom: Double) {
         style.magnifierZoom = zoom
+        if case .magnifier = selectedAnnotation?.kind, let index = selectedAnnotationIndex {
+            let updated = Self.restyled(annotations[index], magnifierZoom: zoom)
+            commitSelectedChange(updated, at: index)
+        }
     }
 
     func selectCurvedArrowBend(_ bend: Double) {
         style.curvedArrowBend = bend
+    }
+
+    /// 切换矩形/椭圆填充开关。
+    func toggleShapeFilled() {
+        if selectedAnnotationSupportsFill {
+            let next = !selectedAnnotationIsFilled
+            style.shapeFilled = next
+            updateSelectedFilled(next)
+        } else {
+            style.shapeFilled.toggle()
+        }
+    }
+
+    /// 显式设置矩形/椭圆填充开关。
+    func selectShapeFilled(_ filled: Bool) {
+        style.shapeFilled = filled
+        if selectedAnnotationSupportsFill {
+            updateSelectedFilled(filled)
+        }
+    }
+
+    /// 切换文字粗体开关。
+    func toggleTextBold() {
+        if case .text = selectedAnnotation?.kind {
+            let next = !selectedAnnotationIsBold
+            style.textBold = next
+            updateSelectedTextBold(next)
+        } else {
+            style.textBold.toggle()
+        }
+    }
+
+    /// 切换文字斜体开关。
+    func toggleTextItalic() {
+        if case .text = selectedAnnotation?.kind {
+            let next = !selectedAnnotationIsItalic
+            style.textItalic = next
+            updateSelectedTextItalic(next)
+        } else {
+            style.textItalic.toggle()
+        }
+    }
+
+    /// 循环切换文字字体族（系统 / 等宽 / 衬线）。
+    func cycleTextFontFamily() {
+        let families = AnnotationStyle.textFontFamilies.map(\.id)
+        let current = selectedAnnotationFontFamily ?? textDraft?.fontFamily ?? style.textFontFamily
+        let currentIndex = families.firstIndex(of: current) ?? 0
+        let next = families[(currentIndex + 1) % families.count]
+        selectTextFontFamily(next)
+    }
+
+    /// 显式设置文字字体族。
+    func selectTextFontFamily(_ family: String) {
+        style.textFontFamily = family
+        if case .text = selectedAnnotation?.kind {
+            updateSelectedTextFontFamily(family)
+        }
+    }
+
+    /// 设置聚光灯焦点外压暗透明度。
+    func selectSpotlightDimOpacity(_ opacity: Double) {
+        let clamped = Self.quantize(
+            opacity,
+            step: 0.05,
+            in: AnnotationStyle.spotlightDimOpacityRange
+        )
+        style.spotlightDimOpacity = clamped
+        if selectedAnnotationIsSpotlight, let index = selectedAnnotationIndex {
+            let updated = Self.restyled(annotations[index], spotlightDimOpacity: clamped)
+            commitSelectedChange(updated, at: index)
+        }
+    }
+
+    /// 修改选中编号标注的序号数字（双击序号就地编辑）。
+    @discardableResult
+    func updateSelectedNumberingIndex(_ newIndex: Int) -> Bool {
+        let sanitized = max(1, min(newIndex, 999))
+        guard let index = selectedAnnotationIndex,
+              case .numbering = annotations[index].kind else {
+            return false
+        }
+        let updated = Self.restyled(annotations[index], numberingIndex: sanitized)
+        commitSelectedChange(updated, at: index)
+        // 若用户改出更大序号，将自动递增计数器同步推进至该值之后，避免下一笔撞号。
+        if sanitized >= numberingCounter {
+            numberingCounter = sanitized + 1
+        }
+        return true
+    }
+
+    /// 滚轮调参：有选中标注时直接微调选中标注核心参数，无选中时微调当前工具默认参数。
+    ///
+    /// - Parameter delta: 滚轮方向与步进（正值放大/加粗，负值缩小/变细）。
+    @discardableResult
+    func adjustParameterByScrollWheel(delta: Double, scaleFactor: CGFloat = 1) -> Bool {
+        guard delta != 0 else { return false }
+        let stepDirection: Double = delta > 0 ? 1 : -1
+
+        if let selected = selectedAnnotation, let index = selectedAnnotationIndex {
+            switch selected.kind {
+            case let .rectangle(_, stroke, _, _),
+                 let .ellipse(_, stroke, _),
+                 let .line(_, _, stroke),
+                 let .arrow(_, _, stroke, _, _),
+                 let .measure(_, _, stroke),
+                 let .freehand(_, stroke),
+                 let .curvedArrow(_, _, _, stroke, _, _):
+                let nextWidth = Self.quantize(
+                    stroke.width + stepDirection,
+                    step: 0.5,
+                    in: AnnotationStyle.lineWidthRange
+                )
+                style.shapeLineWidth = nextWidth
+                updateSelectedLineWidth(nextWidth)
+                return true
+
+            case let .text(_, _, font, _, _, _):
+                let safeScale = scaleFactor > 0 ? Double(scaleFactor) : 1
+                let currentLogical = font.size / safeScale
+                let nextLogical = min(max((currentLogical + stepDirection * 2).rounded(), 10), 96)
+                style.textFontSize = AnnotationStyle.fontSizes.min {
+                    abs($0 - nextLogical) < abs($1 - nextLogical)
+                } ?? style.textFontSize
+                updateSelectedFontSize(nextLogical, scaleFactor: scaleFactor)
+                return true
+
+            case let .numbering(_, radius, _, _, _, _):
+                let nextRadius = min(max((radius + stepDirection * 2).rounded(), 10), 64)
+                style.numberingRadius = AnnotationStyle.numberingRadii.min {
+                    abs($0 - nextRadius) < abs($1 - nextRadius)
+                } ?? style.numberingRadius
+                let updated = Self.restyled(selected, numberingRadius: nextRadius)
+                commitSelectedChange(updated, at: index)
+                return true
+
+            case let .magnifier(_, _, zoom, _):
+                let zooms = AnnotationStyle.magnifierZooms
+                let idx = zooms.enumerated().min { abs($0.element - zoom) < abs($1.element - zoom) }?.offset ?? 1
+                let nextIdx = min(max(idx + (stepDirection > 0 ? 1 : -1), 0), zooms.count - 1)
+                selectMagnifierZoom(zooms[nextIdx])
+                return true
+
+            case let .mosaic(_, _, intensity, _),
+                 let .mosaicStroke(_, _, _, intensity):
+                let sizes = AnnotationStyle.mosaicBlockSizes
+                let current = AnnotationStyle.logicalMosaicBlockSize(forPixelIntensity: intensity, scaleFactor: scaleFactor)
+                let idx = sizes.firstIndex(of: current) ?? 1
+                let nextIdx = min(max(idx + (stepDirection > 0 ? 1 : -1), 0), sizes.count - 1)
+                selectMosaicBlockSize(sizes[nextIdx], scaleFactor: scaleFactor)
+                return true
+
+            case let .spotlight(_, _, dimOpacity):
+                selectSpotlightDimOpacity(dimOpacity + stepDirection * 0.05)
+                return true
+
+            case .highlight:
+                return false
+            }
+        }
+
+        // 无选中标注时：调整当前工具默认参数。
+        switch tool {
+        case .pointer:
+            return false
+        case .rectangle, .ellipse, .line, .arrow, .measure, .freehand, .curvedArrow:
+            let nextWidth = Self.quantize(
+                style.shapeLineWidth + stepDirection,
+                step: 0.5,
+                in: AnnotationStyle.lineWidthRange
+            )
+            selectLineWidth(nextWidth)
+            return true
+        case .text:
+            let sizes = AnnotationStyle.fontSizes
+            let idx = sizes.firstIndex(of: style.textFontSize) ?? 2
+            let nextIdx = min(max(idx + (stepDirection > 0 ? 1 : -1), 0), sizes.count - 1)
+            selectFontSize(sizes[nextIdx], scaleFactor: scaleFactor)
+            return true
+        case .numbering:
+            let radii = AnnotationStyle.numberingRadii
+            let idx = radii.firstIndex(of: style.numberingRadius) ?? 1
+            let nextIdx = min(max(idx + (stepDirection > 0 ? 1 : -1), 0), radii.count - 1)
+            selectNumberingRadius(radii[nextIdx])
+            return true
+        case .magnifier:
+            let zooms = AnnotationStyle.magnifierZooms
+            let idx = zooms.firstIndex(of: style.magnifierZoom) ?? 1
+            let nextIdx = min(max(idx + (stepDirection > 0 ? 1 : -1), 0), zooms.count - 1)
+            selectMagnifierZoom(zooms[nextIdx])
+            return true
+        case .mosaic:
+            if style.mosaicMode == .brush {
+                selectMosaicBrushDiameter(style.mosaicBrushRadius * 2 + stepDirection * 4)
+            } else {
+                let sizes = AnnotationStyle.mosaicBlockSizes
+                let idx = sizes.firstIndex(of: style.mosaicBlockSize) ?? 1
+                let nextIdx = min(max(idx + (stepDirection > 0 ? 1 : -1), 0), sizes.count - 1)
+                selectMosaicBlockSize(sizes[nextIdx], scaleFactor: scaleFactor)
+            }
+            return true
+        case .spotlight:
+            selectSpotlightDimOpacity(style.spotlightDimOpacity + stepDirection * 0.05)
+            return true
+        case .highlight:
+            return false
+        }
     }
 
     func selectLineWidth(_ width: Double) {
@@ -795,18 +1132,18 @@ final class AnnotationEditorState {
         style.mosaicMode = mode
     }
 
-    /// 切换马赛克打码效果（像素化 / 高斯模糊）；在指针选中马赛克时同步更新该标注。
+    /// 切换马赛克打码效果（像素化 / 高斯模糊）；有选中马赛克标注时同步更新该标注。
     func selectMosaicEffectMode(_ mode: MosaicMode) {
         let resolved: MosaicMode = (mode == .blur) ? .blur : .pixelate
         style.mosaicEffectMode = resolved
-        if tool == .pointer, hasSelectedAnnotation {
+        if selectedAnnotationSupportsMosaicEffect {
             updateSelectedMosaicMode(resolved)
         }
     }
 
-    /// 切换手绘风格；在指针选中支持手绘的标注时同步更新该标注。
+    /// 切换手绘风格；有选中支持手绘的标注时同步更新该标注。
     func toggleSketchy() {
-        if tool == .pointer, selectedAnnotationSupportsSketchy {
+        if selectedAnnotationSupportsSketchy {
             let next = !selectedAnnotationIsSketchy
             style.shapeIsSketchy = next
             updateSelectedSketchy(next)
@@ -815,10 +1152,10 @@ final class AnnotationEditorState {
         }
     }
 
-    /// 显式设置手绘风格开关；在指针选中支持手绘的标注时同步更新该标注。
+    /// 显式设置手绘风格开关；有选中支持手绘的标注时同步更新该标注。
     func selectSketchy(_ isSketchy: Bool) {
         style.shapeIsSketchy = isSketchy
-        if tool == .pointer, selectedAnnotationSupportsSketchy {
+        if selectedAnnotationSupportsSketchy {
             updateSelectedSketchy(isSketchy)
         }
     }
@@ -827,7 +1164,7 @@ final class AnnotationEditorState {
         let resolved = AnnotationStyle.mosaicBlockSizes.min { abs($0 - size) < abs($1 - size) }
             ?? AnnotationStyle.mosaicBlockSizes[1]
         style.mosaicBlockSize = resolved
-        if tool == .pointer, hasSelectedAnnotation {
+        if selectedAnnotationSupportsMosaicEffect {
             let pixelIntensity = AnnotationStyle.pixelMosaicIntensity(
                 logicalSize: resolved,
                 scaleFactor: scaleFactor
@@ -875,6 +1212,21 @@ final class AnnotationEditorState {
     }
 
     // MARK: - 标注选中与再编辑
+
+    /// 只读命中查询：返回最顶层命中该点的标注，不改变当前选中态。
+    func annotation(at point: PixelPoint, tolerance: Double) -> Annotation? {
+        annotations.reversed().first { $0.hitTest(point, tolerance: tolerance) }
+    }
+
+    /// 显式选中指定 ID 的标注（存在时才生效）。
+    @discardableResult
+    func selectAnnotation(id: UUID) -> Bool {
+        guard annotations.contains(where: { $0.id == id }) else { return false }
+        guard selectedAnnotationID != id else { return true }
+        selectedAnnotationID = id
+        notifyChange()
+        return true
+    }
 
     /// 按点选中标注（命中测试见 `Annotation.hitTest`）。
     ///
@@ -1045,6 +1397,34 @@ final class AnnotationEditorState {
         commitSelectedChange(updated, at: index)
     }
 
+    /// 修改选中矩形/椭圆标注的填充开关。
+    func updateSelectedFilled(_ filled: Bool) {
+        guard let index = selectedAnnotationIndex else { return }
+        let updated = Self.restyled(annotations[index], filled: filled)
+        commitSelectedChange(updated, at: index)
+    }
+
+    /// 修改选中文字标注的粗体样式。
+    func updateSelectedTextBold(_ isBold: Bool) {
+        guard let index = selectedAnnotationIndex else { return }
+        let updated = Self.restyled(annotations[index], textBold: isBold)
+        commitSelectedChange(updated, at: index)
+    }
+
+    /// 修改选中文字标注的斜体样式。
+    func updateSelectedTextItalic(_ isItalic: Bool) {
+        guard let index = selectedAnnotationIndex else { return }
+        let updated = Self.restyled(annotations[index], textItalic: isItalic)
+        commitSelectedChange(updated, at: index)
+    }
+
+    /// 修改选中文字标注的字体族。
+    func updateSelectedTextFontFamily(_ family: String) {
+        guard let index = selectedAnnotationIndex else { return }
+        let updated = Self.restyled(annotations[index], textFontFamily: family)
+        commitSelectedChange(updated, at: index)
+    }
+
     /// 把一条已重新构造的标注写回数组；若在编辑事务中则仅实时预览不写历史。
     ///
     /// 内容没变就不提交：`selectColor` 这类入口会在「点了一个已是当前颜色的色块」
@@ -1101,7 +1481,15 @@ final class AnnotationEditorState {
         fontSize: Double? = nil,
         isSketchy: Bool? = nil,
         mosaicMode: MosaicMode? = nil,
-        mosaicIntensity: Double? = nil
+        mosaicIntensity: Double? = nil,
+        filled: Bool? = nil,
+        textBold: Bool? = nil,
+        textItalic: Bool? = nil,
+        textFontFamily: String? = nil,
+        spotlightDimOpacity: Double? = nil,
+        numberingRadius: Double? = nil,
+        numberingIndex: Int? = nil,
+        magnifierZoom: Double? = nil
     ) -> Annotation {
         func restroke(_ stroke: StrokeStyle, allowSketchy: Bool = true) -> StrokeStyle {
             StrokeStyle(
@@ -1115,10 +1503,28 @@ final class AnnotationEditorState {
         let kind: Annotation.Kind
         switch annotation.kind {
         case let .rectangle(rect, stroke, fill, cornerRadius):
-            kind = .rectangle(rect: rect, stroke: restroke(stroke), fill: fill, cornerRadius: cornerRadius)
+            let updatedStroke = restroke(stroke)
+            let updatedFill: RGBAColor?
+            if let filled {
+                updatedFill = filled ? AnnotationStyle.fillColor(from: updatedStroke.color) : nil
+            } else if fill != nil, let color {
+                updatedFill = AnnotationStyle.fillColor(from: color)
+            } else {
+                updatedFill = fill
+            }
+            kind = .rectangle(rect: rect, stroke: updatedStroke, fill: updatedFill, cornerRadius: cornerRadius)
 
         case let .ellipse(rect, stroke, fill):
-            kind = .ellipse(rect: rect, stroke: restroke(stroke), fill: fill)
+            let updatedStroke = restroke(stroke)
+            let updatedFill: RGBAColor?
+            if let filled {
+                updatedFill = filled ? AnnotationStyle.fillColor(from: updatedStroke.color) : nil
+            } else if fill != nil, let color {
+                updatedFill = AnnotationStyle.fillColor(from: color)
+            } else {
+                updatedFill = fill
+            }
+            kind = .ellipse(rect: rect, stroke: updatedStroke, fill: updatedFill)
 
         case let .line(start, end, stroke):
             kind = .line(start: start, end: end, stroke: restroke(stroke))
@@ -1139,11 +1545,21 @@ final class AnnotationEditorState {
         case let .text(origin, text, font, textColor, background, maxWidth):
             var updatedFont = font
             var updatedOrigin = origin
+            if let textBold {
+                updatedFont.weight = textBold ? 700 : 400
+            }
+            if let textItalic {
+                updatedFont.italic = textItalic
+            }
+            if let textFontFamily {
+                updatedFont.family = textFontFamily
+            }
             if let fontSize, fontSize > 0, fontSize != font.size {
                 updatedFont.size = fontSize
-                // 模型存的是**基线起点**。字号变大时 ascent 也变大，
-                // 基线原地不动会让文字顶端向上长出去；补上 ascent 差，
-                // 用户看到的左上角就停在原处（与输入框里的观感一致）。
+            }
+            if updatedFont != font {
+                // 模型存的是**基线起点**。字号或字体变化时 ascent 随之变化，
+                // 补上 ascent 差可让用户看到的文字左上角稳稳停在原处。
                 let dy = TextMetrics.ascent(for: updatedFont) - TextMetrics.ascent(for: font)
                 updatedOrigin = PixelPoint(x: origin.x, y: origin.y + dy)
             }
@@ -1156,12 +1572,20 @@ final class AnnotationEditorState {
                 maxWidth: maxWidth
             )
 
-        case let .mosaic(rect, mode, intensity):
+        case let .mosaic(rect, mode, intensity, cornerRadius):
             // 马赛克支持切换像素化 / 高斯模糊效果及强度档位，但不受颜色和线宽影响。
             kind = .mosaic(
                 rect: rect,
                 mode: mosaicMode ?? mode,
-                intensity: mosaicIntensity ?? intensity
+                intensity: mosaicIntensity ?? intensity,
+                cornerRadius: cornerRadius
+            )
+
+        case let .spotlight(rect, cornerRadius, dimOpacity):
+            kind = .spotlight(
+                rect: rect,
+                cornerRadius: cornerRadius,
+                dimOpacity: spotlightDimOpacity ?? dimOpacity
             )
 
         case let .mosaicStroke(points, radius, mode, intensity):
@@ -1177,8 +1601,8 @@ final class AnnotationEditorState {
             // 否则会出现「红圈配蓝字」这种谁也调不回来的状态。
             kind = .numbering(
                 center: center,
-                radius: radius,
-                index: index,
+                radius: numberingRadius ?? radius,
+                index: numberingIndex ?? index,
                 stroke: restroke(stroke, allowSketchy: false),
                 fill: fill,
                 textColor: color ?? textColor
@@ -1192,7 +1616,12 @@ final class AnnotationEditorState {
             kind = .measure(start: start, end: end, stroke: restroke(stroke, allowSketchy: false))
 
         case let .magnifier(center, radius, zoom, border):
-            kind = .magnifier(center: center, radius: radius, zoom: zoom, border: restroke(border, allowSketchy: false))
+            kind = .magnifier(
+                center: center,
+                radius: radius,
+                zoom: magnifierZoom ?? zoom,
+                border: restroke(border, allowSketchy: false)
+            )
 
         case let .freehand(points, stroke):
             kind = .freehand(points: points, stroke: restroke(stroke))
@@ -1289,7 +1718,7 @@ final class AnnotationEditorState {
         let dx = end.x - start.x
         let dy = end.y - start.y
         switch tool {
-        case .rectangle, .ellipse, .highlight, .mosaic:
+        case .rectangle, .ellipse, .highlight, .mosaic, .spotlight:
             let side = max(abs(dx), abs(dy))
             return PixelPoint(
                 x: start.x + (dx >= 0 ? side : -side),
@@ -1344,7 +1773,14 @@ final class AnnotationEditorState {
             return false
         }
 
-        annotations.append(Self.simplifiedForCommit(draft))
+        let committed = Self.simplifiedForCommit(draft)
+        annotations.append(committed)
+        // 绘制优先：画完任意非涂抹标注后自动选中，松手即可直接拖控点、改色、滚轮调参或按 Delete 删除。
+        if case .mosaicStroke = committed.kind {
+            selectedAnnotationID = nil
+        } else {
+            selectedAnnotationID = committed.id
+        }
         self.draft = nil
         draftAnchor = nil
         draftStrokePoints = []
@@ -1404,7 +1840,10 @@ final class AnnotationEditorState {
             text: "",
             fontSize: style.textFontSize,
             color: style.textColor,
-            maxWidth: maxWidth
+            maxWidth: maxWidth,
+            fontFamily: style.textFontFamily,
+            isBold: style.textBold,
+            isItalic: style.textItalic
         )
         notifyChange()
     }
@@ -1424,7 +1863,10 @@ final class AnnotationEditorState {
             // 模型字号是像素，除以 scaleFactor 转回界面用的点。
             fontSize: font.size / safeScale,
             color: color,
-            maxWidth: maxWidth
+            maxWidth: maxWidth,
+            fontFamily: font.family,
+            isBold: font.weight >= 600,
+            isItalic: font.italic
         )
         notifyChange()
     }
@@ -1489,6 +1931,7 @@ final class AnnotationEditorState {
             scaleFactor: scaleFactor
         )
         annotations.append(annotation)
+        selectedAnnotationID = annotation.id
         history.commit(EditState(selection: selection, annotations: annotations))
         return true
     }
@@ -1663,8 +2106,8 @@ final class AnnotationEditorState {
                     width: style.shapeLineWidth,
                     isSketchy: style.shapeIsSketchy
                 ),
-                fill: nil,
-                cornerRadius: 0
+                fill: style.shapeFilled ? AnnotationStyle.fillColor(from: style.shapeColor) : nil,
+                cornerRadius: style.shapeCornerRadius
             ))
 
         case .ellipse:
@@ -1675,7 +2118,7 @@ final class AnnotationEditorState {
                     width: style.shapeLineWidth,
                     isSketchy: style.shapeIsSketchy
                 ),
-                fill: nil
+                fill: style.shapeFilled ? AnnotationStyle.fillColor(from: style.shapeColor) : nil
             ))
 
         case .line:
@@ -1777,6 +2220,13 @@ final class AnnotationEditorState {
                 headWidth: style.arrowHeadWidth
             ))
 
+        case .spotlight:
+            return Annotation(kind: .spotlight(
+                rect: Self.rect(from: start, to: end),
+                cornerRadius: style.spotlightCornerRadius,
+                dimOpacity: style.spotlightDimOpacity
+            ))
+
         case .mosaic:
             let effectMode = style.mosaicEffectMode
             let safeScale = draftScaleFactor > 0 ? Double(draftScaleFactor) : 1
@@ -1789,7 +2239,8 @@ final class AnnotationEditorState {
                 return Annotation(kind: .mosaic(
                     rect: Self.rect(from: start, to: end),
                     mode: effectMode,
-                    intensity: pixelIntensity
+                    intensity: pixelIntensity,
+                    cornerRadius: style.mosaicCornerRadius
                 ))
             case .brush:
                 return Annotation(kind: .mosaicStroke(
@@ -1844,7 +2295,8 @@ final class AnnotationEditorState {
         switch annotation.kind {
         case let .rectangle(rect, _, _, _),
              let .ellipse(rect, _, _),
-             let .mosaic(rect, _, _):
+             let .mosaic(rect, _, _, _),
+             let .spotlight(rect, _, _):
             return rect.size.width >= 2 && rect.size.height >= 2
 
         case let .line(start, end, _), let .arrow(start, end, _, _, _):
@@ -1893,20 +2345,30 @@ final class AnnotationEditorState {
         for annotation: Annotation
     ) -> [(handle: AnnotationControlHandle, point: PixelPoint)] {
         switch annotation.kind {
-        case let .rectangle(rect, _, _, _),
-             let .ellipse(rect, _, _),
-             let .highlight(rect, _),
-             let .mosaic(rect, _, _):
-            let cgRect = CGRect(
-                x: rect.origin.x,
-                y: rect.origin.y,
-                width: rect.size.width,
-                height: rect.size.height
-            )
-            return SelectionHandle.allCases.map { handle in
-                let pt = SelectionGeometry.center(of: handle, in: cgRect)
-                return (.rect(handle), PixelPoint(x: pt.x, y: pt.y))
+        case let .rectangle(rect, _, _, cornerRadius):
+            var items = rectHandles(for: rect)
+            if let radiusPoint = cornerRadiusHandlePoint(in: rect, cornerRadius: cornerRadius) {
+                items.append((.cornerRadius, radiusPoint))
             }
+            return items
+
+        case let .ellipse(rect, _, _),
+             let .highlight(rect, _):
+            return rectHandles(for: rect)
+
+        case let .mosaic(rect, _, _, cornerRadius):
+            var items = rectHandles(for: rect)
+            if let radiusPoint = cornerRadiusHandlePoint(in: rect, cornerRadius: cornerRadius) {
+                items.append((.cornerRadius, radiusPoint))
+            }
+            return items
+
+        case let .spotlight(rect, cornerRadius, _):
+            var items = rectHandles(for: rect)
+            if let radiusPoint = cornerRadiusHandlePoint(in: rect, cornerRadius: cornerRadius) {
+                items.append((.cornerRadius, radiusPoint))
+            }
+            return items
 
         case let .line(start, end, _),
              let .arrow(start, end, _, _, _),
@@ -1925,6 +2387,30 @@ final class AnnotationEditorState {
         }
     }
 
+    private static func rectHandles(for rect: PixelRect) -> [(handle: AnnotationControlHandle, point: PixelPoint)] {
+        let cgRect = CGRect(
+            x: rect.origin.x,
+            y: rect.origin.y,
+            width: rect.size.width,
+            height: rect.size.height
+        )
+        return SelectionHandle.allCases.map { handle in
+            let pt = SelectionGeometry.center(of: handle, in: cgRect)
+            return (.rect(handle), PixelPoint(x: pt.x, y: pt.y))
+        }
+    }
+
+    /// 计算矩形/马赛克/聚光灯内侧的圆角调节手柄坐标（避免与左上角缩放手柄重叠）。
+    private static func cornerRadiusHandlePoint(in rect: PixelRect, cornerRadius: Double) -> PixelPoint? {
+        guard rect.size.width >= 36, rect.size.height >= 36 else { return nil }
+        let maxRadius = min(rect.size.width, rect.size.height) / 2
+        let visualOffset = min(max(14.0, cornerRadius), max(14.0, maxRadius))
+        return PixelPoint(
+            x: rect.origin.x + visualOffset,
+            y: rect.origin.y + 14.0
+        )
+    }
+
     /// 拖动选中标注的几何控制手柄以更新其形状（在编辑事务内仅实时预览）。
     func updateSelectedControlHandle(
         _ handle: AnnotationControlHandle,
@@ -1941,6 +2427,12 @@ final class AnnotationEditorState {
             let resized = resizedPixelRect(rect, handle: rectHandle, to: clamped, keepSquare: isShiftPressed)
             updatedKind = .rectangle(rect: resized, stroke: stroke, fill: fill, cornerRadius: cornerRadius)
 
+        case let (.rectangle(rect, stroke, fill, _), .cornerRadius):
+            let maxR = min(AnnotationStyle.cornerRadiusRange.upperBound, min(rect.size.width, rect.size.height) / 2)
+            let radius = min(max(0, (clamped.x - rect.origin.x - 14.0).rounded()), maxR)
+            style.shapeCornerRadius = radius
+            updatedKind = .rectangle(rect: rect, stroke: stroke, fill: fill, cornerRadius: radius)
+
         case let (.ellipse(rect, stroke, fill), .rect(rectHandle)):
             let resized = resizedPixelRect(rect, handle: rectHandle, to: clamped, keepSquare: isShiftPressed)
             updatedKind = .ellipse(rect: resized, stroke: stroke, fill: fill)
@@ -1949,9 +2441,25 @@ final class AnnotationEditorState {
             let resized = resizedPixelRect(rect, handle: rectHandle, to: clamped, keepSquare: isShiftPressed)
             updatedKind = .highlight(rect: resized, color: color)
 
-        case let (.mosaic(rect, mode, intensity), .rect(rectHandle)):
+        case let (.mosaic(rect, mode, intensity, cornerRadius), .rect(rectHandle)):
             let resized = resizedPixelRect(rect, handle: rectHandle, to: clamped, keepSquare: isShiftPressed)
-            updatedKind = .mosaic(rect: resized, mode: mode, intensity: intensity)
+            updatedKind = .mosaic(rect: resized, mode: mode, intensity: intensity, cornerRadius: cornerRadius)
+
+        case let (.mosaic(rect, mode, intensity, _), .cornerRadius):
+            let maxR = min(AnnotationStyle.cornerRadiusRange.upperBound, min(rect.size.width, rect.size.height) / 2)
+            let radius = min(max(0, (clamped.x - rect.origin.x - 14.0).rounded()), maxR)
+            style.mosaicCornerRadius = radius
+            updatedKind = .mosaic(rect: rect, mode: mode, intensity: intensity, cornerRadius: radius)
+
+        case let (.spotlight(rect, cornerRadius, dimOpacity), .rect(rectHandle)):
+            let resized = resizedPixelRect(rect, handle: rectHandle, to: clamped, keepSquare: isShiftPressed)
+            updatedKind = .spotlight(rect: resized, cornerRadius: cornerRadius, dimOpacity: dimOpacity)
+
+        case let (.spotlight(rect, _, dimOpacity), .cornerRadius):
+            let maxR = min(AnnotationStyle.cornerRadiusRange.upperBound, min(rect.size.width, rect.size.height) / 2)
+            let radius = min(max(0, (clamped.x - rect.origin.x - 14.0).rounded()), maxR)
+            style.spotlightCornerRadius = radius
+            updatedKind = .spotlight(rect: rect, cornerRadius: radius, dimOpacity: dimOpacity)
 
         case let (.line(_, end, stroke), .start):
             let pt = clampPointToSelection(Self.constrainedEndPoint(clamped, from: end, tool: .line, isShiftPressed: isShiftPressed))

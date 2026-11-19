@@ -400,6 +400,9 @@ public final class AppSettings {
         }
         self.shortcuts = shortcuts
         self.pinMaximumCount = Self.readPinLimit(from: store)
+        self.windowCaptureShadow = store.object(forKey: Key.windowCaptureShadow) as? Bool ?? true
+        self.confirmCancelWithAnnotations = store.object(forKey: Key.confirmCancelWithAnnotations) as? Bool ?? true
+        self.toolbarHiddenSlots = Set(store.stringArray(forKey: Key.toolbarHiddenSlots) ?? [])
     }
 
     /// 读文件夹。路径缺失或为空时返回 `nil`。
@@ -552,12 +555,54 @@ public final class AppSettings {
         logger.notice("save destination re-activated remembered folder")
     }
 
+    // MARK: 截图与工具栏交互偏好
+
+    /// 独立窗体截图默认是否合成柔和阴影（默认开启；窗体捕获时按住 `⌥` 可临时反转）。
+    public private(set) var windowCaptureShadow: Bool
+
+    public func setWindowCaptureShadow(_ enabled: Bool) {
+        guard enabled != windowCaptureShadow else { return }
+        windowCaptureShadow = enabled
+        store.set(enabled, forKey: Key.windowCaptureShadow)
+    }
+
+    /// 画有标注时按 `Esc` 是否需要二次确认以防误关（默认开启）。
+    public private(set) var confirmCancelWithAnnotations: Bool
+
+    public func setConfirmCancelWithAnnotations(_ enabled: Bool) {
+        guard enabled != confirmCancelWithAnnotations else { return }
+        confirmCancelWithAnnotations = enabled
+        store.set(enabled, forKey: Key.confirmCancelWithAnnotations)
+    }
+
+    /// 用户隐藏的截图主工具栏槽位标识集合（隐藏按钮但保留快捷键）。
+    public private(set) var toolbarHiddenSlots: Set<String>
+
+    public func setToolbarHiddenSlots(_ slots: Set<String>) {
+        guard slots != toolbarHiddenSlots else { return }
+        toolbarHiddenSlots = slots
+        store.set(Array(slots).sorted(), forKey: Key.toolbarHiddenSlots)
+    }
+
+    public func setToolbarSlot(_ slotID: String, visible: Bool) {
+        var next = toolbarHiddenSlots
+        if visible {
+            next.remove(slotID)
+        } else {
+            next.insert(slotID)
+        }
+        setToolbarHiddenSlots(next)
+    }
+
     // MARK: 键名
 
     private enum Key {
         static let saveMode = "settings.save.mode"
         static let saveFolderPath = "settings.save.folderPath"
         static let pinMaximumCount = "settings.pin.maximumCount"
+        static let windowCaptureShadow = "settings.windowCaptureShadow"
+        static let confirmCancelWithAnnotations = "settings.confirmCancelWithAnnotations"
+        static let toolbarHiddenSlots = "settings.toolbarHiddenSlots"
     }
 
     private enum Mode {

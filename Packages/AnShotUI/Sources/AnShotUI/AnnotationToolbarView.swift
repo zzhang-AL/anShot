@@ -164,6 +164,75 @@ final class AnnotationToolbarView: NSView {
         }
     }
 
+    /// 选中的标注是否支持填充切换（矩形 / 椭圆）。
+    var selectedAnnotationSupportsFill = false {
+        didSet {
+            guard selectedAnnotationSupportsFill != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    /// 选中的标注当前是否已填充。
+    var selectedAnnotationIsFilled = false {
+        didSet {
+            guard selectedAnnotationIsFilled != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    /// 选中的文字当前是否粗体 / 斜体 / 字体族。
+    var selectedAnnotationIsBold = false {
+        didSet {
+            guard selectedAnnotationIsBold != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    var selectedAnnotationIsItalic = false {
+        didSet {
+            guard selectedAnnotationIsItalic != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    var selectedAnnotationFontFamily: String? {
+        didSet {
+            guard selectedAnnotationFontFamily != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    /// 选中的标注是否为聚光灯及当前压暗透明度。
+    var selectedAnnotationIsSpotlight = false {
+        didSet {
+            guard selectedAnnotationIsSpotlight != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    var selectedAnnotationSpotlightDimOpacity: Double? {
+        didSet {
+            guard selectedAnnotationSpotlightDimOpacity != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    /// 二级气泡面板相对主栏的展开方向（向下或向上翻转）。
+    var panelPlacement: AnnotationToolbarLayout.PanelPlacement = .below {
+        didSet {
+            guard panelPlacement != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    /// 用户隐藏的主工具栏槽位集合。
+    var hiddenSlots: Set<String> = [] {
+        didSet {
+            guard hiddenSlots != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
     /// 选中的标注是否支持马赛克打码效果切换（像素化 / 高斯模糊）。
     var selectedAnnotationSupportsMosaicEffect = false {
         didSet {
@@ -203,6 +272,16 @@ final class AnnotationToolbarView: NSView {
     var onSelectMosaicBrushDiameter: ((Double) -> Void)?
     /// 切换手绘风格。
     var onToggleSketchy: (() -> Void)?
+    /// 切换矩形/椭圆填充。
+    var onToggleFill: (() -> Void)?
+    /// 切换文字粗体 / 斜体 / 循环字体族。
+    var onToggleTextBold: (() -> Void)?
+    var onToggleTextItalic: (() -> Void)?
+    var onCycleTextFontFamily: (() -> Void)?
+    /// 选择聚光灯焦点外压暗透明度。
+    var onSelectSpotlightDimOpacity: ((Double) -> Void)?
+    /// 一键取消并退出覆盖层。
+    var onCancel: (() -> Void)?
     var onUndo: (() -> Void)?
     var onRedo: (() -> Void)?
     var onRecord: (() -> Void)?
@@ -304,7 +383,11 @@ final class AnnotationToolbarView: NSView {
         input.selectedAnnotationSupportsColor = selectedAnnotationSupportsColor
         input.selectedAnnotationSupportsLineWidth = selectedAnnotationSupportsLineWidth
         input.selectedAnnotationSupportsSketchy = selectedAnnotationSupportsSketchy
+        input.selectedAnnotationSupportsFill = selectedAnnotationSupportsFill
+        input.selectedAnnotationIsSpotlight = selectedAnnotationIsSpotlight
         input.selectedAnnotationSupportsMosaicEffect = selectedAnnotationSupportsMosaicEffect
+        input.panelPlacement = panelPlacement
+        input.hiddenSlots = hiddenSlots
         return input
     }
 
@@ -369,9 +452,18 @@ final class AnnotationToolbarView: NSView {
         renderer.selectedAnnotationSupportsLineWidth = selectedAnnotationSupportsLineWidth
         renderer.selectedAnnotationSupportsSketchy = selectedAnnotationSupportsSketchy
         renderer.selectedAnnotationIsSketchy = selectedAnnotationIsSketchy
+        renderer.selectedAnnotationSupportsFill = selectedAnnotationSupportsFill
+        renderer.selectedAnnotationIsFilled = selectedAnnotationIsFilled
+        renderer.selectedAnnotationIsBold = selectedAnnotationIsBold
+        renderer.selectedAnnotationIsItalic = selectedAnnotationIsItalic
+        renderer.selectedAnnotationFontFamily = selectedAnnotationFontFamily
+        renderer.selectedAnnotationIsSpotlight = selectedAnnotationIsSpotlight
+        renderer.selectedAnnotationSpotlightDimOpacity = selectedAnnotationSpotlightDimOpacity
         renderer.selectedAnnotationSupportsMosaicEffect = selectedAnnotationSupportsMosaicEffect
         renderer.selectedAnnotationMosaicMode = selectedAnnotationMosaicMode
         renderer.selectedAnnotationMosaicBlockSize = selectedAnnotationMosaicBlockSize
+        renderer.panelPlacement = panelPlacement
+        renderer.hiddenSlots = hiddenSlots
         renderer.hoveredKind = hoveredKind
         renderer.draw(in: context)
     }
@@ -597,6 +689,21 @@ final class AnnotationToolbarView: NSView {
         case .sketchyToggle:
             onToggleSketchy?()
 
+        case .fillToggle:
+            onToggleFill?()
+
+        case .textBoldToggle:
+            onToggleTextBold?()
+
+        case .textItalicToggle:
+            onToggleTextItalic?()
+
+        case .textFontFamily:
+            onCycleTextFontFamily?()
+
+        case let .spotlightDimOpacity(opacity):
+            onSelectSpotlightDimOpacity?(opacity)
+
         case let .mosaicBlockSize(size):
             onSelectMosaicBlockSize?(size)
 
@@ -630,6 +737,9 @@ final class AnnotationToolbarView: NSView {
 
         case .save:
             onSave?()
+
+        case .cancel:
+            onCancel?()
 
         case .deleteSelected:
             onDeleteSelected?()
@@ -678,6 +788,16 @@ final class AnnotationToolbarView: NSView {
             return "打码效果：\(AnnotationToolbarLayout.mosaicEffectLabel(mode))"
         case .sketchyToggle:
             return "手绘风格"
+        case .fillToggle:
+            return "形状填充"
+        case .textBoldToggle:
+            return "粗体"
+        case .textItalicToggle:
+            return "斜体"
+        case .textFontFamily:
+            return "切换字体"
+        case let .spotlightDimOpacity(opacity):
+            return "聚光灯压暗度 \(AnnotationToolbarLayout.spotlightOpacityLabel(opacity))"
         case let .mosaicBlockSize(size):
             let index = AnnotationStyle.mosaicBlockSizes.firstIndex(of: size) ?? 0
             if mosaicEffectMode == .blur {
@@ -706,6 +826,8 @@ final class AnnotationToolbarView: NSView {
             return "复制截图 (⌘C / Enter)"
         case .save:
             return "保存截图 (⌘S)"
+        case .cancel:
+            return "取消截图 (Esc)"
         case .record:
             return "录制选区"
         case .longScreenshot:

@@ -55,9 +55,18 @@ final class AnnotationToolbarRenderer {
     var selectedAnnotationSupportsLineWidth = true
     var selectedAnnotationSupportsSketchy = false
     var selectedAnnotationIsSketchy = false
+    var selectedAnnotationSupportsFill = false
+    var selectedAnnotationIsFilled = false
+    var selectedAnnotationIsBold = false
+    var selectedAnnotationIsItalic = false
+    var selectedAnnotationFontFamily: String?
+    var selectedAnnotationIsSpotlight = false
+    var selectedAnnotationSpotlightDimOpacity: Double?
     var selectedAnnotationSupportsMosaicEffect = false
     var selectedAnnotationMosaicMode: MosaicMode?
     var selectedAnnotationMosaicBlockSize: Double?
+    var panelPlacement: AnnotationToolbarLayout.PanelPlacement = .below
+    var hiddenSlots: Set<String> = []
     var hoveredKind: AnnotationToolbarLayout.Kind?
 
     // MARK: - 布局
@@ -76,7 +85,11 @@ final class AnnotationToolbarRenderer {
         input.selectedAnnotationSupportsColor = selectedAnnotationSupportsColor
         input.selectedAnnotationSupportsLineWidth = selectedAnnotationSupportsLineWidth
         input.selectedAnnotationSupportsSketchy = selectedAnnotationSupportsSketchy
+        input.selectedAnnotationSupportsFill = selectedAnnotationSupportsFill
+        input.selectedAnnotationIsSpotlight = selectedAnnotationIsSpotlight
         input.selectedAnnotationSupportsMosaicEffect = selectedAnnotationSupportsMosaicEffect
+        input.panelPlacement = panelPlacement
+        input.hiddenSlots = hiddenSlots
         return input
     }
 
@@ -112,29 +125,54 @@ final class AnnotationToolbarRenderer {
     }
 
     private func drawBarBackground(_ size: CGSize, in context: CGContext) {
+        let originY = layoutInput.barOriginY
         fillRoundedRect(
-            CGRect(origin: .zero, size: size),
+            CGRect(origin: CGPoint(x: 0, y: originY), size: size),
             radius: 9,
-            color: NSColor.black.withAlphaComponent(0.82),
+            color: NSColor.black.withAlphaComponent(0.84),
             in: context
         )
     }
 
+    /// 绘制二级气泡面板背景及指向当前激活工具图标中心的 `▲`/`▼` 尖角。
     private func drawPanelBackground(_ size: CGSize, in context: CGContext) {
         guard size.height > 0 else { return }
-        let bar = barSize
+        let input = layoutInput
         let rect = CGRect(
             x: 0,
-            y: bar.height + itemSpacing,
+            y: input.panelOriginY,
             width: size.width,
             height: size.height
         )
+        let panelColor = NSColor.black.withAlphaComponent(0.78)
         fillRoundedRect(
             rect,
             radius: 8,
-            color: NSColor.black.withAlphaComponent(0.74),
+            color: panelColor,
             in: context
         )
+
+        // 绘制气泡尖角：向下展开时尖角朝上指向主栏工具图标；向上翻转时尖角朝下指向主栏工具图标。
+        let anchorX = input.panelAnchorX()
+        let halfW = AnnotationToolbarLayout.panelArrowWidth / 2
+        let arrowH = AnnotationToolbarLayout.panelArrowHeight
+        let arrowPath = CGMutablePath()
+        switch input.panelPlacement {
+        case .below:
+            arrowPath.move(to: CGPoint(x: anchorX - halfW, y: rect.minY))
+            arrowPath.addLine(to: CGPoint(x: anchorX, y: rect.minY - arrowH))
+            arrowPath.addLine(to: CGPoint(x: anchorX + halfW, y: rect.minY))
+        case .above:
+            arrowPath.move(to: CGPoint(x: anchorX - halfW, y: rect.maxY))
+            arrowPath.addLine(to: CGPoint(x: anchorX, y: rect.maxY + arrowH))
+            arrowPath.addLine(to: CGPoint(x: anchorX + halfW, y: rect.maxY))
+        }
+        arrowPath.closeSubpath()
+        context.saveGState()
+        context.setFillColor(panelColor.cgColor)
+        context.addPath(arrowPath)
+        context.fillPath()
+        context.restoreGState()
     }
 
     private func fillRoundedRect(
@@ -196,7 +234,8 @@ final class AnnotationToolbarRenderer {
     private static func drawsItemHighlight(_ kind: Kind) -> Bool {
         switch kind {
         case .lineWidthSlider, .arrowHeadScaleSlider, .mosaicBrushDiameterSlider,
-             .color, .magnifierZoom, .mosaicMode, .mosaicEffectMode:
+             .color, .magnifierZoom, .mosaicMode, .mosaicEffectMode,
+             .textFontFamily, .spotlightDimOpacity:
             return false
         default:
             return true
@@ -297,6 +336,38 @@ final class AnnotationToolbarRenderer {
         case .sketchyToggle:
             drawSketchyToggleGlyph(rect: rect, alpha: alpha, in: context)
 
+        case .fillToggle:
+            drawFillToggleGlyph(rect: rect, isFilled: selected, alpha: alpha, in: context)
+
+        case .textBoldToggle:
+            drawTypographicBadge("B", bold: true, italic: false, rect: rect, alpha: alpha, in: context)
+
+        case .textItalicToggle:
+            drawTypographicBadge("I", bold: false, italic: true, rect: rect, alpha: alpha, in: context)
+
+        case .textFontFamily:
+            let activeFamily = (hasSelectedAnnotation && selectedAnnotationIsText)
+                ? (selectedAnnotationFontFamily ?? style.textFontFamily)
+                : style.textFontFamily
+            drawTextButton(
+                AnnotationToolbarLayout.fontFamilyLabel(activeFamily),
+                rect: rect,
+                isSelected: false,
+                isHovered: hover,
+                alpha: alpha,
+                in: context
+            )
+
+        case let .spotlightDimOpacity(opacity):
+            drawTextButton(
+                AnnotationToolbarLayout.spotlightOpacityLabel(opacity),
+                rect: rect,
+                isSelected: selected,
+                isHovered: hover,
+                alpha: alpha,
+                in: context
+            )
+
         case let .mosaicBlockSize(size):
             drawMosaicBlockSizeGlyph(size, rect: rect, alpha: alpha, in: context)
 
@@ -329,6 +400,9 @@ final class AnnotationToolbarRenderer {
 
         case .save:
             drawSaveGlyph(rect: rect, alpha: alpha, in: context)
+
+        case .cancel:
+            drawSymbolGlyph("xmark", rect: rect, alpha: alpha, scale: 0.46, in: context)
 
         case .deleteSelected:
             // 垃圾桶符号：与其它「结束/破坏性」动作一样用系统符号，
@@ -404,12 +478,32 @@ final class AnnotationToolbarRenderer {
             }
             return style.mosaicEffectMode == mode
         case .sketchyToggle:
-            if tool == .pointer, hasSelectedAnnotation {
+            if hasSelectedAnnotation, selectedAnnotationSupportsSketchy {
                 return selectedAnnotationIsSketchy
             }
             return style.shapeIsSketchy
+        case .fillToggle:
+            if hasSelectedAnnotation, selectedAnnotationSupportsFill {
+                return selectedAnnotationIsFilled
+            }
+            return style.shapeFilled
+        case .textBoldToggle:
+            if hasSelectedAnnotation, selectedAnnotationIsText {
+                return selectedAnnotationIsBold
+            }
+            return style.textBold
+        case .textItalicToggle:
+            if hasSelectedAnnotation, selectedAnnotationIsText {
+                return selectedAnnotationIsItalic
+            }
+            return style.textItalic
+        case let .spotlightDimOpacity(opacity):
+            let active = (hasSelectedAnnotation && selectedAnnotationIsSpotlight)
+                ? (selectedAnnotationSpotlightDimOpacity ?? style.spotlightDimOpacity)
+                : style.spotlightDimOpacity
+            return abs(active - opacity) < 0.03
         case let .mosaicBlockSize(size):
-            if tool == .pointer, hasSelectedAnnotation, let selectedAnnotationMosaicBlockSize {
+            if hasSelectedAnnotation, selectedAnnotationSupportsMosaicEffect, let selectedAnnotationMosaicBlockSize {
                 return abs(selectedAnnotationMosaicBlockSize - size) < 0.01
             }
             return abs(style.mosaicBlockSize - size) < 0.01
@@ -422,8 +516,8 @@ final class AnnotationToolbarRenderer {
         case .mosaicBrushDiameterSlider:
             // 与其余滑块同理：连续值没有「选中档位」这回事。
             return false
-        case .colorButton, .colorPicker, .undo, .redo, .copy, .save, .record, .longScreenshot,
-             .recognizeText, .pin, .deleteSelected:
+        case .colorButton, .colorPicker, .undo, .redo, .copy, .save, .cancel, .record, .longScreenshot,
+             .recognizeText, .pin, .deleteSelected, .textFontFamily:
             return false
         }
     }
@@ -1358,6 +1452,9 @@ final class AnnotationToolbarRenderer {
         case .curvedArrow:
             drawCurvedArrowGlyph(box: box, alpha: alpha, in: context)
 
+        case .spotlight:
+            drawSpotlightGlyph(box: box, alpha: alpha, in: context)
+
         case .pointer, .text, .mosaic, .magnifier:
             // 这四个不属于形状组，两个调用方都先按 family 分派，正常路径到不了这里。
             // 仍然显式列出（而不是交给 `default`）的理由见方法头。
@@ -1375,6 +1472,80 @@ final class AnnotationToolbarRenderer {
     /// 椭圆：一个水平微扁的空心椭圆（区别于编号的圆形外框）。
     private func drawEllipseGlyph(box: CGRect, in context: CGContext) {
         context.strokeEllipse(in: box.insetBy(dx: 0.4, dy: 2.2))
+    }
+
+    /// 聚光灯：外层柔和暗框 + 中央高亮聚焦圆角窗，清晰表达“焦点亮、四周暗”。
+    private func drawSpotlightGlyph(box: CGRect, alpha: CGFloat, in context: CGContext) {
+        let outer = CGPath(roundedRect: box, cornerWidth: 2.5, cornerHeight: 2.5, transform: nil)
+        let innerRect = box.insetBy(dx: 3.4, dy: 3.4)
+        let inner = CGPath(roundedRect: innerRect, cornerWidth: 2.0, cornerHeight: 2.0, transform: nil)
+
+        let maskPath = CGMutablePath()
+        maskPath.addPath(outer)
+        maskPath.addPath(inner)
+
+        context.saveGState()
+        context.setFillColor(NSColor.white.withAlphaComponent(alpha * 0.45).cgColor)
+        context.addPath(maskPath)
+        context.fillPath(using: .evenOdd)
+
+        context.setStrokeColor(NSColor.white.withAlphaComponent(alpha).cgColor)
+        context.setLineWidth(1.5)
+        context.addPath(inner)
+        context.strokePath()
+        context.restoreGState()
+    }
+
+    /// 填充开关：描边方框内带实心/半透明填充色块。
+    private func drawFillToggleGlyph(rect: CGRect, isFilled: Bool, alpha: CGFloat, in context: CGContext) {
+        let box = iconBox(in: rect).insetBy(dx: 1, dy: 1)
+        let path = CGPath(roundedRect: box, cornerWidth: 2.5, cornerHeight: 2.5, transform: nil)
+        context.saveGState()
+        context.addPath(path)
+        context.setFillColor(
+            NSColor.white.withAlphaComponent(isFilled ? alpha * 0.65 : alpha * 0.22).cgColor
+        )
+        context.fillPath()
+        context.addPath(path)
+        context.setStrokeColor(NSColor.white.withAlphaComponent(alpha).cgColor)
+        context.setLineWidth(1.5)
+        context.strokePath()
+        context.restoreGState()
+    }
+
+    /// 文字粗体 `B` / 斜体 `I` 紧凑字形按钮。
+    private func drawTypographicBadge(
+        _ symbol: String,
+        bold: Bool,
+        italic: Bool,
+        rect: CGRect,
+        alpha: CGFloat,
+        in context: CGContext
+    ) {
+        let baseFont: NSFont = bold
+            ? .systemFont(ofSize: 13.5, weight: .bold)
+            : .systemFont(ofSize: 13.5, weight: .medium)
+        let font: NSFont
+        if italic {
+            font = NSFontManager.shared.convert(baseFont, toHaveTrait: .italicFontMask)
+        } else {
+            font = baseFont
+        }
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.white.withAlphaComponent(alpha),
+        ]
+        let attributed = NSAttributedString(string: symbol, attributes: attrs)
+        let size = attributed.size()
+        let drawOrigin = CGPoint(
+            x: rect.midX - size.width / 2,
+            y: rect.midY - size.height / 2
+        )
+        NSGraphicsContext.saveGraphicsState()
+        let nsContext = NSGraphicsContext(cgContext: context, flipped: true)
+        NSGraphicsContext.current = nsContext
+        attributed.draw(at: drawOrigin)
+        NSGraphicsContext.restoreGraphicsState()
     }
 
     /// 手绘风格开关：双描边微扰手绘方框，体现随手勾勒效果。

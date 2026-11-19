@@ -593,6 +593,7 @@ private final class SettingsViewController: NSViewController {
             cards = [
                 makeShortcutCard(),
                 makeDirectActionCard(),
+                makeCaptureInteractionCard(),
                 makeLaunchAtLoginCard(),
             ]
         case .save:
@@ -1021,6 +1022,98 @@ private final class SettingsViewController: NSViewController {
     }
 
     // MARK: 启动卡片
+
+    /// 「截图与工具栏交互」卡片：独立窗体阴影、已有标注防误关保护与主工具栏槽位显隐。
+    private func makeCaptureInteractionCard() -> SettingsCardView {
+        let shadowRow = SettingsToggleRow(
+            title: "独立窗体截图合成柔和阴影",
+            subtitle: "窗体模式下按住 ⌥ 单击可临时切换无阴影"
+        )
+        shadowRow.toggle.state = settings.windowCaptureShadow ? .on : .off
+        shadowRow.toggle.target = self
+        shadowRow.toggle.action = #selector(windowCaptureShadowChanged(_:))
+
+        let cancelGuardRow = SettingsToggleRow(
+            title: "已有标注时双按 Esc 防误关",
+            subtitle: "画有标注后首次按 Esc 或右键仅轻提示，1.8 秒内再按才退出"
+        )
+        cancelGuardRow.toggle.state = settings.confirmCancelWithAnnotations ? .on : .off
+        cancelGuardRow.toggle.target = self
+        cancelGuardRow.toggle.action = #selector(confirmCancelChanged(_:))
+
+        let slotTitle = NSTextField(labelWithString: "主工具栏快捷项显示（隐藏不禁用快捷键）")
+        slotTitle.font = .systemFont(ofSize: 12, weight: .medium)
+        slotTitle.textColor = .secondaryLabelColor
+        slotTitle.translatesAutoresizingMaskIntoConstraints = false
+
+        let slotGrid = NSStackView()
+        slotGrid.orientation = .vertical
+        slotGrid.alignment = .leading
+        slotGrid.spacing = 6
+        slotGrid.translatesAutoresizingMaskIntoConstraints = false
+
+        let catalog = AnnotationToolbarLayout.customizableSlotCatalog
+        let rowCount = (catalog.count + 2) / 3
+        for rowIndex in 0 ..< rowCount {
+            let start = rowIndex * 3
+            let end = min(start + 3, catalog.count)
+            let line = NSStackView()
+            line.orientation = .horizontal
+            line.alignment = .centerY
+            line.spacing = 14
+            for item in catalog[start ..< end] {
+                let checkbox = NSButton(
+                    checkboxWithTitle: item.title,
+                    target: self,
+                    action: #selector(toolbarSlotToggled(_:))
+                )
+                checkbox.identifier = NSUserInterfaceItemIdentifier(item.id)
+                checkbox.font = .systemFont(ofSize: 12)
+                checkbox.state = settings.toolbarHiddenSlots.contains(item.id) ? .off : .on
+                line.addArrangedSubview(checkbox)
+            }
+            slotGrid.addArrangedSubview(line)
+        }
+
+        let firstSep = NSBox()
+        firstSep.boxType = .separator
+        let secondSep = NSBox()
+        secondSep.boxType = .separator
+
+        let content = NSStackView(views: [
+            shadowRow,
+            firstSep,
+            cancelGuardRow,
+            secondSep,
+            slotTitle,
+            slotGrid,
+        ])
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 10
+        for subview in content.arrangedSubviews {
+            subview.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        }
+
+        return SettingsCardView(
+            symbolName: "slider.horizontal.3",
+            title: "截图与工具栏",
+            content: content
+        )
+    }
+
+    @objc private func windowCaptureShadowChanged(_ sender: NSSwitch) {
+        settings.setWindowCaptureShadow(sender.state == .on)
+    }
+
+    @objc private func confirmCancelChanged(_ sender: NSSwitch) {
+        settings.setConfirmCancelWithAnnotations(sender.state == .on)
+    }
+
+    @objc private func toolbarSlotToggled(_ sender: NSButton) {
+        guard let slotID = sender.identifier?.rawValue else { return }
+        settings.setToolbarSlot(slotID, visible: sender.state == .on)
+    }
 
     /// 「启动」卡片：登录时自动启动。
     ///

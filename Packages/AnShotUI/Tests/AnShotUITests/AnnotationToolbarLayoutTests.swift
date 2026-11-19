@@ -172,13 +172,13 @@ struct AnnotationToolbarLayoutBarTests {
         #expect(items.first { $0.kind == .redo }?.isEnabled == true)
     }
 
-    @Test("导出组恒存在且顺序固定，排在历史组之后")
+    @Test("导出组恒存在且顺序固定，排在历史组之后（含一键取消按钮）")
     func exportGroupFollowsHistoryInFixedOrder() {
         let (items, _) = makeFullLayout()
         let sorted = items.sorted { $0.rect.minX < $1.rect.minX }
         let kinds = sorted.map(\.kind)
         let expectedTail: [AnnotationToolbarLayout.Kind] = [
-            .undo, .redo, .record, .longScreenshot, .recognizeText, .pin, .copy, .save
+            .undo, .redo, .record, .longScreenshot, .recognizeText, .pin, .copy, .save, .cancel
         ]
         #expect(
             Array(kinds.suffix(expectedTail.count)) == expectedTail,
@@ -325,7 +325,7 @@ struct AnnotationToolbarPointerPanelTests {
     func panelItemsLiveBelowBar() {
         let layout = makePointerLayout(selected: true)
         let (items, size) = layout.layoutPanel()
-        let panelTop = AnnotationToolbarLayout.barHeight + AnnotationToolbarLayout.itemSpacing
+        let panelTop = AnnotationToolbarLayout.barHeight + AnnotationToolbarLayout.panelGap
 
         for item in items {
             #expect(item.rect.minY >= panelTop, "\(item.kind) 跑进了主栏")
@@ -335,7 +335,7 @@ struct AnnotationToolbarPointerPanelTests {
             )
         }
         #expect(layout.toolbarSize.height == AnnotationToolbarLayout.barHeight
-            + AnnotationToolbarLayout.itemSpacing + AnnotationToolbarLayout.panelHeight)
+            + AnnotationToolbarLayout.panelGap + AnnotationToolbarLayout.panelHeight)
     }
 
     @Test("选中与否不影响主栏布局")

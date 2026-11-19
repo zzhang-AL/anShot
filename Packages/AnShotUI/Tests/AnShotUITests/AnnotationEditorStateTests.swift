@@ -759,6 +759,8 @@ struct AnnotationEditorMoveTests {
     func moveWithoutSelectionDoesNothing() {
         let editor = AnnotationEditorState(selection: makeRect(0, 0, 200, 200))
         drawRectangle(editor, from: PixelPoint(x: 10, y: 10), to: PixelPoint(x: 40, y: 40))
+        // 绘制优先契约下刚提交的新标注会自动选中，这里显式取消选中再测无选中移动。
+        editor.clearAnnotationSelection()
         let before = editor.annotations[0]
         editor.moveSelected(by: PixelPoint(x: 10, y: 10))
         #expect(editor.annotations[0] == before)
@@ -795,6 +797,7 @@ struct AnnotationEditorDeleteTests {
     func deleteWithoutSelectionIsNoOp() {
         let editor = AnnotationEditorState(selection: makeRect(0, 0, 200, 200))
         drawRectangle(editor, from: PixelPoint(x: 10, y: 10), to: PixelPoint(x: 50, y: 40))
+        editor.clearAnnotationSelection()
         #expect(!editor.deleteSelected())
         #expect(editor.annotations.count == 1)
     }
@@ -1055,10 +1058,11 @@ struct AnnotationEditorEnhancementTests {
         #expect(editor.commitDraft())
 
         editor.select(.pointer)
-        // 1. 缩放矩形右下角
+        // 1. 缩放矩形右下角（矩形含 8 个缩放手柄 + 1 个圆角调节手柄 = 9 个）
         #expect(editor.selectAnnotation(at: PixelPoint(x: 20, y: 50), tolerance: 3))
         let rectHandles = AnnotationEditorState.controlHandles(for: editor.selectedAnnotation!)
-        #expect(rectHandles.count == 8)
+        #expect(rectHandles.count == 9)
+        #expect(rectHandles.contains(where: { $0.handle == .cornerRadius }))
         editor.updateSelectedControlHandle(.rect(.bottomRight), to: PixelPoint(x: 150, y: 100))
         guard case let .rectangle(resized, _, _, _) = editor.selectedAnnotation?.kind else {
             Issue.record("应为矩形")
@@ -1145,7 +1149,7 @@ struct AnnotationEditorEnhancementTests {
         editor.updateDraft(to: PixelPoint(x: 280, y: 100))
         #expect(editor.commitDraft())
 
-        guard case let .mosaic(_, mode, _) = editor.annotations.last?.kind else {
+        guard case let .mosaic(_, mode, _, _) = editor.annotations.last?.kind else {
             Issue.record("应生成马赛克标注")
             return
         }
@@ -1205,7 +1209,7 @@ struct AnnotationEditorEnhancementTests {
         editor.updateDraft(to: PixelPoint(x: 200, y: 120))
         #expect(editor.commitDraft())
 
-        guard case let .mosaic(_, _, intensity1x) = editor.annotations.last?.kind else {
+        guard case let .mosaic(_, _, intensity1x, _) = editor.annotations.last?.kind else {
             Issue.record("应生成框选马赛克标注")
             return
         }
@@ -1215,13 +1219,13 @@ struct AnnotationEditorEnhancementTests {
         editor.select(.pointer)
         #expect(editor.selectAnnotation(at: PixelPoint(x: 100, y: 80), tolerance: 4))
         editor.selectMosaicBlockSize(AnnotationStyle.mosaicBlockSizes[2], scaleFactor: 2)
-        guard case let .mosaic(_, _, updatedIntensity) = editor.annotations.last?.kind else {
+        guard case let .mosaic(_, _, updatedIntensity, _) = editor.annotations.last?.kind else {
             Issue.record("选中马赛克应保持马赛克类型")
             return
         }
         #expect(updatedIntensity == 56, "切换最高档后应立即更新选中标注为 56px")
         #expect(editor.undo())
-        guard case let .mosaic(_, _, restoredIntensity) = editor.annotations.last?.kind else {
+        guard case let .mosaic(_, _, restoredIntensity, _) = editor.annotations.last?.kind else {
             Issue.record("撤销后应回到马赛克标注")
             return
         }

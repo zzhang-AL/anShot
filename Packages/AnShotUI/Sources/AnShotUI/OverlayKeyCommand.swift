@@ -37,8 +37,10 @@ enum OverlayKeyCommand: Equatable {
     case pin
     /// ⌘D：复制当前选中的标注。
     case duplicate
-    /// 方向键微调（1px；按住 Shift 为 10px）。
+    /// 方向键微调位置（1px；按住 Shift 为 10px）。
     case nudge(dx: Int, dy: Int)
+    /// ⌥ + 方向键微调选区宽高（1px；按住 Shift 为 5px）。
+    case resizeSelection(dw: Int, dh: Int)
     /// 字母键：切换工具。
     case selectTool(AnnotationTool)
 
@@ -67,6 +69,18 @@ enum OverlayKeyCommand: Equatable {
         // 36 = 主键盘回车，76 = 小键盘回车
         if event.keyCode == 36 || event.keyCode == 76 {
             return .copy
+        }
+
+        // ⌥ + 方向键微调选区宽高（不含 ⌘/⌃；配 Shift 步长为 5）。
+        if flags.contains(.option), !flags.contains(.command), !flags.contains(.control) {
+            let step = flags.contains(.shift) ? 5 : 1
+            switch event.keyCode {
+            case 123: return .resizeSelection(dw: -step, dh: 0)
+            case 124: return .resizeSelection(dw: step, dh: 0)
+            case 125: return .resizeSelection(dw: 0, dh: step)
+            case 126: return .resizeSelection(dw: 0, dh: -step)
+            default: break
+            }
         }
 
         let hasCommandLike = flags.contains(.command)

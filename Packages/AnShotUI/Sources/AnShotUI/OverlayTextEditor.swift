@@ -106,7 +106,14 @@ final class OverlayTextEditor: NSObject, NSTextViewDelegate {
         }
 
         let safeScale = scaleFactor > 0 ? scaleFactor : 1
-        let font = NSFont.systemFont(ofSize: CGFloat(draft.fontSize))
+        // 复用模型层的字体描述符构造与导出同源的逻辑点字体（含字体族、粗体、斜体）。
+        let logicalDescriptor = FontDescriptor(
+            family: draft.fontFamily,
+            size: draft.fontSize,
+            weight: draft.isBold ? 700 : 400,
+            italic: draft.isItalic
+        )
+        let font = TextMetrics.font(for: logicalDescriptor) as NSFont
         let color = NSColor(
             srgbRed: CGFloat(draft.color.r),
             green: CGFloat(draft.color.g),

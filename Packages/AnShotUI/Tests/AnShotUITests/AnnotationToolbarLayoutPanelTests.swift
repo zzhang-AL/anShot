@@ -92,7 +92,7 @@ struct AnnotationToolbarLayoutPanelTests {
         //
         // 注意纵坐标的基准：`layoutPanel()` 会把面板条目整体下移一个偏移
         //（面板位于主栏下方），所以不是以 0 为基准、也不是以 `size.height` 为基准。
-        let offsetY = AnnotationToolbarLayout.barHeight + AnnotationToolbarLayout.itemSpacing
+        let offsetY = AnnotationToolbarLayout.barHeight + AnnotationToolbarLayout.panelGap
         for tool in [AnnotationTool.rectangle, .arrow, .curvedArrow, .numbering, .text, .mosaic] {
             let (items, size) = makePanel(tool: tool)
             let expectedMidY = offsetY + size.height / 2
@@ -164,18 +164,23 @@ struct AnnotationToolbarLayoutPanelTests {
         }
     }
 
-    @Test("线宽滑块对每个形状类工具恒存在")
-    func lineWidthSliderAlwaysPresentForShapeTools() {
-        // 只测 shape family。马赛克面板调的是块大小、文字面板调的是字号，
-        // 它们各有自己的主轴参数，不含线宽滑块是**正确**的。
+    @Test("线宽滑块仅在具备描边线宽的形状工具下出现，荧光笔与聚光灯移除无效滑块")
+    func lineWidthSliderMatchesToolCapabilities() {
         let shapeTools = AnnotationTool.tools(in: .shape)
         #expect(!shapeTools.isEmpty, "shape family 不应为空")
         for tool in shapeTools {
+            let hasSlider = makePanel(tool: tool).items.contains { $0.kind == .lineWidthSlider }
             #expect(
-                makePanel(tool: tool).items.contains { $0.kind == .lineWidthSlider },
-                "\(tool) 缺少线宽滑块"
+                hasSlider == tool.supportsLineWidth,
+                "\(tool) 线宽滑块存在性(\(hasSlider))应与 supportsLineWidth(\(tool.supportsLineWidth)) 一致"
             )
         }
+        #expect(!makePanel(tool: .highlight).items.contains { $0.kind == .lineWidthSlider })
+        #expect(!makePanel(tool: .spotlight).items.contains { $0.kind == .lineWidthSlider })
+        #expect(makePanel(tool: .spotlight).items.contains {
+            if case .spotlightDimOpacity = $0.kind { return true }
+            return false
+        })
     }
 
     @Test("色卡数量与调色板一致，且每张都是色卡尺寸")

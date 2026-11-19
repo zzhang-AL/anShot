@@ -21,8 +21,8 @@ struct UITestTargetSmokeTests {
     @Test("能访问 AnShotUI 的内部类型")
     func canAccessInternalTypes() {
         // AnnotationTool 是 internal（非 public）：能取到它就证明
-        // @testable import 生效，这是本 target 存在的全部前提（含椭圆工具共 13 种）。
-        #expect(AnnotationTool.allCases.count == 13)
+        // @testable import 生效，这是本 target 存在的全部前提（含椭圆与聚光灯工具共 14 种）。
+        #expect(AnnotationTool.allCases.count == 14)
     }
 
     @Test("标注工具的家族划分与二级面板内容一致")

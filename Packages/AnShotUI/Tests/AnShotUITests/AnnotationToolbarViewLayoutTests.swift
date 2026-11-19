@@ -138,7 +138,7 @@ struct AnnotationToolbarViewLayoutTests {
         }
         let expectedY =
             AnnotationToolbarLayout.barHeight
-            + AnnotationToolbarLayout.itemSpacing
+            + AnnotationToolbarLayout.panelGap
             + AnnotationToolbarLayout.panelHeight / 2
         for (kind, center) in panelCenters {
             #expect(abs(center.y - expectedY) < 0.5, "\(kind) 不在面板的纵向中心线上")
@@ -146,7 +146,7 @@ struct AnnotationToolbarViewLayoutTests {
         #expect(panelCenters.values.map(\.y).min() ?? 0 > barMaxY)
     }
 
-    @Test("工具栏高度 = 栏高（无面板时）或 栏高 + 间距 + 面板高")
+    @Test("工具栏高度 = 栏高（无面板时）或 栏高 + 气泡间距 + 面板高")
     func toolbarSizeCombinesBarAndPanel() {
         let noPanel = Self.makeToolbar(tool: .pointer)
         #expect(noPanel.toolbarSize.height == AnnotationToolbarLayout.barHeight)
@@ -154,7 +154,7 @@ struct AnnotationToolbarViewLayoutTests {
         let withPanel = Self.makeToolbar(tool: .rectangle)
         #expect(
             withPanel.toolbarSize.height == AnnotationToolbarLayout.barHeight
-                + AnnotationToolbarLayout.itemSpacing
+                + AnnotationToolbarLayout.panelGap
                 + AnnotationToolbarLayout.panelHeight)
         // 面板比主栏宽时取面板宽，否则取主栏宽。
         #expect(

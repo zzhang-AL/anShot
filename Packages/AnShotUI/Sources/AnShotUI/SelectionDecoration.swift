@@ -48,9 +48,8 @@ struct SelectionDecoration {
 
     /// 角手柄的不可见命中半径。
     ///
-    /// 必须覆盖整条**可见**的括号：可见范围沿边界到角点约 17.5pt
-    /// （臂长 16 + 端点圆帽），取 20pt 保证「看得见的都点得到」。
-    let cornerHitRadius: CGFloat = 20
+    /// 收窄至 12pt，与中点手柄一致：兼顾边角拖拽容错，同时显著降低贴近选区四角绘制标注时的误触。
+    let cornerHitRadius: CGFloat = 12
 
     /// 中点手柄的不可见命中半径。
     let midpointHitRadius: CGFloat = 12

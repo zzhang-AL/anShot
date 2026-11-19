@@ -219,6 +219,54 @@ final class OverlayView: NSView {
     /// 上一条已记录的识别结果，用于给日志去重。
     private var lastDetectionDescription: String?
 
+    /// 应用设置（用于读取防误关双按 Esc 开关与工具栏隐藏槽位）。
+    weak var appSettings: AppSettings?
+
+    /// 独立窗体捕获模式（未框选态按 `Space` 切换，或由菜单栏「窗体截图」直达）。
+    var isWindowPickerMode = false {
+        didSet {
+            guard isWindowPickerMode != oldValue else { return }
+            if !isWindowPickerMode {
+                windowPickerCandidates = []
+                windowPickerIndex = 0
+                lastWindowPickerPoint = nil
+            }
+            needsDisplay = true
+            refreshToolbar()
+        }
+    }
+
+    /// 窗体模式开关变化回调（供控制器同步多显示器窗口状态与最大化抑制开关）。
+    var onWindowPickerModeChanged: ((Bool) -> Void)?
+
+    /// 窗体模式下单击确认捕获某个窗口（参数：目标窗口、是否按住 `⌥` 反转阴影）。
+    var onWindowPickerCommit: ((DetectionTarget, Bool) -> Void)?
+
+    /// 光标下方按 Z-order 排序的窗口候选栈与当前穿透下标（供 `Tab`/`⇧Tab` 切换）。
+    private var windowPickerCandidates: [DetectionTarget] = []
+    private var windowPickerIndex: Int = 0
+    private var lastWindowPickerPoint: CGPoint?
+
+    /// 等比缩放选区（按住 `Shift`）时记录的初始选区快照。
+    private var resizingInitialRect: CGRect?
+
+    /// 确认态下是否正按住空格键用于平移整个选区。
+    private var isSpaceKeyPressed = false
+
+    /// 绘图工具下按下瞬间命中的已有标注与起点（用于松手位移 < 3pt 时原地选中该标注）。
+    private var pendingDrawingHitAnnotationID: UUID?
+    private var pendingDrawingDownPoint: CGPoint?
+
+    /// 双按 `Esc` 防误关的上次提醒时间戳。
+    private var lastCancelPromptTime: ContinuousClock.Instant?
+
+    /// 滚轮微调参数的平滑累积器，避免触控板微滑连跳多档。
+    private var wheelDeltaAccumulator: CGFloat = 0
+
+    /// 编号标注双击就地编辑数字的轻量输入框。
+    private var numberingEditorField: NSTextField?
+    private var editingNumberingAnnotationID: UUID?
+
     /// 取消回调（无选区时按 ESC，或右键）。
     var onCancel: (() -> Void)?
 
@@ -342,8 +390,11 @@ final class OverlayView: NSView {
     }
 
     private var interaction: Interaction = .idle {
-        // 活动手柄需要重绘才能显示强调色
-        didSet { needsDisplay = true }
+        // 活动手柄需要重绘才能显示强调色；选区拖拽起止需即时隐显工具栏。
+        didSet {
+            needsDisplay = true
+            refreshToolbar()
+        }
     }
 
     /// 正在被拖动的手柄（无则为 nil）。
@@ -615,6 +666,24 @@ final class OverlayView: NSView {
         view.onToggleSketchy = { [weak self] in
             self?.editorState?.toggleSketchy()
         }
+        view.onToggleFill = { [weak self] in
+            self?.editorState?.toggleShapeFilled()
+        }
+        view.onToggleTextBold = { [weak self] in
+            self?.editorState?.toggleTextBold()
+        }
+        view.onToggleTextItalic = { [weak self] in
+            self?.editorState?.toggleTextItalic()
+        }
+        view.onCycleTextFontFamily = { [weak self] in
+            self?.editorState?.cycleTextFontFamily()
+        }
+        view.onSelectSpotlightDimOpacity = { [weak self] opacity in
+            self?.editorState?.selectSpotlightDimOpacity(opacity)
+        }
+        view.onCancel = { [weak self] in
+            self?.requestCancel(source: .toolbar)
+        }
         view.onSelectMosaicBlockSize = { [weak self] size in
             guard let self else { return }
             self.editorState?.selectMosaicBlockSize(size, scaleFactor: self.backdropScale)
@@ -699,15 +768,18 @@ final class OverlayView: NSView {
 
     /// 按当前选区重新摆放工具栏，并同步它显示的状态。
     ///
-    /// 工具栏只在「有选区」时出现：没有选区就没有可标注的目标。
+    /// 候选态、拖拽新建/移动/缩放选区及窗体选择模式全程隐藏工具栏；
+    /// 仅当选区已确认且未在拖拽选区时展示。
     func refreshToolbar() {
-        // 准备阶段收起工具栏：它是本视图的子视图，自己就能接到点击，
-        // 父视图的 `mouseDown` 守卫拦不住「点到了按钮」这件事。
-        if isRecordSetupActive || hidesToolbarForIntent {
+        if isRecordSetupActive || hidesToolbarForIntent || isWindowPickerMode {
             toolbar.isHidden = true
             return
         }
-        guard let editorState, let selection = effectiveSelection, backdrop != nil else {
+        guard let editorState,
+              editorState.isSelectionConfirmed,
+              !isAdjustingSelectionRect,
+              let selection = effectiveSelection,
+              backdrop != nil else {
             toolbar.isHidden = true
             return
         }
@@ -717,9 +789,6 @@ final class OverlayView: NSView {
         }
 
         toolbar.tool = editorState.tool
-        // 候选态不让任何工具显示为「选中」：此刻会话的真实状态是
-        // 「还在确定选区」，把指针画成选中会让用户以为现在是移动模式
-        // ——这正是用户反馈的困惑来源。
         toolbar.showsToolSelection = editorState.isSelectionConfirmed
         toolbar.style = editorState.style
         toolbar.canUndo = editorState.canUndo
@@ -737,14 +806,22 @@ final class OverlayView: NSView {
         toolbar.selectedAnnotationSupportsLineWidth = capabilities.lineWidth
         toolbar.selectedAnnotationSupportsSketchy = editorState.selectedAnnotationSupportsSketchy
         toolbar.selectedAnnotationIsSketchy = editorState.selectedAnnotationIsSketchy
+        toolbar.selectedAnnotationSupportsFill = editorState.selectedAnnotationSupportsFill
+        toolbar.selectedAnnotationIsFilled = editorState.selectedAnnotationIsFilled
+        toolbar.selectedAnnotationIsBold = editorState.selectedAnnotationIsBold
+        toolbar.selectedAnnotationIsItalic = editorState.selectedAnnotationIsItalic
+        toolbar.selectedAnnotationFontFamily = editorState.selectedAnnotationFontFamily
+        toolbar.selectedAnnotationIsSpotlight = editorState.selectedAnnotationIsSpotlight
+        toolbar.selectedAnnotationSpotlightDimOpacity = editorState.selectedAnnotationSpotlightDimOpacity
         toolbar.selectedAnnotationSupportsMosaicEffect = editorState.selectedAnnotationSupportsMosaicEffect
         toolbar.selectedAnnotationMosaicMode = editorState.selectedAnnotationMosaicMode
         toolbar.selectedAnnotationMosaicBlockSize = editorState.selectedAnnotationMosaicIntensity.map {
             AnnotationStyle.logicalMosaicBlockSize(forPixelIntensity: $0, scaleFactor: backdropScale)
         }
+        toolbar.hiddenSlots = appSettings?.toolbarHiddenSlots ?? []
         toolbar.isHidden = false
 
-        // 输入中的文字也要跟随面板设置：改字号/颜色后，
+        // 输入中的文字也要跟随面板设置：改字号/颜色/粗斜体后，
         // 输入控件里的字必须立刻变，否则「看到的」与「提交的」不一致。
         syncTextEditor()
 
@@ -753,10 +830,20 @@ final class OverlayView: NSView {
             customToolbarOrigin = nil
         }
 
-        let size = toolbar.toolbarSize
         let gap: CGFloat = 8
         let safeInsets = effectiveSafeAreaInsets
         let layoutBounds = toolbarLayoutBounds
+        let initialSize = toolbar.toolbarSize
+        toolbar.panelPlacement = AnnotationToolbarLayout.preferredPanelPlacement(
+            selection: selection,
+            toolbarSize: initialSize,
+            labelReserve: decoration.labelHeight + gap,
+            viewBounds: layoutBounds,
+            gap: gap,
+            safeInsets: safeInsets
+        )
+
+        let size = toolbar.toolbarSize
         let origin: CGPoint
         if let customToolbarOrigin {
             origin = clampedToolbarOrigin(
@@ -778,6 +865,16 @@ final class OverlayView: NSView {
             )
         }
         toolbar.frame = CGRect(origin: origin, size: size)
+    }
+
+    /// 当前是否正在拖拽新建、平移或缩放选区本身（此类手势期间须隐藏工具栏）。
+    private var isAdjustingSelectionRect: Bool {
+        switch interaction {
+        case .creating, .moving, .resizing:
+            return true
+        default:
+            return false
+        }
     }
 
     /// 工具栏布局与钳制所参考的可见视口范围。
@@ -861,7 +958,7 @@ final class OverlayView: NSView {
             return (color: false, lineWidth: false)
         }
         switch kind {
-        case .mosaic, .mosaicStroke:
+        case .mosaic, .mosaicStroke, .spotlight:
             return (color: false, lineWidth: false)
         case .highlight, .text:
             // 高亮只有填充色；文字的颜色可改，粗细由字号表达。
@@ -875,42 +972,19 @@ final class OverlayView: NSView {
 
     /// 工具栏取色。
     ///
-    /// 指针 + 选中时改的是**那一条标注**（`updateSelectedColor`），
-    /// 同时同步样式槽，让面板色卡的选中态与读数仍取自 `style`；
-    /// 其余工具保持原行为：只改「下一笔用什么颜色」。
+    /// 绘制优先模式下，只要当前存在选中标注（无论指针或绘图工具），取色同时更新选中标注与默认样式。
     private func applyToolbarColor(_ color: RGBAColor) {
-        guard let editorState else { return }
-        if editorState.tool == .pointer, editorState.hasSelectedAnnotation {
-            editorState.updateSelectedColor(color)
-            editorState.selectColor(color)
-        } else {
-            editorState.selectColor(color)
-        }
+        editorState?.selectColor(color)
     }
 
     /// 工具栏线宽（滑块）。语义同 `applyToolbarColor`。
-    ///
-    /// 先走 `selectLineWidth` 拿到量化后的值，再把它写到选中标注上：
-    /// 滑块的显示读数与标注的实际线宽因此严格一致（量化只在状态层有一处）。
     private func applyToolbarLineWidth(_ width: Double) {
-        guard let editorState else { return }
-        if editorState.tool == .pointer, editorState.hasSelectedAnnotation {
-            editorState.selectLineWidth(width)
-            editorState.updateSelectedLineWidth(editorState.style.shapeLineWidth)
-        } else {
-            editorState.selectLineWidth(width)
-        }
+        editorState?.selectLineWidth(width)
     }
 
-    /// 工具栏字号（仅选中文字时出现）。语义同 `applyToolbarColor`。
+    /// 工具栏字号（文字工具或选中文字时）。语义同 `applyToolbarColor`。
     private func applyToolbarFontSize(_ size: Double) {
-        guard let editorState else { return }
-        if editorState.tool == .pointer, editorState.hasSelectedAnnotation {
-            editorState.updateSelectedFontSize(size, scaleFactor: backdropScale)
-            editorState.selectFontSize(size, scaleFactor: backdropScale)
-        } else {
-            editorState.selectFontSize(size, scaleFactor: backdropScale)
-        }
+        editorState?.selectFontSize(size, scaleFactor: backdropScale)
     }
 
     // MARK: - 绘制
@@ -933,6 +1007,7 @@ final class OverlayView: NSView {
         drawAnnotationSelection(in: context)
         drawSelection(in: context)
         drawDraftOutline(in: context)
+        drawWindowPickerHUD(in: context)
     }
 
     /// 正在拖拽的标注草稿的辅助轮廓。
@@ -972,7 +1047,12 @@ final class OverlayView: NSView {
         for annotation: Annotation,
         scaleFactor: CGFloat
     ) -> CGRect? {
-        guard case let .mosaic(rect, _, _) = annotation.kind, scaleFactor > 0 else {
+        guard scaleFactor > 0 else { return nil }
+        let rect: PixelRect
+        switch annotation.kind {
+        case let .mosaic(r, _, _, _), let .spotlight(r, _, _):
+            rect = r
+        default:
             return nil
         }
         // 模型坐标是底图像素，视图坐标是逻辑点。
@@ -1091,7 +1171,15 @@ final class OverlayView: NSView {
                 width: radius * 2,
                 height: radius * 2
             )
-            let fillColor: NSColor = (item.handle == .control) ? .systemYellow : .white
+            let fillColor: NSColor
+            switch item.handle {
+            case .control:
+                fillColor = .systemYellow
+            case .cornerRadius:
+                fillColor = .systemOrange
+            default:
+                fillColor = .white
+            }
             context.setFillColor(fillColor.cgColor)
             context.fillEllipse(in: handleRect)
             context.setLineDash(phase: 0, lengths: [])
@@ -1148,31 +1236,84 @@ final class OverlayView: NSView {
     }
 
     private func drawMask(in context: CGContext) {
-        guard dimAlpha > 0 else { return }
+        // 静默首帧不变量：无选区且无悬停候选时保持底图 100% 原亮度，避免呼出瞬间全屏闪暗。
+        guard dimAlpha > 0, let selection = effectiveSelection else { return }
 
         context.saveGState()
         context.setFillColor(NSColor.black.withAlphaComponent(dimAlpha).cgColor)
 
-        if let selection = effectiveSelection {
-            // 用 even-odd 规则挖空选区：选区内保持原始亮度，
-            // 用户能直接看清将要截取的内容，而不是隔着压暗层判断。
-            //
-            // 挖空路径必须与边框**同形**（同一份圆角几何，只差一个 strokeInset，
-            // 见 `SelectionHandleLayout.maskRadii`）。用直角矩形挖空会在四个角
-            // 各留下一块没被压暗的小三角——用户看到的就是
-            // 「边框明明是圆的，外面却还有一个直角」。
-            let path = CGMutablePath()
-            path.addRect(bounds)
-            path.addPath(SelectionHandleLayout.maskPath(
-                for: selection,
-                viewBounds: bounds,
-                displayID: displayID
-            ))
-            context.addPath(path)
-            context.fillPath(using: .evenOdd)
+        // 用 even-odd 规则挖空选区：选区内保持原始亮度，
+        // 挖空路径必须与边框**同形**（同一份圆角几何，只差一个 strokeInset）。
+        let path = CGMutablePath()
+        path.addRect(bounds)
+        path.addPath(SelectionHandleLayout.maskPath(
+            for: selection,
+            viewBounds: bounds,
+            displayID: displayID
+        ))
+        context.addPath(path)
+        context.fillPath(using: .evenOdd)
+        context.restoreGState()
+    }
+
+    /// 独立窗体捕获模式顶部信息胶囊（展示序号/总数、应用名、尺寸、无阴影状态及快捷键提示）。
+    private func drawWindowPickerHUD(in context: CGContext) {
+        guard isWindowPickerMode else { return }
+
+        let total = windowPickerCandidates.count
+        let noShadowActive: Bool = {
+            let base = appSettings?.windowCaptureShadow ?? true
+            let optionFlipped = NSEvent.modifierFlags.contains(.option)
+            return !(optionFlipped ? !base : base)
+        }()
+
+        let text: String
+        if total > 0, windowPickerIndex < total {
+            let target = windowPickerCandidates[windowPickerIndex]
+            let app = target.applicationName ?? target.title ?? "窗口"
+            let w = Int((target.rect.width * pixelsPerPoint).rounded())
+            let h = Int((target.rect.height * pixelsPerPoint).rounded())
+            let shadowSuffix = noShadowActive ? " · 无阴影" : ""
+            text = "\(windowPickerIndex + 1)/\(total) · \(app) · \(w) × \(h)\(shadowSuffix)   Tab 穿透 · ⌥ 阴影 · Space 区域"
         } else {
-            context.fill(bounds)
+            text = "独立窗体模式 · 移动指针选择窗口 · Space 切换区域框选"
         }
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.96),
+        ]
+        let attributed = NSAttributedString(string: text, attributes: attrs)
+        let textSize = attributed.size()
+        let padX: CGFloat = 14
+        let height: CGFloat = 28
+        let width = ceil(textSize.width) + padX * 2
+        let topSafe = max(16, effectiveSafeAreaInsets.top + 12)
+        let pillRect = CGRect(
+            x: ((bounds.width - width) / 2).rounded(),
+            y: topSafe,
+            width: width,
+            height: height
+        )
+
+        context.saveGState()
+        let path = CGPath(roundedRect: pillRect, cornerWidth: height / 2, cornerHeight: height / 2, transform: nil)
+        context.setFillColor(NSColor.black.withAlphaComponent(0.78).cgColor)
+        context.addPath(path)
+        context.fillPath()
+        context.setStrokeColor(NSColor.white.withAlphaComponent(0.18).cgColor)
+        context.setLineWidth(1)
+        context.addPath(path)
+        context.strokePath()
+
+        NSGraphicsContext.saveGraphicsState()
+        let nsContext = NSGraphicsContext(cgContext: context, flipped: true)
+        NSGraphicsContext.current = nsContext
+        attributed.draw(at: CGPoint(
+            x: pillRect.minX + padX,
+            y: pillRect.midY - textSize.height / 2
+        ))
+        NSGraphicsContext.restoreGraphicsState()
         context.restoreGState()
     }
 
@@ -1203,12 +1344,89 @@ final class OverlayView: NSView {
 
     // MARK: - 光标
 
+    /// 覆盖层刚展示时立即按当前鼠标位置显示像素放大镜（并在窗体模式下刷新候选窗）。
+    func presentInitialLoupeAndHint() {
+        guard let window else { return }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        guard bounds.contains(point) else { return }
+        if isWindowPickerMode {
+            updateWindowPicker(at: point, resetIndex: true)
+        } else {
+            updateLoupe(at: point)
+        }
+    }
+
+    /// 窗口列表异步加载完成后调用：若当前处于窗体模式，立即按指针位置高亮候选窗。
+    func refreshWindowPickerAfterDetectionLoad() {
+        guard isWindowPickerMode, let window else { return }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        guard bounds.contains(point) else { return }
+        updateWindowPicker(at: point, resetIndex: true)
+    }
+
+    /// 按光标位置更新独立窗体模式下的 Z-order 候选栈。
+    private func updateWindowPicker(at viewPoint: CGPoint, resetIndex: Bool) {
+        guard isWindowPickerMode, let session = detectionSession else { return }
+        let globalPoint = globalScreenPoint(fromViewPoint: viewPoint)
+        let candidates = session.windowCandidates(atGlobalPoint: globalPoint)
+
+        if resetIndex || lastWindowPickerPoint == nil || hypot(viewPoint.x - (lastWindowPickerPoint?.x ?? 0), viewPoint.y - (lastWindowPickerPoint?.y ?? 0)) > 4 {
+            lastWindowPickerPoint = viewPoint
+            windowPickerCandidates = candidates
+            windowPickerIndex = 0
+        } else if windowPickerCandidates != candidates {
+            windowPickerCandidates = candidates
+            windowPickerIndex = min(windowPickerIndex, max(0, candidates.count - 1))
+        }
+
+        if windowPickerIndex < windowPickerCandidates.count {
+            applyDetectionTarget(windowPickerCandidates[windowPickerIndex])
+        } else {
+            clearPreviewCandidate()
+        }
+        loupeView.isHidden = true
+        needsDisplay = true
+    }
+
+    /// 窗体模式下按 `Tab` / `⇧Tab` 在光标下所有叠放窗口间循环穿透。
+    @discardableResult
+    func cycleWindowPickerCandidate(reverse: Bool) -> Bool {
+        guard isWindowPickerMode else { return false }
+        if windowPickerCandidates.isEmpty, let window {
+            let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+            updateWindowPicker(at: point, resetIndex: true)
+        }
+        guard !windowPickerCandidates.isEmpty else { return false }
+        let count = windowPickerCandidates.count
+        windowPickerIndex = reverse
+            ? (windowPickerIndex - 1 + count) % count
+            : (windowPickerIndex + 1) % count
+        applyDetectionTarget(windowPickerCandidates[windowPickerIndex])
+        needsDisplay = true
+        return true
+    }
+
+    /// 清空未确认态下的候选预览框，回归 100% 原亮度静默画面。
+    private func clearPreviewCandidate() {
+        guard !isSelectionConfirmed else { return }
+        currentDetectionTarget = nil
+        detectionTitle = nil
+        detectionLayerName = nil
+        lastDetectionDescription = nil
+        editorState?.setPreviewSelection(PixelRect(origin: .zero, size: PixelSize(width: 0, height: 0)))
+    }
+
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         // 选取目标优先于一切截图侧处理：此时鼠标的职责是「指向要录的对象」，
         // 若再走一遍识别，候选会被写进编辑器，把用户的截图选区抢走。
         if updateRecordingPick(at: point) {
             loupeView.isHidden = true
+            return
+        }
+        if isWindowPickerMode {
+            updateWindowPicker(at: point, resetIndex: false)
+            NSCursor.pointingHand.set()
             return
         }
         updateCursor(at: point)
@@ -1286,6 +1504,12 @@ final class OverlayView: NSView {
     /// 只监听鼠标移动是不够的：用户按住 `⌥` 但没动鼠标时不会产生
     /// `mouseMoved`，选区会停在上一层的识别结果上，看起来像「按键没反应」。
     override func flagsChanged(with event: NSEvent) {
+        if isWindowPickerMode {
+            // 按下/松开 ⌥ 切换无阴影提示胶囊。
+            needsDisplay = true
+            super.flagsChanged(with: event)
+            return
+        }
         guard let lastMouse = window?.mouseLocationOutsideOfEventStream else {
             super.flagsChanged(with: event)
             return
@@ -1348,6 +1572,8 @@ final class OverlayView: NSView {
             preference: preference
         ) {
             applyDetectionTarget(immediate)
+        } else if session.suppressesMaximizedWindow {
+            clearPreviewCandidate()
         }
         session.scheduleControlTarget(
             atGlobalPoint: globalPoint,
@@ -1355,6 +1581,7 @@ final class OverlayView: NSView {
         ) { [weak self] controlTarget in
             guard let self,
                   self.isDetectionAllowed,
+                  !self.isWindowPickerMode,
                   self.editorState?.tool.isDrawingTool != true,
                   let controlTarget else {
                 return
@@ -1506,21 +1733,33 @@ final class OverlayView: NSView {
             return
         }
 
-        // 绘制模式：选区内部是「画布」，光标统一为十字，
-        // 不再显示手柄与拖动手势——否则用户会以为拖内部是移动选区。
-        if let editorState, editorState.tool.isDrawingTool, selection.contains(point) {
+        // 确认态按住 Space：临时抓手平移选区（不限于指针工具）。
+        if isSpaceKeyPressed, selection.contains(point) {
             hoveredHandle = nil
-            setDrawingCursor(for: editorState)
+            NSCursor.openHand.set()
             return
         }
 
-        if editorState?.tool == .pointer, let annoHandle = annotationControlHandle(at: point) {
+        // 绘制优先：无论处于指针还是绘图工具，命中当前选中标注的控制手柄都优先给出调整光标。
+        if let annoHandle = annotationControlHandle(at: point) {
             hoveredHandle = nil
             switch annoHandle {
             case let .rect(rectHandle):
                 SelectionCursor.cursor(for: rectHandle).set()
-            case .start, .control, .end, .radius:
+            case .start, .control, .end, .radius, .cornerRadius:
                 NSCursor.crosshair.set()
+            }
+            return
+        }
+
+        // 绘制模式：选区内部是「画布」，光标统一为十字（或涂抹笔刷圆圈）。
+        if let editorState, editorState.tool.isDrawingTool, selection.contains(point) {
+            hoveredHandle = nil
+            let flags = NSEvent.modifierFlags
+            if flags.contains(.command) || flags.contains(.control) {
+                NSCursor.openHand.set()
+            } else {
+                setDrawingCursor(for: editorState)
             }
             return
         }
@@ -1672,16 +1911,18 @@ final class OverlayView: NSView {
             return
         }
 
+        // 先落定进行中的编号就地编辑（若有）。
+        commitNumberingEditing()
+
+        // 静默首帧兜底：若用户呼出截图后尚未框选就直接按 Enter / ⌘C / ⌘S / ⌘P，
+        // 自动以当前屏整屏作为选区执行导出，保留「呼出 → 回车截全屏」的零阻力路径。
+        if effectiveSelection == nil, !isInteracting, !isWindowPickerMode, bounds.width >= 8, bounds.height >= 8 {
+            selectionRect = bounds
+            onSelectionChanged?(bounds)
+            onSelectionCommitted?(bounds)
+        }
+
         // 先把仍在进行中的选区手势落定，再合成。
-        //
-        // 快捷键可以在鼠标还没抬起时按下——「框完立刻按 ⌘C」是很常见的手感，
-        // 而选区**只在 `mouseUp` 时才写进模型**（拖拽途中控制器不更新
-        // `editor.selection`），它此刻还停留在自动识别给出的候选框上，
-        // 而那通常比用户刚拖出的框小得多。于是合成拿到的是旧选区，
-        // 用户看到的是「框了一大片，复制到的只有一小块」。
-        //
-        // 放这里而不是 `SessionExporter.finishEditing`：选区的权威在视图
-        // （`selectionRect`），导出层拿不到它，只能由视图先落定。
         guard settleSelectionGestureForExport() else {
             NSSound.beep()
             return
@@ -1918,16 +2159,132 @@ final class OverlayView: NSView {
         return false
     }
 
+    /// 双击命中已有编号标注时弹出轻量内联输入框直接修改数字。
+    private func beginEditingExistingNumbering(at point: CGPoint) -> Bool {
+        guard let editorState else { return false }
+        let sx = backdropScaleX
+        let sy = backdropScaleY
+        guard sx > 0, sy > 0 else { return false }
+        let pixel = pixelPoint(from: point)
+        let tolerance = Double(Self.annotationHitTolerance) * Double(sx)
+
+        for annotation in editorState.annotations.reversed() {
+            guard case let .numbering(center, radius, index, _, _, _) = annotation.kind,
+                  annotation.hitTest(pixel, tolerance: tolerance) else {
+                continue
+            }
+            commitNumberingEditing()
+            editorState.selectAnnotation(id: annotation.id)
+            let fieldWidth: CGFloat = 46
+            let fieldHeight: CGFloat = 24
+            let cx = CGFloat(center.x) / sx
+            let cy = CGFloat(center.y) / sy
+            let field = NSTextField(frame: CGRect(
+                x: (cx - fieldWidth / 2).rounded(),
+                y: (cy - fieldHeight / 2).rounded(),
+                width: fieldWidth,
+                height: fieldHeight
+            ))
+            field.stringValue = "\(index)"
+            field.alignment = .center
+            field.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .bold)
+            field.isBezeled = true
+            field.bezelStyle = .roundedBezel
+            field.target = self
+            field.action = #selector(numberingEditorDidSubmit)
+            addSubview(field)
+            window?.makeFirstResponder(field)
+            field.currentEditor()?.selectAll(nil)
+            numberingEditorField = field
+            editingNumberingAnnotationID = annotation.id
+            _ = radius
+            return true
+        }
+        return false
+    }
+
+    @objc private func numberingEditorDidSubmit() {
+        commitNumberingEditing()
+    }
+
+    /// 提交当前编号数字编辑。
+    private func commitNumberingEditing() {
+        guard let field = numberingEditorField else { return }
+        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let editingID = editingNumberingAnnotationID
+        field.removeFromSuperview()
+        numberingEditorField = nil
+        editingNumberingAnnotationID = nil
+        if window?.firstResponder !== self {
+            window?.makeFirstResponder(self)
+        }
+        if let editingID, let newValue = Int(text), newValue >= 1 {
+            editorState?.selectAnnotation(id: editingID)
+            _ = editorState?.updateSelectedNumberingIndex(newValue)
+        }
+    }
+
+    /// 放弃当前编号数字编辑。
+    private func cancelNumberingEditing() {
+        guard let field = numberingEditorField else { return }
+        field.removeFromSuperview()
+        numberingEditorField = nil
+        editingNumberingAnnotationID = nil
+        if window?.firstResponder !== self {
+            window?.makeFirstResponder(self)
+        }
+    }
+
+    /// 取消请求的触发来源（用于双按 `Esc` 防误关提示文案区分）。
+    enum CancelTriggerSource {
+        case escapeKey
+        case rightClick
+        case toolbar
+    }
+
+    /// 统一取消收口：若画有已提交标注且用户开启防误关保护，首次触发给轻量提醒，1.8 秒内再次触发才真正退出。
+    func requestCancel(source: CancelTriggerSource) {
+        if numberingEditorField != nil {
+            cancelNumberingEditing()
+            return
+        }
+        let hasAnnotations = !(editorState?.annotations.isEmpty ?? true)
+        let shouldGuard = hasAnnotations && (appSettings?.confirmCancelWithAnnotations == true)
+        if shouldGuard {
+            let now = ContinuousClock.now
+            if let last = lastCancelPromptTime, (now - last) < .milliseconds(1800) {
+                lastCancelPromptTime = nil
+                onCancel?()
+                return
+            }
+            lastCancelPromptTime = now
+            let hint: String
+            switch source {
+            case .escapeKey:
+                hint = "再按一次 Esc 退出并放弃标注"
+            case .rightClick:
+                hint = "再点一次右键退出并放弃标注"
+            case .toolbar:
+                hint = "再点一次 ✕ 退出并放弃标注"
+            }
+            ToastPresenter.show(hint, on: window?.screen)
+            return
+        }
+        lastCancelPromptTime = nil
+        onCancel?()
+    }
+
     // MARK: - 鼠标事件
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         // 新手势从「没有改动几何」开始；真正改动发生在 `mouseDragged`。
         selectionGestureChangedGeometry = false
+        pendingDrawingHitAnnotationID = nil
+        pendingDrawingDownPoint = nil
+        resizingInitialRect = nil
 
         // 选取模式下的按下不作决定：它是「点击锁定目标」的前半段，由 `mouseUp` 落实。
-        // 但**要按位置重算一次候选**：用户可能刚进选取就直接点，没有任何悬停，
-        // 此时缓存的候选是空的或已过时（指针已移动）。
         if recordingPick.isActive {
             recordingPick.markGestureDown()
             _ = updateRecordingPick(at: point)
@@ -1935,14 +2292,18 @@ final class OverlayView: NSView {
         }
 
         // 准备阶段（面板已弹出）：截图侧的一切交互暂停。
-        // 否则用户能一边看着面板里的「区域」预览框，一边把截图选区拖到别处。
         if isRecordSetupActive { return }
+
+        // 独立窗体捕获模式：在鼠标抬起时提交窗口捕获，按下阶段仅刷新光标下候选。
+        if isWindowPickerMode {
+            updateWindowPicker(at: point, resetIndex: false)
+            return
+        }
 
         // 按下即取消挂起的后台 AX 控件查询，防止滞后结果覆写用户开始拖拽的选区。
         detectionSession?.cancelPendingControlLookup()
 
         // 点工具栏是设置操作，不应顺手把刚输入的文字提交掉。
-        // 正常情况下工具栏作为子视图先拿到事件，这里只是兜底。
         if isPointInsideToolbar(point) {
             return
         }
@@ -1952,78 +2313,129 @@ final class OverlayView: NSView {
             dismissColorPanel()
         }
 
+        // 点击编号数字输入框外部时自动提交数字编辑。
+        if let numField = numberingEditorField, !numField.frame.contains(point) {
+            commitNumberingEditing()
+        }
+
         // 点击输入控件之外时先结束编辑（与常见文本输入行为一致）。
         if editorState?.isEditingText == true, !isPointInTextEditor(point) {
             commitTextEditing()
         }
 
+        // 静默首帧下双击空白处：快捷选中整屏并确认。
+        if effectiveSelection == nil, !isSelectionConfirmed, event.clickCount >= 2,
+           bounds.width >= decoration.minimumSelectionSize,
+           bounds.height >= decoration.minimumSelectionSize {
+            selectionRect = bounds
+            onSelectionChanged?(bounds)
+            onSelectionCommitted?(bounds)
+            return
+        }
+
         // 候选选区上的按下：先不做决定。
-        //
-        // 按下点落在候选内时，无法立刻区分用户想「单击确认」还是
-        // 「重新框选」，因此先进 pending 由位移阈值裁决。
-        //
-        // 这个判断**优先于手柄命中**：候选态本就不绘制手柄（见 `drawSelection`），
-        // 若这里仍按手柄判定，就会重现「看不见却能点中」那个旧缺陷。
         if let selection = effectiveSelection,
            selection.contains(point),
            !isSelectionConfirmed {
-            // 留底：转成 `.creating` 后 `selectionRect` 就被新矩形覆盖了。
             pendingCandidate = (selection, currentDetectionTarget)
             interaction = .pending(anchor: point)
             NSCursor.crosshair.set()
             return
         }
 
-        // 指针工具：双击文字直接重编辑；命中控制手柄调整几何；命中标注整块平移。
-        if let editorState, editorState.tool == .pointer, isSelectionConfirmed {
-            if let selection = effectiveSelection, selection.contains(point) {
-                if event.clickCount >= 2, beginEditingExistingText(at: point) {
-                    return
-                }
-                if let annoHandle = annotationControlHandle(at: point) {
-                    editorState.beginEditTransaction()
-                    interaction = .resizingAnnotation(handle: annoHandle)
-                    return
-                }
-                let pixel = pixelPoint(from: point)
-                let tolerance = Double(Self.annotationHitTolerance) * Double(backdropScale)
+        // 确认态下按住 Space 拖动选区内部：随时平移整个选区（无论当前使用何种绘图工具）。
+        if isSelectionConfirmed, isSpaceKeyPressed,
+           let selection = effectiveSelection, selection.contains(point) {
+            interaction = .moving(
+                grabOffset: CGPoint(x: point.x - selection.minX, y: point.y - selection.minY)
+            )
+            NSCursor.closedHand.set()
+            return
+        }
+
+        // 绘制优先 + 无缝直编（确认态选区内，全工具统一生效）：
+        // 1) 双击文字 / 编号直接就地编辑；
+        // 2) 命中当前选中标注的控制手柄直接调整几何/圆角；
+        // 3) 指针工具或绘图工具下按住 ⌘/⌃ 点击已有标注，直接选中并平移；
+        // 4) 绘图工具普通按下命中已有标注时先记下候选，若松手位移 < 3pt 则转为选中该标注。
+        if let editorState, isSelectionConfirmed, let selection = effectiveSelection, selection.contains(point) {
+            if event.clickCount >= 2 {
+                if beginEditingExistingText(at: point) { return }
+                if beginEditingExistingNumbering(at: point) { return }
+            }
+
+            if let annoHandle = annotationControlHandle(at: point) {
+                editorState.beginEditTransaction()
+                interaction = .resizingAnnotation(handle: annoHandle)
+                return
+            }
+
+            let pixel = pixelPoint(from: point)
+            let tolerance = Double(Self.annotationHitTolerance) * Double(backdropScale)
+            let flags = event.modifierFlags
+
+            if editorState.tool == .pointer {
                 if editorState.selectAnnotation(at: pixel, tolerance: tolerance) {
                     editorState.beginEditTransaction()
                     interaction = .movingAnnotation(lastPixel: pixel)
                     NSCursor.closedHand.set()
                     return
                 }
-            } else {
-                editorState.clearAnnotationSelection()
-            }
-        }
-
-        // 绘制模式：在选区内按下开始创建。
-        // 文字是「点一下再输入」，其余绘图工具靠拖拽，因此分开处理。
-        if let editorState, let selection = effectiveSelection,
-           selection.contains(point), isSelectionConfirmed {
-            if editorState.tool == .text {
-                // 双击已有文字进入重新编辑；单击空白处新建。
-                if event.clickCount >= 2, beginEditingExistingText(at: point) {
+                // 指针态双击选区内空白直接复制完成。
+                if event.clickCount >= 2 {
+                    performExport(.copy)
                     return
                 }
-                guard !editorState.isEditingText else { return }
-                editorState.beginTextEditing(at: pixelPoint(from: point))
-                syncTextEditor()
-                return
+            } else {
+                // 绘图工具下按住 ⌘ / ⌃ 直接选中并平移已有标注。
+                if (flags.contains(.command) || flags.contains(.control)),
+                   editorState.selectAnnotation(at: pixel, tolerance: tolerance) {
+                    editorState.beginEditTransaction()
+                    interaction = .movingAnnotation(lastPixel: pixel)
+                    NSCursor.closedHand.set()
+                    return
+                }
+
+                // 绘图工具下双击空白区域（未命中任何标注，且非文字工具）直接复制完成。
+                let hitExisting = editorState.annotation(at: pixel, tolerance: tolerance)
+                if event.clickCount >= 2, hitExisting == nil, editorState.tool != .text, editorState.tool != .numbering {
+                    performExport(.copy)
+                    return
+                }
+
+                if editorState.tool == .text {
+                    if let hitExisting {
+                        // 单击已有非文字标注（或文字标注）先选中，双击文字已在上方进入编辑。
+                        editorState.selectAnnotation(id: hitExisting.id)
+                        return
+                    }
+                    guard !editorState.isEditingText else { return }
+                    editorState.clearAnnotationSelection()
+                    editorState.beginTextEditing(at: pixel)
+                    syncTextEditor()
+                    return
+                }
+
+                if editorState.tool.isDraggable {
+                    // 记录潜在点击选中目标：若松手位移 < 3pt 则不建空草稿而是选中已有标注。
+                    if let hitExisting {
+                        pendingDrawingHitAnnotationID = hitExisting.id
+                        pendingDrawingDownPoint = point
+                    }
+                    editorState.beginDraft(at: pixel, scaleFactor: backdropScale)
+                    return
+                }
             }
-            if editorState.tool.isDraggable {
-                editorState.beginDraft(at: pixelPoint(from: point), scaleFactor: backdropScale)
-                return
-            }
+        } else if let editorState, editorState.tool == .pointer, isSelectionConfirmed {
+            editorState.clearAnnotationSelection()
         }
 
         if let selection = effectiveSelection, isSelectionConfirmed {
             // 与 `updateCursor` 同一套判定：手柄优先于「内部移动」，
             // 因为手柄位于选区边界上，两者区域重叠。
             if let hit = handle(at: point, in: selection) {
+                resizingInitialRect = selection
                 interaction = .resizing(handle: hit)
-                // 拖动期间系统不会重置光标，设一次即可全程保持
                 SelectionCursor.cursor(for: hit).set()
                 return
             }
@@ -2041,21 +2453,13 @@ final class OverlayView: NSView {
         interaction = .creating(anchor: point)
         NSCursor.crosshair.set()
         selectionRect = CGRect(origin: point, size: .zero)
-        // 不在这里上报 nil：同上，零尺寸是中间态。真正的「选区被清空」
-        // 由 `mouseUp` 在尺寸不足时上报。
     }
 
     override func mouseDragged(with event: NSEvent) {
-        // 拖拽点钳制在视图内：选区不允许越出本显示器范围。
-        // （跨显示器选区不在 M1 范围内，故不做跨屏扩展。）
         let point = SelectionGeometry.clamp(convert(event.locationInWindow, from: nil), to: bounds)
 
-        // 选取模式下拖拽只是持续换目标（指针划过的窗口依次成为候选），
-        // 不能借此框选：那会同时改掉用户的截图选区。
         if updateRecordingPick(at: point) { return }
-
-        // 准备阶段：拖拽不产生任何截图侧效果。
-        if isRecordSetupActive { return }
+        if isRecordSetupActive || isWindowPickerMode { return }
 
         let isShiftPressed = event.modifierFlags.contains(.shift)
 
@@ -2068,8 +2472,6 @@ final class OverlayView: NSView {
             return
 
         case .movingAnnotation(let lastPixel):
-            // 按「相邻两次像素位置之差」累积：视图坐标可能带缩放，
-            // 直接传单次位移会在往返换算里累积取整误差。
             let current = pixelPoint(from: point)
             let delta = PixelPoint(x: current.x - lastPixel.x, y: current.y - lastPixel.y)
             guard delta != PixelPoint.zero else { return }
@@ -2086,9 +2488,6 @@ final class OverlayView: NSView {
             return
 
         case .pending(let anchor):
-            // 越过阈值才转成真正的框选：单击（含手抖）不越过，
-            // 留给 `mouseUp` 确认候选。未越阈值时不动 `selectionRect`，
-            // 候选保持原样可见，不闪烁。
             let dx = point.x - anchor.x
             let dy = point.y - anchor.y
             guard hypot(dx, dy) >= pendingDragThreshold else { return }
@@ -2113,44 +2512,76 @@ final class OverlayView: NSView {
 
         case .resizing(let handle):
             guard let current = selectionRect else { return }
-            selectionRect = SelectionGeometry.resizedRect(
+            var resized = SelectionGeometry.resizedRect(
                 current,
                 handle: handle,
                 to: point,
                 minimumSize: decoration.minimumSelectionSize
             )
+            // Shift 等比缩放选区：拖动四角手柄时严格保持起始选区宽高比。
+            if isShiftPressed, SelectionHandleLayout.isCorner(handle),
+               let initial = resizingInitialRect, initial.height > 0 {
+                let aspect = initial.width / initial.height
+                resized = Self.aspectConstrainedResizedRect(
+                    resized,
+                    anchorRect: initial,
+                    handle: handle,
+                    aspect: aspect,
+                    minimumSize: decoration.minimumSelectionSize,
+                    in: bounds
+                )
+            }
+            selectionRect = resized
             selectionGestureChangedGeometry = true
         }
 
         updateLoupe(at: point)
 
-        // 只在选区有效时上报。
-        //
-        // 手势中的零尺寸矩形只是**中间态**，不是「用户清空了选区」。
-        // 若照报过去，`selectionDidChange(nil)` 会提交一个空选区并触发全量
-        // 同步，`syncSelectionFromEditor` 再见空选区就 `resetSelection()`——
-        // 于是 `interaction` 与 `pendingCandidate` 在拖拽刚起步时就被抹掉，
-        // 表现是「拖着拖着框自己没了」。
         if let selection = effectiveSelection {
             onSelectionChanged?(selection)
         }
     }
 
+    /// 选区四角手柄按 `Shift` 等比缩放时的矩形约束（以对角锚点为固定基准）。
+    private static func aspectConstrainedResizedRect(
+        _ proposed: CGRect,
+        anchorRect: CGRect,
+        handle: SelectionHandle,
+        aspect: CGFloat,
+        minimumSize: CGFloat,
+        in bounds: CGRect
+    ) -> CGRect {
+        guard aspect > 0 else { return proposed }
+        let anchorX = handle.movesLeftEdge ? anchorRect.maxX : anchorRect.minX
+        let anchorY = handle.movesTopEdge ? anchorRect.maxY : anchorRect.minY
+
+        let widthFromHeight = proposed.height * aspect
+        var width: CGFloat
+        var height: CGFloat
+        if proposed.width >= widthFromHeight {
+            width = max(minimumSize, proposed.width)
+            height = max(minimumSize, width / aspect)
+        } else {
+            height = max(minimumSize, proposed.height)
+            width = max(minimumSize, height * aspect)
+        }
+
+        let maxW = handle.movesLeftEdge ? (anchorX - bounds.minX) : (bounds.maxX - anchorX)
+        let maxH = handle.movesTopEdge ? (anchorY - bounds.minY) : (bounds.maxY - anchorY)
+        let scale = min(1, maxW / max(1, width), maxH / max(1, height))
+        width = max(minimumSize, width * scale)
+        height = max(minimumSize, height * scale)
+
+        let originX = handle.movesLeftEdge ? (anchorX - width) : anchorX
+        let originY = handle.movesTopEdge ? (anchorY - height) : anchorY
+        return CGRect(x: originX, y: originY, width: width, height: height)
+    }
+
     override func mouseUp(with event: NSEvent) {
-        // 选取模式：单击＝锁定鼠标下的目标。
-        //
-        // **按松开位置重新命中**，而不是提交悬停缓存：可能没有先悬停
-        // （刚进选取就点），也可能按下与松开之间指针已移开。
-        //
-        // `consumeGestureDown` 覆盖「按下后按 ESC 取消」的情形：此时选取已退出，
-        // 不吞掉这次松手就会落进下面的草稿/选区提交路径，
-        // 把一次取消变成一次意外的编辑。
         if recordingPick.consumeGestureDown() {
             if recordingPick.isActive {
                 let point = convert(event.locationInWindow, from: nil)
                 let target = recordingPick.accept(hitTarget(at: point))
-                // 候选为空时单击无任何效果，而且不会留下痕迹——
-                // 正是最难查的一类「点了没反应」，故记一条。
                 logger.notice("""
                     recording pick: click at \(NSStringFromPoint(point), privacy: .public) \
                     target=\(target?.title ?? "nil", privacy: .public)
@@ -2162,10 +2593,24 @@ final class OverlayView: NSView {
             return
         }
 
-        // 准备阶段：不提交草稿、不改选区。
         if isRecordSetupActive {
             if let editorState, editorState.hasDraft {
                 editorState.discardDraft()
+            }
+            return
+        }
+
+        // 独立窗体模式：单击即捕获当前高亮窗口，按住 `⌥` 反转阴影设置。
+        if isWindowPickerMode {
+            let point = convert(event.locationInWindow, from: nil)
+            if windowPickerCandidates.isEmpty {
+                updateWindowPicker(at: point, resetIndex: true)
+            }
+            if windowPickerIndex < windowPickerCandidates.count {
+                let target = windowPickerCandidates[windowPickerIndex]
+                onWindowPickerCommit?(target, event.modifierFlags.contains(.option))
+            } else {
+                NSSound.beep()
             }
             return
         }
@@ -2181,44 +2626,45 @@ final class OverlayView: NSView {
             break
         }
 
-        // 绘制模式：松手才提交。拖拽期间它只是草稿，不进撤销历史，
-        // 因此「撤销一次」对应撤掉一个标注，而不是撤掉一串中间鼠标位置。
+        let point = convert(event.locationInWindow, from: nil)
+
+        // 绘制优先 + 无缝直编：绘图工具下单击位移 < 3pt 且按下时命中了已有标注 → 丢弃空草稿并选中该标注。
         if let editorState, editorState.hasDraft {
-            // 选区由编辑器自己持有，提交时直接取用；
-            // 选区手势已经在它自己的 mouseUp 分支里提交过了。
+            if let hitID = pendingDrawingHitAnnotationID,
+               let downPoint = pendingDrawingDownPoint,
+               hypot(point.x - downPoint.x, point.y - downPoint.y) < 3 {
+                pendingDrawingHitAnnotationID = nil
+                pendingDrawingDownPoint = nil
+                editorState.discardDraft()
+                editorState.selectAnnotation(id: hitID)
+                updateCursor(at: point)
+                return
+            }
+            pendingDrawingHitAnnotationID = nil
+            pendingDrawingDownPoint = nil
+
             if effectiveSelection == nil {
                 editorState.discardDraft()
             } else {
                 editorState.commitDraft()
             }
-            updateCursor(at: convert(event.locationInWindow, from: nil))
+            updateCursor(at: point)
             return
         }
 
-        let point = convert(event.locationInWindow, from: nil)
         let wasPending: Bool = {
             if case .pending = interaction { return true }
             return false
         }()
         let wasCreating = isCreating
+        resizingInitialRect = nil
         interaction = .idle
-        // 松手后控件才出现，光标要跟着指回指针下方的部件
-        // （可能已从手柄移到选区内部）
         updateCursor(at: point)
         updateLoupe(at: point)
 
-        // 候选上的一次单击（没越过拖拽阈值）= 确认这个候选。
-        // 几何不变，但要带着它原有的识别身份：用户接受的是「这个窗口/应用」，
-        // 身份丢了，「录制窗口范围」就没有目标可用。
         if wasPending {
             pendingCandidate = nil
             editorState?.confirmSelection()
-            // 单击确认候选也是一次「选区确定」。
-            //
-            // 之前这里只翻 `isSelectionConfirmed`、不通知控制器，于是
-            // 「点窗口」这条路径既不进撤销历史，也无法触发「直达动作」
-            //（录制 / 长截图 / OCR）。几何没变，提交同一个矩形是安全的：
-            // `commitSelection` 对相同值本来就会忽略。
             if let confirmed = effectiveSelection {
                 onSelectionCommitted?(confirmed)
             }
@@ -2228,19 +2674,13 @@ final class OverlayView: NSView {
         guard let selection = effectiveSelection,
               selection.width >= decoration.minimumSelectionSize,
               selection.height >= decoration.minimumSelectionSize else {
-            // 尺寸不足视为误触（最常见的是单击）。
             if wasCreating {
                 if let candidate = pendingCandidate {
-                    // 越过阈值却没拖够：用户是想框选的，只是手没移开。
-                    // 把候选放回去并恢复识别，**不能**当成一次单击确认——
-                    // 那会把一个失败的拖拽变成一个意外的决定。
                     selectionRect = candidate.rect
                     currentDetectionTarget = candidate.target
                     pendingCandidate = nil
                     onSelectionChanged?(candidate.rect)
                 } else {
-                    // 新建失败：清掉那个零尺寸矩形，
-                    // 避免留下一根看不见的细线选区。
                     selectionRect = nil
                     onSelectionChanged?(nil)
                 }
@@ -2248,10 +2688,6 @@ final class OverlayView: NSView {
             return
         }
 
-        // 用户自己拖出的矩形与任何识别目标都无关：留着旧身份会让
-        // 「录制窗口/应用」拿到一个与该矩形无关的窗口 ID。
-        // 但「按下又松开、没有拖动」不改变几何，选区仍是识别到的那个目标，
-        // 身份必须保留——否则单击确认候选后目标就丢了。
         if selectionGestureChangedGeometry {
             currentDetectionTarget = nil
         }
@@ -2261,8 +2697,6 @@ final class OverlayView: NSView {
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        // 右键＝「取消当前这一层」，与多数截图工具一致；
-        // 但指针模式下右击已有标注时，弹出层级与复制/删除上下文菜单。
         if recordingPick.isActive {
             endRecordingTargetPick()
             onRecordingPickCancel?()
@@ -2273,9 +2707,9 @@ final class OverlayView: NSView {
             return
         }
 
+        // 无缝直编：任意工具下右击已有标注均弹出层级/复制/删除上下文菜单。
         let point = convert(event.locationInWindow, from: nil)
         if let editorState,
-           editorState.tool == .pointer,
            isSelectionConfirmed,
            let selection = effectiveSelection,
            selection.contains(point) {
@@ -2287,7 +2721,41 @@ final class OverlayView: NSView {
             }
         }
 
-        onCancel?()
+        requestCancel(source: .rightClick)
+    }
+
+    /// 滚轮调参：有选中标注调整其线宽/字号/模糊强度/压暗度/半径，无选中调整当前工具默认参数。
+    ///
+    /// 在独立图片/长截图滚动编辑窗内，普通滚轮交由 `NSScrollView` 浏览长图；按住 `⌥ + 滚轮` 调参。
+    override func scrollWheel(with event: NSEvent) {
+        if enclosingScrollView != nil, !event.modifierFlags.contains(.option) {
+            super.scrollWheel(with: event)
+            return
+        }
+        guard let editorState,
+              isSelectionConfirmed,
+              !isRecordSetupActive,
+              !recordingPick.isActive,
+              !editorState.isEditingText,
+              numberingEditorField == nil else {
+            super.scrollWheel(with: event)
+            return
+        }
+
+        let rawDelta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : (event.scrollingDeltaY * 10)
+        guard abs(rawDelta) > 0.01 else { return }
+
+        if event.hasPreciseScrollingDeltas {
+            wheelDeltaAccumulator += rawDelta
+            let threshold: CGFloat = 10
+            guard abs(wheelDeltaAccumulator) >= threshold else { return }
+            let step = wheelDeltaAccumulator > 0 ? 1.0 : -1.0
+            wheelDeltaAccumulator = 0
+            _ = editorState.adjustParameterByScrollWheel(delta: step, scaleFactor: backdropScale)
+        } else {
+            let step = rawDelta > 0 ? 1.0 : -1.0
+            _ = editorState.adjustParameterByScrollWheel(delta: step, scaleFactor: backdropScale)
+        }
     }
 
     /// 弹出选中标注的层级与操作上下文菜单。
@@ -2391,18 +2859,69 @@ final class OverlayView: NSView {
             return
         }
 
-        // 文字编辑期间键盘归输入控件：firstResponder 是 NSTextField 时
-        // 正常不会走到这里，此处仅作兜底，避免工具快捷键把文字吞掉。
-        if editorState?.isEditingText == true {
+        // 文字编辑或编号数字编辑期间键盘归输入控件。
+        if editorState?.isEditingText == true || numberingEditorField != nil {
+            if event.keyCode == 53, numberingEditorField != nil {
+                cancelNumberingEditing()
+                return
+            }
             super.keyDown(with: event)
             return
         }
 
-        // Delete / Backspace 删除选中的标注。
-        //
-        // 放在文字编辑判断**之后**：正在输入时这两个键属于输入框（删字），
-        // 而不是删掉整条标注。没有选中时不吞键，保持原有的系统行为。
-        // 51 = 主键盘 Delete(Backspace)，117 = 前向删除。
+        let flags = event.modifierFlags
+        let hasCommandLike = flags.contains(.command) || flags.contains(.control) || flags.contains(.option)
+
+        // 49 = Space：
+        // - 未确认选区态（非拖拽）：在「区域框选」与「独立窗体捕获」之间切换；
+        // - 已确认选区态：按住空格进入临时抓手平移选区（不打断当前标注工具）。
+        if event.keyCode == 49, !hasCommandLike, !event.isARepeat {
+            if !isSelectionConfirmed, !isInteracting {
+                let next = !isWindowPickerMode
+                isWindowPickerMode = next
+                onWindowPickerModeChanged?(next)
+                if next, let window {
+                    let mousePoint = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+                    updateWindowPicker(at: mousePoint, resetIndex: true)
+                    NSCursor.pointingHand.set()
+                } else {
+                    clearPreviewCandidate()
+                    if let window {
+                        let mousePoint = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+                        updateCursor(at: mousePoint)
+                        updateDetection(at: mousePoint)
+                        updateLoupe(at: mousePoint)
+                    }
+                }
+                return
+            }
+            if isSelectionConfirmed {
+                isSpaceKeyPressed = true
+                if let window {
+                    let mousePoint = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+                    updateCursor(at: mousePoint)
+                }
+                return
+            }
+        }
+
+        // 48 = Tab：独立窗体模式下在光标下方全部叠放窗口间循环穿透（⇧Tab 反向）。
+        if event.keyCode == 48, isWindowPickerMode, !hasCommandLike {
+            _ = cycleWindowPickerCandidate(reverse: flags.contains(.shift))
+            return
+        }
+
+        // 窗体模式下回车直接捕获当前高亮窗口。
+        if isWindowPickerMode, (event.keyCode == 36 || event.keyCode == 76) {
+            if windowPickerIndex < windowPickerCandidates.count {
+                onWindowPickerCommit?(windowPickerCandidates[windowPickerIndex], flags.contains(.option))
+            } else {
+                NSSound.beep()
+            }
+            return
+        }
+
+        // Delete / Backspace 删除选中的标注（任意工具下只要有选中即生效）。
         if let editorState, editorState.hasSelectedAnnotation,
            event.keyCode == 51 || event.keyCode == 117 {
             editorState.deleteSelected()
@@ -2410,12 +2929,10 @@ final class OverlayView: NSView {
         }
 
         #if DEBUG
-        // 只记录导出相关的按键：这两个分支一旦因为焦点问题收不到事件，
-        // 用户看到的是「按了没反应」，没有任何报错可查。
         let exportKeyCode = event.keyCode == 36 || event.keyCode == 76
-        let isCommandS = event.modifierFlags.contains(.command)
+        let isCommandS = flags.contains(.command)
             && event.charactersIgnoringModifiers?.lowercased() == "s"
-        let isCommandC = event.modifierFlags.contains(.command)
+        let isCommandC = flags.contains(.command)
             && event.charactersIgnoringModifiers?.lowercased() == "c"
         if exportKeyCode || isCommandS || isCommandC {
             logger.notice("""
@@ -2426,29 +2943,36 @@ final class OverlayView: NSView {
         }
         #endif
 
-        // 候选态按 C 复制 #HEX，按 ⇧C 复制 RGB(r, g, b)。
-        if !isSelectionConfirmed,
-           !event.modifierFlags.contains(.command),
-           !event.modifierFlags.contains(.control),
-           !event.modifierFlags.contains(.option),
+        // 专职取色键：C 复制 #HEX，⇧C 复制 RGB(r, g, b)（已解除与曲线箭头快捷键的冲突）。
+        if !hasCommandLike,
            event.charactersIgnoringModifiers?.lowercased() == "c" {
-            copyColorUnderPointer(asRGB: event.modifierFlags.contains(.shift))
+            copyColorUnderPointer(asRGB: flags.contains(.shift))
             return
         }
 
         // 命令识别与执行分开：识别在 `OverlayKeyCommand`（纯查表，可独立断言），
-        // 这里只做执行。上面三段已经决定了「键盘属于谁」，到这里仍是本视图的。
+        // 这里只做执行。上面几段已经决定了「键盘属于谁」，到这里仍是本视图的。
         guard let command = OverlayKeyCommand.parse(event) else {
             super.keyDown(with: event)
             return
         }
-        // 与抽取前一致：编辑器状态尚未建立时，除 ESC 外的按键一律交给系统，
-        // 否则「会话还没准备好」的瞬间按 ⌘S 会走到导出路径上。
         guard command == .cancel || editorState != nil else {
             super.keyDown(with: event)
             return
         }
         performCommand(command)
+    }
+
+    override func keyUp(with event: NSEvent) {
+        if event.keyCode == 49, isSpaceKeyPressed {
+            isSpaceKeyPressed = false
+            if let window {
+                let mousePoint = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+                updateCursor(at: mousePoint)
+            }
+            return
+        }
+        super.keyUp(with: event)
     }
 
     /// 候选态取色：复制当前光标下像素的 `#RRGGBB` 或 `RGB(r, g, b)` 色值到剪贴板并弹 Toast。
@@ -2482,8 +3006,7 @@ final class OverlayView: NSView {
         guard command == .cancel || editorState != nil else { return }
         switch command {
         case .cancel:
-            // ESC 一次结束会话。
-            onCancel?()
+            requestCancel(source: .escapeKey)
         case .save:
             performExport(.save)
         case .copy:
@@ -2496,6 +3019,8 @@ final class OverlayView: NSView {
             }
         case .nudge(let dx, let dy):
             performNudge(dx: dx, dy: dy)
+        case .resizeSelection(let dw, let dh):
+            performResizeSelection(dw: dw, dh: dh)
         case .undo:
             if let onUndoRequested {
                 onUndoRequested()
@@ -2530,7 +3055,7 @@ final class OverlayView: NSView {
     /// 方向键微调选中标注或当前选区（单位：1px，Shift 为 10px）。
     private func performNudge(dx: Int, dy: Int) {
         guard let editorState else { return }
-        if editorState.tool == .pointer, editorState.hasSelectedAnnotation {
+        if editorState.hasSelectedAnnotation {
             editorState.moveSelected(by: PixelPoint(x: Double(dx), y: Double(dy)))
             return
         }
@@ -2549,6 +3074,29 @@ final class OverlayView: NSView {
         selectionRect = clamped
         onSelectionChanged?(clamped)
         onSelectionCommitted?(clamped)
+    }
+
+    /// `⌥ + 方向键`（配 `⇧` 为 5px）精准微调当前选区宽/高。
+    private func performResizeSelection(dw: Int, dh: Int) {
+        guard let editorState, let selection = effectiveSelection else { return }
+        if !isSelectionConfirmed {
+            editorState.confirmSelection()
+        }
+        let scale = max(1, pixelsPerPoint)
+        let minSize = decoration.minimumSelectionSize
+        let maxW = max(minSize, bounds.maxX - selection.minX)
+        let maxH = max(minSize, bounds.maxY - selection.minY)
+        let nextWidth = min(max(minSize, selection.width + CGFloat(dw) / scale), maxW)
+        let nextHeight = min(max(minSize, selection.height + CGFloat(dh) / scale), maxH)
+        let resized = CGRect(
+            x: selection.minX,
+            y: selection.minY,
+            width: nextWidth,
+            height: nextHeight
+        )
+        selectionRect = resized
+        onSelectionChanged?(resized)
+        onSelectionCommitted?(resized)
     }
 }
 
@@ -2596,6 +3144,8 @@ final class OverlayWindow: NSPanel, NSWindowDelegate {
 
     let displayID: CGDirectDisplayID
     let overlayView: OverlayView
+    /// 是否为全屏冻结覆盖层（区别于独立图片/窗体编辑窗口）。
+    private let isFullScreenOverlay: Bool
 
     /// 图片编辑模式的窗口。
     ///
@@ -2607,6 +3157,7 @@ final class OverlayWindow: NSPanel, NSWindowDelegate {
 
     init(imageFrame: NSRect, canvasSize: CGSize? = nil, displayID: CGDirectDisplayID) {
         self.displayID = displayID
+        self.isFullScreenOverlay = false
         let effectiveCanvasSize = canvasSize ?? imageFrame.size
         self.overlayView = OverlayView(
             frame: NSRect(origin: .zero, size: effectiveCanvasSize),
@@ -2675,6 +3226,7 @@ final class OverlayWindow: NSPanel, NSWindowDelegate {
 
     init(screen: NSScreen, displayID: CGDirectDisplayID) {
         self.displayID = displayID
+        self.isFullScreenOverlay = true
         self.overlayView = OverlayView(
             frame: NSRect(origin: .zero, size: screen.frame.size),
             displayID: displayID
@@ -2693,6 +3245,8 @@ final class OverlayWindow: NSPanel, NSWindowDelegate {
         backgroundColor = .black
         // 层级需高于菜单栏（.mainMenu）与全屏窗口（.fullScreen）。
         level = .screenSaver
+        isFloatingPanel = true
+        becomesKeyOnlyIfNeeded = false
         hasShadow = false
         // 本应用激活策略为 .accessory，失焦是常态，不可因此隐藏覆盖层。
         hidesOnDeactivate = false
@@ -2718,6 +3272,14 @@ final class OverlayWindow: NSPanel, NSWindowDelegate {
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
 
         contentView = overlayView
+    }
+
+    /// 全屏冻结覆盖层原样保持 `screen.frame`，杜绝 macOS 避让菜单栏把窗口向下推 24–37pt 造成的画面跳动。
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        if isFullScreenOverlay {
+            return frameRect
+        }
+        return super.constrainFrameRect(frameRect, to: screen)
     }
 
     /// `.borderless` 窗口默认不能成为 key window；重写以接收 ESC。
