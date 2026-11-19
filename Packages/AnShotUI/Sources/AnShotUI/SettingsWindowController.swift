@@ -168,6 +168,7 @@ final class SettingsWindowController: NSWindowController {
             defer: false
         )
         window.title = L("settings.windowTitle", fallback: "anShot 设置")
+        window.titlebarAppearsTransparent = true
         window.minSize = AnShotTheme.windowMinSize
         window.contentViewController = contentController
 
@@ -384,14 +385,15 @@ private final class SettingsViewController: NSViewController {
         sidebarItems.filter { !$0.isHidden }.map(\.page)
     }
 
-    // Phase 5.1 / 5.2 新增设置控件引用
-    private var appearanceControl: NSSegmentedControl!
+    // 现代设置控件引用
+    private var appearancePicker: SettingsAppearancePicker!
     private var languagePopUp: NSPopUpButton!
     private var toastToggleRow: SettingsToggleRow!
     private var recordingFrameToggleRow: SettingsToggleRow!
-    private var screenPermStatusLabel: NSTextField!
-    private var micPermStatusLabel: NSTextField!
-    private var axPermStatusLabel: NSTextField!
+    private var screenPermPill: SettingsStatusPill!
+    private var micPermPill: SettingsStatusPill!
+    private var axPermPill: SettingsStatusPill!
+    private var toolbarSlotGrid: SettingsToolbarSlotChipGrid!
     private var exportFormatPopUp: NSPopUpButton!
     private var exportQualitySlider: NSSlider!
     private var exportQualityValueLabel: NSTextField!
@@ -491,7 +493,7 @@ private final class SettingsViewController: NSViewController {
         sidebar.translatesAutoresizingMaskIntoConstraints = false
 
         let search = NSSearchField()
-        search.placeholderString = L("settings.searchPlaceholder", fallback: "搜索设置项…")
+        search.placeholderString = L("settings.searchPlaceholder", fallback: "搜索设置项 (⌘F)…")
         search.controlSize = .regular
         search.sendsSearchStringImmediately = true
         search.sendsWholeSearchString = false
@@ -502,7 +504,7 @@ private final class SettingsViewController: NSViewController {
         searchField = search
 
         let emptySearch = NSTextField(labelWithString: "未找到匹配分类")
-        emptySearch.font = .systemFont(ofSize: 11)
+        emptySearch.font = .systemFont(ofSize: 11.5)
         emptySearch.textColor = .tertiaryLabelColor
         emptySearch.alignment = .center
         emptySearch.isHidden = true
@@ -520,9 +522,19 @@ private final class SettingsViewController: NSViewController {
         let itemStack = NSStackView(views: items)
         itemStack.orientation = .vertical
         itemStack.alignment = .leading
-        itemStack.spacing = 2
+        itemStack.spacing = 3
         itemStack.translatesAutoresizingMaskIntoConstraints = false
         sidebar.addSubview(itemStack)
+
+        // 侧边栏底部克制的版本微标识。
+        let rawVersion = UpdateCoordinator.shared.currentVersionDescription
+        let footerText = rawVersion.contains("未知") ? "anShot" : "anShot · \(rawVersion)"
+        let versionFooter = NSTextField(labelWithString: footerText)
+        versionFooter.font = .systemFont(ofSize: 10.5, weight: .medium)
+        versionFooter.textColor = .tertiaryLabelColor
+        versionFooter.lineBreakMode = .byTruncatingTail
+        versionFooter.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(versionFooter)
 
         // 右侧内容滚动容器
         let scrollView = NSScrollView()
@@ -552,8 +564,8 @@ private final class SettingsViewController: NSViewController {
             sidebar.widthAnchor.constraint(equalToConstant: SettingsTheme.sidebarWidth),
 
             search.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 14),
-            search.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 10),
-            search.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -10),
+            search.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 12),
+            search.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -12),
 
             scrollView.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
             scrollView.topAnchor.constraint(equalTo: root.topAnchor),
@@ -565,13 +577,17 @@ private final class SettingsViewController: NSViewController {
             content.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
             minDocHeight,
 
-            itemStack.topAnchor.constraint(equalTo: search.bottomAnchor, constant: 12),
-            itemStack.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 8),
-            itemStack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -8),
+            itemStack.topAnchor.constraint(equalTo: search.bottomAnchor, constant: 14),
+            itemStack.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 10),
+            itemStack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -10),
 
             emptySearch.topAnchor.constraint(equalTo: itemStack.bottomAnchor, constant: 16),
-            emptySearch.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 10),
-            emptySearch.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -10),
+            emptySearch.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 12),
+            emptySearch.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -12),
+
+            versionFooter.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 14),
+            versionFooter.trailingAnchor.constraint(lessThanOrEqualTo: sidebar.trailingAnchor, constant: -12),
+            versionFooter.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -12),
         ])
         for item in items {
             item.widthAnchor.constraint(equalTo: itemStack.widthAnchor).isActive = true
@@ -679,8 +695,12 @@ private final class SettingsViewController: NSViewController {
             cards = [
                 makeAppearanceAndLanguageCard(),
                 makePermissionsCard(),
-                makeCaptureInteractionCard(),
-                makeLaunchAtLoginCard(),
+            ]
+        case .capture:
+            cards = [
+                makeCaptureBehaviorCard(),
+                makeLongshotCard(),
+                makeToolbarSlotsCard(),
             ]
         case .shortcuts:
             cards = [
@@ -705,15 +725,13 @@ private final class SettingsViewController: NSViewController {
         return makePage(page, cards: cards)
     }
 
-    /// 拼一个页面：页头 + 若干卡片，垂直排列。
-    ///
-    /// 标题与图标取自 `SettingsPage` 而不是各处手写：侧边栏项与页头
-    /// 显示同一个名字，分两处写迟早会不一致。
+    /// 拼一个页面：彩徽页头 + 若干分组卡片，垂直排列。
     private func makePage(_ page: SettingsPage, cards: [NSView]) -> NSView {
         let header = SettingsHeaderView(
             symbolName: page.symbolName,
             title: page.title,
-            subtitle: page.subtitle
+            subtitle: page.subtitle,
+            badgeColor: page.badgeColor
         )
 
         let stack = NSStackView(views: [header] + cards)
@@ -745,47 +763,69 @@ private final class SettingsViewController: NSViewController {
         let content = NSStackView(views: rows)
         content.orientation = .vertical
         content.alignment = .leading
-        content.spacing = 8
-
-        // 两个子视图都撑满卡片宽度。理由同 `makePinCard`：
-        // 遍历不会与上面的数组脱节。
+        content.spacing = 6
         for row in rows {
             row.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
         }
 
         return SettingsCardView(
             symbolName: "command",
-            title: "截图快捷键",
+            title: "核心快捷键",
+            accentColor: SettingsPage.shortcuts.badgeColor,
             content: content
         )
     }
 
     // MARK: 直达入口卡片
 
-    /// 录制 / 长截图 / OCR 的全局入口。
-    ///
-    /// 与截图快捷键分卡片：截图是「主入口」，这三个是「带着意图进入」，
-    /// 混在一张卡片里会让用户以为它们只是同一动作的别名。
     private func makeDirectActionCard() -> SettingsCardView {
-        var rows: [NSView] = []
-        for action in Self.intentShortcutActions {
-            rows.append(makeIntentShortcutRow(action))
-        }
-        rows.append(makeIntentShortcutMessageLabel())
+        let actionRows = Self.intentShortcutActions.map { makeIntentShortcutRow($0) }
+        let msgLabel = makeIntentShortcutMessageLabel()
 
-        let content = NSStackView(views: rows)
-        content.orientation = .vertical
-        content.alignment = .leading
-        content.spacing = 8
-        for row in rows {
-            row.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        for (idx, row) in actionRows.enumerated() {
+            stack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            if idx < actionRows.count - 1 {
+                let divider = SettingsRowDivider()
+                stack.addArrangedSubview(divider)
+                divider.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            }
         }
+        stack.addArrangedSubview(msgLabel)
+        msgLabel.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        let resetAllBtn = SettingsPushButton(
+            title: "全部恢复默认",
+            target: self,
+            action: #selector(resetAllIntentShortcuts)
+        )
 
         return SettingsCardView(
-            symbolName: "bolt.horizontal",
+            symbolName: "bolt.horizontal.fill",
             title: "直达入口",
-            content: content
+            accentColor: SettingsPage.shortcuts.badgeColor,
+            trailingAccessory: resetAllBtn,
+            content: stack
         )
+    }
+
+    @objc private func resetAllIntentShortcuts() {
+        var firstError: String?
+        for action in Self.intentShortcutActions {
+            let desired = action.defaultShortcut
+            if let reason = shortcutHost?.applyGlobalShortcut(desired, for: action) {
+                if firstError == nil { firstError = reason }
+            } else {
+                intentRecorders[action]?.shortcut = desired
+            }
+        }
+        setIntentMessage(firstError)
     }
 
     private func makeIntentShortcutRow(_ action: GlobalShortcutAction) -> NSView {
@@ -819,29 +859,32 @@ private final class SettingsViewController: NSViewController {
         nameLabel.textColor = .labelColor
 
         let hintLabel = NSTextField(labelWithString: action.hint)
-        hintLabel.font = .systemFont(ofSize: 11)
+        hintLabel.font = .systemFont(ofSize: 11.5)
         hintLabel.textColor = .secondaryLabelColor
 
         let text = NSStackView(views: [nameLabel, hintLabel])
         text.orientation = .vertical
         text.alignment = .leading
-        text.spacing = 1
+        text.spacing = 2
         text.setContentHuggingPriority(.defaultLow, for: .horizontal)
         text.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
 
-        let clearButton = SettingsPushButton(
-            title: "清空",
+        let idx = Self.intentShortcutActions.firstIndex(of: action) ?? 0
+        let clearButton = SettingsIconButton(
+            symbolName: "xmark.circle",
+            toolTip: "清空并解绑该快捷键",
             target: self,
             action: #selector(clearIntentShortcut(_:))
         )
-        clearButton.tag = Self.intentShortcutActions.firstIndex(of: action) ?? 0
+        clearButton.tag = idx
 
-        let resetButton = SettingsPushButton(
-            title: "恢复默认",
+        let resetButton = SettingsIconButton(
+            symbolName: "arrow.counterclockwise",
+            toolTip: "恢复默认快捷键",
             target: self,
             action: #selector(resetIntentShortcut(_:))
         )
-        resetButton.tag = Self.intentShortcutActions.firstIndex(of: action) ?? 0
+        resetButton.tag = idx
 
         return makeShortcutRow(text: text, recorder: recorder, clearButton: clearButton, resetButton: resetButton)
     }
@@ -852,6 +895,7 @@ private final class SettingsViewController: NSViewController {
         message.textColor = .systemRed
         message.lineBreakMode = .byWordWrapping
         message.maximumNumberOfLines = 3
+        message.isHidden = true
         message.translatesAutoresizingMaskIntoConstraints = false
         intentMessageLabel = message
         return message
@@ -860,12 +904,14 @@ private final class SettingsViewController: NSViewController {
     private func setIntentMessage(_ message: String?) {
         guard let message, !message.isEmpty else {
             intentMessageLabel?.stringValue = ""
+            intentMessageLabel?.isHidden = true
             return
         }
         intentMessageLabel?.stringValue = message
+        intentMessageLabel?.isHidden = false
     }
 
-    /// 截图快捷键的录制行：说明文字 + 键帽 + 「恢复默认」。
+    /// 截图快捷键的录制行：说明文字 + 键帽 + 轻巧图标动作。
     private func makeShortcutRecorderRow() -> NSView {
         let recorder = ShortcutRecorderView(shortcut: settings.optionalShortcut(for: .capture))
         recorder.translatesAutoresizingMaskIntoConstraints = false
@@ -897,22 +943,24 @@ private final class SettingsViewController: NSViewController {
         nameLabel.textColor = .labelColor
 
         let hintLabel = NSTextField(labelWithString: "支持组合键或单键 F1–F20；录制态按 Delete 可解绑")
-        hintLabel.font = .systemFont(ofSize: 11)
+        hintLabel.font = .systemFont(ofSize: 11.5)
         hintLabel.textColor = .secondaryLabelColor
 
         let text = NSStackView(views: [nameLabel, hintLabel])
         text.orientation = .vertical
         text.alignment = .leading
-        text.spacing = 1
+        text.spacing = 2
         text.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        let clearButton = SettingsPushButton(
-            title: "清空",
+        let clearButton = SettingsIconButton(
+            symbolName: "xmark.circle",
+            toolTip: "清空并解绑截图快捷键",
             target: self,
             action: #selector(clearCaptureShortcut)
         )
-        let resetButton = SettingsPushButton(
-            title: "恢复默认",
+        let resetButton = SettingsIconButton(
+            symbolName: "arrow.counterclockwise",
+            toolTip: "恢复默认快捷键",
             target: self,
             action: #selector(resetShortcut)
         )
@@ -920,30 +968,19 @@ private final class SettingsViewController: NSViewController {
         return makeShortcutRow(text: text, recorder: recorder, clearButton: clearButton, resetButton: resetButton)
     }
 
-    /// 常驻消息行。
-    ///
-    /// 内容为空时高度仍在，避免提示出现时整窗跳动。
-    /// 三行容量：Carbon 的失败原因可能较长。
     private func makeShortcutMessageLabel() -> NSView {
         let message = NSTextField(labelWithString: "")
         message.font = .systemFont(ofSize: 11)
         message.textColor = .systemRed
         message.lineBreakMode = .byWordWrapping
         message.maximumNumberOfLines = 3
+        message.isHidden = true
         message.translatesAutoresizingMaskIntoConstraints = false
         self.messageLabel = message
         return message
     }
 
-    /// 「说明 / 键帽 / 次要动作」三段式热键行。
-    ///
-    /// 截图快捷键与固定截图快捷键两张卡片共用这一结构。原先各写一遍
-    ///（后一处的注释还写着「与截图快捷键卡片同构」），一旦其中一处改了间距
-    /// 或忘了等宽约束，用户看到的就是两张本该一致的卡片排版不同。
-    ///
-    /// 本辅助只负责**结构**：两个等重弹性空隙把三部分分到左中右。
-    /// 三个子视图由调用方构造并配置——包括各自的抗压缩优先级：
-    /// 两张卡片的文案长度不同，需要的优先级也不同，那是调用方的决定。
+    /// 精简三段式热键行：左说明 + 右键帽胶囊 + 极简 26pt 图标动作，视觉零噪音。
     private func makeShortcutRow(
         text: NSView,
         recorder: NSView,
@@ -953,7 +990,7 @@ private final class SettingsViewController: NSViewController {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 8
+        row.spacing = 6
         row.translatesAutoresizingMaskIntoConstraints = false
 
         let spacer = NSView()
@@ -967,35 +1004,36 @@ private final class SettingsViewController: NSViewController {
         if let clearButton {
             clearButton.translatesAutoresizingMaskIntoConstraints = false
             row.addArrangedSubview(clearButton)
-            clearButton.widthAnchor.constraint(equalToConstant: 56).isActive = true
         }
         row.addArrangedSubview(resetButton)
 
         recorder.translatesAutoresizingMaskIntoConstraints = false
         resetButton.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            recorder.widthAnchor.constraint(equalToConstant: 128),
-            resetButton.widthAnchor.constraint(equalToConstant: 78),
-        ])
+        recorder.widthAnchor.constraint(equalToConstant: 124).isActive = true
         return row
     }
 
-    // MARK: Phase 5 新增卡片（外观语言 / 权限自愈 / 覆盖层速查 / 导出压缩）
+    // MARK: 通用页（外观偏好与开机启动 / 系统权限与自愈）
 
     private func makeAppearanceAndLanguageCard() -> SettingsCardView {
-        let appearanceSeg = NSSegmentedControl(
-            labels: AppAppearanceMode.allCases.map(\.displayName),
-            trackingMode: .selectOne,
-            target: self,
-            action: #selector(appearanceModeChanged(_:))
-        )
-        appearanceSeg.controlSize = .regular
-        if let idx = AppAppearanceMode.allCases.firstIndex(of: settings.appearanceMode) {
-            appearanceSeg.selectedSegment = idx
-        }
-        appearanceControl = appearanceSeg
-        let appearanceRow = SettingsControlRow(label: "外观主题", control: appearanceSeg)
+        // 1. 可视化迷你桌面外观主题选择卡
+        let themeTitle = NSTextField(labelWithString: "外观主题")
+        themeTitle.font = .systemFont(ofSize: 13, weight: .medium)
+        themeTitle.textColor = .labelColor
 
+        let picker = SettingsAppearancePicker(selected: settings.appearanceMode)
+        picker.onSelect = { [weak self] mode in
+            self?.settings.setAppearanceMode(mode)
+        }
+        appearancePicker = picker
+
+        let themeBlock = NSStackView(views: [themeTitle, picker])
+        themeBlock.orientation = .vertical
+        themeBlock.alignment = .leading
+        themeBlock.spacing = 8
+        picker.widthAnchor.constraint(equalTo: themeBlock.widthAnchor).isActive = true
+
+        // 2. 界面语言（干净原生下拉，左文右控，彻底告别双层套框）
         let langPopup = NSPopUpButton(frame: .zero, pullsDown: false)
         for lang in AppLanguage.allCases {
             langPopup.addItem(withTitle: lang.displayName)
@@ -1005,9 +1043,15 @@ private final class SettingsViewController: NSViewController {
         }
         langPopup.target = self
         langPopup.action = #selector(appLanguageChanged(_:))
+        langPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 148).isActive = true
         languagePopUp = langPopup
-        let langRow = SettingsControlRow(label: "界面语言", control: langPopup)
+        let langRow = SettingsControlRow(
+            label: "界面语言",
+            subtitle: "切换后菜单栏与覆盖层提示立即更新",
+            control: langPopup
+        )
 
+        // 3. 轻提示开关
         let toastRow = SettingsToggleRow(
             title: "操作完成时显示轻提示 (Toast)",
             subtitle: "复制、保存或贴图完成后在屏幕底部短暂显示状态胶囊"
@@ -1017,111 +1061,175 @@ private final class SettingsViewController: NSViewController {
         toastRow.toggle.action = #selector(showCompletionToastChanged(_:))
         toastToggleRow = toastRow
 
-        let recFrameRow = SettingsToggleRow(
-            title: "录屏期间显示边界提示框",
-            subtitle: "在屏幕中标出正在录制的区域边框（绝不会被录进成片）"
+        // 4. 登录自动启动（原孤立的「启动」卡片优雅并入通用偏好，减少视觉碎片）
+        let loginRow = SettingsToggleRow(
+            title: "登录时自动启动",
+            subtitle: "开机登录后自动运行，菜单栏图标随时可用"
         )
-        recFrameRow.isOn = settings.recordingShowRegionFrame
-        recFrameRow.toggle.target = self
-        recFrameRow.toggle.action = #selector(recordingShowRegionFrameChanged(_:))
-        recordingFrameToggleRow = recFrameRow
+        loginRow.toggle.target = self
+        loginRow.toggle.action = #selector(launchAtLoginChanged(_:))
+        launchAtLoginRow = loginRow
+        refreshLaunchAtLoginState()
 
-        let rows: [NSView] = [appearanceRow, langRow, toastRow, recFrameRow]
-        let stack = NSStackView(views: rows)
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 12
-        for row in rows {
-            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        }
-        return SettingsCardView(symbolName: "paintbrush", title: "外观、语言与提示", content: stack)
+        return SettingsCardView(
+            symbolName: "paintbrush.fill",
+            title: "外观、语言与启动",
+            accentColor: SettingsPage.general.badgeColor,
+            rows: [themeBlock, langRow, toastRow, loginRow]
+        )
     }
 
     private func makePermissionsCard() -> SettingsCardView {
-        func makeStatusRow(title: String) -> (NSView, NSTextField) {
+        func makeStatusRow(title: String, subtitle: String) -> (NSView, SettingsStatusPill) {
             let name = NSTextField(labelWithString: title)
             name.font = .systemFont(ofSize: 13, weight: .medium)
             name.textColor = .labelColor
 
-            let badge = NSTextField(labelWithString: "")
-            badge.font = .systemFont(ofSize: 12, weight: .semibold)
-            badge.alignment = .right
+            let sub = NSTextField(labelWithString: subtitle)
+            sub.font = .systemFont(ofSize: 11.5)
+            sub.textColor = .secondaryLabelColor
+
+            let textStack = NSStackView(views: [name, sub])
+            textStack.orientation = .vertical
+            textStack.alignment = .leading
+            textStack.spacing = 2
+            textStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+            let pill = SettingsStatusPill()
+            pill.setContentHuggingPriority(.required, for: .horizontal)
 
             let spacer = NSView()
             spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-            let row = NSStackView(views: [name, spacer, badge])
+            let row = NSStackView(views: [textStack, spacer, pill])
             row.orientation = .horizontal
             row.alignment = .centerY
-            row.spacing = 8
-            return (row, badge)
+            row.spacing = 10
+            return (row, pill)
         }
 
-        let (screenRow, screenBadge) = makeStatusRow(title: "屏幕与系统音频录制（必需）")
-        let (micRow, micBadge) = makeStatusRow(title: "麦克风（录屏旁白按需）")
-        let (axRow, axBadge) = makeStatusRow(title: "辅助功能（自动翻页 / 划词 / 控件吸附）")
-        screenPermStatusLabel = screenBadge
-        micPermStatusLabel = micBadge
-        axPermStatusLabel = axBadge
+        let (screenRow, screenPill) = makeStatusRow(
+            title: "屏幕与系统音频录制",
+            subtitle: "截图、长截图与录屏必需的核心系统权限"
+        )
+        let (micRow, micPill) = makeStatusRow(
+            title: "麦克风",
+            subtitle: "仅在录屏勾选旁白收音时按需使用"
+        )
+        let (axRow, axPill) = makeStatusRow(
+            title: "辅助功能",
+            subtitle: "用于长截图自动翻页、划词翻译与 UI 控件精准吸附"
+        )
+        screenPermPill = screenPill
+        micPermPill = micPill
+        axPermPill = axPill
 
-        let refreshBtn = SettingsPushButton(title: "刷新状态", target: self, action: #selector(refreshPermissionsClicked))
-        let openBtn = SettingsPushButton(title: "打开系统设置", target: self, action: #selector(openSystemPrivacySettings))
-        let repairBtn = SettingsPushButton(title: "重置 TCC 权限自愈…", target: self, action: #selector(resetTCCScreenCapturePermission))
-        let btnRow = NSStackView(views: [refreshBtn, openBtn, repairBtn])
+        let openBtn = SettingsPushButton(
+            title: "打开系统设置",
+            emphasis: .primary,
+            target: self,
+            action: #selector(openSystemPrivacySettings)
+        )
+        let refreshBtn = SettingsPushButton(
+            title: "刷新状态",
+            target: self,
+            action: #selector(refreshPermissionsClicked)
+        )
+        let repairBtn = SettingsPushButton(
+            title: "重置 TCC 自愈…",
+            emphasis: .destructive,
+            target: self,
+            action: #selector(resetTCCScreenCapturePermission)
+        )
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let btnRow = NSStackView(views: [openBtn, refreshBtn, spacer, repairBtn])
         btnRow.orientation = .horizontal
+        btnRow.alignment = .centerY
         btnRow.spacing = 8
 
-        let hint = NSTextField(wrappingLabelWithString: "若系统已勾选权限但仍无法截图，可使用「重置 TCC 权限自愈」清理异常授权缓存后重新勾选。")
+        let hint = NSTextField(wrappingLabelWithString: "若系统已勾选权限但仍无法截图，可使用「重置 TCC 自愈」清理异常授权缓存后重新勾选。")
         hint.font = .systemFont(ofSize: 11)
-        hint.textColor = .secondaryLabelColor
+        hint.textColor = .tertiaryLabelColor
 
-        let rows: [NSView] = [screenRow, micRow, axRow, btnRow, hint]
-        let stack = NSStackView(views: rows)
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 10
-        for row in rows {
-            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        }
+        let actionBlock = NSStackView(views: [btnRow, hint])
+        actionBlock.orientation = .vertical
+        actionBlock.alignment = .leading
+        actionBlock.spacing = 8
+        btnRow.widthAnchor.constraint(equalTo: actionBlock.widthAnchor).isActive = true
+        hint.widthAnchor.constraint(equalTo: actionBlock.widthAnchor).isActive = true
+
         refreshPermissionStatusLabels()
-        return SettingsCardView(symbolName: "lock.shield", title: "系统权限与自愈", content: stack)
+        return SettingsCardView(
+            symbolName: "lock.shield.fill",
+            title: "系统权限与自愈",
+            accentColor: SettingsPage.general.badgeColor,
+            rows: [screenRow, micRow, axRow, actionBlock]
+        )
     }
 
     private func makeOverlayShortcutReferenceCard() -> SettingsCardView {
-        let items: [(String, String)] = [
-            ("Space / Tab", "切换独立窗体捕获模式 / 穿透选择光标下叠放窗口"),
-            ("方向键 / ⌥+方向键", "1px 移动选区 / 调整宽高（按住 ⇧ 步进 5px/10px）"),
-            ("Space + 拖拽 / ⇧ + 拖拽", "整体平移选区 / 锁定当前宽高比等比缩放"),
-            ("C / ⇧C", "复制放大镜采样 HEX 色值 / RGB 色值"),
-            ("R / O / A / U / L / P / H / M / N / T", "矩形 / 椭圆 / 箭头 / 曲线箭头 / 直线 / 画笔 / 荧光笔 / 马赛克 / 编号 / 文字"),
-            ("滚轮 / ⌘Z / ⇧⌘Z", "即时调节当前工具粗细与字号 / 撤销与重做"),
-            ("Enter / ⌘C / ⌘S / ⇧⌘S / ⌘P", "复制 / 复制 / 静默保存 / 另存为 / 钉住贴图"),
+        let items: [([String], String)] = [
+            (["Space", "Tab"], "切换独立窗体模式 / 穿透选择光标下叠放窗口"),
+            (["↑↓←→", "⌥+方向键"], "1px 移动选区 / 调整宽高（按住 ⇧ 步进 5px/10px）"),
+            (["Space+拖拽", "⇧+拖拽"], "整体平移选区 / 锁定当前宽高比等比缩放"),
+            (["C", "⇧C"], "复制放大镜采样 HEX 色值 / RGB 色值"),
+            (["R O A P H T M N"], "矩形 / 椭圆 / 箭头 / 画笔 / 荧光笔 / 文字 / 马赛克 / 编号"),
+            (["滚轮", "⌘Z", "⇧⌘Z"], "即时调节粗细与字号 / 撤销与重做"),
+            (["Enter", "⌘S", "⌥+保存", "⌘P"], "复制 / 静默保存 / 另存为 / 钉住贴图"),
         ]
         var rows: [NSView] = []
-        for (keys, desc) in items {
-            let kLabel = NSTextField(labelWithString: keys)
-            kLabel.font = .monospacedSystemFont(ofSize: 11, weight: .semibold)
-            kLabel.textColor = .labelColor
-            kLabel.setContentHuggingPriority(.required, for: .horizontal)
+        for (badges, desc) in items {
+            let keyStack = NSStackView()
+            keyStack.orientation = .horizontal
+            keyStack.alignment = .centerY
+            keyStack.spacing = 4
+            keyStack.setContentHuggingPriority(.required, for: .horizontal)
+            for badge in badges {
+                keyStack.addArrangedSubview(makeMiniKeycapBadge(badge))
+            }
 
             let dLabel = NSTextField(wrappingLabelWithString: desc)
-            dLabel.font = .systemFont(ofSize: 11)
+            dLabel.font = .systemFont(ofSize: 11.5)
             dLabel.textColor = .secondaryLabelColor
+            dLabel.alignment = .right
+            dLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-            let line = NSStackView(views: [kLabel, dLabel])
+            let spacer = NSView()
+            spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+            let line = NSStackView(views: [keyStack, spacer, dLabel])
             line.orientation = .horizontal
-            line.alignment = .firstBaseline
+            line.alignment = .centerY
             line.spacing = 10
             rows.append(line)
         }
-        let stack = NSStackView(views: rows)
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 7
-        for row in rows {
-            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        }
-        return SettingsCardView(symbolName: "keyboard", title: "覆盖层内快捷键速查", content: stack)
+        return SettingsCardView(
+            symbolName: "keyboard.fill",
+            title: "覆盖层内快捷键速查",
+            accentColor: SettingsPage.shortcuts.badgeColor,
+            rows: rows,
+            rowSpacing: 8
+        )
+    }
+
+    /// 立体小键帽徽章（用于覆盖层快捷键速查表）。
+    private func makeMiniKeycapBadge(_ text: String) -> NSView {
+        let container = ThemedSurfaceView(kind: .inset, cornerRadius: 5)
+        container.translatesAutoresizingMaskIntoConstraints = false
+        let label = NSTextField(labelWithString: text)
+        label.font = .monospacedSystemFont(ofSize: 10.5, weight: .semibold)
+        label.textColor = .labelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.topAnchor.constraint(equalTo: container.topAnchor, constant: 3),
+            label.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -3),
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 6),
+            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -6),
+        ])
+        return container
     }
 
     private func makeExportPipelineCard() -> SettingsCardView {
@@ -1134,28 +1242,38 @@ private final class SettingsViewController: NSViewController {
         }
         formatPop.target = self
         formatPop.action = #selector(exportFormatChanged(_:))
+        formatPop.widthAnchor.constraint(greaterThanOrEqualToConstant: 160).isActive = true
         exportFormatPopUp = formatPop
-        let formatRow = SettingsControlRow(label: "默认保存格式", control: formatPop)
+        let formatRow = SettingsControlRow(
+            label: "默认保存格式",
+            subtitle: "截图主栏右键「保存」也可临时按其他格式导出",
+            control: formatPop
+        )
 
         let slider = NSSlider(value: settings.exportQuality, minValue: 0.1, maxValue: 1.0, target: self, action: #selector(exportQualityChanged(_:)))
         slider.isContinuous = true
         exportQualitySlider = slider
         let valLabel = NSTextField(labelWithString: "\(Int((settings.exportQuality * 100).rounded()))%")
-        valLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        valLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
         valLabel.textColor = .secondaryLabelColor
+        valLabel.alignment = .right
         exportQualityValueLabel = valLabel
 
         let qualityBox = NSStackView(views: [slider, valLabel])
         qualityBox.orientation = .horizontal
         qualityBox.alignment = .centerY
         qualityBox.spacing = 8
-        slider.widthAnchor.constraint(equalToConstant: 160).isActive = true
-        valLabel.widthAnchor.constraint(equalToConstant: 40).isActive = true
-        let qualityRow = SettingsControlRow(label: "JPEG / HEIC 质量", control: qualityBox)
+        slider.widthAnchor.constraint(equalToConstant: 150).isActive = true
+        valLabel.widthAnchor.constraint(equalToConstant: 36).isActive = true
+        let qualityRow = SettingsControlRow(
+            label: "JPEG / HEIC 压缩质量",
+            subtitle: "仅在有损格式导出时生效",
+            control: qualityBox
+        )
 
         let oxiRow = SettingsToggleRow(
             title: "PNG 无损后台精压（MIT oxipng）",
-            subtitle: "保存与复制 PNG 时 0ms 即刻落盘，后台两阶段无损压缩并完整保留 144 DPI 与 ICC（缺工具时静默跳过）"
+            subtitle: "保存与复制 PNG 时 0ms 即刻落盘，后台两阶段无损压缩并完整保留 144 DPI 与 ICC"
         )
         oxiRow.isOn = settings.pngLosslessOptimize
         oxiRow.toggle.target = self
@@ -1164,37 +1282,40 @@ private final class SettingsViewController: NSViewController {
 
         let tiffRow = SettingsToggleRow(
             title: "剪贴板兼容老应用（按需提供 TIFF）",
-            subtitle: "关闭后仅向剪贴板写入精压 PNG，可显著降低部分第三方剪贴板历史工具的内存占用"
+            subtitle: "关闭后仅向剪贴板写入精压 PNG，显著降低部分第三方剪贴板历史工具的内存占用"
         )
         tiffRow.isOn = settings.pasteboardLazyTIFF
         tiffRow.toggle.target = self
         tiffRow.toggle.action = #selector(pasteboardLazyTIFFChanged(_:))
         lazyTIFFRow = tiffRow
 
-        let rows: [NSView] = [formatRow, qualityRow, oxiRow, tiffRow]
-        let stack = NSStackView(views: rows)
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 12
-        for row in rows {
-            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        }
         refreshExportFormatControls()
-        return SettingsCardView(symbolName: "doc.zipper", title: "导出格式、无损压缩与剪贴板", content: stack)
+        return SettingsCardView(
+            symbolName: "doc.zipper",
+            title: "导出格式、无损压缩与剪贴板",
+            accentColor: SettingsPage.save.badgeColor,
+            rows: [formatRow, qualityRow, oxiRow, tiffRow]
+        )
     }
 
     private func refreshPermissionStatusLabels() {
         let screenGranted = ScreenCapturePermissionService().current() == .granted
-        screenPermStatusLabel?.stringValue = screenGranted ? "已授权" : "尚未授权"
-        screenPermStatusLabel?.textColor = screenGranted ? AnShotTheme.success : AnShotTheme.warning
+        screenPermPill?.render(
+            text: screenGranted ? "已授权" : "尚未授权",
+            tone: screenGranted ? .success : .warning
+        )
 
         let micGranted = MicrophonePermission.status == .granted
-        micPermStatusLabel?.stringValue = micGranted ? "已授权" : "未授权（按需）"
-        micPermStatusLabel?.textColor = micGranted ? AnShotTheme.success : .secondaryLabelColor
+        micPermPill?.render(
+            text: micGranted ? "已授权" : "未授权（按需）",
+            tone: micGranted ? .success : .neutral
+        )
 
         let axGranted = SystemElementDetector().hasAccessibilityPermission
-        axPermStatusLabel?.stringValue = axGranted ? "已授权" : "未授权（可选）"
-        axPermStatusLabel?.textColor = axGranted ? AnShotTheme.success : .secondaryLabelColor
+        axPermPill?.render(
+            text: axGranted ? "已授权" : "未授权（可选）",
+            tone: axGranted ? .success : .neutral
+        )
     }
 
     private func refreshExportFormatControls() {
@@ -1207,11 +1328,6 @@ private final class SettingsViewController: NSViewController {
         exportQualityValueLabel?.textColor = settings.exportFormat.supportsQuality ? .labelColor : .tertiaryLabelColor
         pngOptimizeRow?.isOn = settings.pngLosslessOptimize
         lazyTIFFRow?.isOn = settings.pasteboardLazyTIFF
-    }
-
-    @objc private func appearanceModeChanged(_ sender: NSSegmentedControl) {
-        let idx = max(0, min(AppAppearanceMode.allCases.count - 1, sender.selectedSegment))
-        settings.setAppearanceMode(AppAppearanceMode.allCases[idx])
     }
 
     @objc private func appLanguageChanged(_ sender: NSPopUpButton) {
@@ -1308,23 +1424,31 @@ private final class SettingsViewController: NSViewController {
         borderRow.toggle.action = #selector(pinShowBorderChanged(_:))
         pinShowBorderRow = borderRow
 
-        let rows = makePinLimitViews() + [borderRow] + makePinToggleViews()
+        let limitViews = makePinLimitViews()
+        let toggleViews = makePinToggleViews()
 
-        let content = NSStackView(views: rows)
-        content.orientation = .vertical
-        content.alignment = .leading
-        content.spacing = 10
-
-        // 每个子视图都撑满卡片宽度。
-        //
-        // 原先逐个列出四条约束，与上面的视图数组必须手工保持同步——
-        // 漏一条或改错一条的表现是「某一行宽度与其它行不一致」，
-        // 而这种不齐未必一眼看得出来。改成遍历后两者不可能脱节。
-        for row in rows {
-            row.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        let limitBlock = NSStackView(views: limitViews)
+        limitBlock.orientation = .vertical
+        limitBlock.alignment = .leading
+        limitBlock.spacing = 6
+        for v in limitViews {
+            v.widthAnchor.constraint(equalTo: limitBlock.widthAnchor).isActive = true
         }
 
-        return SettingsCardView(symbolName: "pin", title: "固定截图", content: content)
+        let toggleBlock = NSStackView(views: toggleViews)
+        toggleBlock.orientation = .vertical
+        toggleBlock.alignment = .leading
+        toggleBlock.spacing = 6
+        for v in toggleViews {
+            v.widthAnchor.constraint(equalTo: toggleBlock.widthAnchor).isActive = true
+        }
+
+        return SettingsCardView(
+            symbolName: "pin.fill",
+            title: "固定截图",
+            accentColor: SettingsPage.pin.badgeColor,
+            rows: [limitBlock, borderRow, toggleBlock]
+        )
     }
 
     /// 「同时保留」上限区块：步进器 + 说明文字。
@@ -1424,8 +1548,9 @@ private final class SettingsViewController: NSViewController {
         text.setContentHuggingPriority(.defaultLow, for: .horizontal)
         text.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
 
-        let resetButton = SettingsPushButton(
-            title: "恢复默认",
+        let resetButton = SettingsIconButton(
+            symbolName: "arrow.counterclockwise",
+            toolTip: "恢复默认贴图快捷键",
             target: self,
             action: #selector(resetPinToggleShortcut)
         )
@@ -1438,6 +1563,7 @@ private final class SettingsViewController: NSViewController {
         message.textColor = .systemRed
         message.lineBreakMode = .byWordWrapping
         message.maximumNumberOfLines = 3
+        message.isHidden = true
         message.translatesAutoresizingMaskIntoConstraints = false
         pinMessageLabel = message
 
@@ -1449,10 +1575,10 @@ private final class SettingsViewController: NSViewController {
         "\(count) 张"
     }
 
-    // MARK: 启动卡片
+    // MARK: 截图与标注页（独立高内聚分类）
 
-    /// 「截图与工具栏交互」卡片：独立窗体阴影、已有标注防误关保护与主工具栏槽位显隐。
-    private func makeCaptureInteractionCard() -> SettingsCardView {
+    /// 卡片 1：「截图行为与录屏」——窗体阴影、防误关与录屏边界框。
+    private func makeCaptureBehaviorCard() -> SettingsCardView {
         let shadowRow = SettingsToggleRow(
             title: "独立窗体截图合成柔和阴影",
             subtitle: "窗体模式下按住 ⌥ 单击可临时切换无阴影"
@@ -1469,6 +1595,25 @@ private final class SettingsViewController: NSViewController {
         cancelGuardRow.toggle.target = self
         cancelGuardRow.toggle.action = #selector(confirmCancelChanged(_:))
 
+        let recFrameRow = SettingsToggleRow(
+            title: "录屏期间显示边界提示框",
+            subtitle: "在屏幕中标出正在录制的区域边框（绝不会被录进成片）"
+        )
+        recFrameRow.isOn = settings.recordingShowRegionFrame
+        recFrameRow.toggle.target = self
+        recFrameRow.toggle.action = #selector(recordingShowRegionFrameChanged(_:))
+        recordingFrameToggleRow = recFrameRow
+
+        return SettingsCardView(
+            symbolName: "viewfinder",
+            title: "截图行为与录屏",
+            accentColor: SettingsPage.capture.badgeColor,
+            rows: [shadowRow, cancelGuardRow, recFrameRow]
+        )
+    }
+
+    /// 卡片 2：「滚动长截图」——自动翻页开关与翻页速度。
+    private func makeLongshotCard() -> SettingsCardView {
         let autoScrollRow = SettingsToggleRow(
             title: "长截图默认开启自动平滑翻页",
             subtitle: "可按 Space 暂停或直接手动滚动无缝接管；无辅助功能权限时自动降级手动"
@@ -1487,75 +1632,49 @@ private final class SettingsViewController: NSViewController {
         }
         speedPopUp.target = self
         speedPopUp.action = #selector(longshotSpeedChanged)
-        speedPopUp.isBordered = false
-        speedPopUp.bezelStyle = .inline
-        speedPopUp.font = .systemFont(ofSize: 13)
+        speedPopUp.widthAnchor.constraint(greaterThanOrEqualToConstant: 136).isActive = true
         longshotSpeedPopUp = speedPopUp
-        let speedRow = SettingsControlRow(label: "自动翻页速度", control: speedPopUp)
+        let speedRow = SettingsControlRow(
+            label: "自动翻页速度",
+            subtitle: "页面加载慢或动画较多时可调低一档",
+            control: speedPopUp
+        )
 
-        let slotTitle = NSTextField(labelWithString: "主工具栏快捷项显示（隐藏不禁用快捷键）")
-        slotTitle.font = .systemFont(ofSize: 12, weight: .medium)
-        slotTitle.textColor = .secondaryLabelColor
-        slotTitle.translatesAutoresizingMaskIntoConstraints = false
+        return SettingsCardView(
+            symbolName: "arrow.up.and.down.text.horizontal",
+            title: "滚动长截图",
+            accentColor: SettingsPage.capture.badgeColor,
+            rows: [autoScrollRow, speedRow]
+        )
+    }
 
-        let slotGrid = NSStackView()
-        slotGrid.orientation = .vertical
-        slotGrid.alignment = .leading
-        slotGrid.spacing = 6
-        slotGrid.translatesAutoresizingMaskIntoConstraints = false
+    /// 卡片 3：「主工具栏快捷项」——现代胶囊开关网格。
+    private func makeToolbarSlotsCard() -> SettingsCardView {
+        let hint = NSTextField(wrappingLabelWithString: "点击切换主工具栏中常驻显示的扩展与动作按钮；隐藏后对应快捷键仍然可用。")
+        hint.font = .systemFont(ofSize: 11.5)
+        hint.textColor = .secondaryLabelColor
 
-        let catalog = AnnotationToolbarLayout.customizableSlotCatalog
-        let rowCount = (catalog.count + 2) / 3
-        for rowIndex in 0 ..< rowCount {
-            let start = rowIndex * 3
-            let end = min(start + 3, catalog.count)
-            let line = NSStackView()
-            line.orientation = .horizontal
-            line.alignment = .centerY
-            line.spacing = 14
-            for item in catalog[start ..< end] {
-                let checkbox = NSButton(
-                    checkboxWithTitle: item.title,
-                    target: self,
-                    action: #selector(toolbarSlotToggled(_:))
-                )
-                checkbox.identifier = NSUserInterfaceItemIdentifier(item.id)
-                checkbox.font = .systemFont(ofSize: 12)
-                checkbox.state = settings.toolbarHiddenSlots.contains(item.id) ? .off : .on
-                line.addArrangedSubview(checkbox)
-            }
-            slotGrid.addArrangedSubview(line)
+        let grid = SettingsToolbarSlotChipGrid(
+            catalog: AnnotationToolbarLayout.customizableSlotCatalog,
+            hiddenSlots: settings.toolbarHiddenSlots
+        )
+        grid.onToggle = { [weak self] slotID, isVisible in
+            self?.settings.setToolbarSlot(slotID, visible: isVisible)
         }
+        toolbarSlotGrid = grid
 
-        let firstSep = NSBox()
-        firstSep.boxType = .separator
-        let secondSep = NSBox()
-        secondSep.boxType = .separator
-        let thirdSep = NSBox()
-        thirdSep.boxType = .separator
-
-        let content = NSStackView(views: [
-            shadowRow,
-            firstSep,
-            cancelGuardRow,
-            secondSep,
-            autoScrollRow,
-            speedRow,
-            thirdSep,
-            slotTitle,
-            slotGrid,
-        ])
-        content.orientation = .vertical
-        content.alignment = .leading
-        content.spacing = 10
-        for subview in content.arrangedSubviews {
-            subview.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
-        }
+        let stack = NSStackView(views: [hint, grid])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        hint.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        grid.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
 
         return SettingsCardView(
             symbolName: "slider.horizontal.3",
-            title: "截图与工具栏",
-            content: content
+            title: "主工具栏快捷项",
+            accentColor: SettingsPage.capture.badgeColor,
+            content: stack
         )
     }
 
@@ -1577,62 +1696,26 @@ private final class SettingsViewController: NSViewController {
         settings.setLongshotAutoScrollSpeed(AutoScrollSpeed.allCases[index])
     }
 
-    @objc private func toolbarSlotToggled(_ sender: NSButton) {
-        guard let slotID = sender.identifier?.rawValue else { return }
-        settings.setToolbarSlot(slotID, visible: sender.state == .on)
-    }
-
-    /// 「启动」卡片：登录时自动启动。
-    ///
-    /// 独立成一个卡片而不是并进快捷键卡片：两者没有关系，
-    /// 并进去会让「截图快捷键」这个标题下出现一个与快捷键无关的开关。
-    private func makeLaunchAtLoginCard() -> SettingsCardView {
-        let row = SettingsToggleRow(
-            title: "登录时自动启动",
-            subtitle: "开机登录后自动运行，菜单栏图标随时可用"
-        )
-        row.toggle.target = self
-        row.toggle.action = #selector(launchAtLoginChanged(_:))
-        self.launchAtLoginRow = row
-
-        let content = NSStackView(views: [row])
-        content.orientation = .vertical
-        content.alignment = .leading
-        content.spacing = 0
-        row.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
-
-        // 必须在这里同步到系统当前状态。少了这一步，打开窗口会看到开关停在
-        // `NSSwitch` 的默认值（关）上——而系统里的登录项可能是开着的。
-        // 用户会以为它被关掉了，于是再点一次，把它真的关掉。
-        refreshLaunchAtLoginState()
-
-        return SettingsCardView(
-            symbolName: "power",
-            title: "启动",
-            content: content
-        )
-    }
-
     // MARK: 保存卡片
 
     private func makeSaveCard() -> SettingsCardView {
+        let saveAccent = SettingsPage.save.badgeColor
         let askOption = SettingsOptionButton(
             model: .init(
                 symbolName: "hand.point.up.left.fill",
                 title: "每次询问",
-                subtitle: "保存时让我选择位置"
+                subtitle: "保存时让我选择位置",
+                accentColor: saveAccent
             ),
             target: self,
             action: #selector(saveModeChanged(_:))
         )
         let folderOption = SettingsOptionButton(
             model: .init(
-                // 用文件夹而不是「方框 + 箭头」类符号：后者在 15pt 下
-                // 内部细节会糊成一团。符号越小越应该选简单形状，
-                // 而且「保存到**文件夹**」本来就没比文件夹更直白的图标。
                 symbolName: "folder.fill",
                 title: "保存到文件夹",
-                subtitle: "直接存入指定目录"
+                subtitle: "直接存入指定目录",
+                accentColor: saveAccent
             ),
             target: self,
             action: #selector(saveModeChanged(_:))
@@ -1659,22 +1742,19 @@ private final class SettingsViewController: NSViewController {
         let content = NSStackView(views: [options, surface])
         content.orientation = .vertical
         content.alignment = .leading
-        content.spacing = 14
+        content.spacing = 12
 
         NSLayoutConstraint.activate([
             options.widthAnchor.constraint(equalTo: content.widthAnchor),
             surface.widthAnchor.constraint(equalTo: content.widthAnchor)
         ])
 
-        // 必须在这里把界面同步到当前设置。
-        // 少了这一步，打开窗口时会看到「两个选项都没选中」——
-        // 因为 `state` 的默认值是 `.off`，而设置里的真实状态没人读。
-        // 用户会以为当前没有任何保存方式生效。
         refreshSaveControls()
 
         return SettingsCardView(
-            symbolName: "tray.and.arrow.down",
+            symbolName: "tray.and.arrow.down.fill",
             title: "保存位置",
+            accentColor: saveAccent,
             content: content
         )
     }
@@ -1795,9 +1875,8 @@ private final class SettingsViewController: NSViewController {
 
         return SettingsCardView(
             symbolName: "text.viewfinder",
-            // 不叫「文字识别」：页头已经是这个名字，卡片再写一遍就是同一句话说两次。
-            // 卡片标题应当描述**这片内容是什么**（用什么识别），而不是所属分组。
             title: "识别服务",
+            accentColor: SettingsPage.recognition.badgeColor,
             content: content
         )
     }
@@ -1916,8 +1995,9 @@ private final class SettingsViewController: NSViewController {
         refreshTranslationControls()
 
         return SettingsCardView(
-            symbolName: "character.book.closed",
+            symbolName: "character.book.closed.fill",
             title: "翻译服务",
+            accentColor: SettingsPage.translation.badgeColor,
             content: content
         )
     }
@@ -2322,23 +2402,13 @@ private final class SettingsViewController: NSViewController {
 
         let actionRow = makeAboutTrailingRow(leading: status, buttons: [checkButton])
 
-        let rows: [NSView] = [identity, autoCheck, actionRow]
-        let content = NSStackView(views: rows)
-        content.orientation = .vertical
-        content.alignment = .leading
-        content.spacing = 10
-        for row in rows {
-            row.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
-        }
-
-        // 订阅必须放在标签与按钮都建好之后：赋值 `onStateChange` 会立即同步
-        // 回调一次当前状态，回调里要写的控件此时必须已经存在。
         subscribeToUpdateState()
 
         return SettingsCardView(
             symbolName: "arrow.triangle.2.circlepath",
             title: "版本与更新",
-            content: content
+            accentColor: SettingsPage.about.badgeColor,
+            rows: [identity, autoCheck, actionRow]
         )
     }
 
@@ -2415,8 +2485,9 @@ private final class SettingsViewController: NSViewController {
         // 数量不在这里读：构造设置窗时会预建所有页面，而报告枚举要扫多个目录。
         // 具体读取时机见 `refreshAboutCrashCount`。
         return SettingsCardView(
-            symbolName: "exclamationmark.triangle",
+            symbolName: "exclamationmark.triangle.fill",
             title: "崩溃日志",
+            accentColor: SettingsPage.about.badgeColor,
             content: content
         )
     }
@@ -2436,18 +2507,11 @@ private final class SettingsViewController: NSViewController {
             ),
         ]
 
-        let content = NSStackView(views: rows)
-        content.orientation = .vertical
-        content.alignment = .leading
-        content.spacing = 10
-        for row in rows {
-            row.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
-        }
-
         return SettingsCardView(
             symbolName: "link",
             title: "链接",
-            content: content
+            accentColor: SettingsPage.about.badgeColor,
+            rows: rows
         )
     }
 
@@ -2654,22 +2718,22 @@ private final class SettingsViewController: NSViewController {
     private func setMessage(_ message: String?) {
         guard let message, !message.isEmpty else {
             messageLabel.stringValue = ""
+            messageLabel.isHidden = true
             return
         }
         messageLabel.stringValue = message
+        messageLabel.isHidden = false
     }
 
     /// 设置固定截图卡片的消息行。
-    ///
-    /// 与截图快捷键的消息行**分开**：两张卡片可能同时处于需要提示的状态
-    /// （比如刚把两个热键都改成被占用的组合），共用一个标签会让后一条
-    /// 把先一条覆盖掉，而先一条描述的那个热键确实已经出了问题。
     private func setPinMessage(_ message: String?) {
         guard let message, !message.isEmpty else {
             pinMessageLabel.stringValue = ""
+            pinMessageLabel.isHidden = true
             return
         }
         pinMessageLabel.stringValue = message
+        pinMessageLabel.isHidden = false
     }
 
     // MARK: 动作
@@ -2841,14 +2905,15 @@ private final class SettingsViewController: NSViewController {
         view.window?.close()
     }
 
-    /// 接住 ⌘W。
-    ///
-    /// 本应用无应用菜单，`⌘W` 不会由菜单自动绑定，必须自己处理；
-    /// 否则用户在设置窗口里按 ⌘W 会没有任何反应。
+    /// 接住 `⌘W`（关闭窗口）与 `⌘F`（快速聚焦侧边栏跨分类搜索框）。
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if flags == .command, event.charactersIgnoringModifiers == "w" {
             view.window?.performClose(nil)
+            return true
+        }
+        if flags == .command, event.charactersIgnoringModifiers == "f" {
+            view.window?.makeFirstResponder(searchField)
             return true
         }
         return super.performKeyEquivalent(with: event)
@@ -2867,12 +2932,11 @@ private final class SettingsViewController: NSViewController {
         if let speedIdx = AutoScrollSpeed.allCases.firstIndex(of: settings.longshotAutoScrollSpeed) {
             longshotSpeedPopUp?.selectItem(at: speedIdx)
         }
+        toolbarSlotGrid?.update(hiddenSlots: settings.toolbarHiddenSlots)
         for action in Self.intentShortcutActions {
             intentRecorders[action]?.shortcut = settings.optionalShortcut(for: action)
         }
-        if let appIdx = AppAppearanceMode.allCases.firstIndex(of: settings.appearanceMode) {
-            appearanceControl?.selectedSegment = appIdx
-        }
+        appearancePicker?.selectedMode = settings.appearanceMode
         if let langIdx = AppLanguage.allCases.firstIndex(of: settings.appLanguage) {
             languagePopUp?.selectItem(at: langIdx)
         }
@@ -2947,11 +3011,37 @@ private final class SettingsScrollDocumentView: NSView {
 ///
 /// 只填一层底色：与内容区的明度差本身就划出了边界，
 /// 再加一条分隔线反而会让侧边栏显得比内容区「重」。
+/// 现代 macOS 毛玻璃侧边栏：底层 `NSVisualEffectView(.sidebar)` + 右侧 1pt 极细分割线。
 private final class SettingsSidebarView: NSView {
+
+    private let effectView = NSVisualEffectView()
+    private let dividerView = NSView()
 
     init() {
         super.init(frame: .zero)
         wantsLayer = true
+
+        effectView.material = .sidebar
+        effectView.blendingMode = .behindWindow
+        effectView.state = .followsWindowActiveState
+        effectView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(effectView)
+
+        dividerView.wantsLayer = true
+        dividerView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(dividerView)
+
+        NSLayoutConstraint.activate([
+            effectView.topAnchor.constraint(equalTo: topAnchor),
+            effectView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            effectView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            effectView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            dividerView.topAnchor.constraint(equalTo: topAnchor),
+            dividerView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            dividerView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            dividerView.widthAnchor.constraint(equalToConstant: 1),
+        ])
     }
 
     @available(*, unavailable)
@@ -2963,6 +3053,7 @@ private final class SettingsSidebarView: NSView {
 
     override func updateLayer() {
         layer?.backgroundColor = SettingsTheme.sidebarBackground.cgColor
+        dividerView.layer?.backgroundColor = SettingsTheme.sidebarDivider.cgColor
     }
 }
 

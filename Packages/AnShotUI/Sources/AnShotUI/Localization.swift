@@ -103,6 +103,7 @@ public enum AnShotLocalization {
         "settings.windowTitle": "anShot Settings",
         "settings.searchPlaceholder": "Search settings…",
         "settings.page.general": "General",
+        "settings.page.capture": "Capture & Annotate",
         "settings.page.shortcuts": "Shortcuts",
         "settings.page.save": "Save & Export",
         "settings.page.pin": "Pinned",
@@ -111,7 +112,8 @@ public enum AnShotLocalization {
         "settings.page.about": "About",
 
         // 设置分类页副标题
-        "settings.subtitle.general": "Appearance, language, startup, permissions and capture behavior",
+        "settings.subtitle.general": "Appearance, language, startup and system permissions",
+        "settings.subtitle.capture": "Window shadows, Esc guard, recording frame, scrollshot and toolbar slots",
         "settings.subtitle.shortcuts": "Configure global shortcuts, unbind keys or view overlay hotkeys",
         "settings.subtitle.save": "Output directory, format, lossless compression and clipboard",
         "settings.subtitle.pin": "Pinned screenshot limit, border styling and visibility",

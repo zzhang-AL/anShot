@@ -2,19 +2,18 @@
 //  SettingsNavigation.swift
 //  AnShotUI
 //
-//  设置窗口的导航模型：页面清单与主菜单项。
-//
-//  纯数据与标识，不含任何视图代码。视图侧按这些标识决定显示哪一页。
+//  设置窗口的导航模型：8 大清晰分类页面清单（含语义色徽章与跨分类关键词检索）及全局主菜单。
 //
 import AppKit
 
 /// 设置窗口的一页。
 ///
-/// 侧边栏的每一项与这里的 case 一一对应；新增设置分组时，
-/// 加一个 case 就会同时在侧边栏出现，不需要在两处各写一遍标题与图标。
+/// 侧边栏的每一项与这里的 case 一一对应；信息架构经梳理分为 8 大高内聚分类，
+/// 将原先堆积在「通用」中的截图行为、长截图与工具栏自定义拆出为独立的「截图与标注」页。
 enum SettingsPage: String, CaseIterable {
 
     case general
+    case capture
     case shortcuts
     case save
     case pin
@@ -26,6 +25,7 @@ enum SettingsPage: String, CaseIterable {
     var title: String {
         switch self {
         case .general: return L("settings.page.general", fallback: "通用")
+        case .capture: return L("settings.page.capture", fallback: "截图与标注")
         case .shortcuts: return L("settings.page.shortcuts", fallback: "快捷键")
         case .save: return L("settings.page.save", fallback: "保存与导出")
         case .pin: return L("settings.page.pin", fallback: "固定截图")
@@ -37,26 +37,58 @@ enum SettingsPage: String, CaseIterable {
 
     var symbolName: String {
         switch self {
-        case .general: return "gearshape"
+        case .general: return "gearshape.fill"
+        case .capture: return "viewfinder"
         case .shortcuts: return "command"
-        case .save: return "tray.and.arrow.down"
-        case .pin: return "pin"
+        case .save: return "tray.and.arrow.down.fill"
+        case .pin: return "pin.fill"
         case .recognition: return "text.viewfinder"
-        case .translation: return "character.book.closed"
+        case .translation: return "character.book.closed.fill"
         case .about: return "info.circle"
+        }
+    }
+
+    /// 现代 macOS 分类语义色（用于侧边栏 22×22 徽章与页头 40×40 渐变徽章）。
+    var badgeColor: NSColor {
+        switch self {
+        case .general:
+            return NSColor(srgbRed: 0.24, green: 0.52, blue: 0.96, alpha: 1) // 经典系统蓝
+        case .capture:
+            return NSColor(srgbRed: 0.36, green: 0.42, blue: 0.95, alpha: 1) // 活力靛蓝
+        case .shortcuts:
+            return NSColor(srgbRed: 0.58, green: 0.36, blue: 0.92, alpha: 1) // 优雅紫罗兰
+        case .save:
+            return NSColor(srgbRed: 0.16, green: 0.72, blue: 0.48, alpha: 1) // 翡翠绿
+        case .pin:
+            return NSColor(srgbRed: 0.95, green: 0.56, blue: 0.18, alpha: 1) // 琥珀橙
+        case .recognition:
+            return NSColor(srgbRed: 0.12, green: 0.66, blue: 0.78, alpha: 1) // 清澈青碧
+        case .translation:
+            return NSColor(srgbRed: 0.92, green: 0.34, blue: 0.52, alpha: 1) // 珊瑚玫瑰
+        case .about:
+            return NSColor(srgbRed: 0.46, green: 0.50, blue: 0.58, alpha: 1) // 沉稳石板灰
         }
     }
 
     @MainActor
     var subtitle: String {
         switch self {
-        case .general: return L("settings.subtitle.general", fallback: "外观、语言、系统权限、截图交互与登录启动")
-        case .shortcuts: return L("settings.subtitle.shortcuts", fallback: "统一管理全局热键（支持解绑与 F1–F20）及覆盖层快捷键")
-        case .save: return L("settings.subtitle.save", fallback: "保存位置、多格式导出、无损压缩与剪贴板行为")
-        case .pin: return L("settings.subtitle.pin", fallback: "配置固定截图的数量上限、边框样式与隐显快捷键")
-        case .recognition: return L("settings.subtitle.recognition", fallback: "选择本地或云端文字识别引擎与二维码识别")
-        case .translation: return L("settings.subtitle.translation", fallback: "配置系统离线翻译与云端翻译模型")
-        case .about: return L("settings.subtitle.about", fallback: "查看应用版本、更新与诊断信息")
+        case .general:
+            return L("settings.subtitle.general", fallback: "外观主题、界面语言、登录启动与系统权限自愈")
+        case .capture:
+            return L("settings.subtitle.capture", fallback: "窗体阴影、防误关保护、录屏提示框、滚动长截图与工具栏槽位")
+        case .shortcuts:
+            return L("settings.subtitle.shortcuts", fallback: "全局热键（支持解绑与 F1–F20）及覆盖层快捷键速查")
+        case .save:
+            return L("settings.subtitle.save", fallback: "保存位置、多格式导出、无损精压与剪贴板行为")
+        case .pin:
+            return L("settings.subtitle.pin", fallback: "固定截图保留上限、高对比边框与隐显热键")
+        case .recognition:
+            return L("settings.subtitle.recognition", fallback: "本地或云端文字识别引擎、默认语种与二维码扫描")
+        case .translation:
+            return L("settings.subtitle.translation", fallback: "系统离线翻译、云端翻译模型与划词悬浮翻译")
+        case .about:
+            return L("settings.subtitle.about", fallback: "应用版本、自动更新、崩溃诊断日志与项目主页")
         }
     }
 
@@ -64,9 +96,11 @@ enum SettingsPage: String, CaseIterable {
     var searchKeywords: [String] {
         switch self {
         case .general:
-            return ["通用", "general", "外观", "深色", "浅色", "dark", "light", "主题", "theme", "语言", "language", "english", "中文", "权限", "permission", "tcc", "tccutil", "自愈", "屏幕录制", "辅助功能", "麦克风", "阴影", "shadow", "esc", "工具栏", "toolbar", "长截图", "自动翻页", "autoscroll", "提示", "toast", "范围框", "录屏", "启动", "login"]
+            return ["通用", "general", "外观", "深色", "浅色", "dark", "light", "主题", "theme", "语言", "language", "english", "中文", "权限", "permission", "tcc", "tccutil", "自愈", "屏幕录制", "辅助功能", "麦克风", "提示", "toast", "启动", "开机", "login"]
+        case .capture:
+            return ["截图", "标注", "capture", "annotation", "阴影", "shadow", "esc", "防误关", "工具栏", "toolbar", "槽位", "长截图", "滚动", "自动翻页", "autoscroll", "速度", "范围框", "录屏", "recording"]
         case .shortcuts:
-            return ["快捷键", "热键", "shortcut", "hotkey", "f1", "f12", "解绑", "清空", "窗体", "window", "截图", "录制", "长截图", "ocr", "翻译", "贴图"]
+            return ["快捷键", "热键", "shortcut", "hotkey", "f1", "f12", "解绑", "清空", "窗体", "window", "截图", "录制", "长截图", "ocr", "翻译", "贴图", "速查"]
         case .save:
             return ["保存", "导出", "save", "export", "文件夹", "folder", "每次询问", "png", "jpeg", "jpg", "heic", "webp", "质量", "quality", "压缩", "oxipng", "无损", "剪贴板", "tiff", "pasteboard", "dpi"]
         case .pin:
@@ -92,20 +126,9 @@ enum SettingsPage: String, CaseIterable {
     }
 }
 
-// MARK: - 表单控件外壳
+// MARK: - 应用级标准主菜单
 
-/// 应用级标准主菜单（含「编辑」菜单）。
-///
-/// ── 一个「菜单栏辅助程序」为什么需要常驻主菜单 ──────────────
-///
-/// 本应用默认以 `.accessory` 策略运行，没有 Dock 图标。
-/// macOS 的文本编辑快捷键（⌘C / ⌘V / ⌘X / ⌘A）是以菜单项 key equivalent
-/// 经 `NSApplication.sendAction(_:to:from:)` 分发到标准 selector 的。
-/// 若仅在设置窗口打开期间临时安装主菜单，其余窗口（OCR 面板、文字标注框、
-/// 历史/窗口搜索框、取色器 Hex 框、崩溃与长截图日志窗）的文本快捷键会集体失效。
-///
-/// 因此在应用启动时全局常驻挂载本主菜单；截图覆盖层在非文本编辑态会在
-/// `performKeyEquivalent` 中优先拦截画布级 `⌘C / ⌘Z / ⇧⌘Z`，两者互不冲突。
+/// 应用级标准主菜单（含「编辑」「窗口」菜单）。
 @MainActor
 enum SettingsMainMenu {
 
@@ -119,18 +142,9 @@ enum SettingsMainMenu {
         NSApp.mainMenu = nil
     }
 
-    /// 构造菜单。
-    ///
-    /// 独立于 `install` 暴露出来，是为了让诊断能直接检查它：
-    /// 「有没有 `paste:` 项」这类缺失不检查就一定会漏。
     static func make() -> NSMenu {
         let mainMenu = NSMenu()
 
-        // HIG 要求第一个菜单是应用名。
-        //
-        // 注意标题要同时设在 `NSMenuItem` 和它的 `NSMenu` 上：只设 `NSMenu`
-        // 的话菜单栏上会渲染成一个**空白标题**的菜单（系统不会帮忙补），
-        // 而按标题查找子菜单也会失败。
         let appMenuItem = NSMenuItem(title: "anShot", action: nil, keyEquivalent: "")
         let appMenu = NSMenu(title: "anShot")
         appMenu.addItem(
@@ -153,7 +167,6 @@ enum SettingsMainMenu {
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
 
-        // 编辑菜单：下面这几项就是 ⌘C/⌘V/⌘X/⌘A 的分发通道。
         let editMenuItem = NSMenuItem(title: "编辑", action: nil, keyEquivalent: "")
         let editMenu = NSMenu(title: "编辑")
         editMenu.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
@@ -167,7 +180,6 @@ enum SettingsMainMenu {
         editMenuItem.submenu = editMenu
         mainMenu.addItem(editMenuItem)
 
-        // 窗口菜单：提供全局标准 ⌘W 关闭当前窗口通道，避免欢迎页/历史预览/日志等独立窗失灵。
         let windowMenuItem = NSMenuItem(title: "窗口", action: nil, keyEquivalent: "")
         let windowMenu = NSMenu(title: "窗口")
         windowMenu.addItem(withTitle: "关闭窗口", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
@@ -181,21 +193,13 @@ enum SettingsMainMenu {
 
 // MARK: - 前台激活策略协调器
 
-/// 独立窗口的前台激活策略协调器。
-///
-/// 本应用空闲期以 `.accessory`（无 Dock 图标）运行；当任意独立窗口（欢迎页、设置、
-/// 历史记录、预览、崩溃日志、长截图日志、更新窗）可见时，将其切换为 `.regular`，
-/// 让用户可以通过 `⌘Tab` 与 Dock 找回被切走的窗口；所有独立窗口关闭后再切回 `.accessory`。
 @MainActor
 enum ForegroundPolicyCoordinator {
 
-    /// 当前正处于可见状态的独立窗口标识集合。
     private static var activeTokens: Set<String> = []
 
-    /// 测试或诊断可见的当前活跃窗口标识数量。
     static var activeCount: Int { activeTokens.count }
 
-    /// 登记一个独立窗口进入可见态，并在需要时切换为 `.regular`。
     static func acquire(_ token: String) {
         activeTokens.insert(token)
         if NSApp.activationPolicy() != .regular {
@@ -203,7 +207,6 @@ enum ForegroundPolicyCoordinator {
         }
     }
 
-    /// 注销一个独立窗口；若已无其他独立窗口可见，则恢复为 `.accessory`。
     static func release(_ token: String) {
         activeTokens.remove(token)
         if activeTokens.isEmpty, NSApp.activationPolicy() == .regular {
@@ -211,7 +214,6 @@ enum ForegroundPolicyCoordinator {
         }
     }
 
-    /// 清空全部登记状态（仅供测试复位使用）。
     static func resetForTesting() {
         activeTokens.removeAll()
         if NSApp.activationPolicy() == .regular {
@@ -219,5 +221,3 @@ enum ForegroundPolicyCoordinator {
         }
     }
 }
-
-// MARK: - 输入框尾部图标按钮

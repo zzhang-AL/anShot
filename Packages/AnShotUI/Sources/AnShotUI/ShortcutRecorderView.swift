@@ -113,12 +113,12 @@ final class ShortcutRecorderView: NSView {
     // MARK: 尺寸
 
     override var intrinsicContentSize: NSSize {
-        let gap: CGFloat = 5
+        let gap: CGFloat = 4
         let labels = shortcut?.keycapLabels ?? []
         let capsWidth = labels.map(Self.keycapWidth).reduce(0, +)
             + gap * CGFloat(max(0, labels.count - 1))
         return NSSize(
-            width: max(132, capsWidth + 28),
+            width: max(124, capsWidth + 20),
             height: SettingsTheme.keycapHeight + 8
         )
     }
@@ -321,26 +321,33 @@ final class ShortcutRecorderView: NSView {
         let container = bounds.insetBy(dx: 0.5, dy: 0.5)
 
         if isRecording {
-            // 录制态用实心反色块：这是全窗口对比度最高的状态，
-            // 用来明确告知「现在按下的键会被捕获」。
+            // 录制态：柔和强调色背景 + 清晰强调色边框，高辨识度且不刺眼。
             SettingsTheme.fillRoundedRect(
                 container, radius: 8,
-                color: SettingsTheme.accent, in: context
+                color: SettingsTheme.accent.withAlphaComponent(0.16), in: context
+            )
+            SettingsTheme.strokeRoundedRect(
+                container, radius: 8,
+                color: SettingsTheme.accent,
+                lineWidth: 1.5, in: context
             )
             drawCentered(
-                "按下组合键…",
-                size: 12,
-                color: SettingsTheme.onAccent,
-                weight: .medium
+                "按下快捷键…",
+                size: 11.5,
+                color: SettingsTheme.accent,
+                weight: .semibold
             )
         } else {
             SettingsTheme.fillRoundedRect(
                 container, radius: 8,
-                color: SettingsTheme.insetBackground, in: context
+                color: isHovered ? SettingsTheme.hoverSurface : SettingsTheme.insetBackground,
+                in: context
             )
             SettingsTheme.strokeRoundedRect(
                 container, radius: 8,
-                color: isHovered ? NSColor.labelColor.withAlphaComponent(0.25) : SettingsTheme.cardBorder,
+                color: isHovered
+                    ? SettingsTheme.accent.withAlphaComponent(0.55)
+                    : SettingsTheme.cardBorder,
                 lineWidth: 1, in: context
             )
             drawKeycaps(in: context)
@@ -351,14 +358,14 @@ final class ShortcutRecorderView: NSView {
         guard let shortcut else {
             drawCentered(
                 L("common.unbound", fallback: "未设置"),
-                size: 12,
+                size: 11.5,
                 color: .tertiaryLabelColor,
                 weight: .regular
             )
             return
         }
         let labels = shortcut.keycapLabels
-        let gap: CGFloat = 5
+        let gap: CGFloat = 4
         let height = SettingsTheme.keycapHeight
         let y = (bounds.height - height) / 2
 
@@ -374,19 +381,23 @@ final class ShortcutRecorderView: NSView {
     }
 
     private func drawKeycap(_ label: String, in rect: CGRect, context: CGContext) {
+        // 键帽底部 1pt 微投影立体感。
+        let shadowRect = CGRect(x: rect.minX, y: rect.minY - 0.8, width: rect.width, height: rect.height)
+        SettingsTheme.fillRoundedRect(
+            shadowRect, radius: SettingsTheme.keycapRadius,
+            color: NSColor.black.withAlphaComponent(0.12), in: context
+        )
         SettingsTheme.fillRoundedRect(
             rect, radius: SettingsTheme.keycapRadius,
             color: SettingsTheme.keycapBackground, in: context
         )
-        // 描边而非纯色块：键帽的边界靠这条细线勾出，
-        // 浅色模式下白底白键帽才分得开。
         SettingsTheme.strokeRoundedRect(
             rect, radius: SettingsTheme.keycapRadius,
-            color: SettingsTheme.keycapEdge, lineWidth: 1, in: context
+            color: SettingsTheme.keycapEdge, lineWidth: 0.9, in: context
         )
 
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 13, weight: .medium),
+            .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
             .foregroundColor: NSColor.labelColor
         ]
         let size = (label as NSString).size(withAttributes: attributes)
@@ -399,14 +410,13 @@ final class ShortcutRecorderView: NSView {
         )
     }
 
-    /// 单个键帽的宽度。修饰符符号较窄，字母数字较宽，
-    /// 太窄会让「空格」「F12」这类标签贴边。
+    /// 单个键帽的宽度。
     private static func keycapWidth(for label: String) -> CGFloat {
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 13, weight: .medium)
+            .font: NSFont.systemFont(ofSize: 12, weight: .semibold)
         ]
         let textWidth = (label as NSString).size(withAttributes: attributes).width
-        return max(28, textWidth + 16)
+        return max(24, textWidth + 13)
     }
 
     private func drawCentered(

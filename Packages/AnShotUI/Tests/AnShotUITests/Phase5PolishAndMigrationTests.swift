@@ -203,6 +203,11 @@ struct Phase5PolishAndMigrationTests {
         #expect(controller.visibleSidebarPagesForTesting == [.general])
         #expect(controller.currentPageForTesting == .general)
 
+        // 搜索 "shadow" 命中独立「截图与标注」页
+        controller.applySearchForTesting("shadow")
+        #expect(controller.visibleSidebarPagesForTesting == [.capture])
+        #expect(controller.currentPageForTesting == .capture)
+
         // 搜索 "f12" 命中独立快捷键页
         controller.applySearchForTesting("f12")
         #expect(controller.visibleSidebarPagesForTesting == [.shortcuts])
