@@ -19,6 +19,7 @@
 
 import AnShotCore
 import CoreGraphics
+import CoreML
 import CoreText
 import Foundation
 import os
@@ -55,8 +56,8 @@ public enum TextRecognizer {
         }
     }
 
-    /// 我们希望优先使用的语言。**只是偏好**，会和运行时支持列表取交集。
-    private static let preferredLanguageIdentifiers = ["zh-Hans", "zh-Hant", "en-US"]
+    /// 我们希望优先使用的固定多语列表（显式关闭 `automaticallyDetectsLanguage` 以避免首次编译耗时暴涨）。
+    private static let preferredLanguageIdentifiers = ["zh-Hans", "zh-Hant", "en-US", "ja-JP", "ko-KR"]
 
     /// 缓存的识别能力查询结果。
     ///
@@ -192,24 +193,7 @@ public enum TextRecognizer {
         // Vision 的请求执行是同步阻塞的，放到后台执行，避免卡住主线程
         //（整屏识别是几百毫秒量级）。
         return try await Task.detached(priority: .userInitiated) {
-            let request = VNRecognizeTextRequest()
-            request.recognitionLevel = .accurate
-            // 显式锁定 Revision3，与能力探测保持一致。
-            request.revision = VNRecognizeTextRequestRevision3
-            request.usesLanguageCorrection = true
-            if !chosen.isEmpty {
-                request.recognitionLanguages = chosen
-            }
-            // 自动语言检测是 macOS 13.0+，恰在基线内；它能让中英混排不必手动切换。
-            request.automaticallyDetectsLanguage = true
-
-            do {
-                try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
-            } catch {
-                throw Failure.requestFailed(String(describing: error))
-            }
-
-            let observations = request.results ?? []
+            let observations = try Self.performWithComputeFallback(on: image, languages: chosen)
             let rawLines: [OCRTextLine] = observations.compactMap { observation in
                 let candidates = observation.topCandidates(3)
                 guard let best = candidates.first else { return nil }
@@ -229,6 +213,68 @@ public enum TextRecognizer {
                 imagePixelSize: pixelSize
             )
         }.value
+    }
+
+    /// 构造标准化的 Vision 文字识别请求（供真实识别与预热共用同一份配置）。
+    static func makeRequest(
+        languages: [String],
+        level: VNRequestTextRecognitionLevel = .accurate,
+        forceCPU: Bool = false
+    ) -> VNRecognizeTextRequest {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = level
+        request.revision = VNRecognizeTextRequestRevision3
+        request.usesLanguageCorrection = (level == .accurate)
+        if !languages.isEmpty {
+            request.recognitionLanguages = languages
+        }
+        // 显式关闭自动语言检测：避免新版本首次运行时为所有候选语言编译模型导致 ~52s 冷启动。
+        request.automaticallyDetectsLanguage = false
+
+        if forceCPU {
+            if #available(macOS 14.0, *) {
+                if let cpuDevice = MLComputeDevice.allComputeDevices.first(where: {
+                    if case .cpu = $0 { return true }
+                    return false
+                }) {
+                    request.setComputeDevice(cpuDevice, for: .main)
+                } else {
+                    request.usesCPUOnly = true
+                }
+            } else {
+                request.usesCPUOnly = true
+            }
+        }
+        return request
+    }
+
+    /// 三级计算设备兜底执行管线：默认硬件加速(.accurate) → CPU(.accurate) → CPU(.fast)。
+    ///
+    /// 兼容无 ANE、独立 AMD 显卡驱动异常及 Rosetta 2 缺少高精度 Espresso 切片的环境。
+    private static func performWithComputeFallback(
+        on image: CGImage,
+        languages: [String]
+    ) throws -> [VNRecognizedTextObservation] {
+        let tiers: [(level: VNRequestTextRecognitionLevel, forceCPU: Bool)] = [
+            (.accurate, false),
+            (.accurate, true),
+            (.fast, true),
+        ]
+        var lastError: Error?
+        for tier in tiers {
+            let request = makeRequest(
+                languages: languages,
+                level: tier.level,
+                forceCPU: tier.forceCPU
+            )
+            do {
+                try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+                return request.results ?? []
+            } catch {
+                lastError = error
+            }
+        }
+        throw Failure.requestFailed(String(describing: lastError ?? Failure.invalidImage))
     }
 
     // MARK: - 版面与缩进还原

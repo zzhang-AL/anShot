@@ -346,6 +346,59 @@ struct ExporterTests {
         #expect(decoded.height == 20)
     }
 
+    @Test("2x Retina PNG 编码写入 144 DPI 与 pHYs (5669 px/m)")
+    func retinaDPI元数据写入() throws {
+        let backdrop = solidImage(width: 40, height: 40, color: white)
+        let data = try Exporter.pngData(
+            backdrop: backdrop,
+            selection: rect(0, 0, 40, 40),
+            annotations: [],
+            backingScale: 2.0
+        )
+
+        let source = try #require(CGImageSourceCreateWithData(data as CFData, nil))
+        let props = try #require(CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any])
+        let dpiWidth = try #require(props[kCGImagePropertyDPIWidth] as? Double)
+        let dpiHeight = try #require(props[kCGImagePropertyDPIHeight] as? Double)
+        #expect(abs(dpiWidth - 144.0) < 0.5)
+        #expect(abs(dpiHeight - 144.0) < 0.5)
+
+        let pngDict = try #require(props[kCGImagePropertyPNGDictionary] as? [CFString: Any])
+        let xPPM = try #require(pngDict[kCGImagePropertyPNGXPixelsPerMeter] as? Int)
+        let yPPM = try #require(pngDict[kCGImagePropertyPNGYPixelsPerMeter] as? Int)
+        #expect(abs(xPPM - 5669) <= 2)
+        #expect(abs(yPPM - 5669) <= 2)
+    }
+
+    @Test("带透明通道的底图合成时保留 Alpha 不被涂黑")
+    func 保留透明通道() throws {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        let ctx = try #require(CGContext(
+            data: nil,
+            width: 20,
+            height: 20,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ))
+        // 左半透明、右半红色不透明（模拟独立窗口透明圆角外区域）。
+        ctx.clear(CGRect(x: 0, y: 0, width: 20, height: 20))
+        ctx.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+        ctx.fill(CGRect(x: 10, y: 0, width: 10, height: 20))
+        let transparentBackdrop = try #require(ctx.makeImage())
+
+        let composed = try #require(Exporter.compose(
+            backdrop: transparentBackdrop,
+            selection: rect(0, 0, 20, 20),
+            annotations: []
+        ))
+        let pixels = PixelBuffer(composed)
+        #expect(pixels.rgba(x: 2, y: 2).a == 0, "透明区域应保持 Alpha=0，不被涂黑")
+        #expect(pixels.rgba(x: 15, y: 10).a == 255, "不透明区域应保持完整可见")
+    }
+
     @Test("合成失败时抛 renderFailed")
     func 合成失败抛错() {
         let backdrop = solidImage(width: 50, height: 50, color: white)

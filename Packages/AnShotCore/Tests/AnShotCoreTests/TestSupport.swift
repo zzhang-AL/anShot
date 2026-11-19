@@ -144,6 +144,12 @@ struct PixelBuffer {
         let offset = (y * width + x) * 4
         return (Int(bytes[offset]), Int(bytes[offset + 1]), Int(bytes[offset + 2]))
     }
+
+    /// 以左上原点坐标取一个像素的 RGBA。
+    func rgba(x: Int, y: Int) -> (r: Int, g: Int, b: Int, a: Int) {
+        let offset = (y * width + x) * 4
+        return (Int(bytes[offset]), Int(bytes[offset + 1]), Int(bytes[offset + 2]), Int(bytes[offset + 3]))
+    }
 }
 
 func rect(_ x: Double, _ y: Double, _ w: Double, _ h: Double) -> PixelRect {

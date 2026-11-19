@@ -47,19 +47,44 @@ public enum Exporter {
     public static func compose(
         backdrop: CGImage,
         selection: PixelRect,
-        annotations: [Annotation]
+        annotations: [Annotation],
+        preservesAlpha: Bool = true
     ) -> CGImage? {
         AnnotationRenderer.render(
             backdrop: backdrop,
             selection: selection,
-            annotations: annotations
+            annotations: annotations,
+            preservesAlpha: preservesAlpha
         )
     }
 
     // MARK: - 编码
 
+    /// 构造携带屏幕原生 Retina 物理分辨率的 PNG 编码属性（`72 × backingScale` DPI 及 `pHYs`）。
+    ///
+    /// 缺失该元数据时，macOS 预览、备忘录、浏览器等会回落为 72 DPI，
+    /// 将 2x Retina 截图按 200% 线性插值放大显示导致发虚。
+    public static func pngProperties(backingScale: CGFloat) -> CFDictionary {
+        let scale = max(1.0, backingScale)
+        let dpi = 72.0 * scale
+        let ppm = Int((dpi / 0.0254).rounded())
+        return [
+            kCGImagePropertyDPIWidth: dpi,
+            kCGImagePropertyDPIHeight: dpi,
+            kCGImagePropertyTIFFDictionary: [
+                kCGImagePropertyTIFFXResolution: dpi,
+                kCGImagePropertyTIFFYResolution: dpi,
+                kCGImagePropertyTIFFResolutionUnit: 2,
+            ],
+            kCGImagePropertyPNGDictionary: [
+                kCGImagePropertyPNGXPixelsPerMeter: ppm,
+                kCGImagePropertyPNGYPixelsPerMeter: ppm,
+            ],
+        ] as CFDictionary
+    }
+
     /// 编码为 PNG 数据（供剪贴板使用）。
-    public static func pngData(from image: CGImage) -> Data? {
+    public static func pngData(from image: CGImage, backingScale: CGFloat = 1.0) -> Data? {
         let data = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
             data,
@@ -70,7 +95,7 @@ public enum Exporter {
             return nil
         }
 
-        CGImageDestinationAddImage(destination, image, nil)
+        CGImageDestinationAddImage(destination, image, pngProperties(backingScale: backingScale))
         guard CGImageDestinationFinalize(destination) else {
             return nil
         }
@@ -82,7 +107,7 @@ public enum Exporter {
     ///
     /// 用 `CGImageDestinationCreateWithURL` 而不是先编码成 `Data` 再写：
     /// 后者会同时持有一份完整的 PNG 字节流，在 6K 图上是不必要的一笔内存。
-    public static func writePNG(_ image: CGImage, to url: URL) throws {
+    public static func writePNG(_ image: CGImage, to url: URL, backingScale: CGFloat = 1.0) throws {
         guard let destination = CGImageDestinationCreateWithURL(
             url as CFURL,
             UTType.png.identifier as CFString,
@@ -92,7 +117,7 @@ public enum Exporter {
             throw ExportError.encodingFailed
         }
 
-        CGImageDestinationAddImage(destination, image, nil)
+        CGImageDestinationAddImage(destination, image, pngProperties(backingScale: backingScale))
         guard CGImageDestinationFinalize(destination) else {
             throw ExportError.writeFailed(url.path)
         }
@@ -105,34 +130,40 @@ public enum Exporter {
         backdrop: CGImage,
         selection: PixelRect,
         annotations: [Annotation],
-        to url: URL
+        to url: URL,
+        backingScale: CGFloat = 1.0,
+        preservesAlpha: Bool = true
     ) throws {
         guard let image = compose(
             backdrop: backdrop,
             selection: selection,
-            annotations: annotations
+            annotations: annotations,
+            preservesAlpha: preservesAlpha
         ) else {
             throw ExportError.renderFailed
         }
 
-        try writePNG(image, to: url)
+        try writePNG(image, to: url, backingScale: backingScale)
     }
 
     /// 合成并编码 PNG 数据。
     public static func pngData(
         backdrop: CGImage,
         selection: PixelRect,
-        annotations: [Annotation]
+        annotations: [Annotation],
+        backingScale: CGFloat = 1.0,
+        preservesAlpha: Bool = true
     ) throws -> Data {
         guard let image = compose(
             backdrop: backdrop,
             selection: selection,
-            annotations: annotations
+            annotations: annotations,
+            preservesAlpha: preservesAlpha
         ) else {
             throw ExportError.renderFailed
         }
 
-        guard let data = pngData(from: image) else {
+        guard let data = pngData(from: image, backingScale: backingScale) else {
             throw ExportError.encodingFailed
         }
 

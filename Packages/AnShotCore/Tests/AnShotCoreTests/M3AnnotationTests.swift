@@ -212,11 +212,14 @@ struct M3AnnotationRendererTests {
         expectColor(pixels.rgb(x: 5, y: 5), (0, 0, 0), "圆外应保持底图")
     }
 
-    @Test("高亮：矩形内被填充，矩形外保持底图")
+    @Test("高亮：正片叠底在白底上显色且保持黑字锐黑不被洗灰")
     func highlightPlacement() throws {
-        let pixels = try render(m3Kinds[1], on: solidImage(width: 200, height: 200, color: black))
-        expectColor(pixels.rgb(x: 30, y: 20), (255, 255, 0), "高亮矩形内应为黄色")
-        expectColor(pixels.rgb(x: 100, y: 100), (0, 0, 0), "矩形外应保持底图")
+        let whitePixels = try render(m3Kinds[1], on: solidImage(width: 200, height: 200, color: white))
+        expectColor(whitePixels.rgb(x: 30, y: 20), (255, 255, 0), "白底高亮矩形内应为鲜艳黄色")
+        expectColor(whitePixels.rgb(x: 100, y: 100), (255, 255, 255), "矩形外应保持白底")
+
+        let blackPixels = try render(m3Kinds[1], on: solidImage(width: 200, height: 200, color: black))
+        expectColor(blackPixels.rgb(x: 30, y: 20), (0, 0, 0), "正片叠底在纯黑文字像素上应保持锐黑不泛灰")
     }
 
     @Test("测量：连线经过中点，读数不改变连线存在性")

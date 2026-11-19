@@ -436,4 +436,35 @@ struct GIFNoiseAndTextLayoutTests {
         // 枚举音频输入设备（即使测试环境无麦也不得崩溃）。
         _ = MicrophoneCapturer.availableInputDevices()
     }
+
+    @Test("ImageEncoding 对 PNG/JPEG 2x Retina 编码写入 144 DPI，且 Vision 关闭自动语言检测")
+    func imageEncodingRetinaDPIAndVisionConfig() throws {
+        let context = try #require(CGContext(
+            data: nil,
+            width: 64,
+            height: 64,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        context.setFillColor(CGColor(red: 0.3, green: 0.6, blue: 0.9, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 64, height: 64))
+        let image = try #require(context.makeImage())
+
+        for format in [ImageFormat.png, .jpeg(quality: 0.9)] {
+            let encoded = try ImageEncoding.data(from: image, format: format, backingScale: 2.0)
+            let source = try #require(CGImageSourceCreateWithData(encoded as CFData, nil))
+            let props = try #require(CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any])
+            let dpiW = try #require(props[kCGImagePropertyDPIWidth] as? Double)
+            let dpiH = try #require(props[kCGImagePropertyDPIHeight] as? Double)
+            #expect(abs(dpiW - 144.0) < 1.0)
+            #expect(abs(dpiH - 144.0) < 1.0)
+        }
+
+        let request = TextRecognizer.makeRequest(languages: TextRecognizer.availability().preferredLanguages)
+        #expect(request.automaticallyDetectsLanguage == false, "必须关闭自动语言检测，规避新二进制首次 ~52s 模型编译")
+        #expect(request.recognitionLanguages.contains("zh-Hans"))
+        #expect(request.recognitionLanguages.contains("en-US"))
+    }
 }

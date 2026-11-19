@@ -37,15 +37,47 @@ public enum ImageFormat: Sendable {
         }
     }
 
-    /// 编码选项。
-    var properties: CFDictionary? {
+    /// 构造带 Retina 物理分辨率元数据的编码选项。
+    func properties(backingScale: CGFloat) -> CFDictionary {
+        let scale = max(1.0, backingScale)
+        let dpi = 72.0 * scale
+        let ppm = Int((dpi / 0.0254).rounded())
+        let tiffResolution: [CFString: Any] = [
+            kCGImagePropertyTIFFXResolution: dpi,
+            kCGImagePropertyTIFFYResolution: dpi,
+            kCGImagePropertyTIFFResolutionUnit: 2,
+        ]
         switch self {
         case .png:
-            return nil
+            return [
+                kCGImagePropertyDPIWidth: dpi,
+                kCGImagePropertyDPIHeight: dpi,
+                kCGImagePropertyTIFFDictionary: tiffResolution,
+                kCGImagePropertyPNGDictionary: [
+                    kCGImagePropertyPNGXPixelsPerMeter: ppm,
+                    kCGImagePropertyPNGYPixelsPerMeter: ppm,
+                ],
+            ] as CFDictionary
         case .jpeg(let quality):
-            return [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary
+            let roundedDPI = Int(dpi.rounded())
+            return [
+                kCGImageDestinationLossyCompressionQuality: quality,
+                kCGImagePropertyDPIWidth: dpi,
+                kCGImagePropertyDPIHeight: dpi,
+                kCGImagePropertyTIFFDictionary: tiffResolution,
+                kCGImagePropertyJFIFDictionary: [
+                    kCGImagePropertyJFIFXDensity: roundedDPI,
+                    kCGImagePropertyJFIFYDensity: roundedDPI,
+                    kCGImagePropertyJFIFDensityUnit: 1,
+                ],
+            ] as CFDictionary
         case .heic(let quality):
-            return [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary
+            return [
+                kCGImageDestinationLossyCompressionQuality: quality,
+                kCGImagePropertyDPIWidth: dpi,
+                kCGImagePropertyDPIHeight: dpi,
+                kCGImagePropertyTIFFDictionary: tiffResolution,
+            ] as CFDictionary
         }
     }
 }
@@ -75,10 +107,12 @@ public enum ImageEncoding {
     /// - Parameters:
     ///   - image: 待编码图像。
     ///   - format: 输出格式。
+    ///   - backingScale: 屏幕物理缩放系数（2x Retina 屏写入 144 DPI）。
     /// - Returns: 编码后的数据。
     public static func data(
         from image: CGImage,
-        format: ImageFormat
+        format: ImageFormat,
+        backingScale: CGFloat = 1.0
     ) throws -> Data {
         let buffer = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
@@ -90,7 +124,7 @@ public enum ImageEncoding {
             throw ImageEncodingError.cannotCreateDestination(format)
         }
 
-        CGImageDestinationAddImage(destination, image, format.properties)
+        CGImageDestinationAddImage(destination, image, format.properties(backingScale: backingScale))
 
         guard CGImageDestinationFinalize(destination) else {
             throw ImageEncodingError.finalizeFailed
@@ -107,7 +141,8 @@ public enum ImageEncoding {
     public static func write(
         _ image: CGImage,
         to url: URL,
-        format: ImageFormat
+        format: ImageFormat,
+        backingScale: CGFloat = 1.0
     ) throws {
         guard let destination = CGImageDestinationCreateWithURL(
             url as CFURL,
@@ -118,7 +153,7 @@ public enum ImageEncoding {
             throw ImageEncodingError.cannotCreateDestination(format)
         }
 
-        CGImageDestinationAddImage(destination, image, format.properties)
+        CGImageDestinationAddImage(destination, image, format.properties(backingScale: backingScale))
 
         guard CGImageDestinationFinalize(destination) else {
             throw ImageEncodingError.finalizeFailed

@@ -37,13 +37,14 @@ public enum AnnotationRenderer {
     public static func render(
         backdrop: CGImage,
         selection: PixelRect,
-        annotations: [Annotation]
+        annotations: [Annotation],
+        preservesAlpha: Bool = true
     ) -> CGImage? {
         guard let canvas = makeCanvas(backdrop: backdrop, selection: selection) else {
             return nil
         }
 
-        drawBackdrop(backdrop, in: canvas.context, canvas: canvas)
+        drawBackdrop(backdrop, in: canvas.context, canvas: canvas, preservesAlpha: preservesAlpha)
         applyAnnotations(
             annotations,
             in: canvas.context,
@@ -105,12 +106,16 @@ public enum AnnotationRenderer {
     ///
     /// 供需要「原始选区图像」的场景使用（例如 P4 的坐标校验诊断）；
     /// 与 `render(_:_:[])` 的差别仅在于省去一次上下文翻转。
-    public static func crop(backdrop: CGImage, selection: PixelRect) -> CGImage? {
+    public static func crop(
+        backdrop: CGImage,
+        selection: PixelRect,
+        preservesAlpha: Bool = true
+    ) -> CGImage? {
         guard let canvas = makeCanvas(backdrop: backdrop, selection: selection) else {
             return nil
         }
 
-        drawBackdrop(backdrop, in: canvas.context, canvas: canvas)
+        drawBackdrop(backdrop, in: canvas.context, canvas: canvas, preservesAlpha: preservesAlpha)
         return canvas.context.makeImage()
     }
 
@@ -232,7 +237,8 @@ public enum AnnotationRenderer {
     private static func drawBackdrop(
         _ backdrop: CGImage,
         in context: CGContext,
-        canvas: Canvas
+        canvas: Canvas,
+        preservesAlpha: Bool
     ) {
         let drawRect = CGRect(
             x: -Double(canvas.x),
@@ -241,9 +247,15 @@ public enum AnnotationRenderer {
             height: Double(backdrop.height)
         )
 
-        // 先清成不透明黑，避免选区超出底图（理论上被不变量禁止）时出现未初始化像素。
-        context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
-        context.fill(CGRect(x: 0, y: 0, width: context.width, height: context.height))
+        let canvasRect = CGRect(x: 0, y: 0, width: context.width, height: context.height)
+        if preservesAlpha {
+            // 保留底图原始透明通道（例如独立窗口圆角阴影或透明 PNG），避免透明角落被涂黑。
+            context.clear(canvasRect)
+        } else {
+            // 显式要求不透明底色时先清黑底，避免选区越界残留未初始化像素。
+            context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+            context.fill(canvasRect)
+        }
         context.draw(backdrop, in: drawRect)
     }
 
@@ -721,10 +733,10 @@ public enum AnnotationRenderer {
         drawCenteredText(label, center: center.cgPoint, font: font, color: textColor, in: context)
     }
 
-    /// 高亮：半透明填充的矩形。
+    /// 高亮：采用正片叠底（`.multiply`）混合模式的荧光笔矩形。
     ///
-    /// 透明度由调用方写进 `color`（模型层不设默认值）：高亮的作用是「标出来但还看得见
-    /// 底下的内容」，不透明度只能由使用场景决定。
+    /// 正片叠底在浅色背景上能呈现通透的荧光色彩，同时让底下的黑色文字保持 100% 锐黑不被洗灰；
+    /// 透明度仍由调用方写进 `color`。
     private static func drawHighlight(_ rect: PixelRect, color: RGBAColor, in context: CGContext) {
         let cgRect = rect.cgRect
         guard cgRect.width > 0, cgRect.height > 0 else {
@@ -732,6 +744,7 @@ public enum AnnotationRenderer {
         }
         context.saveGState()
         defer { context.restoreGState() }
+        context.setBlendMode(.multiply)
         context.setFillColor(color.cgColor)
         context.fill(cgRect)
     }
