@@ -359,8 +359,13 @@ final class UpdateCoordinator {
         }
     }
 
-    /// 用户点「稍后」：记住版本，自动检查不再提示同一个版本。
+    /// 用户点「稍后」：仅关闭窗口，不永久跳过该版本。
     private func postpone() {
+        windowController?.close()
+    }
+
+    /// 用户点「跳过此版本」：持久化忽略该版本，自动检查不再打扰。
+    private func skipCurrentRelease() {
         if let release = pendingRelease {
             preferences.skippedVersion = release.displayVersion
         }
@@ -409,6 +414,9 @@ final class UpdateCoordinator {
         }
         controller.onRequestLater = { [weak self] in
             self?.postpone()
+        }
+        controller.onRequestSkipVersion = { [weak self] in
+            self?.skipCurrentRelease()
         }
         controller.onRequestOpenPage = { [weak self] in
             self?.openReleasePage()

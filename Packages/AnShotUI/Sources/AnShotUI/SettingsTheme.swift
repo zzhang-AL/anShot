@@ -37,12 +37,50 @@
 //
 import AppKit
 
-enum SettingsTheme {
+/// 全应用外观模式（契约 `ux-polish/model.md` §4.2：`settings.appearanceMode`）。
+public enum AppAppearanceMode: String, CaseIterable, Sendable {
+    case system = "system"
+    case light = "light"
+    case dark = "dark"
+
+    @MainActor
+    public var displayName: String {
+        switch self {
+        case .system: return L("appearance.system", fallback: "跟随系统")
+        case .light: return L("appearance.light", fallback: "浅色")
+        case .dark: return L("appearance.dark", fallback: "深色")
+        }
+    }
+
+    /// 对应的 `NSAppearance`；`.system` 返回 `nil` 让系统接管动态浅/深外观。
+    public var nsAppearance: NSAppearance? {
+        switch self {
+        case .system: return nil
+        case .light: return NSAppearance(named: .aqua)
+        case .dark: return NSAppearance(named: .darkAqua)
+        }
+    }
+}
+
+/// 保留旧名兼容所有既有设置组件引用。
+typealias SettingsTheme = AnShotTheme
+
+/// anShot 全域设计系统令牌与通用外观调度器（一统设置、历史、窗口选择、结果窗、欢迎/更新/崩溃日志与浮层）。
+enum AnShotTheme {
+
+    // ── 全局外观切换 ──
+
+    @MainActor
+    static func apply(appearanceMode: AppAppearanceMode) {
+        guard let app = NSApp else { return }
+        app.appearance = appearanceMode.nsAppearance
+        for window in app.windows {
+            window.invalidateShadow()
+            window.contentView?.needsDisplay = true
+        }
+    }
 
     // ── 尺寸 ──
-    //
-    // 这些是设计选择，不是 HIG 的强制值。它们的作用是让整窗口的
-    // 节奏一致：同一个圆角半径、同一套间距，重复出现才成其为「语言」。
 
     /// 卡片圆角。14pt 与 macOS 13+ 系统设置的分组观感接近。
     static let cardRadius: CGFloat = 14
@@ -52,37 +90,19 @@ enum SettingsTheme {
     static let surfaceRadius: CGFloat = 10
     /// 键帽圆角。
     static let keycapRadius: CGFloat = 5
+    /// 浮窗与弹出面板圆角。
+    static let floatingRadius: CGFloat = 12
 
-    /// 侧边栏宽度。
-    ///
-    /// 176pt 足够容下「文字识别」这样的最长项，又不至于让内容区显得拥挤。
-    static let sidebarWidth: CGFloat = 176
-    /// 内容区宽度（不含侧边栏）。
-    static let contentWidth: CGFloat = 504
-    /// 窗口总宽度。
-    ///
-    /// 固定宽度：设置窗口的尺寸应当稳定，否则选定文件夹后多出一行路径、
-    /// 或切到另一页时高度不同，窗口就会跳一下。
+    /// 侧边栏宽度（容纳实时搜索框与 7 个分类页）。
+    static let sidebarWidth: CGFloat = 192
+    /// 内容区初始宽度（不含侧边栏）。
+    static let contentWidth: CGFloat = 588
+    /// 设置窗口默认初始总宽度（780pt，且支持自由缩放）。
     static let windowWidth: CGFloat = sidebarWidth + contentWidth
-
-    /// 窗口高度（**固定**）。
-    ///
-    /// 取所有页面里最高的那一页，再留一点余量。原有各页内容高度：
-    /// 通用 228 / 保存 345 / 翻译 266 / 文字识别 410；**关于页 524（最高）**。
-    ///
-    /// 2026-11-03：「关于」页加入三张卡片（版本与更新 / 崩溃日志 / 链接）。
-    /// 按各控件实际行高累加——页头 44 + 版本卡 198 + 崩溃卡 96 + 链接卡 138
-    /// + 卡间距 48 = 524；加 48 上下边距 = 572，取 580 留 8pt 余量。
-    /// 只加高窗口、不收窄卡片：其余页面下方多出的留白不会挤压任何内容，
-    /// 切页高度仍然恒定（`-diagnoseSettingsWindow` 有断言守着）。
-    ///
-    /// **刻意不按当前页自适应**：切页时窗口高度跳动比多点留白更分心，
-    /// 而且侧边栏会跟着上下伸缩，观感不稳定。所以宁可让内容少的页下方
-    /// 留白，也要让窗口尺寸恒定。
-    ///
-    /// 新增设置项时仍应尽量控制单页高度；若错误/状态提示展开导致内容超出窗口高度，
-    /// 右侧内容区已包裹自适应 `NSScrollView`，可垂直滚动而不会裁切控件。
-    static let windowHeight: CGFloat = 580
+    /// 设置窗口默认初始高度（600pt，支持自由缩放）。
+    static let windowHeight: CGFloat = 600
+    /// 设置窗口最小可缩尺寸。
+    static let windowMinSize = NSSize(width: 680, height: 500)
     /// 窗口外边距。
     static let margin: CGFloat = 24
     /// 卡片内边距。
@@ -96,14 +116,7 @@ enum SettingsTheme {
     static let keycapHeight: CGFloat = 26
 
     /// 表单控件最大宽度。
-    ///
-    /// 输入框撑满整个卡片宽度并不好用：路径与密钥本来就不长，
-    /// 过宽的输入框会让眼睛在标签与文本之间跑很远，也不像系统设置。
-    /// 窄于这个值时跟随可用宽度收缩，不固定。
-    ///
-    /// 300 是「窗口正方形」约束下的上限：内容区 504 减去外边距与卡片内边距，
-    /// 留给「标签 108 + 间距 10 + 控件」的宽度约 420，控件最多到 300。
-    static let maxFieldWidth: CGFloat = 300
+    static let maxFieldWidth: CGFloat = 320
 
     // ── 颜色 ──
     //
@@ -178,6 +191,35 @@ enum SettingsTheme {
     /// 分组标题的次要色。
     static var sectionLabel: NSColor { .secondaryLabelColor }
 
+    /// 语义状态色（危险/警告/成功），统一用于录屏取消确认、权限状态与 Toast 图标。
+    static var danger: NSColor { .systemRed }
+    static var warning: NSColor { .systemOrange }
+    static var success: NSColor { .systemGreen }
+
+    /// 浮窗与控制胶囊表面色（浅/深双态半透明高对比）。
+    static var floatingSurface: NSColor {
+        dynamic(
+            light: NSColor(white: 0.98, alpha: 0.95),
+            dark: NSColor(white: 0.14, alpha: 0.94)
+        )
+    }
+
+    /// 浮窗细描边。
+    static var floatingBorder: NSColor {
+        dynamic(
+            light: NSColor(white: 0, alpha: 0.10),
+            dark: NSColor(white: 1, alpha: 0.14)
+        )
+    }
+
+    /// 图像预览衬底（自动随浅/深主题更新，绝不在 `init` 冻结 `.cgColor`）。
+    static var previewCanvasBackground: NSColor {
+        dynamic(
+            light: NSColor(white: 0.91, alpha: 1),
+            dark: NSColor(white: 0.16, alpha: 1)
+        )
+    }
+
     // ── 绘制辅助 ──
 
     /// 动态色构造器。
@@ -233,4 +275,68 @@ enum SettingsTheme {
     }
 }
 
-// MARK: - 卡片
+// MARK: - 全域动态主题表面（自动响应浅/深外观切换）
+
+/// 统一动态背景表面容器：所有窗口/面板背景与内嵌卡片共用，彻底消除在 `init` 中写死 `.cgColor` 的外观冻结。
+final class ThemedSurfaceView: NSView {
+    enum SurfaceKind {
+        case windowBackground
+        case card
+        case inset
+        case previewCanvas
+        case floating(cornerRadius: CGFloat)
+    }
+
+    private let kind: SurfaceKind
+    private let customCornerRadius: CGFloat?
+
+    init(kind: SurfaceKind, cornerRadius: CGFloat? = nil, frame: NSRect = .zero) {
+        self.kind = kind
+        self.customCornerRadius = cornerRadius
+        super.init(frame: frame)
+        wantsLayer = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("不支持从 nib 构造")
+    }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        switch kind {
+        case .windowBackground:
+            layer?.backgroundColor = AnShotTheme.windowBackground.cgColor
+            layer?.cornerRadius = customCornerRadius ?? 0
+            layer?.borderWidth = 0
+            layer?.borderColor = nil
+        case .card:
+            layer?.backgroundColor = AnShotTheme.cardBackground.cgColor
+            layer?.cornerRadius = customCornerRadius ?? AnShotTheme.cardRadius
+            layer?.cornerCurve = .continuous
+            layer?.borderWidth = 1
+            layer?.borderColor = AnShotTheme.cardBorder.cgColor
+        case .inset:
+            layer?.backgroundColor = AnShotTheme.insetBackground.cgColor
+            layer?.cornerRadius = customCornerRadius ?? AnShotTheme.surfaceRadius
+            layer?.cornerCurve = .continuous
+            layer?.borderWidth = 0
+            layer?.borderColor = nil
+        case .previewCanvas:
+            layer?.backgroundColor = AnShotTheme.previewCanvasBackground.cgColor
+            layer?.cornerRadius = customCornerRadius ?? 6
+            layer?.cornerCurve = .continuous
+            layer?.borderWidth = 1
+            layer?.borderColor = AnShotTheme.cardBorder.cgColor
+            layer?.masksToBounds = true
+        case .floating(let radius):
+            layer?.backgroundColor = AnShotTheme.floatingSurface.cgColor
+            layer?.cornerRadius = customCornerRadius ?? radius
+            layer?.cornerCurve = .continuous
+            layer?.borderWidth = 1
+            layer?.borderColor = AnShotTheme.floatingBorder.cgColor
+            layer?.masksToBounds = true
+        }
+    }
+}

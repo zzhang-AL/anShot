@@ -173,12 +173,11 @@ final class ScrollshotResultController: NSObject, NSWindowDelegate {
         panel.hidesOnDeactivate = false
         panel.delegate = self
 
-        let content = NSView()
+        let content = ThemedSurfaceView(kind: .windowBackground)
         panel.contentView = content
+        panel.backgroundColor = AnShotTheme.windowBackground
 
         // Auto Layout 量高度需要先确定宽度：换行告警的固有高度随宽度变化。
-        // 窗口的根内容视图尺寸由 AppKit 直接管理，不适合再挂固定宽度；
-        // 因此所有内容放进一个宽度固定的 body，再由 body 量出真实高度。
         let body = NSView()
         body.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(body)
@@ -187,21 +186,13 @@ final class ScrollshotResultController: NSObject, NSWindowDelegate {
             body.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             body.topAnchor.constraint(equalTo: content.topAnchor),
             body.widthAnchor.constraint(equalToConstant: contentWidth),
-            // 刻意**不**把 body 的底边钉到 content：body 的高度由内部内容
-            // （换行告警等）决定，窗口再按这个高度定稿。若先钉底边，初始的
-            // 窗口高度会反过来把内容压扁，量出来的高度就永远等于初始值。
         ])
 
-        // ── 预览 ────────────────────────────────────────────
-        // 外层容器负责圆角与浅灰底：透明区域或整片白色的长图，没有底色边界
-        // 就看不出图像到哪儿结束。
-        let previewContainer = NSView()
-        previewContainer.wantsLayer = true
-        previewContainer.layer?.backgroundColor = NSColor(calibratedWhite: 0.5, alpha: 0.12).cgColor
-        previewContainer.layer?.cornerRadius = Layout.previewCornerRadius
-        previewContainer.layer?.borderWidth = 1
-        previewContainer.layer?.borderColor = NSColor.separatorColor.cgColor
-        previewContainer.layer?.masksToBounds = true
+        // ── 预览（统一使用 AnShotTheme 动态衬底，自动响应浅/深模式切换）──
+        let previewContainer = ThemedSurfaceView(
+            kind: .previewCanvas,
+            cornerRadius: Layout.previewCornerRadius
+        )
         previewContainer.translatesAutoresizingMaskIntoConstraints = false
         body.addSubview(previewContainer)
 

@@ -47,6 +47,7 @@ final class CrashLogWindowController: NSObject, NSWindowDelegate {
         "选择左侧的一条报告查看详情。"
 
     private let window: NSWindow
+    private let searchField = NSSearchField()
     private let tableView = NSTableView()
     private let detailTextView = NSTextView()
     private let emptyListLabel = NSTextField(wrappingLabelWithString: "")
@@ -59,14 +60,18 @@ final class CrashLogWindowController: NSObject, NSWindowDelegate {
     )
     private let copyButton = SettingsPushButton(
         title: "复制详情",
+        emphasis: .primary,
         target: nil,
         action: nil
     )
 
+    private var allEntries: [CrashLogEntry] = []
     private var entries: [CrashLogEntry] = []
-    /// 并发刷新序号：后发起的扫描结果覆盖旧任务，避免异步乱序回写。
+    /// 并发刷新与正文异步加载序号：防快速切换乱序回写。
     private var refreshGeneration = 0
     private var refreshTask: Task<Void, Never>?
+    private var detailLoadGeneration = 0
+    private var detailLoadTask: Task<Void, Never>?
 
     /// 列表时间统一到秒：崩溃报告的时间点本身就是证据的一部分，
     /// 用相对时间（「3 天前」）反而让人无法与报告原文对照。
@@ -124,6 +129,8 @@ final class CrashLogWindowController: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         refreshTask?.cancel()
         refreshTask = nil
+        detailLoadTask?.cancel()
+        detailLoadTask = nil
         ForegroundPolicyCoordinator.release("crashLogs")
     }
 
@@ -146,32 +153,45 @@ final class CrashLogWindowController: NSObject, NSWindowDelegate {
     }
 
     private func applyLoadedEntries(_ loaded: [CrashLogEntry], preservingSelectionID previousID: String?) {
-        entries = loaded
+        allEntries = loaded
+        applySearchFilter(preservingSelectionID: previousID)
+    }
+
+    private func applySearchFilter(preservingSelectionID previousID: String? = nil) {
+        let keepID = previousID ?? selectedEntry?.id
+        let query = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if query.isEmpty {
+            entries = allEntries
+        } else {
+            entries = allEntries.filter { entry in
+                entry.url.lastPathComponent.lowercased().contains(query)
+                    || entry.summary.lowercased().contains(query)
+                    || (entry.appVersion?.lowercased().contains(query) ?? false)
+                    || entry.kind.lowercased().contains(query)
+            }
+        }
         tableView.reloadData()
 
-        if entries.isEmpty {
+        if allEntries.isEmpty {
             statusLabel.stringValue = "系统报告目录里没有 anShot 的记录"
+        } else if query.isEmpty {
+            statusLabel.stringValue = "最近 \(allEntries.count) 份报告（最多 \(Self.limit) 份）"
         } else {
-            statusLabel.stringValue = "最近 \(entries.count) 份报告（最多 \(Self.limit) 份）"
+            statusLabel.stringValue = "匹配 \(entries.count) / \(allEntries.count) 份报告"
         }
 
+        emptyListLabel.stringValue = allEntries.isEmpty ? Self.emptyMessage : "没有匹配的崩溃报告"
         emptyListLabel.isHidden = !entries.isEmpty
 
-        if let previousID,
-           let index = entries.firstIndex(where: { $0.id == previousID }) {
-            tableView.selectRowIndexes(
-                IndexSet(integer: index),
-                byExtendingSelection: false
-            )
+        if let keepID,
+           let index = entries.firstIndex(where: { $0.id == keepID }) {
+            tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
             updateDetail()
         } else if entries.isEmpty {
             tableView.deselectAll(nil)
-            showDetailPlaceholder(Self.emptyMessage)
+            showDetailPlaceholder(allEntries.isEmpty ? Self.emptyMessage : "没有匹配的崩溃报告")
         } else {
-            tableView.selectRowIndexes(
-                IndexSet(integer: 0),
-                byExtendingSelection: false
-            )
+            tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
             updateDetail()
         }
 
@@ -184,7 +204,12 @@ final class CrashLogWindowController: NSObject, NSWindowDelegate {
         return entries[row]
     }
 
+    /// 后台异步读取选中崩溃日志正文，彻底避免大崩溃报告在主线程同步阻塞 UI。
     private func updateDetail() {
+        detailLoadTask?.cancel()
+        detailLoadGeneration += 1
+        let generation = detailLoadGeneration
+
         guard let entry = selectedEntry else {
             showDetailPlaceholder(
                 entries.isEmpty ? Self.emptyMessage : Self.noSelectionMessage
@@ -193,10 +218,23 @@ final class CrashLogWindowController: NSObject, NSWindowDelegate {
             return
         }
 
-        detailPlaceholderLabel.isHidden = true
-        detailTextView.string = CrashLogStore.details(for: entry)
-        detailTextView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+        showDetailPlaceholder("正在读取报告详情…")
         updateActionState()
+
+        detailLoadTask = Task { @MainActor [weak self] in
+            let text = await Task.detached(priority: .userInitiated) {
+                CrashLogStore.details(for: entry)
+            }.value
+            guard let self, self.detailLoadGeneration == generation, !Task.isCancelled else { return }
+            self.detailPlaceholderLabel.isHidden = true
+            self.detailTextView.string = text
+            self.detailTextView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+            self.updateActionState()
+        }
+    }
+
+    @objc private func searchChanged(_ sender: NSSearchField) {
+        applySearchFilter()
     }
 
     private func showDetailPlaceholder(_ text: String) {
@@ -228,9 +266,9 @@ final class CrashLogWindowController: NSObject, NSWindowDelegate {
         statusLabel.lineBreakMode = .byTruncatingTail
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        // 主次按钮语义纠正：「复制详情」为最核心主动作，刷新为普通次按钮。
         let refreshButton = SettingsPushButton(
             title: "刷新",
-            emphasis: .primary,
             target: self,
             action: #selector(refreshTapped)
         )
@@ -240,13 +278,20 @@ final class CrashLogWindowController: NSObject, NSWindowDelegate {
             action: #selector(closeTapped)
         )
 
-        // 左侧状态、右侧动作：动作的视觉重量固定，状态文字随窗口变窄
-        // 先被截断，不会把按钮挤出窗口。
+        searchField.placeholderString = "搜索版本、异常或文件名…"
+        searchField.sendsSearchStringImmediately = true
+        searchField.sendsWholeSearchString = false
+        searchField.target = self
+        searchField.action = #selector(searchChanged(_:))
+        searchField.translatesAutoresizingMaskIntoConstraints = false
+        searchField.widthAnchor.constraint(equalToConstant: 210).isActive = true
+
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let toolbar = NSStackView(views: [
+            searchField,
             statusLabel,
             spacer,
             refreshButton,
@@ -270,10 +315,19 @@ final class CrashLogWindowController: NSObject, NSWindowDelegate {
             content: makeDetailContent()
         )
 
+        // 支持左右分栏自由拖拽调节宽度的 NSSplitView
+        let splitView = NSSplitView()
+        splitView.isVertical = true
+        splitView.dividerStyle = .thin
+        splitView.translatesAutoresizingMaskIntoConstraints = false
+        splitView.addArrangedSubview(listPane)
+        splitView.addArrangedSubview(detailPane)
+        splitView.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
+        splitView.setHoldingPriority(.defaultLow, forSubviewAt: 1)
+
         root.addSubview(header)
         root.addSubview(toolbar)
-        root.addSubview(listPane)
-        root.addSubview(detailPane)
+        root.addSubview(splitView)
 
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: root.topAnchor, constant: SettingsTheme.margin),
@@ -284,18 +338,15 @@ final class CrashLogWindowController: NSObject, NSWindowDelegate {
             toolbar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: SettingsTheme.margin),
             toolbar.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -SettingsTheme.margin),
 
-            listPane.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 12),
-            listPane.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: SettingsTheme.margin),
-            listPane.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -SettingsTheme.margin),
-            // 左侧列表固定宽度：报告摘要的阅读宽度不需要随窗口无限变宽，
-            // 把增长留给右侧原文，长行的横向滚动也更少。
-            listPane.widthAnchor.constraint(equalToConstant: 336),
+            splitView.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 12),
+            splitView.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: SettingsTheme.margin),
+            splitView.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -SettingsTheme.margin),
+            splitView.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -SettingsTheme.margin),
 
-            detailPane.topAnchor.constraint(equalTo: listPane.topAnchor),
-            detailPane.leadingAnchor.constraint(equalTo: listPane.trailingAnchor, constant: 14),
-            detailPane.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -SettingsTheme.margin),
-            detailPane.bottomAnchor.constraint(equalTo: listPane.bottomAnchor),
+            listPane.widthAnchor.constraint(greaterThanOrEqualToConstant: 240),
+            detailPane.widthAnchor.constraint(greaterThanOrEqualToConstant: 320),
         ])
+        splitView.setPosition(310, ofDividerAt: 0)
 
         return root
     }

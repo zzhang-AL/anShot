@@ -1669,7 +1669,12 @@ public final class OverlayController {
         let scrollBackingScale = selectionDisplayID.map { DisplayGeometry.scaleFactor(for: $0) }
             ?? NSScreen.main?.backingScaleFactor
             ?? 1.0
-        let copyResult = SessionExporter.copyToPasteboardWithPNG(image, backingScale: scrollBackingScale)
+        let copyResult = SessionExporter.copyToPasteboardWithPNG(
+            image,
+            backingScale: scrollBackingScale,
+            includeLazyTIFF: settings.pasteboardLazyTIFF,
+            enableLosslessOptimization: settings.pngLosslessOptimize
+        )
         let copied = copyResult?.didCopy ?? false
 
         // 先登记产物：复制失败时结果仍在结果窗口里，
@@ -1709,7 +1714,10 @@ public final class OverlayController {
                 let outcome = SessionExporter.saveWithPanel(
                     image,
                     suggestedName: Exporter.defaultFileName(),
-                    backingScale: scrollBackingScale
+                    backingScale: scrollBackingScale,
+                    initialFormat: settings.exportFormat,
+                    initialQuality: settings.exportQuality,
+                    enablePNGOptimization: settings.pngLosslessOptimize
                 )
                 if case .saved(let url) = outcome {
                     onPromoteLongScreenshotHistory?(url)
@@ -1755,8 +1763,13 @@ public final class OverlayController {
                 onSave: { [weak self] image in
                     self?.saveScrollshotResult(image, backingScale: scale)
                 },
-                onCopy: { image in
-                    let ok = SessionExporter.copyToPasteboard(image, backingScale: scale)
+                onCopy: { [weak self] image in
+                    let ok = SessionExporter.copyToPasteboard(
+                        image,
+                        backingScale: scale,
+                        includeLazyTIFF: self?.settings.pasteboardLazyTIFF ?? true,
+                        enableLosslessOptimization: self?.settings.pngLosslessOptimize ?? false
+                    )
                     ToastPresenter.show(ok ? "长截图已复制到剪贴板" : "复制失败，图片仍在结果窗口里")
                 },
                 onPin: { [weak self] image in
@@ -1798,11 +1811,17 @@ public final class OverlayController {
     }
 
     private func saveScrollshotResult(_ image: CGImage, backingScale: CGFloat) {
+        let forceAsk = NSEvent.modifierFlags.contains(.option) || NSEvent.modifierFlags.contains(.shift)
+        let destination: SaveDestination = forceAsk ? .ask : settings.saveDestination
         let outcome = SessionExporter.save(
             image,
             suggestedName: Exporter.defaultFileName(),
-            destination: settings.saveDestination,
-            backingScale: backingScale
+            destination: destination,
+            backingScale: backingScale,
+            formatOption: settings.exportFormat,
+            quality: settings.exportQuality,
+            enablePNGOptimization: settings.pngLosslessOptimize,
+            fallbackToPanelWhenFolderMissing: true
         )
         switch outcome {
         case .saved(let url):
@@ -1921,7 +1940,12 @@ public final class OverlayController {
                 dismiss()
                 return
             case .copy:
-                let copyResult = SessionExporter.copyToPasteboardWithPNG(image, backingScale: scale)
+                let copyResult = SessionExporter.copyToPasteboardWithPNG(
+                    image,
+                    backingScale: scale,
+                    includeLazyTIFF: settings.pasteboardLazyTIFF,
+                    enableLosslessOptimization: settings.pngLosslessOptimize
+                )
                 inlineEditingPin = nil
                 editingPin.updateImage(image, screenScale: scale)
                 editingPin.showPin()
@@ -1929,12 +1953,17 @@ public final class OverlayController {
                 dismiss()
                 return
             case .save:
-                let destination = settings.saveDestination
+                let forceAsk = NSEvent.modifierFlags.contains(.option) || NSEvent.modifierFlags.contains(.shift)
+                let destination: SaveDestination = forceAsk ? .ask : settings.saveDestination
                 let outcome = SessionExporter.save(
                     image,
                     suggestedName: Exporter.defaultFileName(),
                     destination: destination,
-                    backingScale: scale
+                    backingScale: scale,
+                    formatOption: settings.exportFormat,
+                    quality: settings.exportQuality,
+                    enablePNGOptimization: settings.pngLosslessOptimize,
+                    fallbackToPanelWhenFolderMissing: true
                 )
                 switch outcome {
                 case .saved(let url):
@@ -2001,7 +2030,12 @@ public final class OverlayController {
         case .copy:
             // 编码一次：成功时那份 PNG 直接进历史缓存，不再二次编码。
             let backingScale = exportBackingScale(in: window)
-            let copyResult = SessionExporter.copyToPasteboardWithPNG(image, backingScale: backingScale)
+            let copyResult = SessionExporter.copyToPasteboardWithPNG(
+                image,
+                backingScale: backingScale,
+                includeLazyTIFF: settings.pasteboardLazyTIFF,
+                enableLosslessOptimization: settings.pngLosslessOptimize
+            )
             let copied = copyResult?.didCopy ?? false
             logger.notice("""
                 export copy: success=\(copied, privacy: .public) \
@@ -2023,17 +2057,30 @@ public final class OverlayController {
 
         case .save:
             let backingScale = exportBackingScale(in: window)
-            let destination = settings.saveDestination
-            // 系统模态保存面板默认层级低于 `.screenSaver`，弹出前先暂隐全屏覆盖层，
-            // 避免保存框被自身覆盖层挡住导致假死；取消或失败时再原样恢复。
-            let suspendedOverlays: SuspendedOverlays? = destination == .ask
+            let forceAsk = NSEvent.modifierFlags.contains(.option) || NSEvent.modifierFlags.contains(.shift)
+            let rawDestination: SaveDestination = forceAsk ? .ask : settings.saveDestination
+            // 检查目标目录是否有效：若为 `.ask` 或固定目录已失效需降级弹窗，先暂隐全屏 `.screenSaver` 覆盖层防遮挡。
+            let willShowPanel: Bool
+            switch rawDestination {
+            case .ask:
+                willShowPanel = true
+            case .folder(let folder):
+                var isDir: ObjCBool = false
+                let valid = FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDir) && isDir.boolValue
+                willShowPanel = !valid
+            }
+            let suspendedOverlays: SuspendedOverlays? = willShowPanel
                 ? suspendFullScreenOverlaysForModal()
                 : nil
             let outcome = SessionExporter.save(
                 image,
                 suggestedName: Exporter.defaultFileName(),
-                destination: destination,
-                backingScale: backingScale
+                destination: rawDestination,
+                backingScale: backingScale,
+                formatOption: settings.exportFormat,
+                quality: settings.exportQuality,
+                enablePNGOptimization: settings.pngLosslessOptimize,
+                fallbackToPanelWhenFolderMissing: true
             )
             switch outcome {
             case .saved(let url):
@@ -2507,7 +2554,10 @@ public final class OverlayController {
         let outcome = SessionExporter.saveWithPanel(
             image,
             suggestedName: Exporter.defaultFileName(),
-            backingScale: backingScale
+            backingScale: backingScale,
+            initialFormat: settings.exportFormat,
+            initialQuality: settings.exportQuality,
+            enablePNGOptimization: settings.pngLosslessOptimize
         )
         switch outcome {
         case .saved(let url):

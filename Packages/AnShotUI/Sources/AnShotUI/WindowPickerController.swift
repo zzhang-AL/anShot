@@ -47,12 +47,11 @@ final class WindowPickerController: NSObject, NSWindowDelegate {
     /// 用户取消（按钮、Esc 或关闭窗口）。
     private let onCancel: () -> Void
 
-    /// 列表中的一行。
+    /// 列表中的一行（保留系统 Z-order 顺序并携带进程 ID 与 App 图标）。
     private struct Row {
         let windowID: CGWindowID
+        let processID: pid_t
         let appName: String
-        /// 原样保留窗口标题；空标题的展示文案由视图层补，避免把占位符
-        /// 当成真实标题传给调用方。
         let title: String
         let frame: CGRect
 
@@ -74,11 +73,16 @@ final class WindowPickerController: NSObject, NSWindowDelegate {
 
     private let panel: NSPanel
     private let searchField = NSSearchField()
+    private let refreshButton = SettingsPushButton(title: "刷新", target: nil, action: nil)
     private let tableView = NSTableView()
     private let scrollView = NSScrollView()
     private let countLabel = NSTextField(labelWithString: "")
-    private let chooseButton = NSButton(title: "选择", target: nil, action: nil)
-    private let cancelButton = NSButton(title: "取消", target: nil, action: nil)
+    private let chooseButton = SettingsPushButton(title: "选择", emphasis: .primary, target: nil, action: nil)
+    private let cancelButton = SettingsPushButton(title: "取消", target: nil, action: nil)
+
+    private var thumbnailCache: [CGWindowID: NSImage] = [:]
+    private var appIconCache: [pid_t: NSImage] = [:]
+    private var thumbnailTasks: [CGWindowID: Task<Void, Never>] = [:]
 
     private let emptyStack = NSStackView()
     private let spinner = NSProgressIndicator()
@@ -165,7 +169,8 @@ final class WindowPickerController: NSObject, NSWindowDelegate {
     // MARK: - 视图
 
     private func makeContentView() -> NSView {
-        let content = NSView(frame: CGRect(x: 0, y: 0, width: 560, height: 480))
+        let content = ThemedSurfaceView(kind: .windowBackground, frame: CGRect(x: 0, y: 0, width: 620, height: 500))
+        panel.backgroundColor = AnShotTheme.windowBackground
 
         searchField.placeholderString = "搜索应用或窗口名称"
         searchField.delegate = self
@@ -173,10 +178,14 @@ final class WindowPickerController: NSObject, NSWindowDelegate {
         searchField.sendsSearchStringImmediately = true
         searchField.setAccessibilityLabel("搜索窗口")
 
+        refreshButton.target = self
+        refreshButton.action = #selector(retryTapped)
+        refreshButton.toolTip = "刷新当前屏幕窗口列表"
+
         tableView.dataSource = self
         tableView.delegate = self
-        tableView.rowHeight = 26
-        tableView.intercellSpacing = NSSize(width: 6, height: 2)
+        tableView.rowHeight = 44
+        tableView.intercellSpacing = NSSize(width: 8, height: 4)
         tableView.allowsMultipleSelection = false
         tableView.allowsEmptySelection = true
         tableView.usesAlternatingRowBackgroundColors = false
@@ -186,33 +195,41 @@ final class WindowPickerController: NSObject, NSWindowDelegate {
         tableView.doubleAction = #selector(handleDoubleClick)
         tableView.setAccessibilityLabel("窗口列表")
 
+        let thumbColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("thumb"))
+        thumbColumn.title = "预览"
+        thumbColumn.width = 64
+        thumbColumn.minWidth = 64
+        thumbColumn.maxWidth = 64
         let appColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("app"))
         appColumn.title = "应用"
-        appColumn.width = 170
+        appColumn.width = 165
         appColumn.minWidth = 120
         let titleColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("title"))
         titleColumn.title = "窗口"
-        titleColumn.width = 340
+        titleColumn.width = 310
         titleColumn.minWidth = 180
+        tableView.addTableColumn(thumbColumn)
         tableView.addTableColumn(appColumn)
         tableView.addTableColumn(titleColumn)
 
+        let listCard = ThemedSurfaceView(kind: .card, cornerRadius: AnShotTheme.surfaceRadius)
+        listCard.translatesAutoresizingMaskIntoConstraints = false
         scrollView.documentView = tableView
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        listCard.addSubview(scrollView)
 
         countLabel.font = .systemFont(ofSize: 11)
         countLabel.textColor = .secondaryLabelColor
 
-        chooseButton.bezelStyle = .rounded
         chooseButton.target = self
         chooseButton.action = #selector(chooseTapped)
         chooseButton.keyEquivalent = "\r"
         chooseButton.isEnabled = false
 
-        cancelButton.bezelStyle = .rounded
         cancelButton.target = self
         cancelButton.action = #selector(cancelTapped)
         cancelButton.keyEquivalent = "\u{1b}"
@@ -227,8 +244,6 @@ final class WindowPickerController: NSObject, NSWindowDelegate {
         emptyDetailLabel.textColor = .secondaryLabelColor
         emptyDetailLabel.alignment = .center
         emptyDetailLabel.maximumNumberOfLines = 3
-        // 面板宽度固定，直接给出换行宽度：否则 wrapping label 会按单行
-        // 计算固有宽度，在 Auto Layout 下撑出可视区。
         emptyDetailLabel.preferredMaxLayoutWidth = 480
 
         openSettingsButton.bezelStyle = .rounded
@@ -250,51 +265,50 @@ final class WindowPickerController: NSObject, NSWindowDelegate {
         }
 
         let footer = NSView()
-        let separator = NSBox()
-        separator.boxType = .separator
 
-        for view in [searchField, scrollView, emptyStack, footer] {
+        for view in [searchField, refreshButton, listCard, emptyStack, footer] {
             view.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(view)
         }
-        for view in [separator, countLabel, cancelButton, chooseButton] {
+        for view in [countLabel, cancelButton, chooseButton] {
             view.translatesAutoresizingMaskIntoConstraints = false
             footer.addSubview(view)
         }
 
         NSLayoutConstraint.activate([
             searchField.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
-            searchField.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
-            searchField.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14),
+            searchField.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            searchField.trailingAnchor.constraint(equalTo: refreshButton.leadingAnchor, constant: -8),
 
-            scrollView.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 10),
-            scrollView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: footer.topAnchor),
+            refreshButton.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+            refreshButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            refreshButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 64),
+
+            listCard.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 10),
+            listCard.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            listCard.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            listCard.bottomAnchor.constraint(equalTo: footer.topAnchor, constant: -8),
+
+            scrollView.topAnchor.constraint(equalTo: listCard.topAnchor, constant: 4),
+            scrollView.leadingAnchor.constraint(equalTo: listCard.leadingAnchor, constant: 4),
+            scrollView.trailingAnchor.constraint(equalTo: listCard.trailingAnchor, constant: -4),
+            scrollView.bottomAnchor.constraint(equalTo: listCard.bottomAnchor, constant: -4),
 
             emptyStack.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-            emptyStack.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
-            emptyStack.leadingAnchor.constraint(
-                greaterThanOrEqualTo: content.leadingAnchor, constant: 24
-            ),
-            emptyStack.trailingAnchor.constraint(
-                lessThanOrEqualTo: content.trailingAnchor, constant: -24
-            ),
+            emptyStack.centerYAnchor.constraint(equalTo: listCard.centerYAnchor),
+            emptyStack.leadingAnchor.constraint(greaterThanOrEqualTo: content.leadingAnchor, constant: 24),
+            emptyStack.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -24),
 
             footer.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             footer.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             footer.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             footer.heightAnchor.constraint(equalToConstant: 48),
 
-            separator.topAnchor.constraint(equalTo: footer.topAnchor),
-            separator.leadingAnchor.constraint(equalTo: footer.leadingAnchor),
-            separator.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
-
             countLabel.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
             countLabel.leadingAnchor.constraint(equalTo: footer.leadingAnchor, constant: 16),
 
             chooseButton.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
-            chooseButton.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -14),
+            chooseButton.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -16),
             chooseButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
 
             cancelButton.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
@@ -302,7 +316,6 @@ final class WindowPickerController: NSObject, NSWindowDelegate {
             cancelButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
         ])
 
-        // 初始进入 loading，空态先显示出来，避免第一帧闪一片空白。
         updateEmptyState()
         return content
     }
@@ -376,14 +389,20 @@ final class WindowPickerController: NSObject, NSWindowDelegate {
 
     private func apply(windows: [DetectedWindow]) {
         guard !Task.isCancelled else { return }
+        thumbnailTasks.values.forEach { $0.cancel() }
+        thumbnailTasks.removeAll()
+        thumbnailCache.removeAll()
+
+        // 保留系统天然 Z-order（最前台活跃窗口排在最前，更贴合高频取用直觉）。
         allWindows = windows.map { window in
             Row(
                 windowID: window.windowID,
+                processID: window.processID,
                 appName: window.applicationName ?? "未知应用",
                 title: window.title ?? "",
                 frame: window.frame
             )
-        }.sorted(by: Self.ascending)
+        }
 
         phase = .loaded
         applyFilter()
@@ -633,14 +652,146 @@ extension WindowPickerController: NSTableViewDataSource, NSTableViewDelegate {
         }
 
         let window = visibleWindows[row]
-        let cell = reusableCell(identifier: tableColumn.identifier)
-        if tableColumn.identifier.rawValue == "app" {
+        switch tableColumn.identifier.rawValue {
+        case "thumb":
+            let cell = reusableThumbnailCell(identifier: tableColumn.identifier)
+            if let cached = thumbnailCache[window.windowID] {
+                cell.imageView?.image = cached
+            } else {
+                cell.imageView?.image = icon(for: window.processID)
+                requestThumbnailIfNeeded(for: window)
+            }
+            return cell
+
+        case "app":
+            let cell = reusableAppCell(identifier: tableColumn.identifier)
+            cell.imageView?.image = icon(for: window.processID)
             cell.textField?.stringValue = window.appName
             cell.textField?.textColor = .labelColor
-        } else {
-            cell.textField?.stringValue = window.title.isEmpty ? "（无标题）" : window.title
+            return cell
+
+        default:
+            let cell = reusableCell(identifier: tableColumn.identifier)
+            let dims = "\(Int(window.frame.width.rounded()))×\(Int(window.frame.height.rounded()))"
+            let titleText = window.title.isEmpty ? "（无标题）" : window.title
+            cell.textField?.stringValue = "\(titleText)  ·  \(dims)"
             cell.textField?.textColor = .secondaryLabelColor
+            return cell
         }
+    }
+
+    private func icon(for pid: pid_t) -> NSImage {
+        if let cached = appIconCache[pid] { return cached }
+        let icon = NSRunningApplication(processIdentifier: pid)?.icon
+            ?? NSImage(systemSymbolName: "macwindow", accessibilityDescription: nil)
+            ?? NSImage()
+        appIconCache[pid] = icon
+        return icon
+    }
+
+    /// 异步采集窗口轻量缩略图（不阻塞主线程，且降采样为 112×68 像素后立刻释放原始大图）。
+    private func requestThumbnailIfNeeded(for window: Row) {
+        let wid = window.windowID
+        guard thumbnailCache[wid] == nil, thumbnailTasks[wid] == nil else { return }
+        thumbnailTasks[wid] = Task.detached(priority: .utility) { [weak self] in
+            let capturer = CapturerFactory.makeDefault()
+            let renderedThumb: NSImage?
+            if let frame = try? await capturer.captureFrame(scope: .window(wid)),
+               let smallCG = Self.downsampleThumbnail(frame.image, maxPixelWidth: 112, maxPixelHeight: 68) {
+                renderedThumb = NSImage(cgImage: smallCG, size: NSSize(width: 56, height: 34))
+            } else {
+                renderedThumb = nil
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.thumbnailTasks.removeValue(forKey: wid)
+                guard let renderedThumb else { return }
+                self.thumbnailCache[wid] = renderedThumb
+                if let idx = self.visibleWindows.firstIndex(where: { $0.windowID == wid }) {
+                    self.tableView.reloadData(forRowIndexes: IndexSet(integer: idx), columnIndexes: IndexSet(integer: 0))
+                }
+            }
+        }
+    }
+
+    private nonisolated static func downsampleThumbnail(
+        _ image: CGImage,
+        maxPixelWidth: Int,
+        maxPixelHeight: Int
+    ) -> CGImage? {
+        guard image.width > 0, image.height > 0 else { return nil }
+        let scale = min(
+            Double(maxPixelWidth) / Double(image.width),
+            Double(maxPixelHeight) / Double(image.height),
+            1.0
+        )
+        let targetW = max(1, Int((Double(image.width) * scale).rounded()))
+        let targetH = max(1, Int((Double(image.height) * scale).rounded()))
+        guard let ctx = CGContext(
+            data: nil,
+            width: targetW,
+            height: targetH,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else {
+            return nil
+        }
+        ctx.interpolationQuality = .medium
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: targetW, height: targetH))
+        return ctx.makeImage()
+    }
+
+    private func reusableThumbnailCell(identifier: NSUserInterfaceItemIdentifier) -> NSTableCellView {
+        if let reused = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView {
+            return reused
+        }
+        let cell = NSTableCellView()
+        cell.identifier = identifier
+        let iv = NSImageView()
+        iv.imageScaling = .scaleProportionallyUpOrDown
+        iv.wantsLayer = true
+        iv.layer?.cornerRadius = 4
+        iv.layer?.masksToBounds = true
+        iv.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(iv)
+        cell.imageView = iv
+        NSLayoutConstraint.activate([
+            iv.centerXAnchor.constraint(equalTo: cell.centerXAnchor),
+            iv.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            iv.widthAnchor.constraint(equalToConstant: 56),
+            iv.heightAnchor.constraint(equalToConstant: 34),
+        ])
+        return cell
+    }
+
+    private func reusableAppCell(identifier: NSUserInterfaceItemIdentifier) -> NSTableCellView {
+        if let reused = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView {
+            return reused
+        }
+        let cell = NSTableCellView()
+        cell.identifier = identifier
+        let iv = NSImageView()
+        iv.imageScaling = .scaleProportionallyDown
+        iv.translatesAutoresizingMaskIntoConstraints = false
+        let field = NSTextField(labelWithString: "")
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.font = .systemFont(ofSize: 12, weight: .medium)
+        field.lineBreakMode = .byTruncatingTail
+        cell.addSubview(iv)
+        cell.addSubview(field)
+        cell.imageView = iv
+        cell.textField = field
+        NSLayoutConstraint.activate([
+            iv.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+            iv.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            iv.widthAnchor.constraint(equalToConstant: 18),
+            iv.heightAnchor.constraint(equalToConstant: 18),
+            field.leadingAnchor.constraint(equalTo: iv.trailingAnchor, constant: 6),
+            field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+            field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
         return cell
     }
 

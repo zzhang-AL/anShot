@@ -365,15 +365,22 @@ public final class RecordingSetupPanel: NSObject {
         startButton.action = #selector(startTapped)
     }
 
-    /// 用栈视图排版。面板高度固定、内容不多，避免手算坐标出错。
+    /// 记住上一次选中的 GIF 档位，防止切换到 MP4 后静默复位用户的 GIF 偏好。
+    private static let lastGIFDurationKey = "recording.lastGIFDuration"
+    private static let lastGIFDimensionKey = "recording.lastGIFDimension"
+    private let micWarningLabel = NSTextField(labelWithString: "麦克风尚未授权（开始录制时可授权或在系统设置中开启）")
+
+    /// 用栈视图排版。重建前清理持久控件上的旧外部约束，杜绝多次切换格式导致约束累加。
     private func layout(in container: NSView?) {
         guard let container else { return }
+        // 移除容器全部旧子视图并确保共享持久控件自身不再持有失效旧约束
         container.subviews.forEach { $0.removeFromSuperview() }
+        for persistent in [scopeControl, outputControl, durationPopup, dimensionPopup, systemAudioToggle, microphoneToggle, countdownToggle, statusLabel, pickButton, startButton, gifNoSoundLabel, micWarningLabel] {
+            persistent.removeFromSuperview()
+        }
 
         let isGIF = selectedOutput.isGIF
 
-        // 面板尺寸：宽度固定，**高度按内容算**（栈视图排完再量）。
-        // 先给一个下限尺寸把控件摆好，量出内容高度后再定稿。
         panel.setContentSize(Self.panelMinSize)
         container.frame = NSRect(origin: .zero, size: Self.panelMinSize)
 
@@ -382,13 +389,14 @@ public final class RecordingSetupPanel: NSObject {
         let audioRow = makeAudioRow(isGIF: isGIF)
         let buttonRow = makeButtonRow()
 
-        // 行序：范围 → 输出格式 → GIF 参数 → 音频 → 按钮。
-        // 参数行**紧贴**它作用的格式行，不隔着音频行——
-        // 隔着的话「这参数管的是录的范围还是录的格式」就变成要猜的事。
+        micWarningLabel.font = .systemFont(ofSize: 10.5)
+        micWarningLabel.textColor = .systemOrange
+        micWarningLabel.lineBreakMode = .byTruncatingTail
+
         let stack = NSStackView(views: [
             Self.sectionLabel("录制范围"), scopeControl, statusRow,
             Self.sectionLabel("输出格式"), outputControl, gifParameterRow,
-            Self.sectionLabel("音频"), audioRow, countdownToggle, buttonRow
+            Self.sectionLabel("音频"), audioRow, micWarningLabel, countdownToggle, buttonRow
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -396,7 +404,8 @@ public final class RecordingSetupPanel: NSObject {
         stack.setCustomSpacing(6, after: scopeControl)
         stack.setCustomSpacing(14, after: statusRow)
         stack.setCustomSpacing(14, after: gifParameterRow)
-        stack.setCustomSpacing(10, after: audioRow)
+        stack.setCustomSpacing(4, after: audioRow)
+        stack.setCustomSpacing(10, after: micWarningLabel)
         stack.setCustomSpacing(14, after: countdownToggle)
         self.contentStack = stack
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -414,14 +423,8 @@ public final class RecordingSetupPanel: NSObject {
         buttonRow.translatesAutoresizingMaskIntoConstraints = false
         buttonRow.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
 
-        // ── 高度按内容定稿 ────────────────────────────────────────
-        //
-        // 先按下限尺寸摆好（上面已 `setContentSize(panelMinSize)`），再量内容真实高度，
-        // 最后把面板高度改为「内容 + 上下内边距」，且不低于下限。
-        //
-        // 为何用手算常量替换成实测：一个常量写小了就是「按钮被窗口裁掉、点不到」，
-        // 而它**只在特定内容组合下**才暴露（本次就是 MP4 模式，而 GIF 模式刚好够用），
-        // 手算的估算值很容易在加了一行后静默失效。
+        refreshMicrophoneHint()
+
         container.layoutSubtreeIfNeeded()
         let contentHeight = stack.fittingSize.height
         let neededHeight = Self.contentVerticalInset * 2 + contentHeight
@@ -430,6 +433,12 @@ public final class RecordingSetupPanel: NSObject {
         panel.setContentSize(finalSize)
         container.frame = NSRect(origin: .zero, size: finalSize)
         container.layoutSubtreeIfNeeded()
+    }
+
+    private func refreshMicrophoneHint() {
+        let wantsMic = !selectedOutput.isGIF && microphoneToggle.state == .on
+        let granted = MicrophonePermission.status == .granted
+        micWarningLabel.isHidden = !(wantsMic && !granted)
     }
 
     /// 分组标题的统一外观。
@@ -620,39 +629,37 @@ public final class RecordingSetupPanel: NSObject {
             syncPopups(to: settings)
         } else {
             outputControl.selectedSegment = 0
-            // MP4 下 GIF 档位不参与本次录制，面板也把它收起；
-            // 复位成默认档位，避免用户切到 GIF 时看到的是「上一次」的档位
-            // 却以为那是这次已经确认过的参数。
-            syncPopups(to: GIFSettings())
+            // 切到 MP4 时仍保留用户上次记忆的 GIF 档位（不静默复位），切回 GIF 原样还原。
+            let defaults = UserDefaults.standard
+            let savedDur = defaults.double(forKey: Self.lastGIFDurationKey)
+            let savedDim = defaults.integer(forKey: Self.lastGIFDimensionKey)
+            let rememberedGIF = GIFSettings(
+                maximumDuration: savedDur > 0 ? savedDur : GIFSettings().maximumDuration,
+                maximumPixelDimension: savedDim > 0 ? savedDim : GIFSettings().maximumPixelDimension
+            )
+            syncPopups(to: rememberedGIF)
         }
         systemAudioToggle.state = preferences.systemAudio ? .on : .off
         microphoneToggle.state = preferences.microphone ? .on : .off
         countdownToggle.state = UserDefaults.standard.bool(forKey: Self.countdownPreferenceKey) ? .on : .off
+        refreshMicrophoneHint()
     }
 
-    /// 刷新与输出格式相关的可用性。
-    ///
-    /// **置灰而非隐藏**：开关突然消失、切回 MP4 又出现，比一个置灰且注明理由的
-    /// 控件更让人困惑；也不能保持可勾选——勾了不生效就是静默丢弃用户明确表达的要求。
     private func refreshOutputControls() {
         let isGIF = selectedOutput.isGIF
         systemAudioToggle.isEnabled = !isGIF
         microphoneToggle.isEnabled = !isGIF
         gifNoSoundLabel.isHidden = !isGIF
+        refreshMicrophoneHint()
     }
 
     @objc private func outputChanged() {
-        // 换格式要重排（高度与参数行可见性都变），但**不能重新按锚点摆放**：
-        // 面板可以被用户拖到任意位置，每次切格式都把它拽回选区旁边，
-        // 用户会以为面板自己跳了。只调整高度，并让顶边保持不动。
         let topEdge = panel.frame.maxY
-        // 以面板当前所在的屏幕做钳制依据：此时它才是用户看到的位置。
         let hostScreen = screen(containing: panel.frame)
         layout(in: panel.contentView)
         refreshOutputControls()
         var frame = panel.frame
         frame.origin.y = topEdge - frame.height
-        // 高度变大后底边可能被挤出屏幕，钳回可见区域（顶边此时不得不让位）。
         if let visible = hostScreen?.visibleFrame {
             frame.origin.y = min(
                 max(visible.minY + 8, frame.origin.y),
@@ -660,10 +667,12 @@ public final class RecordingSetupPanel: NSObject {
             )
         }
         panel.setFrame(frame, display: true)
-        // 用户改了格式或 GIF 档位就立即记住：下次弹出直接还原，不再复位成 MP4。
-        // 写的是控件此刻的真实状态（`selectedOutput`），而不是「用户点了哪一段」
-        // ——换格式与改档位走同一个 action，两边都该记住。
-        RecordingPreferencesStore.shared.output = selectedOutput
+        let current = selectedOutput
+        if case .gif(let gifSettings) = current {
+            UserDefaults.standard.set(gifSettings.maximumDuration, forKey: Self.lastGIFDurationKey)
+            UserDefaults.standard.set(gifSettings.maximumPixelDimension, forKey: Self.lastGIFDimensionKey)
+        }
+        RecordingPreferencesStore.shared.output = current
     }
 
     // MARK: - 状态
@@ -743,6 +752,7 @@ public final class RecordingSetupPanel: NSObject {
         let preferences = RecordingPreferencesStore.shared
         preferences.systemAudio = systemAudioToggle.state == .on
         preferences.microphone = microphoneToggle.state == .on
+        refreshMicrophoneHint()
     }
 
     @objc private func countdownChanged() {

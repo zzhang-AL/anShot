@@ -15,30 +15,30 @@ import AppKit
 enum SettingsPage: String, CaseIterable {
 
     case general
+    case shortcuts
     case save
     case pin
     case recognition
     case translation
-    /// 版本、更新与诊断入口。
-    ///
-    /// 放在最后而不是最前：设置页的顺序是「先改行为，再看状态」，
-    /// 关于页是只读信息与诊断入口，放在末尾不会把常用项挤下去。
     case about
 
+    @MainActor
     var title: String {
         switch self {
-        case .general: return "通用"
-        case .save: return "保存"
-        case .pin: return "固定截图"
-        case .recognition: return "文字识别"
-        case .translation: return "翻译"
-        case .about: return "关于"
+        case .general: return L("settings.page.general", fallback: "通用")
+        case .shortcuts: return L("settings.page.shortcuts", fallback: "快捷键")
+        case .save: return L("settings.page.save", fallback: "保存与导出")
+        case .pin: return L("settings.page.pin", fallback: "固定截图")
+        case .recognition: return L("settings.page.recognition", fallback: "文字识别")
+        case .translation: return L("settings.page.translation", fallback: "翻译")
+        case .about: return L("settings.page.about", fallback: "关于")
         }
     }
 
     var symbolName: String {
         switch self {
         case .general: return "gearshape"
+        case .shortcuts: return "command"
         case .save: return "tray.and.arrow.down"
         case .pin: return "pin"
         case .recognition: return "text.viewfinder"
@@ -47,16 +47,48 @@ enum SettingsPage: String, CaseIterable {
         }
     }
 
-    /// 页面右上角的说明。
+    @MainActor
     var subtitle: String {
         switch self {
-        case .general: return "管理全局快捷键与登录启动方式"
-        case .save: return "设置截图保存位置与输出行为"
-        case .pin: return "配置固定截图的数量上限与隐显快捷键"
-        case .recognition: return "选择本地或云端文字识别引擎"
-        case .translation: return "配置系统翻译与云端翻译模型"
-        case .about: return "查看应用版本、更新与诊断信息"
+        case .general: return L("settings.subtitle.general", fallback: "外观、语言、系统权限、截图交互与登录启动")
+        case .shortcuts: return L("settings.subtitle.shortcuts", fallback: "统一管理全局热键（支持解绑与 F1–F20）及覆盖层快捷键")
+        case .save: return L("settings.subtitle.save", fallback: "保存位置、多格式导出、无损压缩与剪贴板行为")
+        case .pin: return L("settings.subtitle.pin", fallback: "配置固定截图的数量上限、边框样式与隐显快捷键")
+        case .recognition: return L("settings.subtitle.recognition", fallback: "选择本地或云端文字识别引擎与二维码识别")
+        case .translation: return L("settings.subtitle.translation", fallback: "配置系统离线翻译与云端翻译模型")
+        case .about: return L("settings.subtitle.about", fallback: "查看应用版本、更新与诊断信息")
         }
+    }
+
+    /// 跨分类搜索关键词表（中英双语覆盖，支持输入任意功能名/术语即时定位）。
+    var searchKeywords: [String] {
+        switch self {
+        case .general:
+            return ["通用", "general", "外观", "深色", "浅色", "dark", "light", "主题", "theme", "语言", "language", "english", "中文", "权限", "permission", "tcc", "tccutil", "自愈", "屏幕录制", "辅助功能", "麦克风", "阴影", "shadow", "esc", "工具栏", "toolbar", "长截图", "自动翻页", "autoscroll", "提示", "toast", "范围框", "录屏", "启动", "login"]
+        case .shortcuts:
+            return ["快捷键", "热键", "shortcut", "hotkey", "f1", "f12", "解绑", "清空", "窗体", "window", "截图", "录制", "长截图", "ocr", "翻译", "贴图"]
+        case .save:
+            return ["保存", "导出", "save", "export", "文件夹", "folder", "每次询问", "png", "jpeg", "jpg", "heic", "webp", "质量", "quality", "压缩", "oxipng", "无损", "剪贴板", "tiff", "pasteboard", "dpi"]
+        case .pin:
+            return ["固定", "贴图", "pin", "上限", "limit", "边框", "border", "穿透", "隐藏"]
+        case .recognition:
+            return ["识别", "文字", "ocr", "vision", "百度", "openai", "claude", "二维码", "qrcode", "barcode", "语言"]
+        case .translation:
+            return ["翻译", "translation", "apple", "系统", "云端", "划词", "悬浮", "目标语种", "语言"]
+        case .about:
+            return ["关于", "about", "版本", "version", "更新", "update", "崩溃", "crash", "日志", "github", "release"]
+        }
+    }
+
+    /// 判断是否命中跨分类搜索查询词。
+    @MainActor
+    func matches(query: String) -> Bool {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !trimmed.isEmpty else { return true }
+        if title.lowercased().contains(trimmed) || subtitle.lowercased().contains(trimmed) {
+            return true
+        }
+        return searchKeywords.contains { $0.contains(trimmed) }
     }
 }
 

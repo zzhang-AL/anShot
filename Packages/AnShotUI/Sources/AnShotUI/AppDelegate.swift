@@ -202,9 +202,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 菜单是 `menuWillOpen` 时现建的，没有可跟随的回调，因此这里缓存一份。
     private var exportProgress: Double?
 
-/// 录制范围框。录制期间在屏幕上标出「正在录哪一块」——
-/// 覆盖层收起后屏幕上没有别的东西能表达这个边界。
-private let recordingFrame = RecordingRegionFrame()
+    /// 录制范围框。默认设置 `excludedFromCapture: true` 防止被第三方会议软件拍进。
+    private lazy var recordingFrame = RecordingRegionFrame(excludedFromCapture: !isDiagnosticRun)
 
     /// 热键注册失败的原因。非 nil 时菜单显示不可用提示，而非静默失效。
     private var globalHotKeyError: String?
@@ -221,6 +220,11 @@ private let recordingFrame = RecordingRegionFrame()
     }
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
+        // 启动即应用用户持久化的全域外观（浅/深/跟随）、界面双语与轻提示偏好。
+        AnShotTheme.apply(appearanceMode: settings.appearanceMode)
+        AnShotLocalization.apply(settings.appLanguage)
+        ToastPresenter.isEnabled = settings.showCompletionToast
+
         // 所有交付都先登记产物，再决定怎么提示。
         //
         // 旧实现只在「保存成功」时写历史，于是复制、钉住、长截图都不留痕：
@@ -565,45 +569,73 @@ private let recordingFrame = RecordingRegionFrame()
     }
 
     /// 重建菜单内容。菜单每次展开都会调用，因此无需额外刷新机制。
+    /// 暴露给单元测试核对菜单栏瘦身结构、SF Symbol 与隐藏规则。
+    func buildStatusMenuForTesting() -> NSMenu {
+        let menu = NSMenu()
+        rebuildMenu(menu)
+        return menu
+    }
+
     private func rebuildMenu(_ menu: NSMenu) {
         menu.removeAllItems()
 
-        // 存在任意点击穿透贴图时，在菜单栏最顶部动态置顶一键恢复入口（契约 §5.2）。
+        // 1. 存在任意点击穿透贴图时，在菜单栏最顶部动态置顶一键恢复入口（契约 §5.2）。
         if overlayController.pinManager.hasClickThroughPins {
             let count = overlayController.pinManager.clickThroughCount
             let restoreItem = makeAction(
-                "取消贴图穿透（\(count) 张）",
-                #selector(disableAllPinClickThrough)
+                "\(L("menu.disableClickThrough", fallback: "取消贴图穿透"))（\(count)）",
+                #selector(disableAllPinClickThrough),
+                symbol: "cursorarrow.click.badge.clock"
             )
             append([restoreItem, .separator()], to: menu)
         }
 
         let permission = permissionService.current()
 
-        append(makeStatusSection(permission), to: menu)
-        append(makeHistorySection(), to: menu)
-        append(makeScrollshotLogSection(), to: menu)
-        append(makePermissionGuideSection(permission), to: menu)
-        if permission == .granted || recordingController.isActive {
+        // 2. 权限状态：已授权时隐藏多余状态行；未授权时突出展示引导。
+        if permission != .granted {
+            append(makeStatusSection(permission), to: menu)
+            append(makePermissionGuideSection(permission), to: menu)
+        } else {
+            // 3. 精简核心动作区（带 SF Symbol 图标与原生右对齐快捷键）
+            append(makeCaptureSection(), to: menu)
+            append([.separator()], to: menu)
+        }
+
+        // 4. 录制中直接展开顶层控制，未录时已在核心动作区的「录制屏幕」子菜单合并
+        if recordingController.isActive {
             append(makeRecordingSection() + [.separator()], to: menu)
         }
+
+        // 5. 历史记录 + 动态固定截图（无贴图时自动隐藏以瘦身）
+        var utilityItems: [NSMenuItem] = [makeHistoryMenuItem()]
+        if !overlayController.pinManager.pins.isEmpty {
+            utilityItems.append(makePinMenuItem())
+        }
+        utilityItems.append(makeMoreAndDiagnosticsSubmenu())
+        append(utilityItems + [.separator()], to: menu)
+
+        // 6. 可选辅助功能提示（未授权才提示，已授权静默隐藏）
         append(makeAccessibilitySection(), to: menu)
+
         #if DEBUG
         append(makeDiagnosticSection(), to: menu)
         #endif
-        append(makeHelpSection(), to: menu)
-        append(makeSettingsSection(), to: menu)
-        append(makeSessionSection(), to: menu)
-    }
 
-    /// 帮助与更新。与设置分开：这三项是「去看看」，不是「改配置」。
-    private func makeHelpSection() -> [NSMenuItem] {
-        [
-            makeAction("检查更新…", #selector(checkForUpdates)),
-            makeAction("崩溃日志…", #selector(openCrashLogs)),
-            makeAction("GitHub 项目主页", #selector(openProjectPage)),
-            .separator(),
-        ]
+        // 7. 设置与退出（标准 HIG 尾部）
+        let settingsItem = makeAction(
+            L("menu.settings", fallback: "设置…"),
+            #selector(openSettings),
+            key: ",",
+            symbol: "gearshape"
+        )
+        let quitItem = NSMenuItem(
+            title: L("menu.quit", fallback: "退出 anShot"),
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+        quitItem.image = menuSymbol("power")
+        append([settingsItem, quitItem], to: menu)
     }
 
     @objc private func checkForUpdates() {
@@ -621,38 +653,47 @@ private let recordingFrame = RecordingRegionFrame()
 
     // MARK: - 菜单区块
 
-    /// 把一个区块的菜单项追加到菜单。
-    ///
-    /// 区块方法一律返回 `[NSMenuItem]`（含其后的分隔线），由这里统一追加：
-    /// 把「构建什么」与「加进哪里」分开，区块之间就不必互相知道对方的存在。
     private func append(_ items: [NSMenuItem], to menu: NSMenu) {
         for item in items {
             menu.addItem(item)
         }
     }
 
-    /// 构造可点击的菜单项。
-    ///
-    /// 抽出来的理由：下面十几个项都是「标题 + selector + target = self」
-    /// 这同一套样板。逐处展开会把菜单的**结构**淹没在重复代码里——
-    /// 而结构正是读这段代码时真正要看的东西。
-    private func makeAction(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
+    private func menuSymbol(_ name: String) -> NSImage? {
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)
+        image?.isTemplate = true
+        return image
+    }
+
+    /// 构造可点击的菜单项（支持 SF Symbol 图标与原生右对齐快捷键）。
+    private func makeAction(
+        _ title: String,
+        _ action: Selector,
+        key: String = "",
+        symbol: String? = nil,
+        shortcutAction: GlobalShortcutAction? = nil
+    ) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
         item.target = self
+        if let symbol {
+            item.image = menuSymbol(symbol)
+        }
+        if let shortcutAction, let shortcut = settings.optionalShortcut(for: shortcutAction) {
+            let eq = shortcut.menuKeyEquivalent
+            if !eq.key.isEmpty {
+                item.keyEquivalent = eq.key
+                item.keyEquivalentModifierMask = eq.modifiers
+            }
+        }
         return item
     }
 
-    /// 构造不可点击的展示项（状态行、导出进度、热键故障提示）。
     private func makeStatus(_ title: String) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.isEnabled = false
         return item
     }
 
-    /// 屏幕录制权限状态行。
-    ///
-    /// 文案一律用「尚未授权」而非「已拒绝」：API 无法区分
-    /// 「用户拒绝」「授权仍在等待」「曾授权后撤销」三种情形。
     private func makeStatusSection(_ permission: ScreenCapturePermission) -> [NSMenuItem] {
         let title: String
         switch permission {
@@ -663,74 +704,128 @@ private let recordingFrame = RecordingRegionFrame()
         case .notGranted:
             title = "屏幕录制权限：尚未授权（此前请求过）"
         }
-        return [makeStatus(title), .separator()]
+        return [makeStatus(title)]
     }
 
-    /// 历史记录入口。有条目时在标题里显示数量。
-    private func makeHistorySection() -> [NSMenuItem] {
-        let history = makeAction("历史记录…", #selector(openHistory))
-        if !historyStore.entries.isEmpty {
-            history.title = "历史记录（\(historyStore.entries.count)）…"
-        }
-        return [history, .separator()]
+    private func makeHistoryMenuItem() -> NSMenuItem {
+        let baseTitle = L("menu.history", fallback: "历史记录…")
+        let title = historyStore.entries.isEmpty
+            ? baseTitle
+            : "\(L("menu.history", fallback: "历史记录").replacingOccurrences(of: "…", with: ""))（\(historyStore.entries.count)）…"
+        return makeAction(title, #selector(openHistory), symbol: "clock.arrow.circlepath")
     }
 
-    /// 长截图日志入口。有记录时在标题里带上异常条数。
-    ///
-    /// Release 也保留（不放在 `#if DEBUG` 诊断区）：断层是**普通用户**会遇到的
-    /// 体验问题，让他们能把现场发出来，比我们自己猜测多少轮都有用。
-    private func makeScrollshotLogSection() -> [NSMenuItem] {
-        let log = makeAction("长截图日志…", #selector(openScrollshotLog))
+    /// 二级「更多与排障」子菜单：收敛低频工具、日志、欢迎、更新、GitHub 与重启，让顶层保持 ~11 项。
+    private func makeMoreAndDiagnosticsSubmenu() -> NSMenuItem {
+        let container = NSMenuItem(
+            title: L("menu.moreTools", fallback: "更多与排障"),
+            action: nil,
+            keyEquivalent: ""
+        )
+        container.image = menuSymbol("ellipsis.circle")
+
+        let sub = NSMenu()
+        sub.addItem(makeAction(L("menu.chooseWindow", fallback: "选择窗口…"), #selector(chooseWindow), symbol: "macwindow.on.rectangle"))
+        sub.addItem(makeAction(L("menu.openImage", fallback: "打开图片…"), #selector(openImageFile), symbol: "photo.on.rectangle"))
+        sub.addItem(makeAction(L("menu.pinFromClipboard", fallback: "从剪贴板贴图"), #selector(pinFromPasteboard), symbol: "pin.circle"))
+        sub.addItem(.separator())
+        sub.addItem(makeAction(L("menu.ocrFromClipboard", fallback: "从剪贴板识别文字"), #selector(ocrFromPasteboard), symbol: "doc.on.clipboard"))
+        sub.addItem(makeAction(L("menu.ocrFromFile", fallback: "识别图片文件文字…"), #selector(ocrFromImageFile), symbol: "doc.text.viewfinder"))
+        sub.addItem(.separator())
+
         let problems = ScrollshotLogStore.shared.entries.filter(\.isProblem).count
-        if problems > 0 {
-            log.title = "长截图日志（\(problems) 条异常）…"
-        }
-        return [log, .separator()]
+        let scrollLogTitle = problems > 0
+            ? "长截图日志（\(problems) 条异常）…"
+            : L("menu.scrollshotLog", fallback: "长截图日志…")
+        sub.addItem(makeAction(scrollLogTitle, #selector(openScrollshotLog), symbol: "doc.plaintext"))
+        sub.addItem(makeAction(L("menu.crashLog", fallback: "崩溃日志…"), #selector(openCrashLogs), symbol: "exclamationmark.triangle"))
+        sub.addItem(makeAction(L("menu.welcome", fallback: "欢迎与权限…"), #selector(openWelcome), symbol: "hand.wave"))
+        sub.addItem(makeAction(L("menu.checkUpdate", fallback: "检查更新…"), #selector(checkForUpdates), symbol: "arrow.triangle.2.circlepath"))
+        sub.addItem(makeAction(L("menu.github", fallback: "GitHub 项目主页"), #selector(openProjectPage), symbol: "safari"))
+        sub.addItem(.separator())
+        sub.addItem(makeAction(L("menu.relaunch", fallback: "重启 anShot"), #selector(relaunch), symbol: "arrow.clockwise"))
+
+        container.submenu = sub
+        return container
     }
 
-    /// 权限引导：未授权时给引导入口，已授权时给实际功能入口。
     private func makePermissionGuideSection(
         _ permission: ScreenCapturePermission
     ) -> [NSMenuItem] {
         switch permission {
         case .notRequested:
-            // 从未请求过：可以触发系统授权对话框
-            return [makeAction("请求屏幕录制权限…", #selector(requestPermission)), .separator()]
-
+            return [makeAction("请求屏幕录制权限…", #selector(requestPermission), symbol: "checkmark.shield"), .separator()]
         case .notGranted:
-            // 已请求过：系统不会再弹窗，只能引导到系统设置
-            return [makeAction("打开系统设置检查权限…", #selector(openScreenRecordingSettings)), .separator()]
-
+            return [makeAction("打开系统设置检查权限…", #selector(openScreenRecordingSettings), symbol: "lock.shield"), .separator()]
         case .granted:
             return makeCaptureSection()
         }
     }
 
-    /// 已授权时的功能入口：截图、剪贴板贴图、固定截图、热键故障提示、录制。
+    /// 瘦身后的高频核心功能区（6 个顶层动作：截图 / 独立窗体 / 滚动长截图 / 识字 / 翻译 / 录屏）。
     private func makeCaptureSection() -> [NSMenuItem] {
-        // 本应用无 Dock 图标也无应用菜单，菜单栏是唯一能常驻的管理入口。
+        // 「翻译」二级子菜单收敛框选翻译与划词翻译
+        let translateRoot = NSMenuItem(title: "翻译", action: nil, keyEquivalent: "")
+        translateRoot.image = menuSymbol("translate")
+        let translateMenu = NSMenu()
+        translateMenu.addItem(makeAction(
+            L("menu.ocrTranslate", fallback: "框选翻译…"),
+            #selector(startOCRAutoTranslateFlow),
+            symbol: "rectangle.and.text.magnifyingglass",
+            shortcutAction: .ocrAutoTranslate
+        ))
+        translateMenu.addItem(makeAction(
+            L("menu.selectionTranslate", fallback: "划词翻译"),
+            #selector(triggerSelectionTranslateFromMenu),
+            symbol: "character.book.closed",
+            shortcutAction: .selectionTranslate
+        ))
+        translateRoot.submenu = translateMenu
+
+        // 「录制屏幕」合并区域/窗口/应用准备入口与全屏快录入口
+        let recordRoot = NSMenuItem(
+            title: L("menu.recording", fallback: "录制屏幕…"),
+            action: #selector(startRecordingFlow),
+            keyEquivalent: ""
+        )
+        recordRoot.target = self
+        recordRoot.image = menuSymbol("record.circle")
+        if let recShortcut = settings.optionalShortcut(for: .recording) {
+            let eq = recShortcut.menuKeyEquivalent
+            if !eq.key.isEmpty {
+                recordRoot.keyEquivalent = eq.key
+                recordRoot.keyEquivalentModifierMask = eq.modifiers
+            }
+        }
+        let recordSub = NSMenu()
+        recordSub.addItem(makeAction(
+            "选择区域 / 窗口 / GIF 录制…",
+            #selector(startRecordingFlow),
+            symbol: "rectangle.dashed.badge.record",
+            shortcutAction: .recording
+        ))
+        recordSub.addItem(makeAction(
+            L("menu.recordingFullScreen", fallback: "立即全屏录制（MP4）"),
+            #selector(startFullScreenRecording),
+            symbol: "display"
+        ))
+        recordRoot.submenu = recordSub
+
         var items: [NSMenuItem] = [
-            makeAction("截图", #selector(startCapture)),
-            makeAction("独立窗体截图", #selector(startWindowCaptureFlow)),
-            makeAction("选择窗口…", #selector(chooseWindow)),
-            makeAction("打开图片…", #selector(openImageFile)),
-            makeAction("从剪贴板贴图", #selector(pinFromPasteboard)),
-            makeAction("滚动长截图…", #selector(startLongScreenshotFlow)),
-            makeAction("识别文字…", #selector(startOCRCaptureFlow)),
-            makeAction("框选翻译…", #selector(startOCRAutoTranslateFlow)),
-            makeAction("划词翻译", #selector(triggerSelectionTranslateFromMenu)),
-            makeAction("从剪贴板识别文字", #selector(ocrFromPasteboard)),
-            makeAction("识别图片文件文字…", #selector(ocrFromImageFile)),
-            makeAction("开始录制…", #selector(startRecordingFlow)),
-            makePinMenuItem(),
+            makeAction(L("menu.capture", fallback: "截图"), #selector(startCapture), symbol: "viewfinder", shortcutAction: .capture),
+            makeAction(L("menu.windowCapture", fallback: "独立窗体截图"), #selector(startWindowCaptureFlow), symbol: "macwindow", shortcutAction: .windowCapture),
+            makeAction(L("menu.longScreenshot", fallback: "滚动长截图…"), #selector(startLongScreenshotFlow), symbol: "arrow.up.and.down.text.horizontal", shortcutAction: .longScreenshot),
+            makeAction(L("menu.ocr", fallback: "识别文字…"), #selector(startOCRCaptureFlow), symbol: "text.viewfinder", shortcutAction: .ocr),
+            translateRoot,
+            recordRoot,
         ]
 
         if let globalHotKeyError {
             items.append(makeStatus("截图快捷键不可用：\(globalHotKeyError)"))
         }
-        // 每个直达热键的失败单独说清：每个键位是独立的可用性事实。
         for action in [
-            GlobalShortcutAction.recording,
+            GlobalShortcutAction.windowCapture,
+            .recording,
             .longScreenshot,
             .ocr,
             .ocrAutoTranslate,
@@ -784,42 +879,10 @@ private let recordingFrame = RecordingRegionFrame()
     }
 
     #if DEBUG
-    /// 临时诊断入口：验证 P2 捕获层能真实抓图。P3 用真正的截图功能替换它。
     private func makeDiagnosticSection() -> [NSMenuItem] {
-        [makeAction("诊断：抓取全屏为 PNG", #selector(diagnoseCapture)), .separator()]
+        [makeAction("诊断：抓取全屏为 PNG", #selector(diagnoseCapture), symbol: "stethoscope"), .separator()]
     }
     #endif
-
-    /// 设置入口。
-    ///
-    /// 本应用无 Dock 图标、无应用菜单，因此没有地方放 HIG 规定的
-    /// 「anShot → 设置…」菜单项；状态菜单是唯一入口。
-    ///
-    /// keyEquivalent 给 ⌘,：它在菜单展开时生效，与 HIG 的约定一致。
-    /// **不**把它注册成全局热键——⌘, 在大量应用里都有含义，
-    /// 抢过来会破坏用户已有的习惯。
-    private func makeSettingsSection() -> [NSMenuItem] {
-        [
-            makeAction("欢迎与权限…", #selector(openWelcome)),
-            makeAction("设置…", #selector(openSettings), key: ","),
-            .separator(),
-        ]
-    }
-
-    /// 排障与退出。
-    ///
-    /// 重启作为**排障手段**常驻，而非「刚授权所以必须重启」的强制流程：
-    /// 授权生效是否需要新进程，取决于 TCC 与 ScreenCaptureKit 的连接状态，
-    /// 无法先验判定。需要时用户可主动使用。
-    private func makeSessionSection() -> [NSMenuItem] {
-        // quit **不设 target**：走响应链交给 NSApplication 处理。
-        let quit = NSMenuItem(
-            title: "退出 anShot",
-            action: #selector(NSApplication.terminate(_:)),
-            keyEquivalent: "q"
-        )
-        return [makeAction("重启 anShot", #selector(relaunch)), quit]
-    }
 
 
     // MARK: - 权限动作
@@ -878,21 +941,30 @@ private let recordingFrame = RecordingRegionFrame()
     ///
     /// 注册失败不阻止应用运行：菜单栏仍提供入口，且失败原因会显示在菜单中。
     private func installGlobalHotKey() {
-        do {
-            globalHotKey = try makeHotKey(for: settings.captureShortcut)
+        if let captureShortcut = settings.optionalShortcut(for: .capture) {
+            do {
+                globalHotKey = try makeHotKey(for: captureShortcut)
+                globalHotKeyError = nil
+            } catch {
+                let message = error.localizedDescription
+                globalHotKeyError = message
+                logger.error("global hotkey unavailable: \(message, privacy: .public)")
+            }
+        } else {
+            globalHotKey?.invalidate()
+            globalHotKey = nil
             globalHotKeyError = nil
-        } catch {
-            let message = error.localizedDescription
-            globalHotKeyError = message
-            logger.error("global hotkey unavailable: \(message, privacy: .public)")
         }
-        installPinToggleHotKey(for: settings.pinToggleShortcut)
 
-        // 直达入口：录制 / 长截图 / OCR。
-        //
-        // 三个动作都复用同一条覆盖层与选区链路，区别只是选区确定后
-        // 执行哪一个动作（见 `OverlaySessionIntent`）。因此这里只登记
-        // 「意图」，不各写一套捕获代码。
+        if let pinShortcut = settings.optionalShortcut(for: .pinToggle) {
+            installPinToggleHotKey(for: pinShortcut)
+        } else {
+            pinToggleHotKey?.invalidate()
+            pinToggleHotKey = nil
+            pinToggleHotKeyError = nil
+        }
+
+        installIntentHotKey(.windowCapture, role: .windowCapture)
         installIntentHotKey(.recording, role: .recording)
         installIntentHotKey(.longScreenshot, role: .longScreenshot)
         installIntentHotKey(.ocr, role: .ocr)
@@ -900,13 +972,19 @@ private let recordingFrame = RecordingRegionFrame()
         installIntentHotKey(.selectionTranslate, role: .selectionTranslate)
     }
 
-    /// 安装一个「直达动作」热键。
+    /// 安装一个「直达动作」热键（若该动作已解绑则静默跳过注册）。
     private func installIntentHotKey(_ action: GlobalShortcutAction, role: GlobalHotKey.Role) {
+        guard let shortcut = settings.optionalShortcut(for: action) else {
+            intentHotKeys[action]?.invalidate()
+            intentHotKeys[action] = nil
+            intentHotKeyErrors[action] = nil
+            return
+        }
         do {
             intentHotKeys[action] = try makeIntentHotKey(
                 action: action,
                 role: role,
-                shortcut: settings.shortcut(for: action)
+                shortcut: shortcut
             )
             intentHotKeyErrors[action] = nil
         } catch {
@@ -932,6 +1010,8 @@ private let recordingFrame = RecordingRegionFrame()
         ) { [weak self] in
             guard let self else { return }
             switch action {
+            case .windowCapture:
+                self.overlayController.present(intent: .windowCapture)
             case .recording:
                 guard !self.recordingController.isActive else {
                     ToastPresenter.show("正在录制中，请先停止当前录制")
@@ -1181,22 +1261,23 @@ private let recordingFrame = RecordingRegionFrame()
             ToastPresenter.show("正在录制中，请先停止当前录制")
             return
         }
-        startRecording(scope: .display(DisplayGeometry.mainDisplay()), output: .movie)
+        // 菜单栏「立即全屏录制」直录不串味读取准备面板的 3 秒倒计时偏好（Phase 5.3 修复）。
+        startRecording(
+            scope: .display(DisplayGeometry.mainDisplay()),
+            output: .movie,
+            countdownSeconds: 0
+        )
     }
 
     /// 窗口录制时的范围框跟随器（其它范围不需要）。
-    ///
-    /// 窗口会移动/缩放，而范围框是静态窗口；不跟随的话框停在旧位置，
-    /// 它指示的边界与成片不符。
     private var windowFollower: WindowFrameFollower?
 
     private func startRecording(
         scope: CaptureScope,
-        // 与准备面板的默认值保持一致（都勾选）。菜单栏入口不经过面板，
-        // 若这里仍用全关的默认值，同样叫「开始录制」的两条路径行为却不同。
         audio: AudioSettings = AudioSettings(systemAudio: true, microphone: true),
         output: RecordingOutputChoice,
-        controlBarRect: CGRect? = nil
+        controlBarRect: CGRect? = nil,
+        countdownSeconds explicitCountdown: Int? = nil
     ) {
         guard !recordingController.isActive else {
             ToastPresenter.show("正在录制中，请先停止当前录制")
@@ -1205,17 +1286,17 @@ private let recordingFrame = RecordingRegionFrame()
         let outputURL = RecordingController.defaultOutputURL(for: settings, output: output)
         logger.notice("开始录制：\(outputURL.path, privacy: .public)")
 
+        let showFrame = settings.recordingShowRegionFrame
         recordingController.onUpdate = { [weak self] state, elapsed in
             self?.recordingBar.update(state: state, elapsed: elapsed)
-            // 暂停时边框换色：边框位置不变，颜色是唯一能区分「在录」与「暂停」的手段
-            self?.recordingFrame.update(appearance: state == .paused ? .paused : .recording)
+            if showFrame {
+                self?.recordingFrame.update(appearance: state == .paused ? .paused : .recording)
+            }
             self?.refreshMenuTitle()
         }
         recordingController.onCountdownTick = { [weak self] remaining in
             self?.recordingBar.updateCountdown(remaining)
         }
-        // 进度单独一根管子（见 `RecordingController.onExportProgress`）。
-        // 同时缓存一份：菜单是在 `menuWillOpen` 时现建的，没有回调可跟。
         recordingController.onExportProgress = { [weak self] value in
             self?.exportProgress = value
             self?.recordingBar.updateExportProgress(value)
@@ -1242,33 +1323,28 @@ private let recordingFrame = RecordingRegionFrame()
             Task { await self.recordingController.cancel() }
         }
 
-        // 顺序要紧：**先摆好录制 UI，再启动捕获**。
-        // 排除窗口需要窗口号，而 windowNumber 只在 orderFront 之后才有值；
-        // 先启动的话拿到的是空列表，范围框与控制条就会被录进成片。
-        let countdownSeconds = RecordingSetupPanel.preferredCountdownSeconds
+        let countdownSeconds = explicitCountdown ?? RecordingSetupPanel.preferredCountdownSeconds
         recordingBar.update(state: .preparing, elapsed: 0)
         if countdownSeconds > 0 {
             recordingBar.updateCountdown(countdownSeconds)
         }
-        // GIF 时把上限交给控制条：录制中它要显示倒计时，因为到达上限会**自动停止**。
         let gifLimit: TimeInterval?
         if case .gif(let gifSettings) = output {
             gifLimit = gifSettings.maximumDuration
         } else {
             gifLimit = nil
         }
-        // 录制所在的屏幕按**录制范围**确定，而不是 `NSScreen.main`
-        //（那是键盘焦点所在屏，多屏时与录制目标无关）。
         let targetScreen = Self.screen(for: scope, rect: controlBarRect)
         recordingBar.show(near: controlBarRect, on: targetScreen, gifLimit: gifLimit)
-        // 范围框与录制区域一致；全屏录制没有具体矩形，用目标显示器的整屏范围。
-        recordingFrame.show(
-            rect: controlBarRect ?? targetScreen?.frame ?? .zero,
-            appearance: .recording
-        )
-
-        // 窗口范围：让范围框跟着窗口走。
-        startWindowFollowing(scope: scope)
+        if showFrame {
+            recordingFrame.show(
+                rect: controlBarRect ?? targetScreen?.frame ?? .zero,
+                appearance: .recording
+            )
+            startWindowFollowing(scope: scope)
+        } else {
+            recordingFrame.hide()
+        }
 
         // 把本应用自己的录制 UI 排除在画面之外。不能只靠窗口层级或
         // nonactivatingPanel——那些都不影响 SCStream 是否采集该窗口。
@@ -1608,12 +1684,13 @@ private let recordingFrame = RecordingRegionFrame()
         let manager = overlayController.pinManager
         let count = manager.pins.count
         let limit = manager.maximumPins
-        // 标题直接写出用量：不展开子菜单也能知道还剩几张。
+        let baseTitle = L("menu.pin", fallback: "固定截图")
         let parent = NSMenuItem(
-            title: count == 0 ? "固定截图" : "固定截图（\(count)/\(limit)）",
+            title: count == 0 ? baseTitle : "\(baseTitle)（\(count)/\(limit)）",
             action: nil,
             keyEquivalent: ""
         )
+        parent.image = menuSymbol("pin")
         let submenu = NSMenu()
 
         if manager.isAtLimit {
@@ -1888,13 +1965,13 @@ extension AppDelegate: NSMenuDelegate {
 /// 用户会以「快捷键突然没了」的形式受到伤害，而这正是最难归因的故障类型。
 extension AppDelegate: ShortcutHosting {
 
-    /// 检测候选组合键是否与本应用其余 4 个全局热键槽位发生内部互撞。
+    /// 检测候选组合键是否与本应用其余已绑定全局热键槽位发生内部互撞。
     func internalConflictMessage(
         for candidate: Shortcut,
         excluding currentAction: GlobalShortcutAction
     ) -> String? {
         for other in GlobalShortcutAction.allCases where other != currentAction {
-            if settings.shortcut(for: other) == candidate {
+            if settings.optionalShortcut(for: other) == candidate {
                 return "与本应用「\(other.displayName)」快捷键冲突"
             }
         }
@@ -2043,12 +2120,12 @@ extension AppDelegate: ShortcutHosting {
             return applyCaptureShortcut(shortcut)
         case .pinToggle:
             return applyPinToggleShortcut(shortcut)
-        case .recording, .longScreenshot, .ocr, .ocrAutoTranslate, .selectionTranslate:
+        case .windowCapture, .recording, .longScreenshot, .ocr, .ocrAutoTranslate, .selectionTranslate:
             if let conflict = internalConflictMessage(for: shortcut, excluding: action) {
                 return conflict
             }
             // 组合未变且注册活跃：Carbon 二次注册返回 -9878，不能重试。
-            if shortcut == settings.shortcut(for: action), intentHotKeys[action] != nil {
+            if shortcut == settings.optionalShortcut(for: action), intentHotKeys[action] != nil {
                 return nil
             }
             do {
@@ -2060,7 +2137,6 @@ extension AppDelegate: ShortcutHosting {
                 intentHotKeys[action] = hotKey
                 intentHotKeyErrors[action] = nil
                 settings.setShortcut(shortcut, for: action)
-                // 提交成功就不需要恢复了，理由同截图快捷键。
                 suspendedIntentShortcuts[action] = nil
                 logger.notice("""
                     intent shortcut changed; action=\(action.rawValue, privacy: .public) \
@@ -2087,16 +2163,15 @@ extension AppDelegate: ShortcutHosting {
             return suspendCaptureShortcut()
         case .pinToggle:
             return suspendPinToggleShortcut()
-        case .recording, .longScreenshot, .ocr, .ocrAutoTranslate, .selectionTranslate:
+        case .windowCapture, .recording, .longScreenshot, .ocr, .ocrAutoTranslate, .selectionTranslate:
             guard suspendedIntentShortcuts[action] == nil else { return true }
             guard let hotKey = intentHotKeys[action] else {
-                // 启动期就注册失败：没有可让出的热键，但设置必须仍可改。
                 logger.notice(
                     "intent suspend requested but no hotkey is active; action=\(action.rawValue, privacy: .public)"
                 )
                 return true
             }
-            suspendedIntentShortcuts[action] = settings.shortcut(for: action)
+            suspendedIntentShortcuts[action] = settings.optionalShortcut(for: action)
             hotKey.invalidate()
             intentHotKeys[action] = nil
             logger.notice("intent shortcut suspended; action=\(action.rawValue, privacy: .public)")
@@ -2110,7 +2185,7 @@ extension AppDelegate: ShortcutHosting {
             return resumeCaptureShortcut()
         case .pinToggle:
             return resumePinToggleShortcut()
-        case .recording, .longScreenshot, .ocr, .ocrAutoTranslate, .selectionTranslate:
+        case .windowCapture, .recording, .longScreenshot, .ocr, .ocrAutoTranslate, .selectionTranslate:
             guard let shortcut = suspendedIntentShortcuts[action] else { return nil }
             suspendedIntentShortcuts[action] = nil
             if let reason = applyGlobalShortcut(shortcut, for: action) {
@@ -2125,8 +2200,30 @@ extension AppDelegate: ShortcutHosting {
         }
     }
 
+    func clearGlobalShortcut(for action: GlobalShortcutAction) {
+        switch action {
+        case .capture:
+            globalHotKey?.invalidate()
+            globalHotKey = nil
+            globalHotKeyError = nil
+            suspendedShortcut = nil
+        case .pinToggle:
+            pinToggleHotKey?.invalidate()
+            pinToggleHotKey = nil
+            pinToggleHotKeyError = nil
+            suspendedPinToggleShortcut = nil
+        case .windowCapture, .recording, .longScreenshot, .ocr, .ocrAutoTranslate, .selectionTranslate:
+            intentHotKeys[action]?.invalidate()
+            intentHotKeys[action] = nil
+            intentHotKeyErrors[action] = nil
+            suspendedIntentShortcuts[action] = nil
+        }
+        settings.clearShortcut(for: action)
+    }
+
     private func role(for action: GlobalShortcutAction) -> GlobalHotKey.Role {
         switch action {
+        case .windowCapture: return .windowCapture
         case .recording: return .recording
         case .longScreenshot: return .longScreenshot
         case .ocr: return .ocr

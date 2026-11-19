@@ -69,8 +69,10 @@ extension CaptureDiagnostics {
         defer { UserDefaults.standard.removePersistentDomain(forName: suiteName) }
 
         let settings = AppSettings(store: store)
-        check("默认快捷键应为 ⌃1", settings.captureShortcut == AppSettings.defaultCaptureShortcut)
-        check("默认保存位置应为「每次询问」", settings.saveDestination == .ask)
+        check("新装默认快捷键应为 ⌃A", settings.captureShortcut == AppSettings.defaultCaptureShortcut)
+        let isFolderDefault: Bool
+        if case .folder = settings.saveDestination { isFolderDefault = true } else { isFolderDefault = false }
+        check("新装默认保存位置应为静默直存文件夹", isFolderDefault)
 
         let custom = Shortcut(keyCode: UInt32(kVK_ANSI_5), modifiers: command | shift)
         settings.setCaptureShortcut(custom)
@@ -207,8 +209,9 @@ extension CaptureDiagnostics {
         check("应只有关闭按钮",
               window.styleMask.contains(.closable)
               && !window.styleMask.contains(.miniaturizable)
-              && !window.styleMask.contains(.resizable))
+              && window.styleMask.contains(.resizable))
 
+        controller.showPageForDiagnostics(.shortcuts)
         guard let contentView = window.contentView,
               let recorder = findShortcutRecorder(in: contentView) else {
             check("应能找得到快捷键录制控件", false)
@@ -217,17 +220,16 @@ extension CaptureDiagnostics {
             return
         }
         check("应能找得到快捷键录制控件", true)
-        check("录制控件初始应显示默认快捷键 ⌃1", recorder.shortcut == AppSettings.defaultCaptureShortcut)
+        check("录制控件初始应显示默认快捷键", recorder.shortcut == AppSettings.defaultCaptureShortcut)
 
-        // 初始化就必须反映当前模式。
-        // 缺失这个刷新时，打开窗口会看到「两个选项都没选中」。
+        // 初始化就必须反映当前模式（新装默认为静默直存文件夹）。
         let initialState = controller.saveControlsState
         check(
-            "初始状态应反映当前保存模式（默认每次询问）",
-            initialState.askSelected && !initialState.folderSelected,
+            "初始状态应反映当前保存模式（新装默认固定文件夹）",
+            !initialState.askSelected && initialState.folderSelected,
             detail: "ask=\(initialState.askSelected) folder=\(initialState.folderSelected)"
         )
-        check("未选过目录时文件夹选项应禁用", !initialState.folderEnabled)
+        check("文件夹选项应始终可点", initialState.folderEnabled)
         check(
             "未选过目录时应显示空状态",
             initialState.primaryText == "尚未选择文件夹",
@@ -396,7 +398,7 @@ extension CaptureDiagnostics {
         try? await Task.sleep(for: .milliseconds(200))
 
         check("按 ⌘⇧5 后应退出录制态", !recorder.isRecording)
-        check("录制结果应为 ⇧⌘5", recorder.shortcut.displayName == "⇧⌘5")
+        check("录制结果应为 ⇧⌘5", recorder.shortcut?.displayName == "⇧⌘5")
         check("提交后应恢复热键", host.resumeCount == 1)
         check("宿主应收到新快捷键", host.applied == recorder.shortcut)
 
@@ -408,7 +410,7 @@ extension CaptureDiagnostics {
         try? await Task.sleep(for: .milliseconds(200))
 
         check("Esc 应退出录制态", !recorder.isRecording)
-        check("Esc 后快捷键应保持原值", recorder.shortcut.displayName == "⇧⌘5")
+        check("Esc 后快捷键应保持原值", recorder.shortcut?.displayName == "⇧⌘5")
         check("Esc 后也应恢复热键", host.resumeCount == 2)
 
         // ── 非法组合应被拒且不退出录制态 ──
@@ -417,7 +419,7 @@ extension CaptureDiagnostics {
         sendKeyEvent(to: window, keyCode: UInt32(kVK_ANSI_A), flags: [.shift], characters: "A")
         try? await Task.sleep(for: .milliseconds(200))
         check("⇧A 应被拒且保持录制态（静态校验不碰系统状态，可以就地重按）",
-              recorder.isRecording && recorder.shortcut.displayName == "⇧⌘5")
+              recorder.isRecording && recorder.shortcut?.displayName == "⇧⌘5")
 
         // ── 键盘可达：Space 启动录制、Tab 退出 ──
         // 这两项不实现的话，纯键盘用户永远进不去也出不来录制态。

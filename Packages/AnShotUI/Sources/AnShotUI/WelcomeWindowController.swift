@@ -69,6 +69,8 @@ final class WelcomeWindowController: NSObject {
     private weak var microphoneRow: PermissionRowView?
     private weak var accessibilityRow: PermissionRowView?
     private weak var shortcutBadge: ShortcutBadgeView?
+    private weak var relaunchButton: SettingsPushButton?
+    private weak var quickShortcutsLabel: NSTextField?
 
     init(
         permission: ScreenCapturePermissionService,
@@ -140,7 +142,18 @@ final class WelcomeWindowController: NSObject {
             isGranted: hasAccessibility
         )
 
-        shortcutBadge.text = settings.captureShortcut.displayName
+        // 全部权限已就绪时隐藏「重新启动」排障按钮，避免造成必须重启的困惑（Phase 5.3）。
+        let allReady = screenStatus.allowsCapture && microphoneStatus.allowsCapture && hasAccessibility
+        relaunchButton?.isHidden = allReady
+
+        shortcutBadge.text = settings.optionalShortcut(for: .capture)?.displayName ?? "未设置"
+        var summaryParts: [String] = []
+        if let s = settings.optionalShortcut(for: .windowCapture) { summaryParts.append("窗体 \(s.displayName)") }
+        if let s = settings.optionalShortcut(for: .longScreenshot) { summaryParts.append("长截图 \(s.displayName)") }
+        if let s = settings.optionalShortcut(for: .ocr) { summaryParts.append("识字 \(s.displayName)") }
+        if let s = settings.optionalShortcut(for: .recording) { summaryParts.append("录屏 \(s.displayName)") }
+        if let s = settings.optionalShortcut(for: .pinToggle) { summaryParts.append("贴图 \(s.displayName)") }
+        quickShortcutsLabel?.stringValue = summaryParts.isEmpty ? "" : "其他直达热键：" + summaryParts.joined(separator: "  ·  ")
     }
 
     private static func microphoneStatusText(_ status: MicrophonePermission.Status) -> String {
@@ -246,6 +259,13 @@ final class WelcomeWindowController: NSObject {
         self.microphoneRow = microphoneRow
         self.accessibilityRow = accessibilityRow
         self.shortcutBadge = shortcutBadge
+        self.relaunchButton = relaunchButton
+
+        let quickLabel = NSTextField(wrappingLabelWithString: "")
+        quickLabel.font = .systemFont(ofSize: 11)
+        quickLabel.textColor = .secondaryLabelColor
+        quickLabel.translatesAutoresizingMaskIntoConstraints = false
+        self.quickShortcutsLabel = quickLabel
 
         // 每一行只负责「把用户送到该去的地方」，权限请求不在这里发生。
         screenRow.onOpenSettings = { [weak self] in
@@ -272,7 +292,7 @@ final class WelcomeWindowController: NSObject {
         buttons.spacing = 10
         buttons.translatesAutoresizingMaskIntoConstraints = false
 
-        for view in [header, permissions, shortcutLine] {
+        for view in [header, permissions, shortcutLine, quickLabel] {
             view.translatesAutoresizingMaskIntoConstraints = false
             root.addSubview(view)
         }
@@ -280,11 +300,9 @@ final class WelcomeWindowController: NSObject {
 
         let margin: CGFloat = 24
 
-        // 内容整体偏上、按钮贴底：窗口固定 420 高，内容不足时多出的空白
-        // 落在快捷键与按钮之间，而不是把所有东西垂直居中后上下各空一截。
         let buttonGap = buttons.topAnchor.constraint(
-            greaterThanOrEqualTo: shortcutLine.bottomAnchor,
-            constant: 16
+            greaterThanOrEqualTo: quickLabel.bottomAnchor,
+            constant: 14
         )
 
         NSLayoutConstraint.activate([
@@ -299,6 +317,10 @@ final class WelcomeWindowController: NSObject {
             shortcutLine.topAnchor.constraint(equalTo: permissions.bottomAnchor, constant: 12),
             shortcutLine.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: margin),
             shortcutLine.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -margin),
+
+            quickLabel.topAnchor.constraint(equalTo: shortcutLine.bottomAnchor, constant: 6),
+            quickLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: margin),
+            quickLabel.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -margin),
 
             buttons.leadingAnchor.constraint(
                 greaterThanOrEqualTo: root.leadingAnchor,

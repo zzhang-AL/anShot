@@ -52,7 +52,19 @@ public final class RecordingControlBar {
     /// 准备倒计时剩余秒数（>0 时处于开拍前倒计时）。
     private var countdownRemaining: Int?
 
-    private static let barSize = CGSize(width: 266, height: 46)
+    /// 取消丢弃两步确认态：首次点击进入危险确认态，2.5s 内再次点击才真正丢弃（防误丢素材）。
+    private var awaitingCancelConfirmation = false
+    private var cancelConfirmResetTimer: Timer?
+    private var containerView: RecordingControlBarContainerView?
+
+    private static let barHeight: CGFloat = 46
+    private static let barMinWidth: CGFloat = 286
+    private static let barSize = CGSize(width: barMinWidth, height: barHeight)
+
+    /// 供测试校验两步防误丢确认状态与层级。
+    var isAwaitingCancelConfirmationForTesting: Bool { awaitingCancelConfirmation }
+    var windowLevelForTesting: NSWindow.Level { panel.level }
+    func triggerCancelForTesting() { handleCancel() }
 
     public init() {
         panel = NSPanel(
@@ -62,19 +74,16 @@ public final class RecordingControlBar {
             defer: false
         )
         panel.isFloatingPanel = true
-        panel.level = .floating
-        // 不激活本应用：见文件头说明
+        // 层级严格高于录制范围框（screenSaver + 1）与截图覆盖层（screenSaver），确保控制条始终在最顶层可点。
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 2)
         panel.becomesKeyOnlyIfNeeded = true
         panel.hidesOnDeactivate = false
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        // 允许背景拖动，避免控制条遮挡目标窗口顶栏或按钮时无法挪开。
         panel.isMovable = true
         panel.isMovableByWindowBackground = true
-        // 防止被第三方会议或屏幕共享软件拍到控制条。
         panel.sharingType = .none
-        // 出现在所有空间，包括全屏应用之上
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.ignoresMouseEvents = false
 
@@ -86,47 +95,60 @@ public final class RecordingControlBar {
     private func configureContent() {
         let container = RecordingControlBarContainerView(frame: CGRect(origin: .zero, size: Self.barSize))
         container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 0.92).cgColor
-        container.layer?.cornerRadius = 10
+        container.layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 0.94).cgColor
+        container.layer?.cornerRadius = Self.barHeight / 2
         container.layer?.borderWidth = 1
-        container.layer?.borderColor = NSColor(calibratedWhite: 1, alpha: 0.12).cgColor
+        container.layer?.borderColor = NSColor(calibratedWhite: 1, alpha: 0.14).cgColor
+        containerView = container
 
-        // 状态圆点
-        statusDot.frame = CGRect(x: 14, y: Self.barSize.height / 2 - 5, width: 10, height: 10)
         statusDot.wantsLayer = true
         statusDot.layer?.cornerRadius = 5
         statusDot.layer?.backgroundColor = CaptureFrameStyle.recording.cgColor
-        container.addSubview(statusDot)
+        statusDot.translatesAutoresizingMaskIntoConstraints = false
 
-        // 计时
-        timeLabel.frame = CGRect(x: 32, y: Self.barSize.height / 2 - 11, width: 72, height: 22)
         timeLabel.font = .monospacedDigitSystemFont(ofSize: 15, weight: .medium)
         timeLabel.textColor = .white
         timeLabel.alignment = .left
-        container.addSubview(timeLabel)
+        timeLabel.setContentHuggingPriority(.required, for: .horizontal)
+        timeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        timeLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        // 状态提示（准备中 / 倒计时 / 已暂停 / 剩余时间 / GIF 进度）
-        hintLabel.frame = CGRect(x: 104, y: Self.barSize.height / 2 - 9, width: 60, height: 18)
-        hintLabel.font = .systemFont(ofSize: 11)
-        hintLabel.textColor = NSColor(calibratedWhite: 1, alpha: 0.65)
-        container.addSubview(hintLabel)
+        hintLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        hintLabel.textColor = NSColor(calibratedWhite: 1, alpha: 0.72)
+        hintLabel.lineBreakMode = .byTruncatingTail
+        hintLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        hintLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        hintLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        // 暂停 / 继续
         styleButton(pauseButton, symbol: "pause.fill", toolTip: "暂停 / 继续录制", action: #selector(handlePause))
-        pauseButton.frame = CGRect(x: 166, y: Self.barSize.height / 2 - 13, width: 26, height: 26)
-        container.addSubview(pauseButton)
-
-        // 停止并保存
         styleButton(stopButton, symbol: "stop.fill", toolTip: "停止并保存录制", action: #selector(handleStop))
-        stopButton.frame = CGRect(x: 198, y: Self.barSize.height / 2 - 13, width: 26, height: 26)
-        container.addSubview(stopButton)
+        styleCancelButton(confirming: false)
 
-        // 取消并丢弃当前录制
-        styleButton(cancelButton, symbol: "xmark", toolTip: "取消并丢弃当前录制", action: #selector(handleCancel))
-        cancelButton.frame = CGRect(x: 230, y: Self.barSize.height / 2 - 13, width: 26, height: 26)
-        container.addSubview(cancelButton)
+        let row = NSStackView(views: [statusDot, timeLabel, hintLabel, pauseButton, stopButton, cancelButton])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.setCustomSpacing(12, after: hintLabel)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(row)
+
+        NSLayoutConstraint.activate([
+            statusDot.widthAnchor.constraint(equalToConstant: 10),
+            statusDot.heightAnchor.constraint(equalToConstant: 10),
+            pauseButton.widthAnchor.constraint(equalToConstant: 26),
+            pauseButton.heightAnchor.constraint(equalToConstant: 26),
+            stopButton.widthAnchor.constraint(equalToConstant: 26),
+            stopButton.heightAnchor.constraint(equalToConstant: 26),
+            cancelButton.heightAnchor.constraint(equalToConstant: 26),
+            cancelButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 26),
+
+            row.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
+            row.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+            row.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+        ])
 
         panel.contentView = container
+        resizeBarToFit()
     }
 
     private func styleButton(_ button: NSButton, symbol: String, toolTip: String, action: Selector) {
@@ -140,18 +162,67 @@ public final class RecordingControlBar {
         button.wantsLayer = true
         button.layer?.backgroundColor = NSColor(calibratedWhite: 1, alpha: 0.14).cgColor
         button.layer?.cornerRadius = 6
+        button.translatesAutoresizingMaskIntoConstraints = false
         if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: toolTip) {
             button.image = image
         } else {
-            // 系统符号不可用时的文字回退（macOS 13 起 SF Symbols 应可用）
-            if symbol == "stop.fill" {
-                button.title = "■"
-            } else if symbol == "xmark" {
-                button.title = "✕"
-            } else {
-                button.title = "II"
-            }
+            button.title = symbol == "stop.fill" ? "■" : (symbol == "xmark" ? "✕" : "II")
             button.imagePosition = .noImage
+        }
+    }
+
+    /// 取消按钮独立危险红色视觉与两步确认文案切换。
+    private func styleCancelButton(confirming: Bool) {
+        cancelButton.bezelStyle = .regularSquare
+        cancelButton.isBordered = false
+        cancelButton.target = self
+        cancelButton.action = #selector(handleCancel)
+        cancelButton.wantsLayer = true
+        cancelButton.layer?.cornerRadius = 6
+        cancelButton.translatesAutoresizingMaskIntoConstraints = false
+
+        if confirming {
+            cancelButton.image = nil
+            cancelButton.imagePosition = .noImage
+            cancelButton.attributedTitle = NSAttributedString(
+                string: " 确认丢弃 ",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                    .foregroundColor: NSColor.white,
+                ]
+            )
+            cancelButton.toolTip = "再次点击立即取消并丢弃当前录制"
+            cancelButton.layer?.backgroundColor = AnShotTheme.danger.cgColor
+        } else {
+            cancelButton.attributedTitle = NSAttributedString(string: "")
+            cancelButton.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "取消并丢弃当前录制")
+            cancelButton.imagePosition = .imageOnly
+            cancelButton.contentTintColor = NSColor(red: 1.0, green: 0.45, blue: 0.42, alpha: 1.0)
+            cancelButton.toolTip = "取消并丢弃当前录制（点击两次确认防误触）"
+            cancelButton.layer?.backgroundColor = AnShotTheme.danger.withAlphaComponent(0.24).cgColor
+        }
+    }
+
+    private func resizeBarToFit() {
+        guard let container = containerView else { return }
+        container.layoutSubtreeIfNeeded()
+        let desiredWidth = max(Self.barMinWidth, ceil(container.fittingSize.width))
+        var frame = panel.frame
+        let centerX = frame.midX
+        frame.size = CGSize(width: desiredWidth, height: Self.barHeight)
+        if frame.origin != .zero {
+            frame.origin.x = centerX - desiredWidth / 2
+        }
+        panel.setFrame(frame, display: true)
+    }
+
+    private func resetCancelConfirmation() {
+        cancelConfirmResetTimer?.invalidate()
+        cancelConfirmResetTimer = nil
+        if awaitingCancelConfirmation {
+            awaitingCancelConfirmation = false
+            styleCancelButton(confirming: false)
+            resizeBarToFit()
         }
     }
 
@@ -218,6 +289,7 @@ public final class RecordingControlBar {
     }
 
     public func hide() {
+        resetCancelConfirmation()
         panel.orderOut(nil)
     }
 
@@ -333,6 +405,8 @@ public final class RecordingControlBar {
         }
         if hintLabel.stringValue != text {
             hintLabel.stringValue = text
+            hintLabel.isHidden = text.isEmpty
+            resizeBarToFit()
         }
     }
 
@@ -365,15 +439,33 @@ public final class RecordingControlBar {
     // MARK: - 动作
 
     @objc private func handlePause() {
+        resetCancelConfirmation()
         onTogglePause?()
     }
 
     @objc private func handleStop() {
+        resetCancelConfirmation()
         onStop?()
     }
 
     @objc private func handleCancel() {
-        onCancel?()
+        // 准备倒计时期间尚未录出素材，一次点击即可取消；已开始录制后须二次点击防误丢素材。
+        if state == .preparing || awaitingCancelConfirmation {
+            resetCancelConfirmation()
+            onCancel?()
+            return
+        }
+        awaitingCancelConfirmation = true
+        styleCancelButton(confirming: true)
+        resizeBarToFit()
+        cancelConfirmResetTimer?.invalidate()
+        let timer = Timer(timeInterval: 2.5, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.resetCancelConfirmation()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        cancelConfirmResetTimer = timer
     }
 
     #if DEBUG

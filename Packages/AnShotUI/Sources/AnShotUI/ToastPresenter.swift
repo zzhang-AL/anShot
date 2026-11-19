@@ -42,32 +42,71 @@ import AppKit
 @MainActor
 public final class ToastPresenter {
 
-    // MARK: - 公开接口
+    /// 语义状态类型（决定左侧 SF Symbol 图标与强调色）。
+    public enum Tone: Sendable {
+        case auto
+        case info
+        case success
+        case warning
+        case error
+
+        fileprivate func resolved(for message: String) -> Tone {
+            guard self == .auto else { return self }
+            if message.contains("失败") || message.contains("无法") || message.contains("错误") || message.contains("异常") {
+                return .error
+            }
+            if message.contains("上限") || message.contains("请先") || message.contains("未授权") || message.contains("暂未") {
+                return .warning
+            }
+            if message.contains("已") || message.contains("成功") || message.contains("完成") || message.contains("updated") {
+                return .success
+            }
+            return .info
+        }
+
+        fileprivate var symbolName: String {
+            switch self {
+            case .success: return "checkmark.circle.fill"
+            case .warning: return "exclamationmark.triangle.fill"
+            case .error:   return "xmark.circle.fill"
+            case .info, .auto: return "info.circle.fill"
+            }
+        }
+
+        fileprivate var tintColor: NSColor {
+            switch self {
+            case .success: return .systemGreen
+            case .warning: return .systemOrange
+            case .error:   return .systemRed
+            case .info, .auto: return NSColor.white.withAlphaComponent(0.9)
+            }
+        }
+    }
+
+    /// 全局完成轻提示开关（由 `AppSettings.showCompletionToast` 同步；失败/警告或带 action 按钮仍可按需展示）。
+    public static var isEnabled: Bool = true
 
     /// 显示一条提示；已有提示会被替换，计时重新开始。
-    ///
-    /// - Parameters:
-    ///   - message: 单行文案，过长时截断（最大宽度见 `maximumTextWidth`）。
-    ///   - screen: 期望出现的屏幕；传 `nil` 时用鼠标所在屏。
-    ///   - duration: 自动关闭的秒数；`<= 0` 表示保持到下一次 `show`/`dismiss`。
-    ///   - actionTitle: 右侧按钮标题。与 `action` 同时给出时才显示按钮。
-    ///   - action: 点击按钮（或兜底的可点击胶囊）后执行；提示会先关闭。
     public static func show(
         _ message: String,
         on screen: NSScreen? = nil,
-        duration: TimeInterval = 1.8,
+        duration: TimeInterval = 2.0,
         actionTitle: String? = nil,
+        tone: Tone = .auto,
         action: (() -> Void)? = nil
     ) {
+        let resolvedTone = tone.resolved(for: message)
+        if !isEnabled && resolvedTone != .error && action == nil {
+            return
+        }
+
         // 先拆旧的：旧回调不能在新提示上被触发，旧计时也不能再关新窗口。
-        dismiss()
+        dismissImmediately()
 
         let targetScreen = screen ?? screenUnderMouse()
-        // 完全没有屏幕（远程会话刚断开等）时仍需一个落点，否则窗口坐标是 NaN。
         let screenFrame = targetScreen?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
 
         let messageFont = NSFont.systemFont(ofSize: 13, weight: .medium)
-        // 只有「标题 + 回调」齐全才显示按钮：只有标题的按钮点了什么也不会发生。
         let trimmedTitle = actionTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
         let usableTitle = (action != nil && trimmedTitle?.isEmpty == false) ? trimmedTitle : nil
 
@@ -80,10 +119,10 @@ public final class ToastPresenter {
             height: ceil(buttonTitleSize.height) + buttonVerticalPadding * 2
         )
         let buttonAreaWidth = usableTitle == nil ? 0 : buttonGap + buttonSize.width
+        let iconAreaWidth: CGFloat = iconSize + iconGap
 
         let maxCapsuleWidth = max(minimumAvailableWidth, screenFrame.width - screenInset * 2)
-        let maxTextWidth = max(1, min(maximumTextWidth, maxCapsuleWidth - horizontalPadding * 2 - buttonAreaWidth))
-        // 支持多行自适应测量，防止长提示（如「固定截图达上限」）被单行截断。
+        let maxTextWidth = max(1, min(maximumTextWidth, maxCapsuleWidth - horizontalPadding * 2 - iconAreaWidth - buttonAreaWidth))
         let boundingRect = (message as NSString).boundingRect(
             with: CGSize(width: maxTextWidth, height: 140),
             options: [.usesLineFragmentOrigin, .usesFontLeading],
@@ -95,7 +134,7 @@ public final class ToastPresenter {
         let isMultiline = messageHeight > singleLineHeight * 1.4
 
         let capsuleHeight = max(minimumCapsuleHeight, messageHeight + verticalPadding * 2)
-        let capsuleWidth = horizontalPadding * 2 + textWidth + buttonAreaWidth
+        let capsuleWidth = horizontalPadding * 2 + iconAreaWidth + textWidth + buttonAreaWidth
 
         let origin = CGPoint(
             x: screenFrame.midX - capsuleWidth / 2,
@@ -104,36 +143,46 @@ public final class ToastPresenter {
 
         let capsule = ToastCapsuleView(frame: CGRect(x: 0, y: 0, width: capsuleWidth, height: capsuleHeight))
         capsule.wantsLayer = true
-        // 深色胶囊：0.82 的黑既能压住浅色壁纸，又能透出一点背景，不致像一块黑板。
-        capsule.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.82).cgColor
-        // 单行维持全圆角胶囊造型，多行改用柔和圆角避免边缘裁切文字。
+        capsule.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.84).cgColor
         capsule.layer?.cornerRadius = isMultiline ? 12 : (capsuleHeight / 2)
-        // 细白描边把胶囊从深色桌面上「抠」出来，否则暗背景下边界会糊掉。
         capsule.layer?.borderWidth = 1
-        capsule.layer?.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
+        capsule.layer?.borderColor = NSColor.white.withAlphaComponent(0.10).cgColor
+
+        let iconView = NSImageView(frame: CGRect(
+            x: horizontalPadding - 2,
+            y: (capsuleHeight - iconSize) / 2,
+            width: iconSize,
+            height: iconSize
+        ))
+        iconView.image = NSImage(systemSymbolName: resolvedTone.symbolName, accessibilityDescription: nil)
+        iconView.contentTintColor = resolvedTone.tintColor
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        capsule.addSubview(iconView)
 
         let label = NSTextField(wrappingLabelWithString: message)
         label.font = messageFont
         label.textColor = .white
         label.lineBreakMode = .byWordWrapping
         label.maximumNumberOfLines = 4
-        label.alignment = (isMultiline && usableTitle == nil) ? .center : .left
+        label.alignment = .left
         label.isSelectable = false
         label.frame = CGRect(
-            x: horizontalPadding,
+            x: horizontalPadding + iconAreaWidth,
             y: (capsuleHeight - messageHeight) / 2,
             width: textWidth,
             height: messageHeight
         )
         capsule.addSubview(label)
 
-        // 给了回调却没给按钮标题时，退化成「整个胶囊可点」：否则这个回调永远没机会执行。
         let capsuleHandlesClick = action != nil && usableTitle == nil
         if capsuleHandlesClick, let action {
             capsule.onClick = {
-                ToastPresenter.dismiss()
+                ToastPresenter.dismissImmediately()
                 action()
             }
+        }
+        capsule.onHoverChanged = { hovered in
+            ToastPresenter.handleHoverChanged(hovered)
         }
 
         let panel = ToastPanel(
@@ -144,21 +193,24 @@ public final class ToastPresenter {
         )
         configure(panel)
         panel.hasShadow = true
-        // 关键：胶囊本身永不接收鼠标；有按钮时由下面的按钮窗口负责点击。
         panel.ignoresMouseEvents = !capsuleHandlesClick
+        panel.alphaValue = 0
         panel.contentView = capsule
 
         var buttonPanel: ToastButtonPanel?
         if usableTitle != nil, let action {
             let relay = ToastActionRelay {
-                // 先关提示再回调：回调往往接着弹窗或开新流程，
-                // 此时旧提示还挂在屏幕上会挡住接下来要看的东西。
-                ToastPresenter.dismiss()
+                ToastPresenter.dismissImmediately()
                 action()
             }
 
             let button = makeActionButton(title: usableTitle ?? "", font: buttonFont, target: relay)
             button.frame = CGRect(origin: .zero, size: buttonSize)
+            if let toastButton = button as? ToastActionButton {
+                toastButton.onHoverChanged = { hovered in
+                    ToastPresenter.handleHoverChanged(hovered)
+                }
+            }
 
             let buttonFrame = CGRect(
                 x: capsuleWidth - horizontalPadding - buttonSize.width,
@@ -178,74 +230,107 @@ public final class ToastPresenter {
                 defer: false
             )
             configure(panelForButton)
-            // 阴影只由胶囊那层出，按钮窗口再投一次会在边缘叠出脏边。
             panelForButton.hasShadow = false
             panelForButton.ignoresMouseEvents = false
+            panelForButton.alphaValue = 0
             panelForButton.contentView = button
 
             buttonPanel = panelForButton
-            // 按钮窗口必须活到点击发生，而 NSControl.target 不持有目标对象。
             self.buttonRelay = relay
         }
 
         self.panel = panel
         self.buttonPanel = buttonPanel
+        self.activeDuration = duration
+        self.toastGeneration &+= 1
+        let currentGen = self.toastGeneration
 
-        // 先胶囊后按钮：同层级下后 order 的在上，按钮才能盖住胶囊右上角。
         panel.orderFrontRegardless()
         buttonPanel?.orderFrontRegardless()
 
-        if duration > 0 {
-            // `.common` 模式见文件头：避免鼠标追踪期间延时被推迟。
-            let timer = Timer(timeInterval: duration, repeats: false) { _ in
-                MainActor.assumeIsolated {
-                    ToastPresenter.dismiss()
-                }
-            }
-            RunLoop.main.add(timer, forMode: .common)
-            dismissTimer = timer
+        // 柔和淡入（0.15s）
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.15
+            panel.animator().alphaValue = 1
+            buttonPanel?.animator().alphaValue = 1
         }
+
+        scheduleAutoDismiss(after: duration, generation: currentGen)
     }
 
-    /// 立即关闭当前提示（没有提示时无副作用）。
+    /// 淡出并关闭当前提示。
     public static func dismiss() {
         dismissTimer?.invalidate()
         dismissTimer = nil
+        guard let currentPanel = panel else { return }
+        let currentButton = buttonPanel
+        let expectedGen = toastGeneration
 
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.18
+            currentPanel.animator().alphaValue = 0
+            currentButton?.animator().alphaValue = 0
+        }, completionHandler: {
+            Task { @MainActor in
+                guard ToastPresenter.toastGeneration == expectedGen else { return }
+                ToastPresenter.dismissImmediately()
+            }
+        })
+    }
+
+    /// 立即同步关闭（供切换新消息、点击动作或测试清理使用）。
+    public static func dismissImmediately() {
+        dismissTimer?.invalidate()
+        dismissTimer = nil
         panel?.orderOut(nil)
         buttonPanel?.orderOut(nil)
         panel = nil
         buttonPanel = nil
-        // 回调可能强引用调用方对象；提示已消失，这个引用也该断掉。
         buttonRelay = nil
+        activeDuration = 0
+    }
+
+    private static func scheduleAutoDismiss(after duration: TimeInterval, generation: UInt64) {
+        dismissTimer?.invalidate()
+        dismissTimer = nil
+        guard duration > 0 else { return }
+        let timer = Timer(timeInterval: duration, repeats: false) { _ in
+            MainActor.assumeIsolated {
+                guard ToastPresenter.toastGeneration == generation else { return }
+                ToastPresenter.dismiss()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        dismissTimer = timer
+    }
+
+    private static func handleHoverChanged(_ hovered: Bool) {
+        if hovered {
+            dismissTimer?.invalidate()
+            dismissTimer = nil
+        } else if activeDuration > 0 {
+            scheduleAutoDismiss(after: max(0.8, activeDuration * 0.6), generation: toastGeneration)
+        }
     }
 
     // MARK: - 静态状态
 
-    /// 当前胶囊窗口（`nil` 表示没有提示）。
     private static var panel: ToastPanel?
-    /// 动作按钮所在的独立窗口；无按钮时为 `nil`。
     private static var buttonPanel: ToastButtonPanel?
     private static var dismissTimer: Timer?
-    /// 按钮的 target 不被 `NSControl` 持有，必须由这里保活。
     private static var buttonRelay: ToastActionRelay?
+    private static var activeDuration: TimeInterval = 0
+    private static var toastGeneration: UInt64 = 0
 
-    /// 提示层级。与截图覆盖层（`.screenSaver`）的其它浮层同为 +1：
-    /// 提示经常紧跟在截图/录制动作之后出现，挂在覆盖层下面就等于没显示。
     private static let toastLevel = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
-
-    /// 距屏幕可用区域底边的距离（`visibleFrame` 已排除 Dock，不会压到 Dock 上）。
     private static let bottomInset: CGFloat = 72
-    /// 胶囊内文字左右留白。
-    private static let horizontalPadding: CGFloat = 18
+    private static let horizontalPadding: CGFloat = 16
     private static let verticalPadding: CGFloat = 10
-    /// 一行中文超过这个宽度就该截断：横跨半屏的胶囊反而更难读。
+    private static let iconSize: CGFloat = 15
+    private static let iconGap: CGFloat = 8
     private static let maximumTextWidth: CGFloat = 420
-    /// 胶囊与屏幕左右边缘至少留这么多，避免贴边。
     private static let screenInset: CGFloat = 24
-    /// 与 13pt 字号配对的胶囊最小高度（纯数字/英文文案时也保持胶囊形状）。
     private static let minimumCapsuleHeight: CGFloat = 36
-    /// 屏幕再窄也要给文案留出可读宽度；低于这个值就没必要继续压缩胶囊。
     private static let minimumAvailableWidth: CGFloat = 120
     private static let buttonGap: CGFloat = 14
     private static let buttonHorizontalPadding: CGFloat = 10
@@ -321,14 +406,32 @@ private final class ToastButtonPanel: NSPanel {
 
 /// 胶囊内容视图。整块可点只在「有回调但没有按钮标题」的兜底路径下启用。
 private final class ToastCapsuleView: NSView {
-    /// 兜底点击回调；只在「有回调但没有按钮标题」时设置。
-    /// 类型标注 `@MainActor` 是因为闭包会直接调用主线程上的提示关闭逻辑。
     var onClick: (@MainActor () -> Void)?
+    var onHoverChanged: (@MainActor (Bool) -> Void)?
+    private var trackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        onHoverChanged?(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onHoverChanged?(false)
+    }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        // 不接管时返回 nil，配合窗口的 ignoresMouseEvents 让点击直接穿透。
         guard onClick != nil, bounds.contains(point) else { return nil }
-        // 不给文字标签接管机会：兜底路径下点文案也应触发回调。
         return self
     }
 
@@ -337,11 +440,31 @@ private final class ToastCapsuleView: NSView {
     }
 }
 
-/// 动作按钮。它待在一个**永远不是 key** 的小面板里，所以：
-/// 1. 必须接受首次点击——否则第一次点击会被当作「激活窗口」，动作不触发；
-/// 2. 用小手光标说明这里可点（胶囊其余部分都是穿透的，不提示的话用户不会去试）。
 private final class ToastActionButton: NSButton {
+    var onHoverChanged: (@MainActor (Bool) -> Void)?
+    private var trackingArea: NSTrackingArea?
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        onHoverChanged?(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onHoverChanged?(false)
+    }
 
     override func resetCursorRects() {
         addCursorRect(bounds, cursor: .pointingHand)

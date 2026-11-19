@@ -46,6 +46,7 @@ final class UpdateWindowController: NSWindowController, NSWindowDelegate {
     var onRequestDownload: (() -> Void)?
     var onRequestInstall: (() -> Void)?
     var onRequestLater: (() -> Void)?
+    var onRequestSkipVersion: (() -> Void)?
     var onRequestOpenPage: (() -> Void)?
     var onRequestRetry: (() -> Void)?
 
@@ -82,6 +83,7 @@ final class UpdateWindowController: NSWindowController, NSWindowDelegate {
         content.onPrimary = { [weak self] in self?.primaryTapped() }
         content.onOpenPage = { [weak self] in self?.onRequestOpenPage?() }
         content.onLater = { [weak self] in self?.onRequestLater?() }
+        content.onSkipVersion = { [weak self] in self?.onRequestSkipVersion?() }
 
         render(.checking)
     }
@@ -164,6 +166,7 @@ private final class UpdateContentView: NSView {
         title: "检查更新", emphasis: .primary, target: nil, action: nil
     )
     private let pageButton = SettingsPushButton(title: "打开发布页", target: nil, action: nil)
+    private let skipButton = SettingsPushButton(title: "跳过此版本", target: nil, action: nil)
     private let laterButton = SettingsPushButton(title: "稍后", target: nil, action: nil)
 
     private(set) var lastRelease: UpdateRelease?
@@ -171,6 +174,7 @@ private final class UpdateContentView: NSView {
     var onPrimary: (() -> Void)?
     var onOpenPage: (() -> Void)?
     var onLater: (() -> Void)?
+    var onSkipVersion: (() -> Void)?
 
     init(frame: NSRect, currentVersionDescription: String) {
         self.currentVersionDescription = currentVersionDescription
@@ -181,6 +185,8 @@ private final class UpdateContentView: NSView {
         primaryButton.action = #selector(primaryTapped)
         pageButton.target = self
         pageButton.action = #selector(pageTapped)
+        skipButton.target = self
+        skipButton.action = #selector(skipTapped)
         laterButton.target = self
         laterButton.action = #selector(laterTapped)
     }
@@ -253,7 +259,7 @@ private final class UpdateContentView: NSView {
         )
 
         // 按钮行右对齐：主操作永远在最右，符合 macOS 习惯。
-        let buttonStack = NSStackView(views: [pageButton, laterButton, primaryButton])
+        let buttonStack = NSStackView(views: [pageButton, skipButton, laterButton, primaryButton])
         buttonStack.orientation = .horizontal
         buttonStack.alignment = .centerY
         buttonStack.spacing = 10
@@ -352,11 +358,12 @@ private final class UpdateContentView: NSView {
             lastRelease = release
             statusLabel.stringValue = "发现新版本 \(release.version)。"
             detailLabel.stringValue = detailText(for: release)
-            notesTextView.string = notesText(for: release)
+            applyRenderedNotes(notesText(for: release))
             hideProgress()
             updateButtons(
                 primary: release.zipURL == nil ? ("打开发布页", true) : ("下载并安装", true),
-                showsLater: true
+                showsLater: true,
+                showsSkip: true
             )
 
         case .downloading(let progress):
@@ -435,14 +442,62 @@ private final class UpdateContentView: NSView {
         }
     }
 
-    private func updateButtons(primary: (title: String, enabled: Bool), showsLater: Bool) {
+    /// 轻量渲染 GitHub Release Notes（标题加粗增大、列表符号缩进、代码块等宽字体）。
+    private func applyRenderedNotes(_ raw: String) {
+        let result = NSMutableAttributedString()
+        let baseFont = NSFont.systemFont(ofSize: 12)
+        let h2Font = NSFont.systemFont(ofSize: 14, weight: .semibold)
+        let h3Font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        let lines = raw.components(separatedBy: .newlines)
+
+        for (idx, line) in lines.enumerated() {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            let suffix = idx == lines.count - 1 ? "" : "\n"
+            if trimmed.hasPrefix("### ") {
+                let text = String(trimmed.dropFirst(4)) + suffix
+                result.append(NSAttributedString(string: text, attributes: [
+                    .font: h3Font,
+                    .foregroundColor: NSColor.labelColor,
+                ]))
+            } else if trimmed.hasPrefix("## ") || trimmed.hasPrefix("# ") {
+                let dropCount = trimmed.hasPrefix("## ") ? 3 : 2
+                let text = String(trimmed.dropFirst(dropCount)) + suffix
+                result.append(NSAttributedString(string: text, attributes: [
+                    .font: h2Font,
+                    .foregroundColor: NSColor.labelColor,
+                ]))
+            } else if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") {
+                let clean = "• " + String(trimmed.dropFirst(2)).replacingOccurrences(of: "**", with: "") + suffix
+                let para = NSMutableParagraphStyle()
+                para.headIndent = 12
+                para.paragraphSpacing = 3
+                result.append(NSAttributedString(string: clean, attributes: [
+                    .font: baseFont,
+                    .foregroundColor: NSColor.labelColor,
+                    .paragraphStyle: para,
+                ]))
+            } else {
+                let clean = line.replacingOccurrences(of: "**", with: "") + suffix
+                result.append(NSAttributedString(string: clean, attributes: [
+                    .font: baseFont,
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]))
+            }
+        }
+        notesTextView.textStorage?.setAttributedString(result)
+    }
+
+    private func updateButtons(
+        primary: (title: String, enabled: Bool),
+        showsLater: Bool,
+        showsSkip: Bool = false
+    ) {
         primaryButton.title = primary.title
         primaryButton.isEnabled = primary.enabled
-        // 自绘按钮的宽度来自 intrinsicContentSize；换标题后必须显式失效，
-        // 否则「下载中…」会沿用上一个标题的宽度。
         primaryButton.invalidateIntrinsicContentSize()
         primaryButton.needsDisplay = true
         laterButton.isHidden = !showsLater
+        skipButton.isHidden = !showsSkip
     }
 
     private static func formatBytes(_ bytes: Int) -> String {
@@ -464,5 +519,9 @@ private final class UpdateContentView: NSView {
 
     @objc private func laterTapped() {
         onLater?()
+    }
+
+    @objc private func skipTapped() {
+        onSkipVersion?()
     }
 }

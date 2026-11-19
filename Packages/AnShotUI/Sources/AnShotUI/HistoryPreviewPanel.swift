@@ -2,25 +2,11 @@
 //  HistoryPreviewPanel.swift
 //  AnShotUI
 //
-//  历史记录预览（契约 §5：空格预览，与设置/欢迎页同一套视觉语言）。
-//
-//  ── 为什么自己做一个窗口而不是 QuickLook ──────────────────
-//
-//  `QLPreviewPanel` 是共享的单例，会抢键盘、激活应用，而且对「录屏」只有
-//  一个播放器外壳——历史窗口需要的是「看一眼这张图画了什么、这条是什么
-//  文件」，而不是另一个应用级预览器。自己做一个小窗口，打开/关闭都
-//  不会打断用户手头的工作。
-//
-//  ── 为什么用 ImageIO 缩略而不是 NSImage(contentsOf:) ─────
-//
-//  预览窗口最多显示两千像素；把一张 6K 长截图整幅解码进内存，只为了把它
-//  缩到窗口大小，峰值内存与解码时间都不划算。`CGImageSource` 能直接在解码
-//  阶段降采样，代价与目标尺寸相关，而不是与源图尺寸相关。
-//
-//  ── 视觉 ─────────────────────────────────────────────────
-//
-//  与历史窗口、设置窗口同一套：透明标题栏 + 隐藏标题 + `SettingsTheme`
-//  背景与卡片、内容页头、24 边距。旧版的黑底 + 系统小按钮已经移除。
+//  历史记录预览（Phase 5.3 精修）：
+//    - 顶部快捷操作栏（复制 ⌘C / 编辑 / 访达 / 关闭）；
+//    - 后台异步解码大图与 GIF 动画（带 generation 防切行乱序，主线程零卡顿）；
+//    - 超长图自动切换为适应宽度可滚动 `NSScrollView`，支持上下滚轮检视细节；
+//    - 智能左右摆位（优先历史窗左侧，空间不足自动切右侧，均不足则居中）。
 //
 
 import AnShotCore
@@ -29,13 +15,11 @@ import AVFoundation
 import AVKit
 import ImageIO
 
-/// 预览窗口：空格或 ESC 关闭。
-///
-/// 与历史窗口一样，按键放在窗口层；输入框等控件成为第一响应者时不会
-/// 冒泡到这里，因此不会误关。
+/// 预览窗口：空格/ESC 关闭，`⌘C` 快速复制当前预览条目。
 private final class HistoryPreviewWindow: NSWindow {
 
     var onDismissKey: (() -> Void)?
+    var onCopyKey: (() -> Void)?
 
     override func keyDown(with event: NSEvent) {
         switch event.keyCode {
@@ -43,30 +27,51 @@ private final class HistoryPreviewWindow: NSWindow {
         default: super.keyDown(with: event)
         }
     }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if flags == .command, event.charactersIgnoringModifiers?.lowercased() == "c" {
+            onCopyKey?()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
+/// 顶对齐滚动文档视图（长图自顶向下滚动）。
+private final class PreviewFlippedDocumentView: NSView {
+    override var isFlipped: Bool { true }
 }
 
 /// 历史记录预览窗口。
 @MainActor
 final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
 
-    /// 关闭后回调（无论是按钮、ESC 还是标题栏红点）。
     var onClose: (() -> Void)?
+    var onCopy: ((HistoryEntry) -> Void)?
+    var onEdit: ((HistoryEntry) -> Void)?
+    var onReveal: ((HistoryEntry) -> Void)?
 
-    private static let defaultSize = CGSize(width: 760, height: 600)
-
-    /// 内容顶部留出的交通灯空间（理由同 `HistoryPanel.topInset`）。
+    private static let defaultSize = CGSize(width: 780, height: 620)
     private static let topInset: CGFloat = 28 + SettingsTheme.margin
 
     private let window: HistoryPreviewWindow
     private let header = SettingsHeaderView(
         symbolName: "eye",
         title: "预览",
-        subtitle: "空格或 ESC 关闭"
+        subtitle: "空格或 ESC 关闭 · ⌘C 复制"
     )
+    private let copyButton = SettingsPushButton(title: "复制", emphasis: .primary, target: nil, action: nil)
+    private let editButton = SettingsPushButton(title: "编辑", target: nil, action: nil)
+    private let revealButton = SettingsPushButton(title: "访达", target: nil, action: nil)
     private let closeButton = SettingsPushButton(title: "关闭", target: nil, action: nil)
+
     private let imageSurface = HistorySurfaceView(style: .inset)
     private let infoSurface = HistorySurfaceView(style: .card)
     private let imageView = NSImageView()
+    private let longImageScrollView = NSScrollView()
+    private let longImageDocumentView = PreviewFlippedDocumentView()
+    private let longImageView = NSImageView()
     private let playerView = AVPlayerView()
     private let placeholderSymbol = NSImageView()
     private let placeholderLabel = NSTextField(labelWithString: "")
@@ -74,8 +79,10 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
     private let nameLabel = NSTextField(labelWithString: "")
     private let infoLabel = NSTextField(wrappingLabelWithString: "")
 
-    /// 防止 `close()` 与 `windowWillClose` 重复回调。
+    private var currentEntry: HistoryEntry?
     private var isOpen = false
+    private var loadGeneration: UInt64 = 0
+    private var loadTask: Task<Void, Never>?
 
     override init() {
         window = HistoryPreviewWindow(
@@ -93,11 +100,23 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
         window.titlebarSeparatorStyle = .none
         window.backgroundColor = SettingsTheme.windowBackground
         window.isMovableByWindowBackground = true
-        window.minSize = CGSize(width: 420, height: 320)
-        // 预览里可能是用户的隐私内容，不能被截进任何截图/录屏。
+        window.minSize = CGSize(width: 480, height: 360)
         window.sharingType = .none
         window.delegate = self
         window.onDismissKey = { [weak self] in self?.close() }
+        window.onCopyKey = { [weak self] in self?.copyTapped() }
+
+        copyButton.target = self
+        copyButton.action = #selector(copyTapped)
+        copyButton.toolTip = "复制当前内容（⌘C）"
+
+        editButton.target = self
+        editButton.action = #selector(editTapped)
+        editButton.toolTip = "在标注编辑器中打开"
+
+        revealButton.target = self
+        revealButton.action = #selector(revealTapped)
+        revealButton.toolTip = "在访达中显示原文件"
 
         closeButton.target = self
         closeButton.action = #selector(closeTapped)
@@ -108,80 +127,143 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
 
     var isVisible: Bool { window.isVisible }
 
+    /// 智能计算预览窗口落点（优先历史窗左侧 → 右侧 → 居中），暴露为内部静态纯函数供单元测试覆盖。
+    static func preferredOrigin(
+        panelSize: CGSize,
+        anchorFrame: CGRect?,
+        visibleFrame: CGRect,
+        gap: CGFloat = 12
+    ) -> CGPoint {
+        if let anchor = anchorFrame {
+            let y = min(
+                max(anchor.midY - panelSize.height / 2, visibleFrame.minY + gap),
+                max(visibleFrame.minY + gap, visibleFrame.maxY - panelSize.height - gap)
+            )
+            // 1. 优先历史窗左侧
+            let leftX = anchor.minX - panelSize.width - gap
+            if leftX >= visibleFrame.minX + gap {
+                return CGPoint(x: leftX, y: y)
+            }
+            // 2. 左侧不够时切历史窗右侧
+            let rightX = anchor.maxX + gap
+            if rightX + panelSize.width <= visibleFrame.maxX - gap {
+                return CGPoint(x: rightX, y: y)
+            }
+        }
+        return CGPoint(
+            x: visibleFrame.midX - panelSize.width / 2,
+            y: visibleFrame.midY - panelSize.height / 2
+        )
+    }
+
     // MARK: - 显示
 
-    /// 显示一条历史记录的预览（支持图片、GIF 动画与 MP4/MOV 视频播放）。
-    ///
-    /// - Parameters:
-    ///   - entry: 要预览的条目。
-    ///   - thumbnail: 列表里已有的缩略图；原图读不出来时用它兜底。
-    ///   - anchor: 历史窗口，用于把预览放在它左侧；不传则居中。
-    ///   - makeKey: 首次空格打开时抢占焦点；方向键联动切换时设为 `false` 保持列表焦点。
     func show(
         _ entry: HistoryEntry,
         thumbnail: NSImage?,
         relativeTo anchor: NSWindow?,
         makeKey: Bool = true
     ) {
+        currentEntry = entry
         let isPresent = entry.isFilePresent
         let isRecording = entry.kind == .recording
         let wasOpen = isOpen
 
-        // 缓存条目的文件名是 UUID，显示出来没有信息量；用「缓存副本」代替。
         nameLabel.stringValue = entry.isCached ? "缓存副本" : entry.fileURL.lastPathComponent
         window.title = "预览 · \(entry.kind.displayName)"
 
+        copyButton.isEnabled = isPresent && onCopy != nil
+        editButton.isHidden = isRecording
+        editButton.isEnabled = isPresent && !isRecording && onEdit != nil
+        revealButton.isEnabled = isPresent && onReveal != nil
+
         releaseContent()
         imageView.isHidden = true
+        longImageScrollView.isHidden = true
         playerView.isHidden = true
         placeholderSymbol.image = nil
         placeholderLabel.stringValue = ""
         placeholderStack.isHidden = false
 
+        loadGeneration &+= 1
+        let gen = loadGeneration
+
         if isRecording {
             if !isPresent {
-                placeholderSymbol.image = NSImage(
-                    systemSymbolName: "video.fill",
-                    accessibilityDescription: "录屏"
-                )
+                placeholderSymbol.image = NSImage(systemSymbolName: "video.fill", accessibilityDescription: "录屏")
                 placeholderLabel.stringValue = "录屏文件已移走"
             } else if entry.fileURL.pathExtension.lowercased() == "gif" {
-                // GIF 支持逐帧动画预览。
-                if let gifImage = NSImage(contentsOf: entry.fileURL) {
-                    imageView.animates = true
-                    imageView.image = gifImage
-                    imageView.isHidden = false
-                    placeholderStack.isHidden = true
-                } else {
-                    placeholderSymbol.image = NSImage(
-                        systemSymbolName: "video.fill",
-                        accessibilityDescription: "GIF"
-                    )
-                    placeholderLabel.stringValue = "无法读取 GIF 文件"
+                placeholderSymbol.image = NSImage(systemSymbolName: "photo.stack", accessibilityDescription: "GIF")
+                placeholderLabel.stringValue = "正在加载 GIF 动画…"
+                let url = entry.fileURL
+                loadTask = Task { @MainActor [weak self] in
+                    let data = await Task.detached(priority: .userInitiated) {
+                        try? Data(contentsOf: url)
+                    }.value
+                    guard let self, self.loadGeneration == gen, !Task.isCancelled else { return }
+                    if let data, let gifImage = NSImage(data: data) {
+                        self.imageView.animates = true
+                        self.imageView.image = gifImage
+                        self.imageView.isHidden = false
+                        self.placeholderStack.isHidden = true
+                    } else {
+                        self.placeholderSymbol.image = NSImage(systemSymbolName: "video.fill", accessibilityDescription: "GIF")
+                        self.placeholderLabel.stringValue = "无法读取 GIF 文件"
+                    }
                 }
             } else {
-                // 视频文件内嵌 AVPlayerView 播放，供用户快速核对录制片段。
                 let player = AVPlayer(url: entry.fileURL)
                 playerView.player = player
                 playerView.isHidden = false
                 placeholderStack.isHidden = true
                 player.play()
             }
-        } else if let image = Self.loadPreviewImage(at: entry.fileURL, maxPixelSize: 2000) {
-            imageView.image = image
-            imageView.isHidden = false
-            placeholderStack.isHidden = true
-        } else if let thumbnail {
-            // 原图读不出来时退回列表缩略图：至少让用户确认这是哪一条。
-            imageView.image = thumbnail
-            imageView.isHidden = false
-            placeholderStack.isHidden = true
+        } else if !isPresent {
+            if let thumbnail {
+                imageView.image = thumbnail
+                imageView.isHidden = false
+                placeholderStack.isHidden = true
+            } else {
+                placeholderSymbol.image = NSImage(systemSymbolName: "photo", accessibilityDescription: "图片")
+                placeholderLabel.stringValue = "文件已移走"
+            }
         } else {
-            placeholderSymbol.image = NSImage(
-                systemSymbolName: "photo",
-                accessibilityDescription: "图片"
-            )
-            placeholderLabel.stringValue = isPresent ? "无法读取图片" : "文件已移走"
+            // 先用缩略图即时占位，后台异步全精度解码大图/长图，杜绝主线程卡顿。
+            if let thumbnail {
+                imageView.image = thumbnail
+                imageView.isHidden = false
+                placeholderStack.isHidden = true
+            } else {
+                placeholderSymbol.image = NSImage(systemSymbolName: "photo", accessibilityDescription: "图片")
+                placeholderLabel.stringValue = "正在加载原图…"
+            }
+            let isLongImage = entry.kind == .longScreenshot
+                || (entry.pixelWidth > 0 && Double(entry.pixelHeight) / Double(entry.pixelWidth) > 1.65)
+            let url = entry.fileURL
+            let maxPixel = isLongImage ? 6000 : 2400
+            loadTask = Task { @MainActor [weak self] in
+                let cgImage = await Task.detached(priority: .userInitiated) {
+                    Self.loadPreviewCGImage(at: url, maxPixelSize: maxPixel)
+                }.value
+                guard let self, self.loadGeneration == gen, !Task.isCancelled else { return }
+                if let cgImage {
+                    let nsImage = NSImage(
+                        cgImage: cgImage,
+                        size: NSSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
+                    )
+                    if isLongImage && Double(cgImage.height) / Double(max(1, cgImage.width)) > 1.65 {
+                        self.presentLongScrollableImage(nsImage, pixelWidth: cgImage.width, pixelHeight: cgImage.height)
+                    } else {
+                        self.longImageScrollView.isHidden = true
+                        self.imageView.image = nsImage
+                        self.imageView.isHidden = false
+                    }
+                    self.placeholderStack.isHidden = true
+                } else if thumbnail == nil {
+                    self.placeholderSymbol.image = NSImage(systemSymbolName: "photo", accessibilityDescription: "图片")
+                    self.placeholderLabel.stringValue = "无法读取图片"
+                }
+            }
         }
 
         infoLabel.stringValue = Self.infoText(for: entry, isPresent: isPresent)
@@ -199,6 +281,21 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
         }
     }
 
+    private func presentLongScrollableImage(_ image: NSImage, pixelWidth: Int, pixelHeight: Int) {
+        imageView.isHidden = true
+        longImageScrollView.isHidden = false
+        imageSurface.layoutSubtreeIfNeeded()
+        let viewportW = max(240, longImageScrollView.contentView.bounds.width - 8)
+        let aspect = CGFloat(pixelHeight) / CGFloat(max(1, pixelWidth))
+        let displayW = viewportW
+        let displayH = max(longImageScrollView.contentView.bounds.height, displayW * aspect)
+        longImageDocumentView.frame = CGRect(x: 0, y: 0, width: displayW, height: displayH)
+        longImageView.frame = longImageDocumentView.bounds
+        longImageView.image = image
+        longImageScrollView.contentView.scroll(to: .zero)
+        longImageScrollView.reflectScrolledClipView(longImageScrollView.contentView)
+    }
+
     func close() {
         guard isOpen else { return }
         isOpen = false
@@ -209,11 +306,13 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
     }
 
     private func releaseContent() {
-        // 大图与视频解码器占用高内存；关闭或切换即立即释放。
+        loadTask?.cancel()
+        loadTask = nil
         playerView.player?.pause()
         playerView.player = nil
         imageView.animates = false
         imageView.image = nil
+        longImageView.image = nil
         placeholderSymbol.image = nil
     }
 
@@ -229,6 +328,19 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
         imageView.translatesAutoresizingMaskIntoConstraints = false
         imageView.isHidden = true
         imageSurface.addSubview(imageView)
+
+        longImageScrollView.hasVerticalScroller = true
+        longImageScrollView.hasHorizontalScroller = false
+        longImageScrollView.autohidesScrollers = true
+        longImageScrollView.drawsBackground = false
+        longImageScrollView.borderType = .noBorder
+        longImageScrollView.translatesAutoresizingMaskIntoConstraints = false
+        longImageScrollView.isHidden = true
+        longImageView.imageScaling = .scaleProportionallyUpOrDown
+        longImageView.imageFrameStyle = .none
+        longImageDocumentView.addSubview(longImageView)
+        longImageScrollView.documentView = longImageDocumentView
+        imageSurface.addSubview(longImageScrollView)
 
         playerView.controlsStyle = .inline
         playerView.translatesAutoresizingMaskIntoConstraints = false
@@ -256,6 +368,11 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
             imageView.leadingAnchor.constraint(equalTo: imageSurface.leadingAnchor, constant: 12),
             imageView.trailingAnchor.constraint(equalTo: imageSurface.trailingAnchor, constant: -12),
             imageView.bottomAnchor.constraint(equalTo: imageSurface.bottomAnchor, constant: -12),
+
+            longImageScrollView.topAnchor.constraint(equalTo: imageSurface.topAnchor, constant: 12),
+            longImageScrollView.leadingAnchor.constraint(equalTo: imageSurface.leadingAnchor, constant: 12),
+            longImageScrollView.trailingAnchor.constraint(equalTo: imageSurface.trailingAnchor, constant: -12),
+            longImageScrollView.bottomAnchor.constraint(equalTo: imageSurface.bottomAnchor, constant: -12),
 
             playerView.topAnchor.constraint(equalTo: imageSurface.topAnchor, constant: 12),
             playerView.leadingAnchor.constraint(equalTo: imageSurface.leadingAnchor, constant: 12),
@@ -294,7 +411,13 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
             infoLabel.widthAnchor.constraint(equalTo: infoStack.widthAnchor),
         ])
 
-        for view in [header, closeButton, imageSurface, infoSurface] {
+        let actionBar = NSStackView(views: [copyButton, editButton, revealButton, closeButton])
+        actionBar.orientation = .horizontal
+        actionBar.alignment = .centerY
+        actionBar.spacing = 6
+        actionBar.translatesAutoresizingMaskIntoConstraints = false
+
+        for view in [header, actionBar, imageSurface, infoSurface] {
             view.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(view)
         }
@@ -303,12 +426,10 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: content.topAnchor, constant: Self.topInset),
             header.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: margin),
-            // 宽度显式钉住（否则 `SettingsHeaderView` 内部的「<=」不等式
-            // 会让页头宽度欠定），右端留给关闭按钮。
-            header.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -16),
+            header.trailingAnchor.constraint(lessThanOrEqualTo: actionBar.leadingAnchor, constant: -12),
 
-            closeButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
-            closeButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -margin),
+            actionBar.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            actionBar.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -margin),
 
             imageSurface.topAnchor.constraint(equalTo: header.bottomAnchor, constant: SettingsTheme.cardGap),
             imageSurface.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: margin),
@@ -326,29 +447,11 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
         let size = window.frame.size
         let screen = anchor?.screen ?? NSScreen.main
         guard let visible = screen?.visibleFrame else { return }
-
-        let origin: CGPoint
-        if let anchor, anchor.isVisible {
-            // 优先贴历史窗口左侧：两个窗口并排，列表仍然可见。
-            let left = anchor.frame.minX - size.width - 12
-            if left >= visible.minX + 12 {
-                let y = anchor.frame.midY - size.height / 2
-                origin = CGPoint(
-                    x: left,
-                    y: min(max(y, visible.minY + 12), visible.maxY - size.height - 12)
-                )
-            } else {
-                origin = CGPoint(
-                    x: visible.midX - size.width / 2,
-                    y: visible.midY - size.height / 2
-                )
-            }
-        } else {
-            origin = CGPoint(
-                x: visible.midX - size.width / 2,
-                y: visible.midY - size.height / 2
-            )
-        }
+        let origin = Self.preferredOrigin(
+            panelSize: size,
+            anchorFrame: (anchor?.isVisible == true) ? anchor?.frame : nil,
+            visibleFrame: visible
+        )
         window.setFrameOrigin(origin)
     }
 
@@ -378,7 +481,6 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
             second += " · \(source)"
         }
 
-        // 缓存副本的路径是 `<uuid>.png`，对用户没有意义；只说清它是副本。
         let location = entry.isCached
             ? "历史缓存副本"
             : (entry.filePath as NSString).abbreviatingWithTildeInPath
@@ -404,24 +506,32 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
         return ByteCountFormatter.string(fromByteCount: size.int64Value, countStyle: .file)
     }
 
-    /// 解码阶段就降采样，峰值内存只与预览尺寸相关。
-    private static func loadPreviewImage(at url: URL, maxPixelSize: Int) -> NSImage? {
+    private nonisolated static func loadPreviewCGImage(at url: URL, maxPixelSize: Int) -> CGImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
         ]
-        guard let image = CGImageSourceCreateThumbnailAtIndex(
-            source, 0, options as CFDictionary
-        ) else { return nil }
-        return NSImage(
-            cgImage: image,
-            size: NSSize(width: CGFloat(image.width), height: CGFloat(image.height))
-        )
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }
 
     // MARK: - 动作
+
+    @objc private func copyTapped() {
+        guard let entry = currentEntry, entry.isFilePresent else { return }
+        onCopy?(entry)
+    }
+
+    @objc private func editTapped() {
+        guard let entry = currentEntry, entry.isFilePresent, entry.kind != .recording else { return }
+        onEdit?(entry)
+    }
+
+    @objc private func revealTapped() {
+        guard let entry = currentEntry, entry.isFilePresent else { return }
+        onReveal?(entry)
+    }
 
     @objc private func closeTapped() {
         close()
@@ -429,7 +539,6 @@ final class HistoryPreviewPanel: NSObject, NSWindowDelegate {
 
     // MARK: - NSWindowDelegate
 
-    /// 用户点标题栏红点时不会走 `close()`；这里补齐清理与回调。
     func windowWillClose(_ notification: Notification) {
         guard isOpen else { return }
         isOpen = false

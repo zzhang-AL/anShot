@@ -103,11 +103,13 @@ protocol ShortcutHosting: AnyObject {
 
     /// 恢复之前让出的全局动作热键。重复调用安全。
     func resumeGlobalShortcut(for action: GlobalShortcutAction) -> String?
+
+    /// 清空并解绑某个全局动作的热键（反注册系统热键并持久化未绑定标记）。
+    func clearGlobalShortcut(for action: GlobalShortcutAction)
 }
 
 extension ShortcutHosting {
-    /// 默认实现让只为测试提供 capture/pin 的宿主无需一次实现全部五个动作。
-    /// 真实应用由 `AppDelegate` 覆盖。
+    /// 默认实现让只为测试提供 capture/pin 的宿主无需一次实现全部动作。
     func applyGlobalShortcut(_ shortcut: Shortcut, for action: GlobalShortcutAction) -> String? {
         "当前环境不支持修改这个快捷键。"
     }
@@ -116,6 +118,8 @@ extension ShortcutHosting {
     func suspendGlobalShortcut(for action: GlobalShortcutAction) -> Bool { true }
 
     func resumeGlobalShortcut(for action: GlobalShortcutAction) -> String? { nil }
+
+    func clearGlobalShortcut(for action: GlobalShortcutAction) {}
 }
 
 // MARK: - 设置窗口控制器
@@ -158,12 +162,13 @@ final class SettingsWindowController: NSWindowController {
                 width: SettingsTheme.windowWidth,
                 height: SettingsTheme.windowHeight
             ),
-            // 只留关闭按钮：HIG 要求设置窗口禁用最小化与缩放。
-            styleMask: [.titled, .closable],
+            // Phase 5.2：改为可缩放窗口（初始 780×600，最小 680×500），容纳跨分类搜索与丰富配置。
+            styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
         )
-        window.title = "anShot 设置"
+        window.title = L("settings.windowTitle", fallback: "anShot 设置")
+        window.minSize = AnShotTheme.windowMinSize
         window.contentViewController = contentController
 
         // 让 Autosave 生效必须关掉这个：默认 true 时窗口关闭即释放，
@@ -184,23 +189,15 @@ final class SettingsWindowController: NSWindowController {
         // 顺序有讲究：必须先 setFrameUsingName 再 setFrameAutosaveName。
         // 反过来的话，autosave 会先把当前（零）位置写进去，把上次的覆盖掉。
         if window.setFrameUsingName(Self.frameAutosaveName) {
-            // 只沿用 autosave 的**位置**，尺寸强制回到当前设计值。
-            //
-            // 窗口不可缩放，尺寸是设计决定（见 `SettingsTheme.windowHeight`）。
-            // 若连尺寸一起沿用，autosave 里那个上一次的长方形会把新尺寸盖掉，
-            // 「把窗口改成正方形」对老用户就完全不可见——
-            // 实测第一次改完尺寸后窗口仍然渲染成 0x32，就是这个原因。
-            //
-            // 以**顶边**为锚：窗口高度变了之后保持上沿不动，
-            // 否则窗口会从屏幕下方往上跳。
-            let topEdge = window.frame.maxY
-            window.setContentSize(NSSize(
-                width: SettingsTheme.windowWidth,
-                height: SettingsTheme.windowHeight
-            ))
+            // 若旧版保存的 frame 小于新版最小尺寸，抬升至合法最小宽高防止内容挤压。
             var frame = window.frame
-            frame.origin.y = topEdge - frame.height
-            window.setFrame(frame, display: false)
+            if frame.width < AnShotTheme.windowMinSize.width || frame.height < AnShotTheme.windowMinSize.height {
+                let topEdge = frame.maxY
+                frame.size.width = max(frame.width, SettingsTheme.windowWidth)
+                frame.size.height = max(frame.height, SettingsTheme.windowHeight)
+                frame.origin.y = topEdge - frame.height
+                window.setFrame(frame, display: false)
+            }
         } else {
             window.center()
         }
@@ -214,6 +211,20 @@ final class SettingsWindowController: NSWindowController {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("不支持从 nib 构造")
+    }
+
+    /// 暴露跨分类搜索接口供测试验证过滤与页跳转。
+    func applySearchForTesting(_ query: String) {
+        contentController.applySearchQuery(query)
+    }
+
+    /// 返回当前搜索后侧边栏可见的分类页列表（测试用）。
+    var visibleSidebarPagesForTesting: [SettingsPage] {
+        contentController.visibleSidebarPages
+    }
+
+    var currentPageForTesting: SettingsPage {
+        contentController.currentPage
     }
 
     /// 把界面重新同步到当前设置。
@@ -364,7 +375,28 @@ private final class SettingsViewController: NSViewController {
     /// 右侧滚动容器与文档内容容器：切页时只替换文档容器的子视图。
     private var contentScrollView: NSScrollView!
     private var contentContainer: NSView!
+    private var searchField: NSSearchField!
+    private var searchEmptyLabel: NSTextField!
     private var sidebarItems: [SettingsSidebarItem] = []
+
+    /// 当前侧边栏未被搜索过滤的分类页列表。
+    var visibleSidebarPages: [SettingsPage] {
+        sidebarItems.filter { !$0.isHidden }.map(\.page)
+    }
+
+    // Phase 5.1 / 5.2 新增设置控件引用
+    private var appearanceControl: NSSegmentedControl!
+    private var languagePopUp: NSPopUpButton!
+    private var toastToggleRow: SettingsToggleRow!
+    private var recordingFrameToggleRow: SettingsToggleRow!
+    private var screenPermStatusLabel: NSTextField!
+    private var micPermStatusLabel: NSTextField!
+    private var axPermStatusLabel: NSTextField!
+    private var exportFormatPopUp: NSPopUpButton!
+    private var exportQualitySlider: NSSlider!
+    private var exportQualityValueLabel: NSTextField!
+    private var pngOptimizeRow: SettingsToggleRow!
+    private var lazyTIFFRow: SettingsToggleRow!
 
     /// 已构建的页面视图。懒创建 + 缓存（理由见 `showPage`）。
     private var pageViews: [SettingsPage: NSView] = [:]
@@ -422,9 +454,9 @@ private final class SettingsViewController: NSViewController {
     private var intentRecorders: [GlobalShortcutAction: ShortcutRecorderView] = [:]
     private var intentMessageLabel: NSTextField!
 
-    /// 直达动作的显示顺序（也是重置按钮 tag 的序号来源）。
+    /// 直达动作的显示顺序（也是重置按钮 tag 的序号来源，含 Phase 5 新增 `.windowCapture`）。
     private static let intentShortcutActions: [GlobalShortcutAction] = [
-        .recording, .longScreenshot, .ocr, .ocrAutoTranslate, .selectionTranslate
+        .windowCapture, .longScreenshot, .ocr, .recording, .ocrAutoTranslate, .selectionTranslate
     ]
 
     // MARK: 关于页的状态
@@ -454,9 +486,29 @@ private final class SettingsViewController: NSViewController {
     override func loadView() {
         let root = SettingsBackgroundView()
 
-        // 左侧导航
+        // 左侧导航 + 顶部跨分类实时搜索框
         let sidebar = SettingsSidebarView()
         sidebar.translatesAutoresizingMaskIntoConstraints = false
+
+        let search = NSSearchField()
+        search.placeholderString = L("settings.searchPlaceholder", fallback: "搜索设置项…")
+        search.controlSize = .regular
+        search.sendsSearchStringImmediately = true
+        search.sendsWholeSearchString = false
+        search.target = self
+        search.action = #selector(searchFieldChanged(_:))
+        search.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(search)
+        searchField = search
+
+        let emptySearch = NSTextField(labelWithString: "未找到匹配分类")
+        emptySearch.font = .systemFont(ofSize: 11)
+        emptySearch.textColor = .tertiaryLabelColor
+        emptySearch.alignment = .center
+        emptySearch.isHidden = true
+        emptySearch.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(emptySearch)
+        searchEmptyLabel = emptySearch
 
         var items: [SettingsSidebarItem] = []
         for page in SettingsPage.allCases {
@@ -472,7 +524,7 @@ private final class SettingsViewController: NSViewController {
         itemStack.translatesAutoresizingMaskIntoConstraints = false
         sidebar.addSubview(itemStack)
 
-        // 右侧内容滚动容器：防止提示语展开后超出固定 580pt 高度而被裁切。
+        // 右侧内容滚动容器
         let scrollView = NSScrollView()
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
@@ -494,12 +546,14 @@ private final class SettingsViewController: NSViewController {
         minDocHeight.priority = .defaultLow
 
         NSLayoutConstraint.activate([
-            root.widthAnchor.constraint(equalToConstant: SettingsTheme.windowWidth),
-
             sidebar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             sidebar.topAnchor.constraint(equalTo: root.topAnchor),
             sidebar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
             sidebar.widthAnchor.constraint(equalToConstant: SettingsTheme.sidebarWidth),
+
+            search.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 14),
+            search.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 10),
+            search.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -10),
 
             scrollView.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
             scrollView.topAnchor.constraint(equalTo: root.topAnchor),
@@ -511,10 +565,13 @@ private final class SettingsViewController: NSViewController {
             content.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
             minDocHeight,
 
-            // 侧边栏项左右各缩进一小段，左边距与内容区的 margin 形成节奏。
-            itemStack.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 16),
+            itemStack.topAnchor.constraint(equalTo: search.bottomAnchor, constant: 12),
             itemStack.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 8),
             itemStack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -8),
+
+            emptySearch.topAnchor.constraint(equalTo: itemStack.bottomAnchor, constant: 16),
+            emptySearch.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 10),
+            emptySearch.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -10),
         ])
         for item in items {
             item.widthAnchor.constraint(equalTo: itemStack.widthAnchor).isActive = true
@@ -592,18 +649,50 @@ private final class SettingsViewController: NSViewController {
         // 不必再回到 `showPage` 里找位置。
     }
 
+    @objc private func searchFieldChanged(_ sender: NSSearchField) {
+        applySearchQuery(sender.stringValue)
+    }
+
+    /// 跨分类实时过滤并自动跳转至首个命中的设置分类。
+    func applySearchQuery(_ rawQuery: String) {
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        var firstMatch: SettingsPage?
+        var matchCount = 0
+        for item in sidebarItems {
+            let matched = item.page.matches(query: query)
+            item.isHidden = !matched
+            if matched {
+                matchCount += 1
+                if firstMatch == nil { firstMatch = item.page }
+            }
+        }
+        searchEmptyLabel?.isHidden = matchCount > 0
+        if let firstMatch, !currentPage.matches(query: query) {
+            showPage(firstMatch)
+        }
+    }
+
     private func buildPage(_ page: SettingsPage) -> NSView {
         let cards: [NSView]
         switch page {
         case .general:
             cards = [
-                makeShortcutCard(),
-                makeDirectActionCard(),
+                makeAppearanceAndLanguageCard(),
+                makePermissionsCard(),
                 makeCaptureInteractionCard(),
                 makeLaunchAtLoginCard(),
             ]
+        case .shortcuts:
+            cards = [
+                makeShortcutCard(),
+                makeDirectActionCard(),
+                makeOverlayShortcutReferenceCard(),
+            ]
         case .save:
-            cards = [makeSaveCard()]
+            cards = [
+                makeSaveCard(),
+                makeExportPipelineCard(),
+            ]
         case .pin:
             cards = [makePinCard()]
         case .recognition:
@@ -700,7 +789,7 @@ private final class SettingsViewController: NSViewController {
     }
 
     private func makeIntentShortcutRow(_ action: GlobalShortcutAction) -> NSView {
-        let recorder = ShortcutRecorderView(shortcut: settings.shortcut(for: action))
+        let recorder = ShortcutRecorderView(shortcut: settings.optionalShortcut(for: action))
         recorder.translatesAutoresizingMaskIntoConstraints = false
         recorder.willBeginRecording = { [weak self] in
             guard let self else { return false }
@@ -715,6 +804,10 @@ private final class SettingsViewController: NSViewController {
         recorder.commitHandler = { [weak self] candidate in
             guard let self else { return "设置窗口已关闭，请重新打开。" }
             return self.shortcutHost?.applyGlobalShortcut(candidate, for: action)
+        }
+        recorder.clearHandler = { [weak self] in
+            self?.shortcutHost?.clearGlobalShortcut(for: action)
+            self?.setIntentMessage(nil)
         }
         recorder.onMessage = { [weak self] message in
             self?.setIntentMessage(message)
@@ -736,6 +829,13 @@ private final class SettingsViewController: NSViewController {
         text.setContentHuggingPriority(.defaultLow, for: .horizontal)
         text.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
 
+        let clearButton = SettingsPushButton(
+            title: "清空",
+            target: self,
+            action: #selector(clearIntentShortcut(_:))
+        )
+        clearButton.tag = Self.intentShortcutActions.firstIndex(of: action) ?? 0
+
         let resetButton = SettingsPushButton(
             title: "恢复默认",
             target: self,
@@ -743,7 +843,7 @@ private final class SettingsViewController: NSViewController {
         )
         resetButton.tag = Self.intentShortcutActions.firstIndex(of: action) ?? 0
 
-        return makeShortcutRow(text: text, recorder: recorder, resetButton: resetButton)
+        return makeShortcutRow(text: text, recorder: recorder, clearButton: clearButton, resetButton: resetButton)
     }
 
     private func makeIntentShortcutMessageLabel() -> NSView {
@@ -767,39 +867,36 @@ private final class SettingsViewController: NSViewController {
 
     /// 截图快捷键的录制行：说明文字 + 键帽 + 「恢复默认」。
     private func makeShortcutRecorderRow() -> NSView {
-        let recorder = ShortcutRecorderView(shortcut: settings.captureShortcut)
+        let recorder = ShortcutRecorderView(shortcut: settings.optionalShortcut(for: .capture))
         recorder.translatesAutoresizingMaskIntoConstraints = false
         recorder.willBeginRecording = { [weak self] in
             guard let self else { return false }
-            // 让出全局热键。不让出的话，用户按当前快捷键时事件会被
-            // Carbon 系统级截获并触发一次截图，录制控件什么都收不到。
             return self.shortcutHost?.suspendCaptureShortcut() ?? false
         }
         recorder.didEndRecording = { [weak self] in
             guard let self else { return }
-            // 恢复让出的热键。失败必须让用户看到：
-            // 那意味着他的截图快捷键已经不存在了。
             if let reason = self.shortcutHost?.resumeCaptureShortcut() {
                 self.setMessage("原快捷键恢复失败：\(reason)")
             }
         }
         recorder.commitHandler = { [weak self] candidate in
             guard let self else { return "设置窗口已关闭，请重新打开。" }
-            // 不在 UI 层做「值没变就算成功」的短路：
-            // 启动期注册失败时热键并不存在，短路会报一个假的成功。
             return self.shortcutHost?.applyCaptureShortcut(candidate)
+        }
+        recorder.clearHandler = { [weak self] in
+            self?.shortcutHost?.clearGlobalShortcut(for: .capture)
+            self?.setMessage(nil)
         }
         recorder.onMessage = { [weak self] message in
             self?.setMessage(message)
         }
         self.recorder = recorder
 
-        // 左侧说明：名称 + 一句用途。
         let nameLabel = NSTextField(labelWithString: "开始截图")
         nameLabel.font = .systemFont(ofSize: 13, weight: .medium)
         nameLabel.textColor = .labelColor
 
-        let hintLabel = NSTextField(labelWithString: "按下组合键立即截图")
+        let hintLabel = NSTextField(labelWithString: "支持组合键或单键 F1–F20；录制态按 Delete 可解绑")
         hintLabel.font = .systemFont(ofSize: 11)
         hintLabel.textColor = .secondaryLabelColor
 
@@ -807,16 +904,20 @@ private final class SettingsViewController: NSViewController {
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 1
-        // 让说明吸收多余宽度，把录制控件与按钮顶到右侧。
         text.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
+        let clearButton = SettingsPushButton(
+            title: "清空",
+            target: self,
+            action: #selector(clearCaptureShortcut)
+        )
         let resetButton = SettingsPushButton(
             title: "恢复默认",
             target: self,
             action: #selector(resetShortcut)
         )
 
-        return makeShortcutRow(text: text, recorder: recorder, resetButton: resetButton)
+        return makeShortcutRow(text: text, recorder: recorder, clearButton: clearButton, resetButton: resetButton)
     }
 
     /// 常驻消息行。
@@ -846,19 +947,15 @@ private final class SettingsViewController: NSViewController {
     private func makeShortcutRow(
         text: NSView,
         recorder: NSView,
+        clearButton: NSView? = nil,
         resetButton: NSView
     ) -> NSStackView {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 10
+        row.spacing = 8
         row.translatesAutoresizingMaskIntoConstraints = false
 
-        // 键帽与「恢复默认」各自固定一列，而不是用两个等宽空隙夹住。
-        //
-        // 用空隙时，左侧文案长度不同会把键帽推到不同位置；截图里同一张卡片
-        // 的三行键帽与按钮边缘各差几个点，正是这样来的。固定列宽后，
-        // 无论文案多长，键帽中心与按钮右边缘在每一行都对齐。
         let spacer = NSView()
         spacer.translatesAutoresizingMaskIntoConstraints = false
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -867,15 +964,331 @@ private final class SettingsViewController: NSViewController {
         row.addArrangedSubview(text)
         row.addArrangedSubview(spacer)
         row.addArrangedSubview(recorder)
+        if let clearButton {
+            clearButton.translatesAutoresizingMaskIntoConstraints = false
+            row.addArrangedSubview(clearButton)
+            clearButton.widthAnchor.constraint(equalToConstant: 56).isActive = true
+        }
         row.addArrangedSubview(resetButton)
 
         recorder.translatesAutoresizingMaskIntoConstraints = false
         resetButton.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            recorder.widthAnchor.constraint(equalToConstant: 132),
-            resetButton.widthAnchor.constraint(equalToConstant: 84),
+            recorder.widthAnchor.constraint(equalToConstant: 128),
+            resetButton.widthAnchor.constraint(equalToConstant: 78),
         ])
         return row
+    }
+
+    // MARK: Phase 5 新增卡片（外观语言 / 权限自愈 / 覆盖层速查 / 导出压缩）
+
+    private func makeAppearanceAndLanguageCard() -> SettingsCardView {
+        let appearanceSeg = NSSegmentedControl(
+            labels: AppAppearanceMode.allCases.map(\.displayName),
+            trackingMode: .selectOne,
+            target: self,
+            action: #selector(appearanceModeChanged(_:))
+        )
+        appearanceSeg.controlSize = .regular
+        if let idx = AppAppearanceMode.allCases.firstIndex(of: settings.appearanceMode) {
+            appearanceSeg.selectedSegment = idx
+        }
+        appearanceControl = appearanceSeg
+        let appearanceRow = SettingsControlRow(label: "外观主题", control: appearanceSeg)
+
+        let langPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        for lang in AppLanguage.allCases {
+            langPopup.addItem(withTitle: lang.displayName)
+        }
+        if let idx = AppLanguage.allCases.firstIndex(of: settings.appLanguage) {
+            langPopup.selectItem(at: idx)
+        }
+        langPopup.target = self
+        langPopup.action = #selector(appLanguageChanged(_:))
+        languagePopUp = langPopup
+        let langRow = SettingsControlRow(label: "界面语言", control: langPopup)
+
+        let toastRow = SettingsToggleRow(
+            title: "操作完成时显示轻提示 (Toast)",
+            subtitle: "复制、保存或贴图完成后在屏幕底部短暂显示状态胶囊"
+        )
+        toastRow.isOn = settings.showCompletionToast
+        toastRow.toggle.target = self
+        toastRow.toggle.action = #selector(showCompletionToastChanged(_:))
+        toastToggleRow = toastRow
+
+        let recFrameRow = SettingsToggleRow(
+            title: "录屏期间显示边界提示框",
+            subtitle: "在屏幕中标出正在录制的区域边框（绝不会被录进成片）"
+        )
+        recFrameRow.isOn = settings.recordingShowRegionFrame
+        recFrameRow.toggle.target = self
+        recFrameRow.toggle.action = #selector(recordingShowRegionFrameChanged(_:))
+        recordingFrameToggleRow = recFrameRow
+
+        let rows: [NSView] = [appearanceRow, langRow, toastRow, recFrameRow]
+        let stack = NSStackView(views: rows)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        for row in rows {
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        return SettingsCardView(symbolName: "paintbrush", title: "外观、语言与提示", content: stack)
+    }
+
+    private func makePermissionsCard() -> SettingsCardView {
+        func makeStatusRow(title: String) -> (NSView, NSTextField) {
+            let name = NSTextField(labelWithString: title)
+            name.font = .systemFont(ofSize: 13, weight: .medium)
+            name.textColor = .labelColor
+
+            let badge = NSTextField(labelWithString: "")
+            badge.font = .systemFont(ofSize: 12, weight: .semibold)
+            badge.alignment = .right
+
+            let spacer = NSView()
+            spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+            let row = NSStackView(views: [name, spacer, badge])
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.spacing = 8
+            return (row, badge)
+        }
+
+        let (screenRow, screenBadge) = makeStatusRow(title: "屏幕与系统音频录制（必需）")
+        let (micRow, micBadge) = makeStatusRow(title: "麦克风（录屏旁白按需）")
+        let (axRow, axBadge) = makeStatusRow(title: "辅助功能（自动翻页 / 划词 / 控件吸附）")
+        screenPermStatusLabel = screenBadge
+        micPermStatusLabel = micBadge
+        axPermStatusLabel = axBadge
+
+        let refreshBtn = SettingsPushButton(title: "刷新状态", target: self, action: #selector(refreshPermissionsClicked))
+        let openBtn = SettingsPushButton(title: "打开系统设置", target: self, action: #selector(openSystemPrivacySettings))
+        let repairBtn = SettingsPushButton(title: "重置 TCC 权限自愈…", target: self, action: #selector(resetTCCScreenCapturePermission))
+        let btnRow = NSStackView(views: [refreshBtn, openBtn, repairBtn])
+        btnRow.orientation = .horizontal
+        btnRow.spacing = 8
+
+        let hint = NSTextField(wrappingLabelWithString: "若系统已勾选权限但仍无法截图，可使用「重置 TCC 权限自愈」清理异常授权缓存后重新勾选。")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+
+        let rows: [NSView] = [screenRow, micRow, axRow, btnRow, hint]
+        let stack = NSStackView(views: rows)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        for row in rows {
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        refreshPermissionStatusLabels()
+        return SettingsCardView(symbolName: "lock.shield", title: "系统权限与自愈", content: stack)
+    }
+
+    private func makeOverlayShortcutReferenceCard() -> SettingsCardView {
+        let items: [(String, String)] = [
+            ("Space / Tab", "切换独立窗体捕获模式 / 穿透选择光标下叠放窗口"),
+            ("方向键 / ⌥+方向键", "1px 移动选区 / 调整宽高（按住 ⇧ 步进 5px/10px）"),
+            ("Space + 拖拽 / ⇧ + 拖拽", "整体平移选区 / 锁定当前宽高比等比缩放"),
+            ("C / ⇧C", "复制放大镜采样 HEX 色值 / RGB 色值"),
+            ("R / O / A / U / L / P / H / M / N / T", "矩形 / 椭圆 / 箭头 / 曲线箭头 / 直线 / 画笔 / 荧光笔 / 马赛克 / 编号 / 文字"),
+            ("滚轮 / ⌘Z / ⇧⌘Z", "即时调节当前工具粗细与字号 / 撤销与重做"),
+            ("Enter / ⌘C / ⌘S / ⇧⌘S / ⌘P", "复制 / 复制 / 静默保存 / 另存为 / 钉住贴图"),
+        ]
+        var rows: [NSView] = []
+        for (keys, desc) in items {
+            let kLabel = NSTextField(labelWithString: keys)
+            kLabel.font = .monospacedSystemFont(ofSize: 11, weight: .semibold)
+            kLabel.textColor = .labelColor
+            kLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+            let dLabel = NSTextField(wrappingLabelWithString: desc)
+            dLabel.font = .systemFont(ofSize: 11)
+            dLabel.textColor = .secondaryLabelColor
+
+            let line = NSStackView(views: [kLabel, dLabel])
+            line.orientation = .horizontal
+            line.alignment = .firstBaseline
+            line.spacing = 10
+            rows.append(line)
+        }
+        let stack = NSStackView(views: rows)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 7
+        for row in rows {
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        return SettingsCardView(symbolName: "keyboard", title: "覆盖层内快捷键速查", content: stack)
+    }
+
+    private func makeExportPipelineCard() -> SettingsCardView {
+        let formatPop = NSPopUpButton(frame: .zero, pullsDown: false)
+        for option in ExportFormatOption.allCases {
+            formatPop.addItem(withTitle: option.displayName)
+        }
+        if let idx = ExportFormatOption.allCases.firstIndex(of: settings.exportFormat) {
+            formatPop.selectItem(at: idx)
+        }
+        formatPop.target = self
+        formatPop.action = #selector(exportFormatChanged(_:))
+        exportFormatPopUp = formatPop
+        let formatRow = SettingsControlRow(label: "默认保存格式", control: formatPop)
+
+        let slider = NSSlider(value: settings.exportQuality, minValue: 0.1, maxValue: 1.0, target: self, action: #selector(exportQualityChanged(_:)))
+        slider.isContinuous = true
+        exportQualitySlider = slider
+        let valLabel = NSTextField(labelWithString: "\(Int((settings.exportQuality * 100).rounded()))%")
+        valLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        valLabel.textColor = .secondaryLabelColor
+        exportQualityValueLabel = valLabel
+
+        let qualityBox = NSStackView(views: [slider, valLabel])
+        qualityBox.orientation = .horizontal
+        qualityBox.alignment = .centerY
+        qualityBox.spacing = 8
+        slider.widthAnchor.constraint(equalToConstant: 160).isActive = true
+        valLabel.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        let qualityRow = SettingsControlRow(label: "JPEG / HEIC 质量", control: qualityBox)
+
+        let oxiRow = SettingsToggleRow(
+            title: "PNG 无损后台精压（MIT oxipng）",
+            subtitle: "保存与复制 PNG 时 0ms 即刻落盘，后台两阶段无损压缩并完整保留 144 DPI 与 ICC（缺工具时静默跳过）"
+        )
+        oxiRow.isOn = settings.pngLosslessOptimize
+        oxiRow.toggle.target = self
+        oxiRow.toggle.action = #selector(pngLosslessOptimizeChanged(_:))
+        pngOptimizeRow = oxiRow
+
+        let tiffRow = SettingsToggleRow(
+            title: "剪贴板兼容老应用（按需提供 TIFF）",
+            subtitle: "关闭后仅向剪贴板写入精压 PNG，可显著降低部分第三方剪贴板历史工具的内存占用"
+        )
+        tiffRow.isOn = settings.pasteboardLazyTIFF
+        tiffRow.toggle.target = self
+        tiffRow.toggle.action = #selector(pasteboardLazyTIFFChanged(_:))
+        lazyTIFFRow = tiffRow
+
+        let rows: [NSView] = [formatRow, qualityRow, oxiRow, tiffRow]
+        let stack = NSStackView(views: rows)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        for row in rows {
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        refreshExportFormatControls()
+        return SettingsCardView(symbolName: "doc.zipper", title: "导出格式、无损压缩与剪贴板", content: stack)
+    }
+
+    private func refreshPermissionStatusLabels() {
+        let screenGranted = ScreenCapturePermissionService().current() == .granted
+        screenPermStatusLabel?.stringValue = screenGranted ? "已授权" : "尚未授权"
+        screenPermStatusLabel?.textColor = screenGranted ? AnShotTheme.success : AnShotTheme.warning
+
+        let micGranted = MicrophonePermission.status == .granted
+        micPermStatusLabel?.stringValue = micGranted ? "已授权" : "未授权（按需）"
+        micPermStatusLabel?.textColor = micGranted ? AnShotTheme.success : .secondaryLabelColor
+
+        let axGranted = SystemElementDetector().hasAccessibilityPermission
+        axPermStatusLabel?.stringValue = axGranted ? "已授权" : "未授权（可选）"
+        axPermStatusLabel?.textColor = axGranted ? AnShotTheme.success : .secondaryLabelColor
+    }
+
+    private func refreshExportFormatControls() {
+        if let idx = ExportFormatOption.allCases.firstIndex(of: settings.exportFormat) {
+            exportFormatPopUp?.selectItem(at: idx)
+        }
+        exportQualitySlider?.doubleValue = settings.exportQuality
+        exportQualitySlider?.isEnabled = settings.exportFormat.supportsQuality
+        exportQualityValueLabel?.stringValue = "\(Int((settings.exportQuality * 100).rounded()))%"
+        exportQualityValueLabel?.textColor = settings.exportFormat.supportsQuality ? .labelColor : .tertiaryLabelColor
+        pngOptimizeRow?.isOn = settings.pngLosslessOptimize
+        lazyTIFFRow?.isOn = settings.pasteboardLazyTIFF
+    }
+
+    @objc private func appearanceModeChanged(_ sender: NSSegmentedControl) {
+        let idx = max(0, min(AppAppearanceMode.allCases.count - 1, sender.selectedSegment))
+        settings.setAppearanceMode(AppAppearanceMode.allCases[idx])
+    }
+
+    @objc private func appLanguageChanged(_ sender: NSPopUpButton) {
+        let idx = max(0, min(AppLanguage.allCases.count - 1, sender.indexOfSelectedItem))
+        settings.setAppLanguage(AppLanguage.allCases[idx])
+        view.window?.title = L("settings.windowTitle", fallback: "anShot 设置")
+        ToastPresenter.show(AnShotLocalization.isEnglish ? "Language updated" : "界面语言已更新（菜单栏即时生效）")
+    }
+
+    @objc private func showCompletionToastChanged(_ sender: NSSwitch) {
+        settings.setShowCompletionToast(sender.state == .on)
+    }
+
+    @objc private func recordingShowRegionFrameChanged(_ sender: NSSwitch) {
+        settings.setRecordingShowRegionFrame(sender.state == .on)
+    }
+
+    @objc private func refreshPermissionsClicked() {
+        refreshPermissionStatusLabels()
+    }
+
+    @objc private func openSystemPrivacySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc private func resetTCCScreenCapturePermission() {
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.anshot.app"
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "重置屏幕录制权限缓存？"
+        alert.informativeText = "将执行 `tccutil reset ScreenCapture \(bundleID)` 清除可能损坏的权限条目，随后自动打开「系统设置 → 屏幕录制」供您重新勾选。"
+        alert.addButton(withTitle: "执行重置")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        process.arguments = ["reset", "ScreenCapture", bundleID]
+        try? process.run()
+        process.waitUntilExit()
+        refreshPermissionStatusLabels()
+        openSystemPrivacySettings()
+    }
+
+    @objc private func exportFormatChanged(_ sender: NSPopUpButton) {
+        let idx = max(0, min(ExportFormatOption.allCases.count - 1, sender.indexOfSelectedItem))
+        settings.setExportFormat(ExportFormatOption.allCases[idx])
+        refreshExportFormatControls()
+    }
+
+    @objc private func exportQualityChanged(_ sender: NSSlider) {
+        settings.setExportQuality(sender.doubleValue)
+        exportQualityValueLabel?.stringValue = "\(Int((settings.exportQuality * 100).rounded()))%"
+    }
+
+    @objc private func pngLosslessOptimizeChanged(_ sender: NSSwitch) {
+        settings.setPNGLosslessOptimize(sender.state == .on)
+    }
+
+    @objc private func pasteboardLazyTIFFChanged(_ sender: NSSwitch) {
+        settings.setPasteboardLazyTIFF(sender.state == .on)
+    }
+
+    @objc private func clearCaptureShortcut() {
+        shortcutHost?.clearGlobalShortcut(for: .capture)
+        recorder.shortcut = nil
+        setMessage(nil)
+    }
+
+    @objc private func clearIntentShortcut(_ sender: NSButton) {
+        guard sender.tag >= 0, sender.tag < Self.intentShortcutActions.count else { return }
+        let action = Self.intentShortcutActions[sender.tag]
+        shortcutHost?.clearGlobalShortcut(for: action)
+        intentRecorders[action]?.shortcut = nil
+        setIntentMessage(nil)
     }
 
     // MARK: 固定截图卡片
@@ -2445,27 +2858,32 @@ private final class SettingsViewController: NSViewController {
 
     /// 把界面重新同步到当前设置。仅供诊断使用。
     func reloadFromSettings() {
-        recorder.shortcut = settings.captureShortcut
+        recorder.shortcut = settings.optionalShortcut(for: .capture)
         pinLimitStepper.integerValue = settings.pinMaximumCount
         pinLimitValueLabel.stringValue = Self.pinLimitText(settings.pinMaximumCount)
-        pinToggleRecorder.shortcut = settings.pinToggleShortcut
+        pinToggleRecorder.shortcut = settings.optionalShortcut(for: .pinToggle)
         pinShowBorderRow?.isOn = settings.pinShowBorder
         longshotAutoScrollRow?.isOn = settings.longshotAutoScrollEnabled
         if let speedIdx = AutoScrollSpeed.allCases.firstIndex(of: settings.longshotAutoScrollSpeed) {
             longshotSpeedPopUp?.selectItem(at: speedIdx)
         }
         for action in Self.intentShortcutActions {
-            intentRecorders[action]?.shortcut = settings.shortcut(for: action)
+            intentRecorders[action]?.shortcut = settings.optionalShortcut(for: action)
         }
+        if let appIdx = AppAppearanceMode.allCases.firstIndex(of: settings.appearanceMode) {
+            appearanceControl?.selectedSegment = appIdx
+        }
+        if let langIdx = AppLanguage.allCases.firstIndex(of: settings.appLanguage) {
+            languagePopUp?.selectItem(at: langIdx)
+        }
+        toastToggleRow?.isOn = settings.showCompletionToast
+        recordingFrameToggleRow?.isOn = settings.recordingShowRegionFrame
+        refreshPermissionStatusLabels()
         refreshSaveControls()
+        refreshExportFormatControls()
         refreshOCRControls()
         refreshTranslationControls()
-        // 登录项的状态在系统手里，重新同步必须**重新问系统**一次，
-        // 不能沿用上次读到的值——用户在系统设置里改过之后，
-        // 缓存下来的那个值已经过期了。
         refreshLaunchAtLoginState()
-        // 更新检查与崩溃日志都是窗口之外的状态，重新同步时一并重读；
-        // 否则诊断（或用户改完偏好回来）会看到过期文本。
         refreshAboutPage()
         setMessage(nil)
     }
@@ -2492,7 +2910,7 @@ private final class SettingsViewController: NSViewController {
             limit: settings.pinMaximumCount,
             limitText: pinLimitValueLabel.stringValue,
             stepperValue: pinLimitStepper.integerValue,
-            toggleShortcut: pinToggleRecorder.shortcut.displayName,
+            toggleShortcut: pinToggleRecorder.shortcut?.displayName ?? L("common.unbound", fallback: "未设置"),
             message: pinMessageLabel.stringValue
         )
     }

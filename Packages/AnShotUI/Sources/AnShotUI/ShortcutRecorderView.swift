@@ -35,11 +35,10 @@ final class ShortcutRecorderView: NSView {
 
     // MARK: 对外接口
 
-    /// 当前显示的快捷键。
-    var shortcut: Shortcut {
+    /// 当前显示的快捷键；`nil` 表示已清空解绑（「未设置」）。
+    var shortcut: Shortcut? {
         didSet {
             guard shortcut != oldValue else { return }
-            // 键帽数量变化会改变需要的宽度。
             invalidateIntrinsicContentSize()
             needsDisplay = true
         }
@@ -48,13 +47,13 @@ final class ShortcutRecorderView: NSView {
     /// 即将进入录制态。返回 `false` 可以拒绝进入（宿主无法让出热键时）。
     var willBeginRecording: (() -> Bool)?
 
-    /// 已退出录制态（提交或取消都会调用）。宿主在此恢复热键注册。
+    /// 已退出录制态（提交、清空或取消都会调用）。宿主在此恢复热键注册。
     var didEndRecording: (() -> Void)?
     /// 用户提交了一个候选组合。
-    ///
-    /// - Returns: `nil` 表示接受；返回字符串表示拒绝，内容是给用户看的原因。
-    ///   宿主在这里做**真实**的注册尝试——只有它能知道组合是否已被占用。
     var commitHandler: ((Shortcut) -> String?)?
+
+    /// 用户在录制态按下 Delete/Backspace 请求解绑清空该快捷键时回调。
+    var clearHandler: (() -> Void)?
 
     /// 需要展示一条错误说明。传 `nil` 清除。
     var onMessage: ((String?) -> Void)?
@@ -68,11 +67,9 @@ final class ShortcutRecorderView: NSView {
 
     // MARK: 构造
 
-    init(shortcut: Shortcut) {
+    init(shortcut: Shortcut?) {
         self.shortcut = shortcut
         super.init(frame: .zero)
-        // 让系统负责 focus ring，不在 draw 里自绘——自绘的 ring 在
-        // 不同 macOS 版本和高对比度模式下与系统样式对不上。
         focusRingType = .default
     }
 
@@ -116,10 +113,8 @@ final class ShortcutRecorderView: NSView {
     // MARK: 尺寸
 
     override var intrinsicContentSize: NSSize {
-        // 宽度按当前键帽总宽算，但设一个下限：
-        // 录制态的提示文字比单个键帽长，不留余地会让控件在两种状态间跳动。
         let gap: CGFloat = 5
-        let labels = shortcut.keycapLabels
+        let labels = shortcut?.keycapLabels ?? []
         let capsWidth = labels.map(Self.keycapWidth).reduce(0, +)
             + gap * CGFloat(max(0, labels.count - 1))
         return NSSize(
@@ -203,9 +198,7 @@ final class ShortcutRecorderView: NSView {
     private func cancelRecording() {
         guard isRecording else { return }
         // 恢复进入录制前显示的值：用户按 Esc 就是「当我没动过」。
-        if let shortcutBeforeRecording {
-            shortcut = shortcutBeforeRecording
-        }
+        shortcut = shortcutBeforeRecording
         onMessage?(nil)
         endRecording()
     }
@@ -257,9 +250,21 @@ final class ShortcutRecorderView: NSView {
             return
         }
 
+        // 无修饰键 Delete / ForwardDelete：一键清空解绑当前快捷键（契约 `ux-polish/model.md` §4.1）。
+        let mods = Shortcut.carbonModifiers(from: event.modifierFlags)
+        if mods == 0,
+           (code == UInt32(kVK_Delete) || code == UInt32(kVK_ForwardDelete)),
+           let clearHandler {
+            shortcut = nil
+            onMessage?(nil)
+            clearHandler()
+            endRecording()
+            return
+        }
+
         let candidate = Shortcut(
             keyCode: code,
-            modifiers: Shortcut.carbonModifiers(from: event.modifierFlags)
+            modifiers: mods
         )
 
         // 先做静态校验（缺修饰键之类），再做注册尝试。
@@ -343,6 +348,15 @@ final class ShortcutRecorderView: NSView {
     }
 
     private func drawKeycaps(in context: CGContext) {
+        guard let shortcut else {
+            drawCentered(
+                L("common.unbound", fallback: "未设置"),
+                size: 12,
+                color: .tertiaryLabelColor,
+                weight: .regular
+            )
+            return
+        }
         let labels = shortcut.keycapLabels
         let gap: CGFloat = 5
         let height = SettingsTheme.keycapHeight
@@ -424,7 +438,8 @@ final class ShortcutRecorderView: NSView {
     override func accessibilityLabel() -> String? { "快捷键" }
 
     override func accessibilityValue() -> Any? {
-        isRecording ? "正在录制" : shortcut.displayName
+        if isRecording { return "正在录制" }
+        return shortcut?.displayName ?? L("common.unbound", fallback: "未设置")
     }
 
     override func accessibilityHelp() -> String? {

@@ -622,6 +622,15 @@ private final class HistoryRowView: NSTableCellView {
         actionButtons[.reveal]?.isEnabled = isPresent && availability.reveal
         actionButtons[.delete]?.isEnabled = availability.delete
         actionButtons[.favorite]?.isEnabled = availability.favorite
+        updateSecondaryActionsVisibility()
+    }
+
+    /// 视觉瘦身：未悬停且未选中时仅高亮保留「复制 / 收藏」两项高频动作，悬停或选中行时展开全部行尾按钮。
+    private func updateSecondaryActionsVisibility() {
+        let showSecondary = isHovered || isSelected
+        for action in [HistoryRowAction.edit, .pin, .reveal, .delete] {
+            actionButtons[action]?.alphaValue = showSecondary ? 1.0 : 0.18
+        }
     }
 
     private func updateToolTips(for entry: HistoryEntry) {
@@ -630,15 +639,17 @@ private final class HistoryRowView: NSTableCellView {
             ? (isRecording ? "复制录屏文件" : "复制图片")
             : "源文件已不在原位置，无法复制"
         actionButtons[.edit]?.toolTip = isPresent
-            ? "在标注编辑器中重新打开"
-            : "源文件已不在原位置，无法编辑"
-        actionButtons[.pin]?.toolTip = isPresent
-            ? "把这张图钉在屏幕上"
-            : "源文件已不在原位置，无法钉住"
+            ? (isRecording ? "打开并播放录屏" : "在标注编辑器中重新打开")
+            : "源文件已不在原位置，无法打开"
+        actionButtons[.pin]?.toolTip = isRecording
+            ? "录屏条目暂不支持固定在屏幕上"
+            : (isPresent ? "把这张图钉在屏幕上" : "源文件已不在原位置，无法钉住")
         actionButtons[.reveal]?.toolTip = isPresent
             ? "在访达中显示"
             : "源文件已不在原位置，无法显示"
-        actionButtons[.delete]?.toolTip = "从历史中移除（不会删除已经保存的文件）"
+        actionButtons[.delete]?.toolTip = entry.isCached
+            ? "移除并清理历史缓存副本"
+            : "从历史中移除（不会删除已经保存的文件）"
     }
 
     private static func thumbnailSymbol(for kind: HistoryEntryKind) -> String {
@@ -735,12 +746,14 @@ private final class HistoryRowView: NSTableCellView {
 
     override func mouseEntered(with event: NSEvent) {
         isHovered = true
+        updateSecondaryActionsVisibility()
         needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) {
         isHovered = false
         isPressed = false
+        updateSecondaryActionsVisibility()
         needsDisplay = true
     }
 
@@ -983,6 +996,7 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate, NST
     /// 若不拦住，`makeKeyAndOrderFront` 会在 `windowWillClose` 期间把窗口
     /// 重新拉回前台——表现为「点了红点，窗口又闪回来」。
     private var isClosing = false
+    private var hasPersistedWindowFrame = false
 
     /// 缩略图只用于屏上几十点，系统内存吃紧时允许回收。
     private let thumbnailCache = NSCache<NSString, NSImage>()
@@ -1040,7 +1054,18 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate, NST
         configureKindFilter()
         window.contentView = makeContentView()
 
+        // 记忆历史窗口位置与尺寸（先恢复上次 frame，再绑定 autosaveName）。
+        if window.setFrameUsingName("anShotHistoryWindow") {
+            hasPersistedWindowFrame = true
+        } else {
+            repositionIfNeeded()
+        }
+        window.setFrameAutosaveName("anShotHistoryWindow")
+
         preview.onClose = { [weak self] in self?.restoreFocusAfterPreview() }
+        preview.onCopy = { [weak self] entry in self?.onCopy?(entry) }
+        preview.onEdit = { [weak self] entry in self?.onEdit?(entry) }
+        preview.onReveal = { [weak self] entry in self?.onReveal?(entry) }
     }
 
     var isVisible: Bool { window.isVisible }
@@ -1070,7 +1095,10 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate, NST
         schedulePresenceRefresh()
         rebuildRows()
 
-        repositionIfNeeded()
+        if !hasPersistedWindowFrame {
+            repositionIfNeeded()
+            hasPersistedWindowFrame = true
+        }
         ForegroundPolicyCoordinator.acquire("history")
         // 标准窗口要成为 key 才能接收搜索输入与空格预览；菜单栏程序在被
         // 打开窗口时需要显式激活一次，否则窗口只是「浮上来」但没有焦点。
@@ -1163,6 +1191,8 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate, NST
         tableView.gridStyleMask = []
         tableView.dataSource = self
         tableView.delegate = self
+        // 支持把历史条目直接拖出到访达、微信、编辑器等外部应用（Phase 5.3）。
+        tableView.setDraggingSourceOperationMask(.copy, forLocal: false)
 
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("history"))
         column.resizingMask = .autoresizingMask
@@ -1431,6 +1461,14 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate, NST
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
         HistoryPlainTableRowView()
+    }
+
+    /// 支持将历史列表中的截图/录屏直接拖拽出窗口投递到访达、微信、Slack 或编辑器。
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> (any NSPasteboardWriting)? {
+        guard row >= 0, row < visibleEntryIndices.count else { return nil }
+        let entry = entries[visibleEntryIndices[row]]
+        guard isEntryPresent(entry) else { return nil }
+        return entry.fileURL as NSURL
     }
 
     private func updateSummary() {
@@ -1718,6 +1756,15 @@ final class HistoryPanel: NSObject, NSSearchFieldDelegate, NSWindowDelegate, NST
         case .reveal:
             onReveal?(entry)
         case .delete:
+            if entry.isCached {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "删除该历史缓存副本？"
+                alert.informativeText = "该条目未另存为用户文件，移除后将同时清理缓存副本且无法恢复。"
+                alert.addButton(withTitle: "删除")
+                alert.addButton(withTitle: "取消")
+                guard alert.runModal() == .alertFirstButtonReturn else { return }
+            }
             onDelete?(entry)
         case .favorite:
             toggleFavorite(rowIndex: rowIndex, entry: entry)

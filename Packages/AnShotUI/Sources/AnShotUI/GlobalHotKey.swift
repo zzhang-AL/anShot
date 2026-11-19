@@ -73,6 +73,8 @@ public final class GlobalHotKey {
         case ocrAutoTranslate = 6
         /// 划词翻译当前选中文本（默认 ⌥D）。
         case selectionTranslate = 7
+        /// 直达独立窗体无遮挡截图（新装默认 ⌃S）。
+        case windowCapture = 8
     }
 
     private let action: () -> Void
