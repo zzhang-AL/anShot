@@ -399,6 +399,7 @@ struct AnnotationToolbarLayout {
         selection: CGRect,
         toolbarSize: CGSize,
         labelReserve: CGFloat,
+        aboveLabelReserve: CGFloat? = nil,
         viewBounds: CGRect,
         gap: CGFloat,
         safeInsets: NSEdgeInsets = NSEdgeInsetsZero
@@ -412,7 +413,8 @@ struct AnnotationToolbarLayout {
         if below + toolbarSize.height <= maxYBound && below >= minYBound {
             return .below
         }
-        let above = selection.minY - labelReserve - gap - toolbarSize.height
+        let topReserve = aboveLabelReserve ?? labelReserve
+        let above = selection.minY - topReserve - gap - toolbarSize.height
         if above >= minYBound && above + toolbarSize.height <= maxYBound {
             return .above
         }
@@ -421,18 +423,13 @@ struct AnnotationToolbarLayout {
 
     /// 工具栏相对选区的落点（本视图坐标）。
     ///
-    /// 三级避让：优先贴在**尺寸标签**下方；放不下翻到选区上方（标签之上）；
-    /// 两边都不够就落在视图内，宁可紧贴也不越界。中间那层不是可选的——
-    /// 顶部贴边的小选区若只处理「下方」，会算出负的 y 而跑出屏幕。
-    ///
-    /// - Parameters:
-    ///   - labelReserve: 要给尺寸标签留出的纵向空间。
-    ///     尺寸标签总是紧贴选区（见 `SelectionChromeRenderer.drawSizeLabel`），
-    ///     工具栏不避让它就会盖住尺寸读数——实测踩过。
+    /// 三级避让：优先贴在选区下方（若下方有尺寸胶囊则避让）；放不下翻到选区上方（避让上方尺寸胶囊）；
+    /// 两边都不够就落在视图内，宁可紧贴也不越界。
     static func toolbarOrigin(
         selection: CGRect,
         toolbarSize: CGSize,
         labelReserve: CGFloat,
+        aboveLabelReserve: CGFloat? = nil,
         viewBounds: CGRect,
         gap: CGFloat,
         safeInsets: NSEdgeInsets = NSEdgeInsetsZero
@@ -447,10 +444,9 @@ struct AnnotationToolbarLayout {
         let minYBound = viewBounds.minY + topMargin
         let maxYBound = viewBounds.maxY - bottomMargin
 
-        // 优先贴在标签下方；放不下就翻到选区上方（标签之上）；
-        // 两边都不够时落在当前可视区域安全区内，避开 MacBook 顶部刘海与滚动滚出视口。
+        let topReserve = aboveLabelReserve ?? labelReserve
         let below = selection.maxY + labelReserve + gap
-        let above = selection.minY - labelReserve - gap - toolbarSize.height
+        let above = selection.minY - topReserve - gap - toolbarSize.height
 
         let y: CGFloat
         if below + toolbarSize.height <= maxYBound && below >= minYBound {

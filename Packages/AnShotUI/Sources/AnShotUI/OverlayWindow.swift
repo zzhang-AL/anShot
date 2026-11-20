@@ -452,6 +452,20 @@ final class OverlayView: NSView {
         }
     }
 
+    /// 指针是否悬停在选区尺寸胶囊平移把手上（用于高亮边框视觉反馈）。
+    private var isHoveringSizeLabel = false {
+        didSet {
+            if isHoveringSizeLabel != oldValue { needsDisplay = true }
+        }
+    }
+
+    /// 当前是否正通过尺寸胶囊平移选区（用于激活态主题色高亮）。
+    private var isDraggingSizeLabel = false {
+        didSet {
+            if isDraggingSizeLabel != oldValue { needsDisplay = true }
+        }
+    }
+
     /// 是否正在新建选区（框选过程中不显示调整控件）。
     /// 是否正在进行选区手势。
     ///
@@ -506,6 +520,8 @@ final class OverlayView: NSView {
     func resetSelection(notifying: Bool = true) {
         clearSpaceKeyState()
         isShortcutCheatSheetVisible = false
+        isHoveringSizeLabel = false
+        isDraggingSizeLabel = false
         selectionRect = nil
         customToolbarOrigin = nil
         lastSelectionForToolbarOrigin = nil
@@ -886,10 +902,18 @@ final class OverlayView: NSView {
         let safeInsets = effectiveSafeAreaInsets
         let layoutBounds = toolbarLayoutBounds
         let initialSize = toolbar.toolbarSize
+        // 按尺寸胶囊实际停靠方向精确预留避让高度：胶囊在上方时工具栏紧贴下方，互不重叠也不留白缝。
+        let labelFrame = sizeLabelDragRect()
+        let labelIsAbove = labelFrame.map { $0.maxY <= selection.minY } ?? true
+        let labelIsBelow = labelFrame.map { $0.minY >= selection.maxY } ?? false
+        let belowReserve: CGFloat = labelIsBelow ? (decoration.labelHeight + gap) : 0
+        let aboveReserve: CGFloat = labelIsAbove ? (decoration.labelHeight + gap) : 0
+
         toolbar.panelPlacement = AnnotationToolbarLayout.preferredPanelPlacement(
             selection: selection,
             toolbarSize: initialSize,
-            labelReserve: decoration.labelHeight + gap,
+            labelReserve: belowReserve,
+            aboveLabelReserve: aboveReserve,
             viewBounds: layoutBounds,
             gap: gap,
             safeInsets: safeInsets
@@ -919,7 +943,8 @@ final class OverlayView: NSView {
             origin = AnnotationToolbarLayout.toolbarOrigin(
                 selection: selection,
                 toolbarSize: size,
-                labelReserve: decoration.labelHeight + gap,
+                labelReserve: belowReserve,
+                aboveLabelReserve: aboveReserve,
                 viewBounds: layoutBounds,
                 gap: gap,
                 safeInsets: safeInsets
@@ -1123,7 +1148,10 @@ final class OverlayView: NSView {
                 isConfirmed: true,
                 isCreating: false,
                 activeHandle: activeHandle,
-                hoveredHandle: hoveredHandle
+                hoveredHandle: hoveredHandle,
+                topSafeInset: effectiveSafeAreaInsets.top,
+                isSizeLabelHovered: isHoveringSizeLabel,
+                isSizeLabelActive: isDraggingSizeLabel
             )
         )
     }
@@ -1466,7 +1494,10 @@ final class OverlayView: NSView {
                 isConfirmed: isSelectionConfirmed,
                 isCreating: isCreating,
                 activeHandle: activeHandle,
-                hoveredHandle: hoveredHandle
+                hoveredHandle: hoveredHandle,
+                topSafeInset: effectiveSafeAreaInsets.top,
+                isSizeLabelHovered: isHoveringSizeLabel,
+                isSizeLabelActive: isDraggingSizeLabel
             ),
             in: context
         )
@@ -1570,6 +1601,7 @@ final class OverlayView: NSView {
 
     override func mouseExited(with event: NSEvent) {
         loupeView.isHidden = true
+        isHoveringSizeLabel = false
         detectionSession?.cancelPendingControlLookup()
         super.mouseExited(with: event)
     }
@@ -1899,6 +1931,7 @@ final class OverlayView: NSView {
     /// 判定顺序必须与 `mouseDown` 完全一致（手柄 → 选区内部 → 空白），
     /// 否则会出现「光标说是移动、结果却改了尺寸」的错位。
     private func updateCursor(at point: CGPoint) {
+        isHoveringSizeLabel = false
         // 悬停在左下角快捷微提示或速查卡开关上时显示手型光标。
         if let hudHit = OverlayShortcutHUD.hitTest(point, state: shortcutHUDState()) {
             hoveredHandle = nil
@@ -1969,8 +2002,9 @@ final class OverlayView: NSView {
         }
 
         // 尺寸胶囊平移把手（严格排在选区 8 个边角缩放手柄之后，绝不抢占角/边缩放）：
-        // 任意工具下悬停在选区外侧尺寸胶囊上显示抓手，可直接按住平移整个截图框。
+        // 任意工具下悬停在选区外侧尺寸胶囊上显示抓手与高亮边框，可直接按住平移整个截图框。
         if let labelRect = sizeLabelDragRect(), labelRect.contains(point) {
+            isHoveringSizeLabel = true
             NSCursor.openHand.set()
             return
         }
@@ -2676,6 +2710,7 @@ final class OverlayView: NSView {
                 // 选区外侧「尺寸胶囊」平移把手（严格在选区边角缩放手柄之后，绝不抢占改选区大小）：
                 // 任意标注工具下按住尺寸胶囊即可直接平移整个截图框，无需切回指针或按住 Space。
                 if let labelRect = sizeLabelDragRect(), labelRect.contains(point) {
+                    isDraggingSizeLabel = true
                     interaction = .moving(
                         grabOffset: CGPoint(x: point.x - selection.minX, y: point.y - selection.minY)
                     )
@@ -2983,6 +3018,7 @@ final class OverlayView: NSView {
         let previousConfirmedSelection = preCreatingSelectionRect
         preCreatingSelectionRect = nil
         resizingInitialRect = nil
+        isDraggingSizeLabel = false
         interaction = .idle
         updateCursor(at: point)
         updateLoupe(at: point)

@@ -428,8 +428,9 @@ struct SelectionGestureExportTests {
         fixture.editor.confirmSelection()
         fixture.editor.select(.rectangle)
 
-        // 1. 绘图工具下，抓着选区外侧「尺寸胶囊」直接拖动应平移整个选区，且不新建矩形标注
+        // 1. 绘图工具下，抓着选区正上方外侧「尺寸胶囊」直接拖动应平移整个选区，且不新建矩形标注
         let labelRect = try #require(fixture.view.sizeLabelDragRect(), "已确认非创建态应存在尺寸胶囊")
+        #expect(labelRect.maxY <= logicalSelection.minY, "空间充足时尺寸胶囊应停靠在选区上方外侧，与下方工具栏上下分离")
         let labelCenter = CGPoint(x: labelRect.midX, y: labelRect.midY)
         fixture.send(.leftMouseDown, at: labelCenter)
         fixture.send(.leftMouseDragged, at: CGPoint(x: labelCenter.x + 40, y: labelCenter.y + 30))

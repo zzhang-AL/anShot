@@ -42,6 +42,12 @@ enum SelectionChromeRenderer {
         let isCreating: Bool
         let activeHandle: SelectionHandle?
         let hoveredHandle: SelectionHandle?
+        /// 屏幕顶部安全边距（避开刘海/菜单栏）。
+        var topSafeInset: CGFloat = 0
+        /// 光标是否正悬停在尺寸胶囊平移把手上。
+        var isSizeLabelHovered: Bool = false
+        /// 是否正在按住尺寸胶囊平移整个选区。
+        var isSizeLabelActive: Bool = false
     }
 
     /// 绘制边框、手柄与尺寸标签。
@@ -218,6 +224,9 @@ enum SelectionChromeRenderer {
     }
 
     /// 计算像素尺寸胶囊矩形（绘制与鼠标拖动命中共用同一份几何，绝不漂移）。
+    ///
+    /// 布局策略：优先放在**选区正上方外侧居中**（与下方标注工具栏自然上下分离、一眼可见）；
+    /// 上方放不下时翻到选区正下方外侧；上下都放不下（如整屏选区）时落于底边内侧居中，避开顶部工具栏。
     static func sizeLabelRect(for chrome: Chrome) -> CGRect {
         let pixelSize = CoordinateConversion.pixelRect(
             fromLogical: chrome.selection,
@@ -231,7 +240,8 @@ enum SelectionChromeRenderer {
         let textSize = (text as NSString).size(withAttributes: attributes)
 
         let showsDragGrip = chrome.isConfirmed && !chrome.isCreating
-        let gripReserve: CGFloat = showsDragGrip ? 11 : 0
+        // 预留 11pt 矢量四向移动图标 + 6pt 间距
+        let gripReserve: CGFloat = showsDragGrip ? 17 : 0
         let horizontalPadding: CGFloat = 10
         let labelSize = CGSize(
             // 下限取两倍高度，保证极窄的内容（如 "9 × 9"）也得到胶囊而非圆
@@ -239,15 +249,14 @@ enum SelectionChromeRenderer {
             height: chrome.decoration.labelHeight
         )
 
-        // 垂直：优先选区下方；下方放不下则上方；上下都放不下时
-        // （选区几乎占满屏幕高度）贴屏幕下沿内侧。
         let gap: CGFloat = 8
-        var y = chrome.selection.maxY + gap
-        if y + labelSize.height > chrome.viewBounds.maxY - 4 {
-            y = chrome.selection.minY - labelSize.height - gap
+        let topMinY = max(4, chrome.topSafeInset + 4)
+        var y = chrome.selection.minY - labelSize.height - gap
+        if y < topMinY {
+            y = chrome.selection.maxY + gap
         }
-        if y < 4 {
-            y = chrome.viewBounds.maxY - labelSize.height - 4
+        if y + labelSize.height > chrome.viewBounds.maxY - 4 {
+            y = chrome.viewBounds.maxY - labelSize.height - 6
         }
 
         // 水平：跟随选区居中，贴屏幕左右边缘时收进来。
@@ -260,7 +269,48 @@ enum SelectionChromeRenderer {
         return CGRect(origin: CGPoint(x: x, y: y), size: labelSize)
     }
 
-    /// 绘制像素尺寸提示（已确认态左侧附带极简 6 点握把，作为任意工具下平移选区的直观把手）。
+    /// 绘制清晰的 11×11pt 矢量四向移动图标（十字轴 + 四端箭头），直白表达可抓握平移整个选区。
+    private static func drawMoveArrowsIcon(
+        centeredAt center: CGPoint,
+        color: CGColor,
+        in context: CGContext
+    ) {
+        let arm: CGFloat = 5.0
+        let tip: CGFloat = 2.1
+        context.saveGState()
+        context.setStrokeColor(color)
+        context.setLineWidth(1.25)
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+
+        // 横竖十字轴
+        context.move(to: CGPoint(x: center.x - arm, y: center.y))
+        context.addLine(to: CGPoint(x: center.x + arm, y: center.y))
+        context.move(to: CGPoint(x: center.x, y: center.y - arm))
+        context.addLine(to: CGPoint(x: center.x, y: center.y + arm))
+
+        // 上箭头
+        context.move(to: CGPoint(x: center.x - tip, y: center.y - arm + tip))
+        context.addLine(to: CGPoint(x: center.x, y: center.y - arm))
+        context.addLine(to: CGPoint(x: center.x + tip, y: center.y - arm + tip))
+        // 下箭头
+        context.move(to: CGPoint(x: center.x - tip, y: center.y + arm - tip))
+        context.addLine(to: CGPoint(x: center.x, y: center.y + arm))
+        context.addLine(to: CGPoint(x: center.x + tip, y: center.y + arm - tip))
+        // 左箭头
+        context.move(to: CGPoint(x: center.x - arm + tip, y: center.y - tip))
+        context.addLine(to: CGPoint(x: center.x - arm, y: center.y))
+        context.addLine(to: CGPoint(x: center.x - arm + tip, y: center.y + tip))
+        // 右箭头
+        context.move(to: CGPoint(x: center.x + arm - tip, y: center.y - tip))
+        context.addLine(to: CGPoint(x: center.x + arm, y: center.y))
+        context.addLine(to: CGPoint(x: center.x + arm - tip, y: center.y + tip))
+
+        context.strokePath()
+        context.restoreGState()
+    }
+
+    /// 绘制像素尺寸提示（已确认态左侧附带清晰四向移动图标，作为任意工具下平移选区的直观把手）。
     ///
     /// 显示的是**像素**而非逻辑点：用户关心的最终产物尺寸是像素，
     /// 而选区在 2x 屏上的逻辑点数值是像素的一半。
@@ -289,50 +339,56 @@ enum SelectionChromeRenderer {
             transform: nil
         )
 
+        let bgColor: NSColor = if chrome.isSizeLabelActive {
+            NSColor.controlAccentColor.withAlphaComponent(0.92)
+        } else if chrome.isSizeLabelHovered {
+            NSColor(calibratedWhite: 0.16, alpha: 0.92)
+        } else {
+            NSColor.black.withAlphaComponent(0.78)
+        }
+
         context.saveGState()
         context.setShadow(
             offset: CGSize(width: 0, height: 1),
             blur: 3,
             color: NSColor.black.withAlphaComponent(0.35).cgColor
         )
-        context.setFillColor(NSColor.black.withAlphaComponent(0.78).cgColor)
+        context.setFillColor(bgColor.cgColor)
         context.addPath(path)
         context.fillPath()
         context.restoreGState()
 
-        // 淡色浅边框：让深色胶囊压在深色画面内容上时仍保留轮廓
+        // 悬停或拖动激活时高亮边框，直观传达可抓取交互反馈。
+        let borderColor: NSColor = if chrome.isSizeLabelActive {
+            NSColor.white.withAlphaComponent(0.65)
+        } else if chrome.isSizeLabelHovered {
+            NSColor.controlAccentColor.withAlphaComponent(0.9)
+        } else {
+            NSColor.white.withAlphaComponent(0.2)
+        }
         context.saveGState()
-        context.setStrokeColor(NSColor.white.withAlphaComponent(0.16).cgColor)
-        context.setLineWidth(1)
+        context.setStrokeColor(borderColor.cgColor)
+        context.setLineWidth(chrome.isSizeLabelHovered || chrome.isSizeLabelActive ? 1.25 : 1)
         context.addPath(path)
         context.strokePath()
         context.restoreGState()
 
         if showsDragGrip {
-            // 绘制柔和 2×3 六点握把，暗示可直接抓着尺寸胶囊平移整个选区。
-            let gripWidth: CGFloat = 5
-            let gripGap: CGFloat = 6
-            let contentWidth = gripWidth + gripGap + textSize.width
+            let iconSize: CGFloat = 11
+            let iconGap: CGFloat = 6
+            let contentWidth = iconSize + iconGap + textSize.width
             let startX = labelRect.midX - contentWidth / 2
-            let dotRadius: CGFloat = 0.85
-            context.saveGState()
-            context.setFillColor(NSColor.white.withAlphaComponent(0.55).cgColor)
-            for col in 0 ..< 2 {
-                for row in 0 ..< 3 {
-                    let cx = startX + CGFloat(col) * 3.2 + dotRadius
-                    let cy = labelRect.midY + CGFloat(row - 1) * 3.1
-                    context.fillEllipse(in: CGRect(
-                        x: cx - dotRadius,
-                        y: cy - dotRadius,
-                        width: dotRadius * 2,
-                        height: dotRadius * 2
-                    ))
-                }
-            }
-            context.restoreGState()
+            let iconColor = NSColor.white.withAlphaComponent(
+                (chrome.isSizeLabelHovered || chrome.isSizeLabelActive) ? 1.0 : 0.88
+            ).cgColor
+            drawMoveArrowsIcon(
+                centeredAt: CGPoint(x: startX + iconSize / 2, y: labelRect.midY),
+                color: iconColor,
+                in: context
+            )
 
             attributed.draw(at: CGPoint(
-                x: startX + gripWidth + gripGap,
+                x: startX + iconSize + iconGap,
                 y: labelRect.midY - textSize.height / 2
             ))
         } else {
