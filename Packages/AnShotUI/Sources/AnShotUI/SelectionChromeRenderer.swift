@@ -20,6 +20,7 @@
 import AnShotCapture
 import AnShotCore
 import AppKit
+import CoreText
 
 /// 选区的边框、手柄与尺寸标签。
 @MainActor
@@ -63,21 +64,42 @@ enum SelectionChromeRenderer {
         drawSizeLabel(for: chrome, in: context)
     }
 
-    /// 绘制选区边框。
-    ///
-    /// 圆角双层的依据：这条边框不再追求「一个设备像素的精确线」——
-    /// 全屏压暗的底图上它几乎看不见，而边框的职责是明确告诉用户
-    /// 「截到这里」，可见性优先于纤细。
-    ///
-    /// 圆角只是这一圈线的画法：选区的裁剪几何仍是严格矩形
-    /// （`SelectionGeometry` 与导出路径都不读这里的路径），
-    /// 因此导出图不会带圆角。
+    private static let sizeLabelFont: CTFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium) as CTFont
+    private static let sizeLabelTextColor: CGColor = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
+
+    /// 构造纯 CoreText 尺寸文本行（绕开 AppKit `NSString.size(withAttributes:)` 高频重绘触发的字典深拷贝异常）。
+    private static func makeSizeLabelLine(_ text: String) -> (line: CTLine, width: CGFloat, height: CGFloat, ascent: CGFloat) {
+        let cfText = text as CFString
+        let attrStr = CFAttributedStringCreateMutable(kCFAllocatorDefault, 0)!
+        CFAttributedStringReplaceString(attrStr, CFRange(location: 0, length: 0), cfText)
+        let range = CFRange(location: 0, length: CFAttributedStringGetLength(attrStr))
+        CFAttributedStringSetAttribute(attrStr, range, kCTFontAttributeName, sizeLabelFont)
+        CFAttributedStringSetAttribute(attrStr, range, kCTForegroundColorAttributeName, sizeLabelTextColor)
+        let line = CTLineCreateWithAttributedString(attrStr)
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        var leading: CGFloat = 0
+        let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
+        return (line, width, ascent + descent, ascent)
+    }
+
+    /// 绘制选区边框（未确认候选态附加极轻主题色微光填充，配合全屏原亮度静止零闪烁呈现吸附目标）。
     private static func drawBorder(for chrome: Chrome, in context: CGContext) {
+        let decorated = SelectionHandleLayout.decoratedRect(for: chrome.selection)
+        let cornerRadii = radii(for: chrome)
+        if !chrome.isConfirmed, !chrome.isCreating {
+            let fillPath = CaptureFrameStyle.roundedPath(in: decorated, radii: cornerRadii)
+            context.saveGState()
+            context.setFillColor(NSColor.controlAccentColor.withAlphaComponent(0.08).cgColor)
+            context.addPath(fillPath)
+            context.fillPath()
+            context.restoreGState()
+        }
         CaptureFrameStyle.drawBorder(
-            in: SelectionHandleLayout.decoratedRect(for: chrome.selection),
+            in: decorated,
             color: CaptureFrameStyle.selection,
             lineWidth: CaptureFrameStyle.selectionStrokeWidth,
-            radii: radii(for: chrome),
+            radii: cornerRadii,
             dash: chrome.isConfirmed ? nil : CaptureFrameStyle.candidateDashPattern,
             in: context
         )
@@ -233,11 +255,7 @@ enum SelectionChromeRenderer {
             scaleFactor: chrome.scaleFactor
         ).size
         let text = "\(Int(pixelSize.width.rounded())) × \(Int(pixelSize.height.rounded()))"
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium),
-            .foregroundColor: NSColor.white
-        ]
-        let textSize = (text as NSString).size(withAttributes: attributes)
+        let measured = makeSizeLabelLine(text)
 
         let showsDragGrip = chrome.isConfirmed && !chrome.isCreating
         // 预留 11pt 矢量四向移动图标 + 6pt 间距
@@ -245,7 +263,7 @@ enum SelectionChromeRenderer {
         let horizontalPadding: CGFloat = 10
         let labelSize = CGSize(
             // 下限取两倍高度，保证极窄的内容（如 "9 × 9"）也得到胶囊而非圆
-            width: max(textSize.width + gripReserve + horizontalPadding * 2, chrome.decoration.labelHeight * 2),
+            width: max(ceil(measured.width) + gripReserve + horizontalPadding * 2, chrome.decoration.labelHeight * 2),
             height: chrome.decoration.labelHeight
         )
 
@@ -320,13 +338,7 @@ enum SelectionChromeRenderer {
             scaleFactor: chrome.scaleFactor
         ).size
         let text = "\(Int(pixelSize.width.rounded())) × \(Int(pixelSize.height.rounded()))"
-
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium),
-            .foregroundColor: NSColor.white
-        ]
-        let attributed = NSAttributedString(string: text, attributes: attributes)
-        let textSize = attributed.size()
+        let measured = makeSizeLabelLine(text)
 
         let showsDragGrip = chrome.isConfirmed && !chrome.isCreating
         let labelRect = sizeLabelRect(for: chrome)
@@ -373,10 +385,11 @@ enum SelectionChromeRenderer {
         context.strokePath()
         context.restoreGState()
 
+        let textTopY = labelRect.midY - measured.height / 2
         if showsDragGrip {
             let iconSize: CGFloat = 11
             let iconGap: CGFloat = 6
-            let contentWidth = iconSize + iconGap + textSize.width
+            let contentWidth = iconSize + iconGap + measured.width
             let startX = labelRect.midX - contentWidth / 2
             let iconColor = NSColor.white.withAlphaComponent(
                 (chrome.isSizeLabelHovered || chrome.isSizeLabelActive) ? 1.0 : 0.88
@@ -387,15 +400,17 @@ enum SelectionChromeRenderer {
                 in: context
             )
 
-            attributed.draw(at: CGPoint(
-                x: startX + iconSize + iconGap,
-                y: labelRect.midY - textSize.height / 2
-            ))
+            context.saveGState()
+            context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+            context.textPosition = CGPoint(x: startX + iconSize + iconGap, y: textTopY + measured.ascent)
+            CTLineDraw(measured.line, context)
+            context.restoreGState()
         } else {
-            attributed.draw(at: CGPoint(
-                x: labelRect.midX - textSize.width / 2,
-                y: labelRect.midY - textSize.height / 2
-            ))
+            context.saveGState()
+            context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+            context.textPosition = CGPoint(x: labelRect.midX - measured.width / 2, y: textTopY + measured.ascent)
+            CTLineDraw(measured.line, context)
+            context.restoreGState()
         }
     }
 }

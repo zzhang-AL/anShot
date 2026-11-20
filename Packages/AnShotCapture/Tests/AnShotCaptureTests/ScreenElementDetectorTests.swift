@@ -216,4 +216,71 @@ struct DetectionSessionAsyncTests {
         #expect(candidates.first?.applicationName == "Safari")
         #expect(candidates.last?.applicationName == "Notes")
     }
+
+    @MainActor
+    @Test("拒绝不包含光标的错位 AX 控件，裁剪越界控件进窗口，补齐 windowID 并支持层级链滚轮切换")
+    func rejectsDisplacedControlClipsToWindowAndStepsHierarchy() async {
+        final class CustomControlDetector: ScreenElementDetecting, @unchecked Sendable {
+            let win: DetectedWindow
+            var nextHit: ControlHit?
+            init(win: DetectedWindow) { self.win = win }
+            var hasAccessibilityPermission: Bool { true }
+            func windows(onDisplay displayID: CGDirectDisplayID) async throws -> [DetectedWindow] { [win] }
+            func control(atGlobalPoint point: CGPoint, inApplication processID: pid_t) -> ControlHit? { nextHit }
+        }
+
+        let displayBounds = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let window = DetectedWindow(
+            windowID: 777,
+            frame: CGRect(x: 100, y: 40, width: 800, height: 600),
+            layer: 0,
+            title: "IDE",
+            processID: 42,
+            applicationName: "IDE"
+        )
+        let detector = CustomControlDetector(win: window)
+        let session = DetectionSession(detector: detector, displayID: 1, displayBounds: displayBounds)
+        await session.load()
+
+        // 1. 鼠标在窗口顶部 (300, 60)，若 AX 错位吐回底部组件 (300, 560, 140, 40)，必须被拦截丢弃
+        detector.nextHit = ControlHit(frame: CGRect(x: 300, y: 560, width: 140, height: 40), role: "AXButton")
+        let displaced = await session.resolveTargetAsync(atGlobalPoint: CGPoint(x: 300, y: 60), preference: .automatic)
+        #expect(displaced?.layer == .window, "不包含鼠标点的错位 AX 控件必须丢弃并回落窗口层")
+
+        // 2. 合法控件超出窗口右缘时，应被严格裁剪到 window.frame 内，且带上所属 windowID
+        detector.nextHit = ControlHit(
+            frame: CGRect(x: 260, y: 50, width: 800, height: 48),
+            role: "AXToolbar",
+            ancestors: [
+                .init(frame: CGRect(x: 120, y: 45, width: 760, height: 180), role: "AXGroup")
+            ]
+        )
+        var callbackTarget: DetectionTarget?
+        session.scheduleControlTarget(
+            atGlobalPoint: CGPoint(x: 300, y: 70),
+            preference: .automatic,
+            debounce: .milliseconds(5)
+        ) { target in
+            callbackTarget = target
+        }
+        try? await Task.sleep(for: .milliseconds(40))
+
+        #expect(callbackTarget?.layer == .control)
+        #expect(callbackTarget?.windowID == 777, "控件目标必须携带所属 windowID 保证粘性保稳生效")
+        #expect((callbackTarget?.rect.maxX ?? 0) <= window.frame.maxX + 0.1, "越界控件必须裁剪在所属窗口边界内")
+
+        // 3. 滚轮层级链切换：按钮/工具栏 → 祖先容器 → 窗口，再缩回
+        #expect(session.controlHierarchyCount == 3)
+        let expanded1 = session.stepControlHierarchy(expand: true)
+        #expect(expanded1?.layer == .control && expanded1?.rect.height == 180)
+        let expanded2 = session.stepControlHierarchy(expand: true)
+        #expect(expanded2?.layer == .window && expanded2?.windowID == 777)
+        let shrunk = session.stepControlHierarchy(expand: false)
+        #expect(shrunk?.layer == .control && shrunk?.rect.height == 180)
+
+        // 4. 细长分隔线与极小碎片应被 isValidControlFrame 淘汰
+        #expect(!SystemElementDetector.isValidControlFrame(CGRect(x: 0, y: 0, width: 14, height: 14)))
+        #expect(!SystemElementDetector.isValidControlFrame(CGRect(x: 0, y: 0, width: 900, height: 18)))
+        #expect(SystemElementDetector.isValidControlFrame(CGRect(x: 0, y: 0, width: 80, height: 28)))
+    }
 }

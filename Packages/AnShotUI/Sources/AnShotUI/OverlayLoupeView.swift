@@ -8,6 +8,7 @@
 
 import AnShotCore
 import AppKit
+import CoreText
 
 /// 单次光标像素采样结果。
 struct LoupeSample: Equatable {
@@ -162,6 +163,49 @@ final class OverlayLoupeView: NSView {
     private static let previewSize: CGFloat = 152
     private static let previewInset: CGFloat = 10
 
+    // 静态缓存纯 CoreText 字体与颜色，避免高频重绘时每帧创建 NSFont / 触发 AppKit NSString.size(withAttributes:)
+    // 在 macOS 27 CoreText TAttributes::ApplyFont → initWithDictionary:copyItems: 路径下的 nil 崩溃。
+    private static let hexFont: CTFont = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .semibold) as CTFont
+    private static let coordFont: CTFont = NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .regular) as CTFont
+    private static let rgbFont: CTFont = NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .regular) as CTFont
+    private static let hintFont: CTFont = NSFont.systemFont(ofSize: 9.5, weight: .medium) as CTFont
+
+    private static let whiteColor: CGColor = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
+    private static let coordColor: CGColor = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.68)
+    private static let rgbColor: CGColor = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.78)
+    private static let hintColor: CGColor = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.58)
+
+    /// 构造纯 CoreText `CTLine`（使用 `CFAttributedString` 绕开 AppKit `NSCoreTypesetter` 字典深拷贝崩溃）。
+    private static func makeLine(_ text: String, font: CTFont, color: CGColor) -> (line: CTLine, width: CGFloat, ascent: CGFloat) {
+        let cfText = text as CFString
+        let attrStr = CFAttributedStringCreateMutable(kCFAllocatorDefault, 0)!
+        CFAttributedStringReplaceString(attrStr, CFRange(location: 0, length: 0), cfText)
+        let range = CFRange(location: 0, length: CFAttributedStringGetLength(attrStr))
+        CFAttributedStringSetAttribute(attrStr, range, kCTFontAttributeName, font)
+        CFAttributedStringSetAttribute(attrStr, range, kCTForegroundColorAttributeName, color)
+        let line = CTLineCreateWithAttributedString(attrStr)
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        var leading: CGFloat = 0
+        let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
+        return (line, width, ascent)
+    }
+
+    /// 在翻转坐标系（左上原点）的 `CGContext` 中绘制纯 CoreText `CTLine`。
+    private static func drawLine(
+        _ line: CTLine,
+        atTopLeft origin: CGPoint,
+        ascent: CGFloat,
+        in context: CGContext
+    ) {
+        context.saveGState()
+        // 视图为 isFlipped = true，设置 y 轴翻转文本矩阵以正向绘制字形。
+        context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+        context.textPosition = CGPoint(x: origin.x, y: origin.y + ascent)
+        CTLineDraw(line, context)
+        context.restoreGState()
+    }
+
     private var sample: LoupeSample?
     private var showsCopyHint = true
 
@@ -288,49 +332,22 @@ final class OverlayLoupeView: NSView {
         context.strokeEllipse(in: swatchRect)
         context.restoreGState()
 
-        let hexAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 10.5, weight: .semibold),
-            .foregroundColor: NSColor.white,
-        ]
         let hexOriginX = swatchRect.maxX + 5
-        let hexSize = (sample.hexString as NSString).size(withAttributes: hexAttrs)
-        (sample.hexString as NSString).draw(
-            at: CGPoint(x: hexOriginX, y: infoTop),
-            withAttributes: hexAttrs
-        )
+        let hex = Self.makeLine(sample.hexString, font: Self.hexFont, color: Self.whiteColor)
+        Self.drawLine(hex.line, atTopLeft: CGPoint(x: hexOriginX, y: infoTop), ascent: hex.ascent, in: context)
 
         let coordText = "(\(sample.pixelX), \(sample.pixelY))"
-        let coordAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .regular),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.68),
-        ]
-        let coordSize = (coordText as NSString).size(withAttributes: coordAttrs)
-        let coordX = max(hexOriginX + hexSize.width + 4, bounds.width - Self.previewInset - coordSize.width)
-        (coordText as NSString).draw(
-            at: CGPoint(x: coordX, y: infoTop + 1),
-            withAttributes: coordAttrs
-        )
+        let coord = Self.makeLine(coordText, font: Self.coordFont, color: Self.coordColor)
+        let coordX = max(hexOriginX + hex.width + 4, bounds.width - Self.previewInset - coord.width)
+        Self.drawLine(coord.line, atTopLeft: CGPoint(x: coordX, y: infoTop + 1), ascent: coord.ascent, in: context)
 
-        let rgbAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .regular),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.78),
-        ]
-        (sample.rgbText as NSString).draw(
-            at: CGPoint(x: Self.previewInset, y: infoTop + 18),
-            withAttributes: rgbAttrs
-        )
+        let rgb = Self.makeLine(sample.rgbText, font: Self.rgbFont, color: Self.rgbColor)
+        Self.drawLine(rgb.line, atTopLeft: CGPoint(x: Self.previewInset, y: infoTop + 18), ascent: rgb.ascent, in: context)
 
         if showsCopyHint {
-            let hintText = "C / ⇧C"
-            let hintAttrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .medium),
-                .foregroundColor: NSColor.white.withAlphaComponent(0.58),
-            ]
-            let hintSize = (hintText as NSString).size(withAttributes: hintAttrs)
-            (hintText as NSString).draw(
-                at: CGPoint(x: bounds.width - Self.previewInset - hintSize.width, y: infoTop + 18.5),
-                withAttributes: hintAttrs
-            )
+            let hint = Self.makeLine("C / ⇧C", font: Self.hintFont, color: Self.hintColor)
+            let hintX = bounds.width - Self.previewInset - hint.width
+            Self.drawLine(hint.line, atTopLeft: CGPoint(x: hintX, y: infoTop + 18), ascent: hint.ascent, in: context)
         }
     }
 }

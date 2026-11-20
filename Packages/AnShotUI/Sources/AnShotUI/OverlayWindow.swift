@@ -220,6 +220,9 @@ final class OverlayView: NSView {
 
     /// 上一条已记录的识别结果，用于给日志去重。
     private var lastDetectionDescription: String?
+    /// 上一次发起控件探测的视图点与偏好（用于 3pt 移动死区，避免像素级慢移反复查 AX）。
+    private var lastDetectionProbePoint: CGPoint?
+    private var lastDetectionProbePreference: DetectionLayerPreference?
 
     /// 应用设置（用于读取防误关双按 Esc 开关与工具栏隐藏槽位）。
     weak var appSettings: AppSettings?
@@ -522,6 +525,9 @@ final class OverlayView: NSView {
         isShortcutCheatSheetVisible = false
         isHoveringSizeLabel = false
         isDraggingSizeLabel = false
+        lastDetectionProbePoint = nil
+        lastDetectionProbePreference = nil
+        detectionSession?.clearControlHierarchy()
         selectionRect = nil
         customToolbarOrigin = nil
         lastSelectionForToolbarOrigin = nil
@@ -1382,11 +1388,24 @@ final class OverlayView: NSView {
     }
 
     private func drawMask(in context: CGContext) {
-        // 静默首帧不变量：无选区且无悬停候选时保持底图 100% 原亮度，避免呼出瞬间全屏闪暗。
+        // 零闪屏护城河：
+        // - 普通区域截图的未确认候选态（!isSelectionConfirmed && !isCreating && !isWindowPickerMode）
+        //   保持屏幕 100% 原亮度静止，仅由 `SelectionChromeRenderer` 绘制清晰蓝框 + 柔和微光填充，
+        //   彻底杜绝控件悬停慢移时全屏在 0% ↔ 45% 压暗之间剧烈明暗频闪；
+        // - 独立窗体选择模式使用柔和 0.28 压暗突出目标窗；
+        // - 拖拽框选（isCreating）与确认态（isSelectionConfirmed）正常压暗选区外 `dimAlpha`（0.45）。
         guard dimAlpha > 0, let selection = effectiveSelection else { return }
+        let effectiveDimAlpha: CGFloat
+        if isSelectionConfirmed || isCreating {
+            effectiveDimAlpha = dimAlpha
+        } else if isWindowPickerMode {
+            effectiveDimAlpha = min(dimAlpha, 0.28)
+        } else {
+            return
+        }
 
         context.saveGState()
-        context.setFillColor(NSColor.black.withAlphaComponent(dimAlpha).cgColor)
+        context.setFillColor(NSColor.black.withAlphaComponent(effectiveDimAlpha).cgColor)
 
         // 用 even-odd 规则挖空选区：选区内保持原始亮度，
         // 挖空路径必须与边框**同形**（同一份圆角几何，只差一个 strokeInset）。
@@ -1740,9 +1759,18 @@ final class OverlayView: NSView {
         let globalPoint = globalScreenPoint(fromViewPoint: viewPoint)
         let preference = detectionPreference
 
+        // 3pt 移动死区：同一偏好下像素级微移不重复发起跨进程 AX 查询。
+        if let lastPt = lastDetectionProbePoint,
+           lastDetectionProbePreference == preference,
+           hypot(viewPoint.x - lastPt.x, viewPoint.y - lastPt.y) < 3 {
+            return
+        }
+        lastDetectionProbePoint = viewPoint
+        lastDetectionProbePreference = preference
+
         // 粘性保稳判定：自动模式下，只要当前已命中控件且光标仍在同一个顶层窗口内，
         // 同步阶段暂不提前覆盖为整窗或清屏（避免同一控件内慢移、以及相邻控件切换时出现
-        // 20ms 的「控件 ↔ 整窗/空白」乒乓闪烁），统一由后台 AX 回调无缝切换或平滑回退。
+        // 乒乓抖动），统一由后台 AX 回调无缝切换或平滑回退。
         let topWindowID = session.topWindowID(atGlobalPoint: globalPoint)
         let shouldHoldCurrentControl: Bool = {
             guard preference == .automatic,
@@ -1792,19 +1820,30 @@ final class OverlayView: NSView {
         }
     }
 
-    /// 视图坐标（左上原点）→ 全局屏幕坐标（左上原点）。
+    /// 视图坐标（左上原点）→ 全局屏幕坐标（CoreGraphics 左上原点，与 `SCWindow.frame` / `AXUIElement` 同源）。
     ///
-    /// 视图 → 窗口需要一次翻转（窗口坐标原点在左下），漏掉这一步会让识别
-    /// 永远偏出目标——在取色器定位上踩过同一个坑。翻转量取**主屏**高度，
-    /// 不能用手边这块屏的高度：多屏时每块屏的翻转量不同。
+    /// 全屏覆盖层视图直接按 `CGDisplayBounds(displayID).origin + point` 映射，
+    /// 避免经由 `NSScreen.screens.first` 二次翻转导致多屏或刘海屏偏移；
+    /// 非全屏窗口（如图片编辑）回落至以 `CGMainDisplayID()` 高度为基准的屏幕坐标翻转。
     private func globalScreenPoint(fromViewPoint point: CGPoint) -> CGPoint {
+        let displayBounds = DisplayGeometry.bounds(for: displayID)
+        if enclosingScrollView == nil,
+           displayBounds.width > 0, displayBounds.height > 0,
+           abs(bounds.width - displayBounds.width) <= 2,
+           abs(bounds.height - displayBounds.height) <= 2 {
+            return CGPoint(
+                x: displayBounds.origin.x + point.x,
+                y: displayBounds.origin.y + point.y
+            )
+        }
         guard let window else { return point }
         let inWindow = convert(point, to: nil)
         let onScreen = window.convertPoint(toScreen: inWindow)
-        guard let primary = NSScreen.screens.first else { return onScreen }
+        let mainHeight = DisplayGeometry.bounds(for: DisplayGeometry.mainDisplay()).height
+        let flipHeight = mainHeight > 0 ? mainHeight : (NSScreen.screens.first?.frame.maxY ?? 0)
         return CGPoint(
             x: onScreen.x,
-            y: primary.frame.maxY - onScreen.y
+            y: flipHeight - onScreen.y
         )
     }
 
@@ -3092,14 +3131,42 @@ final class OverlayView: NSView {
         requestCancel(source: .rightClick)
     }
 
-    /// 滚轮调参：有选中标注调整其线宽/字号/模糊强度/压暗度/半径，无选中调整当前工具默认参数。
-    ///
-    /// 在独立图片/长截图滚动编辑窗内，普通滚轮交由 `NSScrollView` 浏览长图；按住 `⌥ + 滚轮` 调参。
+    /// 滚轮交互：
+    /// - 未确认选区且悬停命中控件时：沿当前 AX 父级链逐层放大/缩小吸附范围（如 按钮 ↔ 卡片 ↔ 面板 ↔ 窗口）；
+    /// - 已确认选区时：有选中标注调整其线宽/字号/模糊强度/压暗度/半径，无选中调整当前工具默认参数；
+    /// - 独立图片/长截图滚动编辑窗内：普通滚轮交由 `NSScrollView` 浏览长图，按住 `⌥ + 滚轮` 调参。
     override func scrollWheel(with event: NSEvent) {
         if enclosingScrollView != nil, !event.modifierFlags.contains(.option) {
             super.scrollWheel(with: event)
             return
         }
+
+        // 未确认候选态：滚轮在 AX 控件层级链上逐层扩大 / 缩小吸附范围。
+        if !isSelectionConfirmed,
+           !isInteracting,
+           !isWindowPickerMode,
+           !isRecordSetupActive,
+           !recordingPick.isActive,
+           let session = detectionSession,
+           session.controlHierarchyCount > 1 {
+            let rawDelta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : (event.scrollingDeltaY * 10)
+            guard abs(rawDelta) > 0.01 else { return }
+            let stepDirection: Double?
+            if event.hasPreciseScrollingDeltas {
+                wheelDeltaAccumulator += rawDelta
+                guard abs(wheelDeltaAccumulator) >= 14 else { return }
+                stepDirection = wheelDeltaAccumulator > 0 ? 1.0 : -1.0
+                wheelDeltaAccumulator = 0
+            } else {
+                stepDirection = rawDelta > 0 ? 1.0 : -1.0
+            }
+            if let dir = stepDirection,
+               let nextTarget = session.stepControlHierarchy(expand: dir > 0) {
+                applyDetectionTarget(nextTarget)
+            }
+            return
+        }
+
         guard let editorState,
               isSelectionConfirmed,
               !isRecordSetupActive,

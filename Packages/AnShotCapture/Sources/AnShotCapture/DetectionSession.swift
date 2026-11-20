@@ -46,6 +46,9 @@ public final class DetectionSession {
     /// 后台控件去抖查询代际号与当前任务。
     private var controlLookupGeneration: UInt64 = 0
     private var controlLookupTask: Task<Void, Never>?
+    /// 最近一次在光标位置收集到的层级候选栈（由内到外：控件 → 语义父容器 → 窗口），供悬停滚轮逐层切换。
+    private var hierarchyTargets: [DetectionTarget] = []
+    private var hierarchyIndex: Int = 0
 
     public init(
         detector: ScreenElementDetecting,
@@ -227,7 +230,7 @@ public final class DetectionSession {
             detector.control(atGlobalPoint: point, inApplication: pid)
         }.value
 
-        if let hit, let control = makeControlTarget(from: hit, in: window) {
+        if let hit, let control = makeControlTarget(from: hit, in: window, atGlobalPoint: point) {
             return control
         }
         if let target = windowTarget(atGlobalPoint: point) {
@@ -242,12 +245,14 @@ public final class DetectionSession {
     public func scheduleControlTarget(
         atGlobalPoint point: CGPoint,
         preference: DetectionLayerPreference,
-        debounce: Duration = .milliseconds(20),
+        debounce: Duration = .milliseconds(45),
         onUpdate: @escaping @MainActor (DetectionTarget?) -> Void
     ) {
         cancelPendingControlLookup()
         guard preference == .automatic, isLoaded, cachedAccessibilityPermission,
               let window = windows.first(where: { $0.frame.contains(point) }) else {
+            hierarchyTargets = []
+            hierarchyIndex = 0
             return
         }
 
@@ -272,9 +277,35 @@ public final class DetectionSession {
 
             guard !Task.isCancelled, let self else { return }
             guard self.controlLookupGeneration == generation, self.isLoaded else { return }
-            let controlTarget = hit.flatMap { self.makeControlTarget(from: $0, in: window) }
-            onUpdate(controlTarget)
+            let chain = hit.map { self.makeControlHierarchy(from: $0, in: window, atGlobalPoint: point) } ?? []
+            self.hierarchyTargets = chain
+            self.hierarchyIndex = 0
+            onUpdate(chain.first)
         }
+    }
+
+    /// 悬停预框选期间沿当前光标处的 AX 控件层级链放大（`expand == true`）或缩小一层。
+    ///
+    /// 仅当当前点存在 2 层及以上可选层级（如 按钮 → 卡片 → 面板 → 窗口）时返回新目标；否则返回 `nil`。
+    public func stepControlHierarchy(expand: Bool) -> DetectionTarget? {
+        guard hierarchyTargets.count > 1 else { return nil }
+        let nextIndex = expand
+            ? min(hierarchyTargets.count - 1, hierarchyIndex + 1)
+            : max(0, hierarchyIndex - 1)
+        guard nextIndex != hierarchyIndex else { return nil }
+        hierarchyIndex = nextIndex
+        return hierarchyTargets[nextIndex]
+    }
+
+    /// 当前层级栈深度（用于判断悬停滚轮是否可切换层级）。
+    public var controlHierarchyCount: Int {
+        hierarchyTargets.count
+    }
+
+    /// 清空当前层级候选栈。
+    public func clearControlHierarchy() {
+        hierarchyTargets = []
+        hierarchyIndex = 0
     }
 
     /// 取消挂起的后台控件查询。
@@ -402,20 +433,86 @@ public final class DetectionSession {
               ) else {
             return nil
         }
-        return makeControlTarget(from: hit, in: window)
+        return makeControlTarget(from: hit, in: window, atGlobalPoint: point)
+    }
+
+    /// 构造从最内层语义控件到外层容器（含可选窗口层）的完整层级链。
+    private func makeControlHierarchy(
+        from hit: ControlHit,
+        in window: DetectedWindow,
+        atGlobalPoint point: CGPoint
+    ) -> [DetectionTarget] {
+        var result: [DetectionTarget] = []
+        if let primary = makeValidatedControlTarget(frame: hit.frame, role: hit.role, in: window, atGlobalPoint: point) {
+            result.append(primary)
+        }
+        for ancestor in hit.ancestors {
+            if let target = makeValidatedControlTarget(frame: ancestor.frame, role: ancestor.role, in: window, atGlobalPoint: point) {
+                if let last = result.last,
+                   abs(last.rect.minX - target.rect.minX) <= 2,
+                   abs(last.rect.minY - target.rect.minY) <= 2,
+                   abs(last.rect.width - target.rect.width) <= 4,
+                   abs(last.rect.height - target.rect.height) <= 4 {
+                    continue
+                }
+                result.append(target)
+            }
+        }
+        // 非最大化窗口时，允许滚轮最后扩一层到完整窗口本身。
+        if !result.isEmpty,
+           !(suppressesMaximizedWindow && Self.isMaximizedLike(window.frame, in: displayBounds)),
+           let localWindow = DetectionGeometry.clampedLocalBounds(ofGlobalRects: [window.frame], displayBounds: displayBounds) {
+            result.append(DetectionTarget(
+                layer: .window,
+                rect: localWindow,
+                displayID: displayID,
+                title: window.title ?? window.applicationName,
+                windowID: window.windowID,
+                processID: window.processID,
+                globalRect: window.frame,
+                applicationName: window.applicationName
+            ))
+        }
+        return result
     }
 
     /// 将 AX 控件命中结果收敛为有效的控件级 `DetectionTarget`。
-    private func makeControlTarget(from hit: ControlHit, in window: DetectedWindow) -> DetectionTarget? {
-        // 命中的元素就是窗口本身时，「控件层」与「窗口层」会给出同一个矩形，
-        // 这一层就等于没有价值，还多花一次跨进程调用。
-        // 用面积占比判断：覆盖窗口九成以上即视为非控件。
-        if isEffectivelyWindowSized(hit.frame, windowFrame: window.frame) {
+    private func makeControlTarget(
+        from hit: ControlHit,
+        in window: DetectedWindow,
+        atGlobalPoint point: CGPoint
+    ) -> DetectionTarget? {
+        makeValidatedControlTarget(frame: hit.frame, role: hit.role, in: window, atGlobalPoint: point)
+    }
+
+    /// 校验并构造单个控件级 `DetectionTarget`：
+    /// 1. 强不变量：控件矩形必须包含当前鼠标坐标 `point`，彻底杜绝跨位/幽灵 AX 节点（如鼠标在顶上却吸到底部）；
+    /// 2. 严格裁剪到所属 `window.frame` 内，防止滚动内容越出窗口边界；
+    /// 3. 过滤过碎节点及占窗口 ≥ 85% 的假整窗容器；
+    /// 4. 补齐 `windowID` / `processID` / `applicationName`，确保上层粘性保稳准确识别同一窗口。
+    private func makeValidatedControlTarget(
+        frame: CGRect,
+        role: String?,
+        in window: DetectedWindow,
+        atGlobalPoint point: CGPoint
+    ) -> DetectionTarget? {
+        guard frame.insetBy(dx: -4, dy: -4).contains(point) else {
+            return nil
+        }
+
+        let clippedToWindow = frame.intersection(window.frame)
+        guard !clippedToWindow.isNull,
+              clippedToWindow.insetBy(dx: -4, dy: -4).contains(point),
+              SystemElementDetector.isValidControlFrame(clippedToWindow) else {
+            return nil
+        }
+
+        if isEffectivelyWindowSized(clippedToWindow, windowFrame: window.frame) {
             return nil
         }
 
         guard let local = DetectionGeometry.clampedLocalBounds(
-            ofGlobalRects: [hit.frame],
+            ofGlobalRects: [clippedToWindow],
             displayBounds: displayBounds
         ) else {
             return nil
@@ -424,22 +521,22 @@ public final class DetectionSession {
             layer: .control,
             rect: local,
             displayID: displayID,
-            title: hit.role,
-            globalRect: hit.frame
+            title: role,
+            windowID: window.windowID,
+            processID: window.processID,
+            globalRect: clippedToWindow,
+            applicationName: window.applicationName
         )
     }
 
-    /// 命中矩形是否实质上等于整个窗口。
-    ///
-    /// 用面积比而不是精确相等：窗口边框、阴影与 AX 报告的尺寸常有几像素出入，
-    /// 精确比较会把「就是窗口本身」判成控件。
+    /// 命中矩形是否实质上等于整个窗口（面积占比 ≥ 85% 视为窗口本身而非细控件）。
     private func isEffectivelyWindowSized(_ rect: CGRect, windowFrame: CGRect) -> Bool {
         let windowArea = windowFrame.width * windowFrame.height
         guard windowArea > 0 else {
             return true
         }
         let ratio = (rect.width * rect.height) / windowArea
-        return ratio >= 0.9
+        return ratio >= 0.85
     }
 }
 

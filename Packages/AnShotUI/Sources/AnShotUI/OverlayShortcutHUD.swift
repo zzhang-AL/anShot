@@ -61,6 +61,14 @@ enum OverlayShortcutHUD {
     private static let segmentGap: CGFloat = 10
     private static let avoidPadding: CGFloat = 10
 
+    // 静态缓存字体，避免在高频重绘中重复创建 NSFont 触发 macOS 27 CoreText 字典深拷贝异常。
+    private static let pillKeyFont = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .semibold)
+    private static let pillLabelFont = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+    private static let sheetTitleFont = NSFont.systemFont(ofSize: 13, weight: .semibold)
+    private static let sheetCloseFont = NSFont.systemFont(ofSize: 11, weight: .regular)
+    private static let sheetSectionFont = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
+    private static let sheetDescFont = NSFont.systemFont(ofSize: 11.5, weight: .regular)
+
     // MARK: - 文案
 
     static func pillSegments(isSelectionConfirmed: Bool, isEnglish: Bool) -> [PillSegment] {
@@ -131,6 +139,7 @@ enum OverlayShortcutHUD {
                 title: "选区与取景",
                 items: [
                     ("Space", "切换窗体模式 / 按住平移选区"),
+                    ("悬停滚轮", "逐层扩大或缩小吸附控件范围"),
                     ("拖尺寸胶囊", "任意标注工具下直接平移选区"),
                     ("方向键 / ⌥+方向键", "1px 移动 / 调整选区宽高"),
                     ("C / ⇧C", "复制光标处 HEX / RGB 色值"),
@@ -170,8 +179,8 @@ enum OverlayShortcutHUD {
         }
 
         let segments = pillSegments(isSelectionConfirmed: state.isSelectionConfirmed, isEnglish: state.isEnglish)
-        let keyFont = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .semibold)
-        let labelFont = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        let keyFont = pillKeyFont
+        let labelFont = pillLabelFont
 
         var contentWidth: CGFloat = 0
         for (index, segment) in segments.enumerated() {
@@ -280,8 +289,8 @@ enum OverlayShortcutHUD {
         context.strokePath()
 
         let segments = pillSegments(isSelectionConfirmed: state.isSelectionConfirmed, isEnglish: state.isEnglish)
-        let keyFont = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .semibold)
-        let labelFont = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        let keyFont = pillKeyFont
+        let labelFont = pillLabelFont
         let keyAttrs: [NSAttributedString.Key: Any] = [
             .font: keyFont,
             .foregroundColor: NSColor.white.withAlphaComponent(0.95),

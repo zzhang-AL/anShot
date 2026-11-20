@@ -46,16 +46,29 @@ public struct DetectedWindow: Equatable, Sendable {
     }
 }
 
-/// 一次控件命中的结果。
+/// 一次控件命中的结果（可选携带沿 AX 父级链收集到的面积递增祖先容器，供滚轮逐层扩大/缩小）。
 public struct ControlHit: Equatable, Sendable {
     /// 全局左上原点屏幕坐标下的控件矩形。
     public let frame: CGRect
     /// AX 角色，例如 `AXButton`；读不到时为 `nil`。
     public let role: String?
+    /// 包含当前点的祖先容器链（由内到外、面积递增，不含自身）。
+    public let ancestors: [ControlAncestor]
 
-    public init(frame: CGRect, role: String?) {
+    public struct ControlAncestor: Equatable, Sendable {
+        public let frame: CGRect
+        public let role: String?
+
+        public init(frame: CGRect, role: String?) {
+            self.frame = frame
+            self.role = role
+        }
+    }
+
+    public init(frame: CGRect, role: String?, ancestors: [ControlAncestor] = []) {
         self.frame = frame
         self.role = role
+        self.ancestors = ancestors
     }
 }
 
@@ -117,10 +130,40 @@ public final class SystemElementDetector: ScreenElementDetecting {
     /// 跨进程 AX IPC 单次超时上限（秒），杜绝无响应应用冻结主线程 6 秒。
     static let axMessagingTimeoutSeconds: Float = 0.04
 
-    /// 允许向上回溯归并的碎片叶子角色。
+    /// 允许向上回溯归并的碎片叶子与透明包装角色。
     static let fragmentLeafRoles: Set<String> = [
         kAXStaticTextRole as String,
-        kAXImageRole as String
+        kAXImageRole as String,
+        "AXUnknown"
+    ]
+
+    /// 高语义独立交互/卡片控件角色（遇到此类节点时优先吸附，不再盲目外扩）。
+    static let semanticControlRoles: Set<String> = [
+        kAXButtonRole as String,
+        kAXCheckBoxRole as String,
+        kAXRadioButtonRole as String,
+        kAXPopUpButtonRole as String,
+        kAXMenuButtonRole as String,
+        kAXComboBoxRole as String,
+        kAXTextFieldRole as String,
+        kAXTextAreaRole as String,
+        "AXSearchField",
+        kAXToolbarRole as String,
+        kAXTabGroupRole as String,
+        kAXCellRole as String,
+        kAXRowRole as String,
+        "AXOutlineRow",
+        kAXSheetRole as String,
+        "AXPopover",
+        kAXMenuRole as String,
+        kAXMenuItemRole as String
+    ]
+
+    /// 透明布局包装角色（常包在文字/图标外层，若其父级为高语义控件则继续穿透归并）。
+    static let wrapperGroupRoles: Set<String> = [
+        kAXGroupRole as String,
+        "AXGenericElement",
+        "AXLink"
     ]
 
     /// 回溯归并时应当止步的顶层/大容器角色，避免把控件直接放大成整个窗口。
@@ -132,8 +175,8 @@ public final class SystemElementDetector: ScreenElementDetecting {
         kAXSplitGroupRole as String
     ]
 
-    /// 向上回溯的最大层数。
-    static let maxAscendDepth = 3
+    /// 向上回溯的最大层数（覆盖现代 Electron / Chromium / SwiftUI 深层嵌套包装）。
+    static let maxAscendDepth = 6
 
     public init(ownProcessID: pid_t = ProcessInfo.processInfo.processIdentifier) {
         self.ownProcessID = ownProcessID
@@ -279,26 +322,48 @@ public final class SystemElementDetector: ScreenElementDetecting {
             return nil
         }
 
-        return resolveControlHit(startingAt: element)
+        return resolveControlHit(startingAt: element, queryPoint: point)
     }
 
-    /// 一次性读取元素的 Position / Size / Role / Parent，并在命中过碎叶子节点时向上归并（限 3 层）。
-    private func resolveControlHit(startingAt element: AXUIElement) -> ControlHit? {
+    /// 一次性读取元素的 Position / Size / Role / Parent，并在命中过碎叶子/包装层时智能向上归并（限 6 层），
+    /// 同时收集面积严格递增的合法父级链供滚轮逐层放大/缩小，并强制校验每个候选框必须包含鼠标坐标。
+    private func resolveControlHit(startingAt element: AXUIElement, queryPoint: CGPoint) -> ControlHit? {
         guard var currentSnapshot = readSnapshot(of: element) else {
             return nil
         }
 
-        var bestHit: ControlHit?
-        if let frame = currentSnapshot.frame, Self.isValidControlFrame(frame) {
-            bestHit = ControlHit(frame: frame, role: currentSnapshot.role)
+        // 收集从内到外全部合法且包含鼠标点的节点。
+        var chain: [(frame: CGRect, role: String?)] = []
+        func appendIfEligible(frame: CGRect?, role: String?) {
+            guard let frame,
+                  Self.isValidControlFrame(frame),
+                  frame.insetBy(dx: -4, dy: -4).contains(queryPoint) else {
+                return
+            }
+            // 与上一层几乎同框时：仅当新节点语义更强时替换，否则去重跳过。
+            if let last = chain.last,
+               abs(last.frame.minX - frame.minX) <= 2,
+               abs(last.frame.minY - frame.minY) <= 2,
+               abs(last.frame.width - frame.width) <= 4,
+               abs(last.frame.height - frame.height) <= 4 {
+                if let role, Self.semanticControlRoles.contains(role),
+                   !(last.role.map(Self.semanticControlRoles.contains) ?? false) {
+                    chain[chain.count - 1] = (frame, role)
+                }
+                return
+            }
+            chain.append((frame, role))
         }
 
-        // 命中非碎片且尺寸足够的控件，直接返回。
-        if let bestHit, !Self.shouldAscendFromLeaf(role: currentSnapshot.role, frame: currentSnapshot.frame) {
-            return bestHit
-        }
+        appendIfEligible(frame: currentSnapshot.frame, role: currentSnapshot.role)
 
-        // 过碎叶子节点（如 AXStaticText、AXImage）或尺寸过小节点，向上回溯归并到语义控件容器。
+        // 决定默认最合适的起点索引：
+        // 若起点本身是非碎片、非包装的语义控件，先锁定它，但仍可继续向上采集祖先链供滚轮扩展。
+        var preferredIndex: Int? = chain.isEmpty ? nil : 0
+        var stillSeekingPreferred = (preferredIndex == nil)
+            || Self.shouldAscendFromLeaf(role: currentSnapshot.role, frame: currentSnapshot.frame)
+            || (currentSnapshot.role.map(Self.wrapperGroupRoles.contains) ?? false)
+
         var depth = 0
         var parentElement = currentSnapshot.parent
         while depth < Self.maxAscendDepth, let parent = parentElement {
@@ -309,22 +374,63 @@ public final class SystemElementDetector: ScreenElementDetecting {
             if Self.shouldStopAscending(parentRole: parentSnapshot.role) {
                 break
             }
-            if let parentFrame = parentSnapshot.frame, Self.isValidControlFrame(parentFrame) {
-                bestHit = ControlHit(frame: parentFrame, role: parentSnapshot.role)
-                if !Self.shouldAscendFromLeaf(role: parentSnapshot.role, frame: parentFrame) {
-                    return bestHit
+
+            let countBefore = chain.count
+            appendIfEligible(frame: parentSnapshot.frame, role: parentSnapshot.role)
+            let addedOrReplaced = chain.count > countBefore || (countBefore > 0 && chain[countBefore - 1].role == parentSnapshot.role)
+
+            if stillSeekingPreferred, addedOrReplaced, !chain.isEmpty {
+                let candidateIdx = chain.count - 1
+                let candidate = chain[candidateIdx]
+                let isSemantic = candidate.role.map(Self.semanticControlRoles.contains) ?? false
+                let isWrapper = candidate.role.map(Self.wrapperGroupRoles.contains) ?? false
+                let isLeaf = Self.shouldAscendFromLeaf(role: candidate.role, frame: candidate.frame)
+
+                if let prevIdx = preferredIndex, prevIdx < candidateIdx {
+                    let prevArea = chain[prevIdx].frame.width * chain[prevIdx].frame.height
+                    let nextArea = candidate.frame.width * candidate.frame.height
+                    // 防止为了归并一个小文字，把候选直接放大成 25 倍以上的巨型背景板。
+                    let hugeJump = prevArea > 0 && (nextArea / prevArea > 25) && nextArea > 90_000
+                    if !hugeJump || isSemantic {
+                        preferredIndex = candidateIdx
+                    }
+                } else {
+                    preferredIndex = candidateIdx
+                }
+
+                if isSemantic || (!isLeaf && !isWrapper) {
+                    stillSeekingPreferred = false
                 }
             }
+
             currentSnapshot = parentSnapshot
             parentElement = currentSnapshot.parent
         }
 
-        return bestHit
+        guard let idx = preferredIndex, idx < chain.count else {
+            return nil
+        }
+        let chosen = chain[idx]
+        let ancestors = chain.dropFirst(idx + 1).map {
+            ControlHit.ControlAncestor(frame: $0.frame, role: $0.role)
+        }
+        return ControlHit(frame: chosen.frame, role: chosen.role, ancestors: ancestors)
     }
 
-    /// 判断节点尺寸是否满足控件最小有效阈值（过滤分隔线、微小图标）。
+    /// 判断节点尺寸是否满足控件最小有效阈值（过滤微小图标碎片、分隔线与细长滚动条）。
     static func isValidControlFrame(_ frame: CGRect) -> Bool {
-        frame.width >= 8 && frame.height >= 8
+        let width = frame.width
+        let height = frame.height
+        guard width >= 18, height >= 18 else { return false }
+        let area = width * height
+        guard area >= 480 else { return false }
+        let shortSide = min(width, height)
+        let longSide = max(width, height)
+        // 过滤极细长分隔线 / 滚动条槽（如 1400×18 或 18×800）。
+        if shortSide < 24, longSide / shortSide > 16 {
+            return false
+        }
+        return true
     }
 
     /// 判断当前命中节点是否属于需要向上归并的碎片叶子或过小节点。
