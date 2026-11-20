@@ -22,6 +22,18 @@ private final class OverlayInputTextView: NSTextView {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+        // 绘制柔和圆角细虚线边框：无论浅色还是深色截图底图，都能一眼看清当前文字输入框范围与自动折行边界。
+        let borderRect = bounds.insetBy(dx: 0.75, dy: 0.75)
+        if borderRect.width > 2, borderRect.height > 2 {
+            let path = NSBezierPath(roundedRect: borderRect, xRadius: 4, yRadius: 4)
+            path.lineWidth = 1
+            NSColor.black.withAlphaComponent(0.35).setStroke()
+            path.stroke()
+            let dash: [CGFloat] = [4, 3]
+            path.setLineDash(dash, count: dash.count, phase: 0)
+            NSColor.white.withAlphaComponent(0.82).setStroke()
+            path.stroke()
+        }
         guard string.isEmpty, !hasMarkedText(), let font else { return }
         let attrs: [NSAttributedString.Key: Any] = [
             .font: font,

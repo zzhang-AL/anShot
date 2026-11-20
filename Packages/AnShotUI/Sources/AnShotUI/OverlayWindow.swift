@@ -196,11 +196,11 @@ final class OverlayView: NSView {
     /// 太大则用户拖了一小段却什么都没发生。
     private let pendingDragThreshold: CGFloat = 4
 
-    /// 指针工具点击标注的命中容差（逻辑点）。
+    /// 标注命中容差（逻辑点）。
     ///
-    /// 与 `pendingDragThreshold` 取同一个量级：用户点细线时手抖 2~3pt 是常态，
-    /// 容差太小会让「明明点在线上」变成点空、顺带清掉选中。
-    private static let annotationHitTolerance: CGFloat = 4
+    /// 取 `6pt`（略大于外扩 3pt 的选中虚线框）：既让刚画好的细边框/细线容易抓握拖动，
+    /// 又不会大到吞掉空心框内部空白区的叠加绘制空间。
+    private static let annotationHitTolerance: CGFloat = 6
 
     /// 当前选区是否已被用户确认（而非自动识别给出的候选）。
     ///
@@ -251,6 +251,14 @@ final class OverlayView: NSView {
 
     /// 等比缩放选区（按住 `Shift`）时记录的初始选区快照。
     private var resizingInitialRect: CGRect?
+
+    /// 在已有确认选区上从暗区拖拽重框前的原选区快照（若新框未达最小尺寸则恢复原选区而非清空）。
+    private var preCreatingSelectionRect: CGRect?
+
+    /// 键盘方向键连续微调的事务合并防抖任务（400ms 内连按合并为单条撤销记录）。
+    private var nudgeCommitWorkItem: DispatchWorkItem?
+    /// 键盘微调选区期间暂存的最新逻辑选区（待防抖结束统一提交一条历史）。
+    private var pendingSelectionNudgeRect: CGRect?
 
     /// 确认态下是否正按住空格键用于平移整个选区。
     private var isSpaceKeyPressed = false
@@ -385,6 +393,8 @@ final class OverlayView: NSView {
         /// 按下瞬间无法区分两者，而后果相差很大（确认 vs 丢掉候选重画），
         /// 因此先进这个状态，由 `mouseDragged` 的位移阈值裁决。
         case pending(anchor: CGPoint)
+        /// 已确认选区外暗区的按下（尚无标注）：单击只取消标注选中不闪烁，拖动超过阈值再重新框选。
+        case pendingRecreate(anchor: CGPoint, previousSelection: CGRect)
         /// 从 `anchor` 开始新建选区。
         case creating(anchor: CGPoint)
         /// 拖动选区内部移动。`grabOffset` 是按下点相对选区原点的偏移，
@@ -597,6 +607,7 @@ final class OverlayView: NSView {
         switch interaction {
         case .idle: return "idle"
         case .pending: return "pending"
+        case .pendingRecreate: return "pendingRecreate"
         case .creating: return "creating"
         case .moving: return "moving"
         case .movingAnnotation: return "movingAnnotation"
@@ -814,6 +825,7 @@ final class OverlayView: NSView {
         toolbar.canRedo = editorState.canRedo
         toolbar.allowsCaptureActions = allowsCaptureActions
         toolbar.hasSelectedAnnotation = editorState.hasSelectedAnnotation
+        toolbar.selectedAnnotationMatchesTool = editorState.selectedAnnotationMatchesTool
         toolbar.selectedAnnotationIsText = selectedAnnotationIsText
         toolbar.selectedAnnotationIsHighlight = selectedAnnotationIsHighlight
         toolbar.selectedAnnotationColor = editorState.selectedAnnotationColor
@@ -1566,8 +1578,10 @@ final class OverlayView: NSView {
         }
         // 选取目标时修饰键不参与决定层级（层级由所选范围强制），
         // 更不能让它触发一次截图侧识别。
-        if !updateRecordingPick(at: convert(lastMouse, from: nil)) {
-            updateDetection(at: convert(lastMouse, from: nil))
+        let localPoint = convert(lastMouse, from: nil)
+        if !updateRecordingPick(at: localPoint) {
+            updateDetection(at: localPoint)
+            updateCursor(at: localPoint)
         }
         super.flagsChanged(with: event)
     }
@@ -1834,7 +1848,7 @@ final class OverlayView: NSView {
             return
         }
 
-        // 绘制优先：无论处于指针还是绘图工具，命中当前选中标注的控制手柄都优先给出调整光标。
+        // 绘制优先：无论处于指针还是绘图工具，命中当前选中标注的控制手柄都优先给出调整光标（不限于选区内部，保证贴边控点 360° 可点）。
         if let annoHandle = annotationControlHandle(at: point) {
             hoveredHandle = nil
             switch annoHandle {
@@ -1846,25 +1860,43 @@ final class OverlayView: NSView {
             return
         }
 
-        // 绘制模式：选区内部是「画布」，光标统一为十字（或涂抹笔刷圆圈）。
-        if let editorState, editorState.tool.isDrawingTool, selection.contains(point) {
-            hoveredHandle = nil
+        // 命中可直接拖动的标注（刚画好/已选中的标注含空心框内部，或非背景型已有标注，或按住 ⌘/⌃ 命中任意标注）时
+        // 立刻切换为抓手光标，与 `mouseDown` 共用同一份 `directMoveTarget` 判定。
+        if let editorState {
             let flags = NSEvent.modifierFlags
-            if flags.contains(.command) || flags.contains(.control) {
+            let forceMove = flags.contains(.command) || flags.contains(.control)
+            let pixel = pixelPoint(from: point)
+            let tolerance = Double(Self.annotationHitTolerance) * Double(backdropScale)
+            let canCheckAnnotation = selection.contains(point) || editorState.hasSelectedAnnotation
+            if canCheckAnnotation,
+               editorState.directMoveTarget(at: pixel, tolerance: tolerance, forceMove: forceMove) != nil {
+                hoveredHandle = nil
                 NSCursor.openHand.set()
-            } else {
+                return
+            }
+        }
+
+        // 选区 8 个边角缩放手柄：未命中标注及标注控点时，无论指针还是绘图工具均可直接拉动调整截图边界。
+        let hit = handle(at: point, in: selection)
+        hoveredHandle = hit
+        if let hit {
+            SelectionCursor.cursor(for: hit).set()
+            return
+        }
+
+        // 选区内部其余区域：绘图工具显示绘制光标，指针工具显示抓手平移选区。
+        if selection.contains(point) {
+            if let editorState, editorState.tool.isDrawingTool {
                 setDrawingCursor(for: editorState)
+            } else {
+                NSCursor.openHand.set()
             }
             return
         }
 
-        let hit = handle(at: point, in: selection)
-        hoveredHandle = hit
-
-        if let hit {
-            SelectionCursor.cursor(for: hit).set()
-        } else if selection.contains(point) {
-            NSCursor.openHand.set()
+        // 已确认选区外暗区：若已有标注则提示默认箭头（点击仅取消选中不清空选区），无标注则显示十字允许拖拽重框。
+        if editorState?.annotations.isEmpty == false {
+            NSCursor.arrow.set()
         } else {
             NSCursor.crosshair.set()
         }
@@ -2085,24 +2117,37 @@ final class OverlayView: NSView {
     /// 而在测试里造真实鼠标事件序列的代价远高于收益。
     @discardableResult
     func settleSelectionGestureForExport() -> Bool {
+        flushPendingNudgeTransaction()
         guard isInteracting else { return true }
 
+        let wasPendingRecreate: Bool = {
+            if case .pendingRecreate = interaction { return true }
+            return false
+        }()
         let wasCreating = isCreating
+        let previousConfirmedSelection = preCreatingSelectionRect
+        preCreatingSelectionRect = nil
         let changedGeometry = selectionGestureChangedGeometry
         selectionGestureChangedGeometry = false
         interaction = .idle
         hoveredHandle = nil
+
+        if wasPendingRecreate {
+            return true
+        }
 
         guard let selection = effectiveSelection,
               selection.width >= decoration.minimumSelectionSize,
               selection.height >= decoration.minimumSelectionSize else {
             if wasCreating {
                 // 与 `mouseUp` 的失败分支同一套处理：越过阈值却没拖够时把候选
-                // 放回去，新建失败则清掉那个零尺寸矩形（否则会留下一根看不见的
+                // 或原确认选区放回去，新建失败则清掉那个零尺寸矩形（否则会留下一根看不见的
                 // 细线选区）。
                 if let candidate = pendingCandidate {
                     selectionRect = candidate.rect
                     currentDetectionTarget = candidate.target
+                } else if let previousConfirmedSelection {
+                    selectionRect = previousConfirmedSelection
                 } else {
                     selectionRect = nil
                 }
@@ -2379,12 +2424,14 @@ final class OverlayView: NSView {
     // MARK: - 鼠标事件
 
     override func mouseDown(with event: NSEvent) {
+        flushPendingNudgeTransaction()
         let point = convert(event.locationInWindow, from: nil)
         // 新手势从「没有改动几何」开始；真正改动发生在 `mouseDragged`。
         selectionGestureChangedGeometry = false
         pendingDrawingHitAnnotationID = nil
         pendingDrawingDownPoint = nil
         resizingInitialRect = nil
+        preCreatingSelectionRect = nil
 
         // 选取模式下的按下不作决定：它是「点击锁定目标」的前半段，由 `mouseUp` 落实。
         if recordingPick.isActive {
@@ -2455,107 +2502,124 @@ final class OverlayView: NSView {
             return
         }
 
-        // 绘制优先 + 无缝直编（确认态选区内，全工具统一生效）：
-        // 1) 双击文字 / 编号直接就地编辑；
-        // 2) 命中当前选中标注的控制手柄直接调整几何/圆角；
-        // 3) 指针工具或绘图工具下按住 ⌘/⌃ 点击已有标注，直接选中并平移；
-        // 4) 绘图工具普通按下命中已有标注时先记下候选，若松手位移 < 3pt 则转为选中该标注。
-        if let editorState, isSelectionConfirmed, let selection = effectiveSelection, selection.contains(point) {
-            if event.clickCount >= 2 {
-                if beginEditingExistingText(at: point) { return }
-                if beginEditingExistingNumbering(at: point) { return }
-            }
+        // 绘制优先 + 无缝直编（确认态全工具统一生效，判定顺序与 `updateCursor` 严格一致）：
+        // 1) 命中当前选中标注的控制手柄（不受选区边界裁切，保证贴边控点 360° 可拖）；
+        // 2) 选区内双击文字 / 编号直接就地编辑；
+        // 3) 命中可直接拖动的标注（刚画好/已选中的标注含空心框内部、非背景型已有标注、或按住 ⌘/⌃）直接选中并平移；
+        // 4) 命中截图选区 8 个边角缩放手柄（即使在绘图工具下也可顺手微调截图边界）；
+        // 5) 选区内其余区域：绘图工具新建标注，指针工具拖动选区；
+        // 6) 选区外暗区：已有标注时仅取消选中并保护原选区，尚无标注时进入 `.pendingRecreate` 防误点清空。
+        if let selection = effectiveSelection, isSelectionConfirmed {
+            if let editorState {
+                if let annoHandle = annotationControlHandle(at: point) {
+                    editorState.beginEditTransaction()
+                    interaction = .resizingAnnotation(handle: annoHandle)
+                    return
+                }
 
-            if let annoHandle = annotationControlHandle(at: point) {
-                editorState.beginEditTransaction()
-                interaction = .resizingAnnotation(handle: annoHandle)
-                return
-            }
+                let inSelection = selection.contains(point)
+                if inSelection, event.clickCount >= 2 {
+                    if beginEditingExistingText(at: point) { return }
+                    if beginEditingExistingNumbering(at: point) { return }
+                }
 
-            let pixel = pixelPoint(from: point)
-            let tolerance = Double(Self.annotationHitTolerance) * Double(backdropScale)
-            let flags = event.modifierFlags
+                let pixel = pixelPoint(from: point)
+                let tolerance = Double(Self.annotationHitTolerance) * Double(backdropScale)
+                let flags = event.modifierFlags
+                let forceMove = flags.contains(.command) || flags.contains(.control)
 
-            if editorState.tool == .pointer {
-                if editorState.selectAnnotation(at: pixel, tolerance: tolerance) {
+                if inSelection || editorState.hasSelectedAnnotation,
+                   let moveTarget = editorState.directMoveTarget(
+                       at: pixel,
+                       tolerance: tolerance,
+                       forceMove: forceMove
+                   ) {
+                    editorState.selectAnnotation(id: moveTarget.id)
                     toolbar.expandPanelForInteraction()
                     editorState.beginEditTransaction()
                     interaction = .movingAnnotation(lastPixel: pixel)
                     NSCursor.closedHand.set()
                     return
                 }
-                // 指针态双击选区内空白直接复制完成。
-                if event.clickCount >= 2 {
-                    performExport(.copy)
+
+                // 选区 8 个调整手柄：未命中标注控点及可直接拖动标注时，绘图工具下也可直接缩放截图选区。
+                if let hit = handle(at: point, in: selection) {
+                    resizingInitialRect = selection
+                    interaction = .resizing(handle: hit)
+                    SelectionCursor.cursor(for: hit).set()
+                    return
+                }
+
+                if inSelection {
+                    if editorState.tool == .pointer {
+                        editorState.clearAnnotationSelection()
+                        // 指针态双击选区内空白直接复制完成。
+                        if event.clickCount >= 2 {
+                            performExport(.copy)
+                            return
+                        }
+                        interaction = .moving(
+                            grabOffset: CGPoint(x: point.x - selection.minX, y: point.y - selection.minY)
+                        )
+                        NSCursor.closedHand.set()
+                        return
+                    }
+
+                    // 绘图工具下双击空白区域（未命中任何标注，且非文字/编号工具）直接复制完成。
+                    let hitExisting = editorState.annotation(at: pixel, tolerance: tolerance)
+                    if event.clickCount >= 2, hitExisting == nil, editorState.tool != .text, editorState.tool != .numbering {
+                        performExport(.copy)
+                        return
+                    }
+
+                    if editorState.tool == .text {
+                        guard !editorState.isEditingText else { return }
+                        toolbar.collapsePanelForDrawing()
+                        editorState.clearAnnotationSelection()
+                        editorState.beginTextEditing(at: pixel)
+                        syncTextEditor()
+                        return
+                    }
+
+                    if editorState.tool.isDraggable {
+                        // 记录潜在点击选中目标：若松手位移 < 3pt 则不建空草稿而是选中已有标注。
+                        if let hitExisting {
+                            pendingDrawingHitAnnotationID = hitExisting.id
+                            pendingDrawingDownPoint = point
+                        }
+                        editorState.beginDraft(at: pixel, scaleFactor: backdropScale)
+                        return
+                    }
+                } else {
+                    // 点击已确认选区外暗区：先取消标注选中；若已有标注则锁定选区防误清，无标注时允许拖动重框。
+                    editorState.clearAnnotationSelection()
+                    if !editorState.annotations.isEmpty {
+                        updateCursor(at: point)
+                        return
+                    }
+                    interaction = .pendingRecreate(anchor: point, previousSelection: selection)
+                    NSCursor.crosshair.set()
                     return
                 }
             } else {
-                // 绘图工具下按住 ⌘ / ⌃ 直接选中并平移已有标注。
-                if (flags.contains(.command) || flags.contains(.control)),
-                   editorState.selectAnnotation(at: pixel, tolerance: tolerance) {
-                    toolbar.expandPanelForInteraction()
-                    editorState.beginEditTransaction()
-                    interaction = .movingAnnotation(lastPixel: pixel)
+                // 无编辑器（如早期诊断视图）保留原有选区手柄/移动/重框路径。
+                if let hit = handle(at: point, in: selection) {
+                    resizingInitialRect = selection
+                    interaction = .resizing(handle: hit)
+                    SelectionCursor.cursor(for: hit).set()
+                    return
+                }
+                if selection.contains(point) {
+                    interaction = .moving(
+                        grabOffset: CGPoint(x: point.x - selection.minX, y: point.y - selection.minY)
+                    )
                     NSCursor.closedHand.set()
                     return
                 }
-
-                // 绘图工具下双击空白区域（未命中任何标注，且非文字工具）直接复制完成。
-                let hitExisting = editorState.annotation(at: pixel, tolerance: tolerance)
-                if event.clickCount >= 2, hitExisting == nil, editorState.tool != .text, editorState.tool != .numbering {
-                    performExport(.copy)
-                    return
-                }
-
-                if editorState.tool == .text {
-                    if let hitExisting {
-                        // 单击已有非文字标注（或文字标注）先选中，双击文字已在上方进入编辑。
-                        editorState.selectAnnotation(id: hitExisting.id)
-                        toolbar.expandPanelForInteraction()
-                        return
-                    }
-                    guard !editorState.isEditingText else { return }
-                    toolbar.collapsePanelForDrawing()
-                    editorState.clearAnnotationSelection()
-                    editorState.beginTextEditing(at: pixel)
-                    syncTextEditor()
-                    return
-                }
-
-                if editorState.tool.isDraggable {
-                    // 记录潜在点击选中目标：若松手位移 < 3pt 则不建空草稿而是选中已有标注。
-                    if let hitExisting {
-                        pendingDrawingHitAnnotationID = hitExisting.id
-                        pendingDrawingDownPoint = point
-                    }
-                    editorState.beginDraft(at: pixel, scaleFactor: backdropScale)
-                    return
-                }
-            }
-        } else if let editorState, editorState.tool == .pointer, isSelectionConfirmed {
-            editorState.clearAnnotationSelection()
-        }
-
-        if let selection = effectiveSelection, isSelectionConfirmed {
-            // 与 `updateCursor` 同一套判定：手柄优先于「内部移动」，
-            // 因为手柄位于选区边界上，两者区域重叠。
-            if let hit = handle(at: point, in: selection) {
-                resizingInitialRect = selection
-                interaction = .resizing(handle: hit)
-                SelectionCursor.cursor(for: hit).set()
-                return
-            }
-
-            if selection.contains(point) {
-                interaction = .moving(
-                    grabOffset: CGPoint(x: point.x - selection.minX, y: point.y - selection.minY)
-                )
-                NSCursor.closedHand.set()
-                return
             }
         }
 
-        // 其余位置（含已确认选区之外）都开始新建选区。
+        // 其余位置（无选区或未确认候选之外）开始新建选区。
         interaction = .creating(anchor: point)
         NSCursor.crosshair.set()
         selectionRect = CGRect(origin: point, size: .zero)
@@ -2571,10 +2635,11 @@ final class OverlayView: NSView {
 
         switch interaction {
         case .idle:
-            // 绘制模式下的拖拽不改变选区，只更新未提交的草稿；一落笔拖拽立即轻收起二级属性气泡让出画布视野。
+            // 绘制模式下的拖拽不改变选区，只更新未提交的草稿；将点夹在当前选区内，防止标注越界画进暗区。
             if editorState?.hasDraft == true {
                 toolbar.collapsePanelForDrawing()
-                editorState?.updateDraft(to: pixelPoint(from: point), isShiftPressed: isShiftPressed)
+                let clampedPoint = effectiveSelection.map { SelectionGeometry.clamp(point, to: $0) } ?? point
+                editorState?.updateDraft(to: pixelPoint(from: clampedPoint), isShiftPressed: isShiftPressed)
             }
             return
 
@@ -2600,6 +2665,16 @@ final class OverlayView: NSView {
             let dx = point.x - anchor.x
             let dy = point.y - anchor.y
             guard hypot(dx, dy) >= pendingDragThreshold else { return }
+            interaction = .creating(anchor: anchor)
+            let target = Self.constrainedSelectionPoint(point, from: anchor, in: bounds, isShiftPressed: isShiftPressed)
+            selectionRect = SelectionGeometry.normalizedRect(from: anchor, to: target)
+            selectionGestureChangedGeometry = true
+
+        case .pendingRecreate(let anchor, let previousSelection):
+            let dx = point.x - anchor.x
+            let dy = point.y - anchor.y
+            guard hypot(dx, dy) >= pendingDragThreshold else { return }
+            preCreatingSelectionRect = previousSelection
             interaction = .creating(anchor: anchor)
             let target = Self.constrainedSelectionPoint(point, from: anchor, in: bounds, isShiftPressed: isShiftPressed)
             selectionRect = SelectionGeometry.normalizedRect(from: anchor, to: target)
@@ -2755,8 +2830,9 @@ final class OverlayView: NSView {
 
             if effectiveSelection == nil {
                 editorState.discardDraft()
-            } else {
-                editorState.commitDraft()
+            } else if !editorState.commitDraft() {
+                // 空白处轻点（未拖出有效新标注）：清除当前选中态，避免残留虚线框。
+                editorState.clearAnnotationSelection()
             }
             updateCursor(at: point)
             return
@@ -2766,11 +2842,21 @@ final class OverlayView: NSView {
             if case .pending = interaction { return true }
             return false
         }()
+        let wasPendingRecreate: Bool = {
+            if case .pendingRecreate = interaction { return true }
+            return false
+        }()
         let wasCreating = isCreating
+        let previousConfirmedSelection = preCreatingSelectionRect
+        preCreatingSelectionRect = nil
         resizingInitialRect = nil
         interaction = .idle
         updateCursor(at: point)
         updateLoupe(at: point)
+
+        if wasPendingRecreate {
+            return
+        }
 
         if wasPending {
             pendingCandidate = nil
@@ -2790,6 +2876,9 @@ final class OverlayView: NSView {
                     currentDetectionTarget = candidate.target
                     pendingCandidate = nil
                     onSelectionChanged?(candidate.rect)
+                } else if let previousConfirmedSelection {
+                    selectionRect = previousConfirmedSelection
+                    onSelectionChanged?(previousConfirmedSelection)
                 } else {
                     selectionRect = nil
                     onSelectionChanged?(nil)
@@ -3114,6 +3203,13 @@ final class OverlayView: NSView {
     /// 执行一条按键命令。
     func performCommand(_ command: OverlayKeyCommand) {
         guard command == .cancel || editorState != nil else { return }
+        // 非微调命令执行前先落盘挂起的键盘微调事务，保证撤销/导出/复制读取到一致历史。
+        switch command {
+        case .nudge, .resizeSelection:
+            break
+        default:
+            flushPendingNudgeTransaction()
+        }
         switch command {
         case .cancel:
             requestCancel(source: .escapeKey)
@@ -3165,11 +3261,37 @@ final class OverlayView: NSView {
         }
     }
 
-    /// 方向键微调选中标注或当前选区（单位：1px，Shift 为 10px）。
+    /// 将键盘连续微调（方向键移动标注或微调选区）合并提交为单条撤销记录。
+    private func flushPendingNudgeTransaction() {
+        nudgeCommitWorkItem?.cancel()
+        nudgeCommitWorkItem = nil
+        if editorState?.isInEditTransaction == true {
+            editorState?.commitEditTransaction()
+        }
+        if let pendingRect = pendingSelectionNudgeRect {
+            pendingSelectionNudgeRect = nil
+            onSelectionCommitted?(pendingRect)
+        }
+    }
+
+    private func scheduleNudgeTransactionCommit() {
+        nudgeCommitWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.flushPendingNudgeTransaction()
+        }
+        nudgeCommitWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: item)
+    }
+
+    /// 方向键微调选中标注或当前选区（单位：1px，Shift 为 10px；400ms 内连续按键合并为单条撤销记录）。
     private func performNudge(dx: Int, dy: Int) {
         guard let editorState else { return }
         if editorState.hasSelectedAnnotation {
+            if !editorState.isInEditTransaction {
+                editorState.beginEditTransaction()
+            }
             editorState.moveSelected(by: PixelPoint(x: Double(dx), y: Double(dy)))
+            scheduleNudgeTransactionCommit()
             return
         }
         guard let selection = effectiveSelection else { return }
@@ -3185,11 +3307,12 @@ final class OverlayView: NSView {
         )
         let clamped = SelectionGeometry.clamp(moved, to: bounds)
         selectionRect = clamped
+        pendingSelectionNudgeRect = clamped
         onSelectionChanged?(clamped)
-        onSelectionCommitted?(clamped)
+        scheduleNudgeTransactionCommit()
     }
 
-    /// `⌥ + 方向键`（配 `⇧` 为 5px）精准微调当前选区宽/高。
+    /// `⌥ + 方向键`（配 `⇧` 为 5px）精准微调当前选区宽/高（连续按键合并为单条撤销记录）。
     private func performResizeSelection(dw: Int, dh: Int) {
         guard let editorState, let selection = effectiveSelection else { return }
         if !isSelectionConfirmed {
@@ -3208,8 +3331,9 @@ final class OverlayView: NSView {
             height: nextHeight
         )
         selectionRect = resized
+        pendingSelectionNudgeRect = resized
         onSelectionChanged?(resized)
-        onSelectionCommitted?(resized)
+        scheduleNudgeTransactionCommit()
     }
 }
 

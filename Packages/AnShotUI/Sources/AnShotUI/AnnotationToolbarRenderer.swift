@@ -42,6 +42,7 @@ final class AnnotationToolbarRenderer {
     var allowsCaptureActions = true
     /// 指针工具下是否有选中标注（决定面板内容）。
     var hasSelectedAnnotation = false
+    var selectedAnnotationMatchesTool = true
     /// 选中的标注是否是文字（面板用字号档位代替线宽滑块）。
     var selectedAnnotationIsText = false
     /// 选中的标注是否是高亮荧光笔（面板改用半透明荧光色板）。
@@ -163,6 +164,7 @@ final class AnnotationToolbarRenderer {
         input.isPanelExpanded = isPanelExpanded
         input.allowsCaptureActions = allowsCaptureActions
         input.hasSelectedAnnotation = hasSelectedAnnotation
+        input.selectedAnnotationMatchesTool = selectedAnnotationMatchesTool
         input.selectedAnnotationIsText = selectedAnnotationIsText
         input.selectedAnnotationIsHighlight = selectedAnnotationIsHighlight
         input.selectedAnnotationSupportsColor = selectedAnnotationSupportsColor
@@ -813,7 +815,7 @@ final class AnnotationToolbarRenderer {
         case .moreTools:
             return AnnotationToolbarLayout.isSecondaryTool(tool)
         case let .color(color):
-            if tool == .pointer, let selectedAnnotationColor {
+            if hasSelectedAnnotation, let selectedAnnotationColor {
                 return selectedAnnotationColor == color
             }
             if tool == .pointer {
@@ -830,7 +832,7 @@ final class AnnotationToolbarRenderer {
         case let .mosaicMode(mode):
             return style.mosaicMode == mode
         case let .mosaicEffectMode(mode):
-            if tool == .pointer, hasSelectedAnnotation {
+            if hasSelectedAnnotation, selectedAnnotationSupportsMosaicEffect {
                 return selectedAnnotationMosaicMode == mode
             }
             return style.mosaicEffectMode == mode

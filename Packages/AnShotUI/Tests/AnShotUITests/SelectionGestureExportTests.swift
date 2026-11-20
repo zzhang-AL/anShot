@@ -142,6 +142,8 @@ private struct Fixture {
             view.mouseDown(with: event)
         case .leftMouseDragged:
             view.mouseDragged(with: event)
+        case .leftMouseUp:
+            view.mouseUp(with: event)
         default:
             Issue.record("未覆盖的事件类型：\(type)")
         }
@@ -336,5 +338,78 @@ struct SelectionGestureExportTests {
         fixture.view.mouseDown(with: doubleClick)
         #expect(fixture.editor.isEditingText, "指针模式下双击已有文字必须进入编辑态")
         #expect(fixture.editor.textDraft?.fontSize == AnnotationStyle.default.textFontSize)
+    }
+
+    @Test("已确认选区误点暗区不清空选区，有标注时锁定防误丢，绘图工具下可直拉选区手柄与选区内约束草稿")
+    func confirmedSelectionGuardsAndAnnotationInteractions() {
+        let initial = makeRect(200, 200, 600, 400) // 逻辑点 (100,100,300,200)
+        let fixture = Fixture(scale: 2, initialSelection: initial)
+        let logicalSelection = CGRect(x: 100, y: 100, width: 300, height: 200)
+        fixture.view.setSelection(logicalSelection)
+        fixture.editor.confirmSelection()
+
+        // 1. 无标注时，在选区外暗区轻点一下：零闪烁，原选区完好保留
+        fixture.send(.leftMouseDown, at: CGPoint(x: 30, y: 30))
+        #expect(fixture.view.effectiveSelection == logicalSelection, "选区外按下瞬间不应立刻清空原选区")
+        fixture.send(.leftMouseUp, at: CGPoint(x: 30, y: 30))
+        #expect(fixture.view.effectiveSelection == logicalSelection, "选区外轻点抬起后应保持原选区")
+
+        // 2. 矩形工具下新建草稿并拖出选区外部：草稿必须被夹紧在选区内，不越界画进暗区
+        fixture.editor.select(.rectangle)
+        fixture.send(.leftMouseDown, at: CGPoint(x: 150, y: 150))
+        fixture.send(.leftMouseDragged, at: CGPoint(x: 600, y: 500))
+        fixture.send(.leftMouseUp, at: CGPoint(x: 600, y: 500))
+        #expect(fixture.editor.annotations.count == 1)
+        if case let .rectangle(rect, _, _, _) = fixture.editor.annotations[0].kind {
+            #expect(rect.origin.x + rect.size.width <= initial.origin.x + initial.size.width + 0.5, "草稿右缘不得越出选区")
+            #expect(rect.origin.y + rect.size.height <= initial.origin.y + initial.size.height + 0.5, "草稿下缘不得越出选区")
+        } else {
+            Issue.record("应提交矩形标注")
+        }
+
+        // 3. 刚画好矩形处于选中态，在框内拖动直接移动它（不新建第二个矩形）
+        let beforeMove = fixture.editor.annotations[0].boundingRect
+        fixture.send(.leftMouseDown, at: CGPoint(x: 220, y: 220))
+        fixture.send(.leftMouseDragged, at: CGPoint(x: 200, y: 200))
+        fixture.send(.leftMouseUp, at: CGPoint(x: 200, y: 200))
+        #expect(fixture.editor.annotations.count == 1, "拖动已选中空心框内部必须移动它，不得新建重复框")
+        let afterMove = fixture.editor.annotations[0].boundingRect
+        #expect(afterMove.origin.x < beforeMove.origin.x && afterMove.origin.y < beforeMove.origin.y)
+
+        // 4. 已有标注时，在选区外暗区误点或拖拽：仅取消标注选中，绝不清空选区
+        fixture.send(.leftMouseDown, at: CGPoint(x: 20, y: 20))
+        fixture.send(.leftMouseDragged, at: CGPoint(x: 80, y: 80))
+        fixture.send(.leftMouseUp, at: CGPoint(x: 80, y: 80))
+        #expect(fixture.view.effectiveSelection == logicalSelection, "已有标注时选区外误拖不得清空原选区")
+        #expect(!fixture.editor.hasSelectedAnnotation, "点击选区外暗区应清除当前标注选中态")
+
+        // 5. 绘图工具下拖动选区左上角手柄可直接缩放截图选区
+        fixture.send(.leftMouseDown, at: CGPoint(x: 100, y: 100))
+        fixture.send(.leftMouseDragged, at: CGPoint(x: 80, y: 80))
+        fixture.send(.leftMouseUp, at: CGPoint(x: 80, y: 80))
+        #expect(fixture.view.effectiveSelection?.minX == 80, "绘图工具下直接拖动选区左上角手柄应可扩大选区")
+
+        // 6. 方向键连续微调标注：多次微调合并为单条撤销记录
+        fixture.editor.selectAnnotation(id: fixture.editor.annotations[0].id)
+        let beforeNudge = fixture.editor.annotations[0].boundingRect
+        for _ in 0 ..< 5 {
+            fixture.view.performCommand(.nudge(dx: 2, dy: 0))
+        }
+        #expect(fixture.editor.annotations[0].boundingRect.origin.x == beforeNudge.origin.x + 10)
+        // 触发一次非微调命令（undo），先自动落盘事务再撤销，一次撤销应完整回到微调前
+        fixture.view.performCommand(.undo)
+        #expect(fixture.editor.annotations[0].boundingRect.origin.x == beforeNudge.origin.x, "连续 5 次方向键微调应合并为单条撤销记录")
+
+        // 7. 跨类型选中标注：矩形工具下选中文字，工具栏布局自动切为文字属性检查面板（含字号与删除）
+        var layout = AnnotationToolbarLayout()
+        layout.tool = .rectangle
+        layout.hasSelectedAnnotation = true
+        layout.selectedAnnotationMatchesTool = false
+        layout.selectedAnnotationIsText = true
+        layout.selectedAnnotationSupportsColor = true
+        layout.selectedAnnotationSupportsLineWidth = false
+        let panelKinds = Set(layout.layoutPanel().items.map(\.kind))
+        #expect(panelKinds.contains(.deleteSelected), "跨类型选中检查面板应包含删除按钮")
+        #expect(panelKinds.contains(.textBoldToggle), "矩形工具下选中文字时应展示文字属性控件而非矩形线宽")
     }
 }

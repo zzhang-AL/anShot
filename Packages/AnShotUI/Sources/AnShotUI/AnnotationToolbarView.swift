@@ -103,6 +103,14 @@ final class AnnotationToolbarView: NSView {
         }
     }
 
+    /// 选中的标注是否与当前激活的绘图工具同类型。
+    var selectedAnnotationMatchesTool = true {
+        didSet {
+            guard selectedAnnotationMatchesTool != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
     /// 选中的标注是否是文字（面板换用字号档位而不是线宽滑块）。
     var selectedAnnotationIsText = false {
         didSet {
@@ -446,6 +454,7 @@ final class AnnotationToolbarView: NSView {
         input.isPanelExpanded = isPanelExpanded
         input.allowsCaptureActions = allowsCaptureActions
         input.hasSelectedAnnotation = hasSelectedAnnotation
+        input.selectedAnnotationMatchesTool = selectedAnnotationMatchesTool
         input.selectedAnnotationIsText = selectedAnnotationIsText
         input.selectedAnnotationIsHighlight = selectedAnnotationIsHighlight
         input.selectedAnnotationSupportsColor = selectedAnnotationSupportsColor
@@ -512,6 +521,7 @@ final class AnnotationToolbarView: NSView {
         renderer.canRedo = canRedo
         renderer.allowsCaptureActions = allowsCaptureActions
         renderer.hasSelectedAnnotation = hasSelectedAnnotation
+        renderer.selectedAnnotationMatchesTool = selectedAnnotationMatchesTool
         renderer.selectedAnnotationIsText = selectedAnnotationIsText
         renderer.selectedAnnotationIsHighlight = selectedAnnotationIsHighlight
         renderer.selectedAnnotationColor = selectedAnnotationColor
@@ -1173,7 +1183,7 @@ final class AnnotationToolbarView: NSView {
     override func accessibilityLabel() -> String? { "标注工具栏" }
 
     private var activeMosaicEffectMode: MosaicMode {
-        (tool == .pointer && hasSelectedAnnotation)
+        (hasSelectedAnnotation && selectedAnnotationSupportsMosaicEffect)
             ? (selectedAnnotationMosaicMode ?? style.mosaicEffectMode)
             : style.mosaicEffectMode
     }

@@ -788,34 +788,33 @@ final class AnnotationEditorState {
     }
 
     func selectColor(_ color: RGBAColor) {
-        // 按当前工具写入对应的颜色槽，避免「改文字颜色顺手改了箭头」。
+        // 当存在选中标注时，按「选中标注本身的类型」同步对应颜色槽，
+        // 避免在矩形等绘图工具下选中文字/高亮改色时串改当前工具的默认颜色。
+        if let kind = selectedAnnotation?.kind {
+            switch kind {
+            case .highlight:
+                style.highlightColor = Self.normalizedHighlightColor(color)
+            case .text:
+                style.textColor = color
+            case .mosaic, .mosaicStroke, .spotlight:
+                break
+            default:
+                style.shapeColor = color
+            }
+            updateSelectedColor(color)
+            return
+        }
+
+        // 无选中标注时：按当前工具写入对应的颜色槽，避免「改文字颜色顺手改了箭头」。
         switch tool {
         case .text:
             style.textColor = color
         case .highlight:
             style.highlightColor = Self.normalizedHighlightColor(color)
-        case .pointer:
-            // 指针选中高亮或文字时，同步到对应颜色槽以便色卡高亮准确。
-            if let kind = selectedAnnotation?.kind {
-                switch kind {
-                case .highlight:
-                    style.highlightColor = Self.normalizedHighlightColor(color)
-                case .text:
-                    style.textColor = color
-                default:
-                    style.shapeColor = color
-                }
-            } else {
-                style.shapeColor = color
-            }
-        // 放大镜、马赛克与聚光灯不取前景色（面板也不会显示颜色）。
-        case .rectangle, .ellipse, .line, .arrow, .mosaic, .magnifier,
+        case .pointer, .rectangle, .ellipse, .line, .arrow, .mosaic, .magnifier,
              .numbering, .measure, .freehand, .curvedArrow, .spotlight:
             style.shapeColor = color
         }
-        // 有选中标注时，颜色按钮的作用对象是**当前选中的那一条**：
-        // 无论是在指针模式还是刚画完的绘制优先模式，修改颜色都即时作用于选中标注并同步样式槽。
-        updateSelectedColor(color)
     }
 
     func selectNumberingRadius(_ radius: Double) {
@@ -1216,6 +1215,128 @@ final class AnnotationEditorState {
     /// 只读命中查询：返回最顶层命中该点的标注，不改变当前选中态。
     func annotation(at point: PixelPoint, tolerance: Double) -> Annotation? {
         annotations.reversed().first { $0.hitTest(point, tolerance: tolerance) }
+    }
+
+    /// 判定标注是否属于「大面状背景型」（容易在其上方叠加画框、箭头或文字）。
+    ///
+    /// - 已选中态（含刚画完自动选中）允许直接拖动微调位置；
+    /// - 未选中态下绘图工具的普通拖动优先放行在其上方叠加新标注，避免误拖底层区域；
+    ///   需要移动时可单击选中后再拖，或按住 `⌘/⌃` 直接拖，或切指针工具拖动。
+    static func isBackdropSurfaceAnnotation(_ annotation: Annotation) -> Bool {
+        switch annotation.kind {
+        case .mosaic, .highlight, .spotlight:
+            return true
+        case let .rectangle(_, _, fill, _), let .ellipse(_, _, fill):
+            return fill != nil
+        case .line, .arrow, .curvedArrow, .text, .mosaicStroke, .numbering, .measure, .magnifier, .freehand:
+            return false
+        }
+    }
+
+    /// 当前选中的标注是否与当前激活的绘图工具同属同一类型。
+    ///
+    /// 用于工具栏判断：当绘图工具下跨类型选中了其他标注（例如矩形工具下点中了文字或马赛克），
+    /// 二级面板自动切换为匹配选中标注能力的属性检查面板，避免控件错位。
+    var selectedAnnotationMatchesTool: Bool {
+        guard let kind = selectedAnnotation?.kind else { return true }
+        switch (tool, kind) {
+        case (.rectangle, .rectangle),
+             (.ellipse, .ellipse),
+             (.line, .line),
+             (.arrow, .arrow),
+             (.text, .text),
+             (.mosaic, .mosaic),
+             (.mosaic, .mosaicStroke),
+             (.numbering, .numbering),
+             (.highlight, .highlight),
+             (.measure, .measure),
+             (.magnifier, .magnifier),
+             (.freehand, .freehand),
+             (.curvedArrow, .curvedArrow),
+             (.spotlight, .spotlight):
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 判定当前**已选中**标注在直接拖动时是否命中 `point`。
+    ///
+    /// - 对已选中的空心矩形与空心椭圆：除边框外，**框内任意位置**也视为可抓取区域，
+    ///   让刚画好或刚点选的框可直接从框内一把拖走（无需刻意瞄准细边线）；
+    /// - 取消选中后，空心框恢复仅边框命中，内部空白继续放行套画小框/箭头/文字。
+    private static func selectedAnnotationDirectMoveHit(
+        _ annotation: Annotation,
+        at point: PixelPoint,
+        tolerance: Double
+    ) -> Bool {
+        if annotation.hitTest(point, tolerance: tolerance) {
+            return true
+        }
+        let slack = max(0, tolerance)
+        switch annotation.kind {
+        case let .rectangle(rect, stroke, nil, _):
+            let expand = slack + stroke.width / 2
+            return point.x >= rect.origin.x - expand
+                && point.x <= rect.origin.x + rect.size.width + expand
+                && point.y >= rect.origin.y - expand
+                && point.y <= rect.origin.y + rect.size.height + expand
+        case let .ellipse(rect, stroke, nil):
+            let rx = rect.size.width / 2
+            let ry = rect.size.height / 2
+            guard rx > 0, ry > 0 else { return false }
+            let expand = slack + stroke.width / 2
+            let cx = rect.origin.x + rx
+            let cy = rect.origin.y + ry
+            let nx = (point.x - cx) / (rx + expand)
+            let ny = (point.y - cy) / (ry + expand)
+            return nx * nx + ny * ny <= 1
+        default:
+            return false
+        }
+    }
+
+    /// 判定在当前工具与修饰键下，按下 `point` 是否应当直接移动已有标注（而非新建标注）。
+    ///
+    /// 由 `OverlayView.mouseDown` 与 `OverlayView.updateCursor` 共同调用，
+    /// 保证「光标显示抓手 ↔ 拖动即移动」行为严格一致：
+    /// 1. 指针工具或按住 `⌘/⌃`（`forceMove == true`）：优先命中当前选中标注（含空心框内部），否则命中最顶层任意标注；
+    /// 2. 连续笔触工具（手绘 / 涂抹马赛克）：不截胡普通拖动，防止连笔或反复涂抹误拖旧轨迹；
+    /// 3. 其余绘图工具（矩形/椭圆/直线/箭头/文字/编号/框选马赛克/高亮/聚光灯/放大镜/测量等）：
+    ///    - 优先命中**当前已选中的标注**（刚画好或刚选中的框/椭圆/线/文字/马赛克等均可直接拖动调整位置，含空心框内部）；
+    ///    - 其次命中**非面状背景型**已有标注（如已有空心框边线、箭头、文字、编号、放大镜），直接选中并拖动；
+    ///    - 命中的若是未选中的面状背景型标注或零散手绘/涂抹笔迹，返回 `nil` 放行叠加绘制。
+    func directMoveTarget(
+        at point: PixelPoint,
+        tolerance: Double,
+        forceMove: Bool = false
+    ) -> Annotation? {
+        if tool == .pointer || forceMove {
+            if let selected = selectedAnnotation,
+               Self.selectedAnnotationDirectMoveHit(selected, at: point, tolerance: tolerance) {
+                return selected
+            }
+            return annotation(at: point, tolerance: tolerance)
+        }
+
+        if accumulatesStrokePoints {
+            return nil
+        }
+
+        if let selected = selectedAnnotation,
+           Self.selectedAnnotationDirectMoveHit(selected, at: point, tolerance: tolerance) {
+            return selected
+        }
+
+        guard let topHit = annotation(at: point, tolerance: tolerance) else {
+            return nil
+        }
+        if Self.isBackdropSurfaceAnnotation(topHit) {
+            return nil
+        }
+        if case .freehand = topHit.kind { return nil }
+        if case .mosaicStroke = topHit.kind { return nil }
+        return topHit
     }
 
     /// 显式选中指定 ID 的标注（存在时才生效）。
@@ -1675,12 +1796,18 @@ final class AnnotationEditorState {
     /// `[start, end]`——**拖出来的永远是直线**，鼠标轨迹整段被丢掉。
     func updateDraft(to rawPoint: PixelPoint, isShiftPressed: Bool = false) {
         guard let anchor = draftAnchor else { return }
-        let point = Self.constrainedEndPoint(
+        var point = Self.constrainedEndPoint(
             rawPoint,
             from: anchor,
             tool: tool,
             isShiftPressed: isShiftPressed
         )
+        // 当起点位于有效选区内且 Shift 约束把终点推出选区外时，将其安全夹回选区边界内。
+        if isShiftPressed, selection.size.width > 0, selection.size.height > 0,
+           anchor.x >= selection.origin.x, anchor.x <= selection.origin.x + selection.size.width,
+           anchor.y >= selection.origin.y, anchor.y <= selection.origin.y + selection.size.height {
+            point = clampPointToSelection(point)
+        }
 
         // 正常路径下 beginDraft 已经分配过序号；这里兜底一次，
         // 避免草稿被外部重置（如 `resetNumberingCounter`）后落下没有序号的标注。

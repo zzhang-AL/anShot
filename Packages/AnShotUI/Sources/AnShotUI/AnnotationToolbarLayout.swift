@@ -227,6 +227,8 @@ struct AnnotationToolbarLayout {
     /// 指针分组本身没有可调项，面板只在「有选中标注」时才有内容；
     /// 没有选中时面板仍是空的（不占高度，也不画背景）。
     var hasSelectedAnnotation = false
+    /// 选中的标注是否与当前激活工具同类型（绘图工具跨类型选中异类标注时自动切为检查面板）。
+    var selectedAnnotationMatchesTool = true
     /// 选中的标注是否是文字。
     ///
     /// 文字的样式槽是字号而不是线宽，面板据此换掉那一组控件。
@@ -578,6 +580,11 @@ struct AnnotationToolbarLayout {
             guard hasSelectedAnnotation else {
                 return ([], .zero)
             }
+            return layoutPointerSelectionPanel()
+        }
+        // 绘图工具下跨类型选中已有标注（如矩形工具下点中文字/马赛克/高亮/聚光灯）：
+        // 自动切换为匹配选中标注能力的属性检查面板，避免控件与当前对象不匹配。
+        if hasSelectedAnnotation, !selectedAnnotationMatchesTool {
             return layoutPointerSelectionPanel()
         }
         if Self.isSecondaryTool(tool) {

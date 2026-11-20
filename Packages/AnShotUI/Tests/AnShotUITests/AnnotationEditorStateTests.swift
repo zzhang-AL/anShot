@@ -1231,4 +1231,107 @@ struct AnnotationEditorEnhancementTests {
         }
         #expect(restoredIntensity == intensity1x, "撤销应还原先前强度")
     }
+
+    @Test("绘图工具下可直接拖动刚画好及已有非背景标注，同时保留未选中框内套画与面状叠加绘制能力")
+    func directMoveTargetMatchesDrawingWorkflow() {
+        let editor = AnnotationEditorState(selection: makeRect(0, 0, 800, 600))
+
+        // 1. 刚画完的空心矩形处于选中态：边框与框内任意位置均可直接拖动移动；
+        //    取消选中后，框内空白恢复放行新建标注（支持大框内套画小框）。
+        editor.select(.rectangle)
+        editor.beginDraft(at: PixelPoint(x: 100, y: 100))
+        editor.updateDraft(to: PixelPoint(x: 300, y: 260))
+        #expect(editor.commitDraft())
+        let rectID = editor.annotations[0].id
+        #expect(editor.selectedAnnotationID == rectID)
+        #expect(editor.selectedAnnotationMatchesTool)
+
+        #expect(
+            editor.directMoveTarget(at: PixelPoint(x: 200, y: 100), tolerance: 6)?.id == rectID,
+            "刚画好矩形的边框应可直接拖动移动，不需切指针工具"
+        )
+        #expect(
+            editor.directMoveTarget(at: PixelPoint(x: 200, y: 180), tolerance: 6)?.id == rectID,
+            "当前已选中的空心矩形在框内任意位置也应可直接拖动移动"
+        )
+
+        editor.clearAnnotationSelection()
+        #expect(
+            editor.directMoveTarget(at: PixelPoint(x: 200, y: 180), tolerance: 6) == nil,
+            "取消选中后，空心矩形内部空白处应放行新建标注（支持大框内套画小框）"
+        )
+
+        // 2. 继续画第二个框后，旧框虽然不再是选中态，其边框仍可直接选中并拖动
+        editor.beginDraft(at: PixelPoint(x: 400, y: 100))
+        editor.updateDraft(to: PixelPoint(x: 560, y: 220))
+        #expect(editor.commitDraft())
+        let secondRectID = editor.annotations[1].id
+        #expect(editor.selectedAnnotationID == secondRectID)
+
+        #expect(
+            editor.directMoveTarget(at: PixelPoint(x: 200, y: 100), tolerance: 6)?.id == rectID,
+            "绘图工具下点击旧空心框的边框也应可直接拖走"
+        )
+
+        // 3. 刚画完的聚光灯（面状背景型）处于选中态时可直接拖动微调；
+        //    切换到箭头工具后聚光灯取消选中，在其内部普通拖动应放行叠加画箭头，按 ⌘/⌃ 则强制拖动
+        editor.select(.spotlight)
+        editor.beginDraft(at: PixelPoint(x: 50, y: 300))
+        editor.updateDraft(to: PixelPoint(x: 350, y: 500))
+        #expect(editor.commitDraft())
+        let spotlightID = editor.annotations[2].id
+        #expect(
+            editor.directMoveTarget(at: PixelPoint(x: 200, y: 400), tolerance: 6)?.id == spotlightID,
+            "刚画完且选中的聚光灯应允许直接拖动对齐"
+        )
+
+        editor.select(.arrow)
+        #expect(editor.selectedAnnotationID == nil)
+        #expect(
+            editor.directMoveTarget(at: PixelPoint(x: 200, y: 400), tolerance: 6) == nil,
+            "未选中的聚光灯内部在箭头工具下应放行叠加画箭头"
+        )
+        #expect(
+            editor.directMoveTarget(at: PixelPoint(x: 200, y: 400), tolerance: 6, forceMove: true)?.id == spotlightID,
+            "按住 ⌘/⌃（forceMove）时应可强行拖动底层聚光灯"
+        )
+
+        // 4. 文字工具下：刚提交的文字处于选中态可直接拖动，点在未选中聚光灯上放行新建文字
+        editor.select(.text)
+        editor.beginTextEditing(at: PixelPoint(x: 500, y: 350))
+        editor.updateTextDraft("Hello")
+        #expect(editor.commitTextDraft(scaleFactor: 1))
+        let textID = editor.annotations[3].id
+        #expect(
+            editor.directMoveTarget(at: PixelPoint(x: 515, y: 365), tolerance: 6)?.id == textID,
+            "文字工具下刚输入的文字应可直接拖动移动"
+        )
+        #expect(
+            editor.directMoveTarget(at: PixelPoint(x: 200, y: 400), tolerance: 6) == nil,
+            "文字工具点在未选中的聚光灯上应放行直接新建文字"
+        )
+
+        // 5. 跨类型选中标注：矩形工具下选中文字，selectedAnnotationMatchesTool 为 false，改色只改文字不污染矩形默认色
+        editor.select(.rectangle)
+        let originalShapeColor = editor.style.shapeColor
+        let blue = AnnotationStyle.palette[3]
+        #expect(originalShapeColor != blue)
+        editor.selectAnnotation(id: textID)
+        #expect(!editor.selectedAnnotationMatchesTool, "矩形工具下选中文字应标记为跨类型选中")
+        editor.selectColor(blue)
+        #expect(editor.style.shapeColor == originalShapeColor, "跨类型给文字改色不得污染矩形工具默认颜色")
+        #expect(editor.style.textColor == blue, "跨类型给文字改色应同步到文字颜色槽")
+        #expect(editor.selectedAnnotationColor == blue)
+
+        // 6. 连续笔触工具（手绘 / 涂抹马赛克）：普通拖动不截胡，避免连笔误拖旧标注；按 forceMove 才移动
+        editor.select(.freehand)
+        #expect(
+            editor.directMoveTarget(at: PixelPoint(x: 200, y: 100), tolerance: 6) == nil,
+            "手绘工具普通拖动不应误拖已有边框"
+        )
+        #expect(
+            editor.directMoveTarget(at: PixelPoint(x: 200, y: 100), tolerance: 6, forceMove: true)?.id == rectID,
+            "手绘工具按住 ⌘/⌃ 仍可移动已有标注"
+        )
+    }
 }
