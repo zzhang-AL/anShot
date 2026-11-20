@@ -23,6 +23,7 @@
 //  响应：[UInt32 BE jsonLen][JSON(CommandReport)][UInt32 BE binLen][binaryBytes]
 //
 
+import AnShotCapture
 import Darwin
 import Foundation
 
@@ -31,6 +32,20 @@ struct DaemonSocketRequest: Codable, Sendable, Equatable {
     let action: IPCRequest.Action
     let outputPath: String?
     let timeoutSeconds: TimeInterval
+    /// 可选访问令牌（对应调用方环境变量 `ANSHOT_MCP_TOKEN`）。
+    let accessToken: String?
+
+    init(
+        action: IPCRequest.Action,
+        outputPath: String?,
+        timeoutSeconds: TimeInterval,
+        accessToken: String? = nil
+    ) {
+        self.action = action
+        self.outputPath = outputPath
+        self.timeoutSeconds = timeoutSeconds
+        self.accessToken = accessToken
+    }
 }
 
 /// Socket 传输层错误（区分「常驻未运行可降级」与「已连接但中途通信异常」）。
@@ -169,9 +184,11 @@ public final class AutomationDaemonServer: @unchecked Sendable {
     static let maxConcurrentRequests = 4
 
     typealias RequestHandler = @Sendable (DaemonSocketRequest) async -> (report: CommandReport, binaryData: Data?)
+    typealias PeerVerifier = @Sendable (Int32) -> Bool
 
     private let socketPath: String
     private let handler: RequestHandler
+    private let peerVerifier: PeerVerifier
     private let stateLock = NSLock()
     private let acceptQueue = DispatchQueue(label: "com.anshot.automation.daemon.accept", qos: .userInitiated)
     private let semaphore = AsyncSemaphore(limit: maxConcurrentRequests)
@@ -183,19 +200,38 @@ public final class AutomationDaemonServer: @unchecked Sendable {
     public convenience init() {
         self.init(
             socketPath: AutomationSocketTransport.defaultSocketPath(),
+            peerVerifier: { fd in
+                PeerCodeSignatureVerifier.verifySameSignedApplication(fd)
+            },
             handler: { request in
                 await IPCActionExecutor.executeForDaemon(request)
             }
         )
     }
 
-    init(socketPath: String, handler: @escaping RequestHandler) {
+    init(
+        socketPath: String,
+        peerVerifier: @escaping PeerVerifier = { PeerCodeSignatureVerifier.verifySameSignedApplication($0) },
+        handler: @escaping RequestHandler
+    ) {
         self.socketPath = socketPath
+        self.peerVerifier = peerVerifier
         self.handler = handler
     }
 
     deinit {
         stop()
+    }
+
+    /// 依据当前「MCP 与自动化安全」总开关实时启停 Socket 监听。
+    public func syncWithSecuritySettings(
+        _ settings: AutomationSecuritySettings = .shared
+    ) {
+        if settings.isAutomationEnabled {
+            _ = start()
+        } else {
+            stop()
+        }
     }
 
     /// 启动 Unix Domain Socket 监听（幂等；失败仅写 stderr 诊断，绝不阻塞 GUI 主路径）。
@@ -329,10 +365,13 @@ public final class AutomationDaemonServer: @unchecked Sendable {
 
             _ = fcntl(clientFD, F_SETFD, FD_CLOEXEC)
 
-            // 严格鉴权：仅允许与当前进程同 UID 的本机客户端接入。
+            // 防线 1：先核验同 UID，再通过内核 `LOCAL_PEERTOKEN`（audit_token_t）核验对端代码签名
+            // 必须为同一证书签发的合法 `anShot.app` 二进制，彻底封死外部脚本直连 Socket。
             var peerUID: uid_t = 0
             var peerGID: gid_t = 0
-            guard getpeereid(clientFD, &peerUID, &peerGID) == 0, peerUID == geteuid() else {
+            guard getpeereid(clientFD, &peerUID, &peerGID) == 0,
+                  peerUID == geteuid(),
+                  peerVerifier(clientFD) else {
                 Darwin.close(clientFD)
                 continue
             }
@@ -445,6 +484,7 @@ enum AutomationDaemonClient {
         action: IPCRequest.Action,
         outputPath: String? = nil,
         timeout: TimeInterval,
+        accessToken: String? = AutomationSecurityGate.currentEnvironmentToken(),
         socketPath: String = AutomationSocketTransport.defaultSocketPath()
     ) async throws -> (report: CommandReport, binaryData: Data?) {
         guard let resolved = AutomationSocketTransport.makeSockAddr(path: socketPath) else {
@@ -474,7 +514,8 @@ enum AutomationDaemonClient {
         let request = DaemonSocketRequest(
             action: action,
             outputPath: outputPath,
-            timeoutSeconds: timeout
+            timeoutSeconds: timeout,
+            accessToken: accessToken
         )
         let requestData: Data
         do {
@@ -527,10 +568,22 @@ enum AutomationDaemonClient {
 /// 统一的自动化动作执行器：供常驻 Socket 服务端与 `--ipc-request` 兜底子进程共用同一套实现。
 enum IPCActionExecutor {
 
-    /// 供常驻 Unix Domain Socket 服务端执行：截图数据纯内存返回，零临时磁盘中转。
+    /// 供常驻 Unix Domain Socket 服务端执行：强制执行总开关 + Token 鉴权、路径沙箱校验与隐私窗口屏蔽。
     static func executeForDaemon(
-        _ request: DaemonSocketRequest
+        _ request: DaemonSocketRequest,
+        securitySettings: AutomationSecuritySettings = .shared
     ) async -> (report: CommandReport, binaryData: Data?) {
+        do {
+            try AutomationSecurityGate.authorize(
+                providedToken: request.accessToken,
+                settings: securitySettings
+            )
+        } catch let error as AutomationError {
+            return (CommandReport.failure(error.localizedDescription), nil)
+        } catch {
+            return (CommandReport.failure("自动化鉴权失败：\(error.localizedDescription)"), nil)
+        }
+
         switch request.action {
         case .listWindows:
             return (CommandReport(ok: true, windows: WindowCatalog.all()), nil)
@@ -539,7 +592,11 @@ enum IPCActionExecutor {
             params.savePath = nil
             do {
                 let timeout = max(10, request.timeoutSeconds)
-                let outcome = try await CaptureService.capture(params, lockTimeout: timeout)
+                let outcome = try await CaptureService.capture(
+                    params,
+                    lockTimeout: timeout,
+                    authorizedByDaemon: true
+                )
                 let report = CommandReport(
                     ok: true,
                     capture: CaptureOutput(outcome: outcome, overrideSavedPath: nil)
@@ -553,7 +610,11 @@ enum IPCActionExecutor {
 
         case .ocr(let params):
             do {
-                let ocr = try await AutomationOCRService.recognize(params, execution: .currentProcess)
+                let ocr = try await AutomationOCRService.recognize(
+                    params,
+                    execution: .currentProcess,
+                    authorizedByDaemon: true
+                )
                 return (CommandReport(ok: true, ocr: ocr), nil)
             } catch let error as AutomationError {
                 return (CommandReport.failure(error.localizedDescription), nil)
@@ -563,7 +624,11 @@ enum IPCActionExecutor {
 
         case .inspectElements(let params):
             do {
-                let elements = try await AccessibilityInspector.inspect(params, execution: .currentProcess)
+                let elements = try await AccessibilityInspector.inspect(
+                    params,
+                    execution: .currentProcess,
+                    authorizedByDaemon: true
+                )
                 return (CommandReport(ok: true, elements: elements), nil)
             } catch let error as AutomationError {
                 return (CommandReport.failure(error.localizedDescription), nil)
@@ -573,19 +638,23 @@ enum IPCActionExecutor {
 
         case .record(let params):
             do {
-                let artifact = try await RecordingService.recordLocallyToTemporaryFile(params)
+                guard let outputPath = request.outputPath else {
+                    throw AutomationError.outputFailed("常驻录制请求缺少中转输出路径。")
+                }
+                let safeOutputURL = try AutomationPathSandbox.validateTransferOutputPath(outputPath)
+                let artifact = try await RecordingService.recordLocallyToTemporaryFile(
+                    params,
+                    authorizedByDaemon: true
+                )
                 defer {
                     try? FileManager.default.removeItem(
                         at: artifact.temporaryURL.deletingLastPathComponent()
                     )
                 }
-                guard let outputPath = request.outputPath else {
-                    throw AutomationError.outputFailed("常驻录制请求缺少中转输出路径。")
-                }
                 let data = try Data(contentsOf: artifact.temporaryURL, options: [.mappedIfSafe])
-                try IPCRequest.writePrivateFile(data, to: URL(fileURLWithPath: outputPath))
+                try IPCRequest.writePrivateFile(data, to: safeOutputURL)
                 let rec = RecordingOutcomeOutput(
-                    savedPath: outputPath,
+                    savedPath: safeOutputURL.path,
                     format: artifact.format,
                     durationSeconds: artifact.durationSeconds,
                     pixelWidth: artifact.pixelWidth,

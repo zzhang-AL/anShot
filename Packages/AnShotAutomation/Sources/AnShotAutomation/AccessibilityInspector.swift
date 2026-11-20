@@ -143,12 +143,13 @@ public enum AccessibilityInspector {
     /// 执行控件树探测。
     public static func inspect(
         _ parameters: InspectElementsParameters,
-        execution: CaptureExecution = .reuseApplicationAuthorization
+        execution: CaptureExecution = .reuseApplicationAuthorization,
+        authorizedByDaemon: Bool = false
     ) async throws -> ElementsInspectionOutput {
         try parameters.validate()
 
         // 若请求复用 anShot.app 权限、本进程尚未拿到辅助功能权限、且在 .app 内，
-        // 委托给 anShot.app 子实例执行（它可能已获得用户的辅助功能与屏幕录制双授权）。
+        // 委托给 anShot.app 常驻/子实例执行（它可能已获得用户的辅助功能与屏幕录制双授权）。
         if execution == .reuseApplicationAuthorization,
            !AXIsProcessTrusted(),
            let appURL = OutOfProcessCapture.currentAppURL {
@@ -159,8 +160,18 @@ public enum AccessibilityInspector {
             )
         }
 
+        if !authorizedByDaemon {
+            try AutomationSecurityGate.authorize(providedToken: AutomationSecurityGate.currentEnvironmentToken())
+        }
+
         // 就地解析目标窗口/进程（确保走与窗口目录一致的解析策略）。
         let resolvedTarget = try resolveTarget(parameters)
+
+        // 防线 4：禁止通过 AX 控件树读取受保护密码管理器/系统钥匙串的界面文本。
+        try AutomationSecurityGate.validateTargetWindowAllowed(
+            pid: resolvedTarget.pid,
+            applicationName: resolvedTarget.applicationName
+        )
 
         guard AXIsProcessTrusted() else {
             return ElementsInspectionOutput(

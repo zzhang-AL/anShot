@@ -257,6 +257,21 @@ public protocol ScreenCapturing: Sendable {
     ///   乘以该显示器的缩放系数对应。
     /// - Throws: `CaptureError`
     func captureFrame(scope: CaptureScope) async throws -> CapturedFrame
+
+    /// 带敏感窗口隐私排除清单抓取单帧（用于自动化/MCP 截全屏或区域时在系统合成层自动剔除密码库等敏感窗口）。
+    func captureFrame(
+        scope: CaptureScope,
+        privacyExclusion: CapturePrivacyExclusion
+    ) async throws -> CapturedFrame
+}
+
+public extension ScreenCapturing {
+    func captureFrame(
+        scope: CaptureScope,
+        privacyExclusion: CapturePrivacyExclusion
+    ) async throws -> CapturedFrame {
+        try await captureFrame(scope: scope)
+    }
 }
 
 // MARK: - 显示器几何工具

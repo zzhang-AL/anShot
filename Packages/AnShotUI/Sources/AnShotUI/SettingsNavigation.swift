@@ -96,7 +96,7 @@ enum SettingsPage: String, CaseIterable {
     var searchKeywords: [String] {
         switch self {
         case .general:
-            return ["通用", "general", "外观", "深色", "浅色", "dark", "light", "主题", "theme", "语言", "language", "english", "中文", "权限", "permission", "tcc", "tccutil", "自愈", "屏幕录制", "辅助功能", "麦克风", "提示", "toast", "启动", "开机", "login"]
+            return ["通用", "general", "外观", "深色", "浅色", "dark", "light", "主题", "theme", "语言", "language", "english", "中文", "权限", "permission", "tcc", "tccutil", "自愈", "屏幕录制", "辅助功能", "麦克风", "提示", "toast", "启动", "开机", "login", "mcp", "自动化", "automation", "token", "令牌", "安全", "security", "隐私", "密码", "1password", "socket"]
         case .capture:
             return ["截图", "标注", "capture", "annotation", "阴影", "shadow", "esc", "防误关", "工具栏", "toolbar", "槽位", "长截图", "滚动", "自动翻页", "autoscroll", "速度", "范围框", "录屏", "recording"]
         case .shortcuts:

@@ -27,6 +27,13 @@ public struct ScreenshotCapturer: ScreenCapturing {
     }
 
     public func captureFrame(scope: CaptureScope) async throws -> CapturedFrame {
+        try await captureFrame(scope: scope, privacyExclusion: .none)
+    }
+
+    public func captureFrame(
+        scope: CaptureScope,
+        privacyExclusion: CapturePrivacyExclusion
+    ) async throws -> CapturedFrame {
         let t0 = Date()
 
         try CaptureSetup.requirePermission()
@@ -46,7 +53,8 @@ public struct ScreenshotCapturer: ScreenCapturing {
                 target: target,
                 scope: scope,
                 content: content,
-                showsCursor: false
+                showsCursor: false,
+                privacyExclusion: privacyExclusion
             )
 
             let t3 = Date()

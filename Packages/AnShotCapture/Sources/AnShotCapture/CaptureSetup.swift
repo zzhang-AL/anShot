@@ -120,20 +120,29 @@ enum CaptureSetup {
         let windowInfo: WindowCaptureInfo?
     }
 
-    /// 按目标构造过滤器、配置与产物元数据。
+    /// 按目标构造过滤器、配置与产物元数据（支持传入隐私排除清单在整屏/区域截图中底层剔除受保护窗口）。
     static func makeSingleFrameSetup(
         target: SingleFrameTarget,
         scope: CaptureScope,
         content: SCShareableContent,
-        showsCursor: Bool
+        showsCursor: Bool,
+        privacyExclusion: CapturePrivacyExclusion = .none
     ) throws -> SingleFrameSetup {
         switch target {
         case .display(let targetDisplayID, let region):
             let context = try displayContext(for: targetDisplayID)
             let display = try self.display(in: content, matching: targetDisplayID)
+            let excludedWindows: [SCWindow] = privacyExclusion.isEmpty
+                ? []
+                : content.windows.filter { window in
+                    privacyExclusion.matches(
+                        bundleIdentifier: window.owningApplication?.bundleIdentifier,
+                        applicationName: window.owningApplication?.applicationName
+                    )
+                }
 
             return SingleFrameSetup(
-                filter: makeFilter(display: display),
+                filter: makeFilter(display: display, excludingWindows: excludedWindows),
                 configuration: makeConfiguration(
                     scope: scope,
                     displayID: targetDisplayID,
@@ -284,11 +293,9 @@ enum CaptureSetup {
 
     // MARK: - 过滤器与配置
 
-    /// 构造内容过滤器：包含该显示器上的全部内容。
-    ///
-    /// 截图应还原用户所见，故不排除自己的窗口。
-    static func makeFilter(display: SCDisplay) -> SCContentFilter {
-        SCContentFilter(display: display, excludingWindows: [])
+    /// 构造内容过滤器：默认包含该显示器上的全部内容；传入 `excludingWindows` 时在底层合成阶段隐身剔除敏感窗口。
+    static func makeFilter(display: SCDisplay, excludingWindows: [SCWindow] = []) -> SCContentFilter {
+        SCContentFilter(display: display, excludingWindows: excludingWindows)
     }
 
     /// 构造流配置。

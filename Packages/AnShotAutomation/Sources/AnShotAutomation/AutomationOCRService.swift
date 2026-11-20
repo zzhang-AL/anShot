@@ -130,12 +130,16 @@ public enum AutomationOCRService {
     /// 执行离线文字识别。
     public static func recognize(
         _ parameters: OCRParameters,
-        execution: CaptureExecution = .reuseApplicationAuthorization
+        execution: CaptureExecution = .reuseApplicationAuthorization,
+        authorizedByDaemon: Bool = false
     ) async throws -> OCRResponseOutput {
         try parameters.validate()
 
-        // 1. 本地图像路径：直接在本进程读取文件并运行 Vision OCR（无需屏幕录制权限）。
+        // 1. 本地图像路径：直接在本进程读取文件并运行 Vision OCR（无需屏幕录制权限，但同样受自动化总开关与令牌保护）。
         if let imagePath = parameters.imagePath {
+            if !authorizedByDaemon {
+                try AutomationSecurityGate.authorize(providedToken: AutomationSecurityGate.currentEnvironmentToken())
+            }
             let image = try loadImage(at: imagePath)
             return try await runVisionOCR(on: image, languages: parameters.languages)
         }
@@ -151,9 +155,13 @@ public enum AutomationOCRService {
             )
         }
 
-        // 3. 就地执行（--direct 或子实例或单测）。
+        // 3. 就地执行（--direct 或常驻/子实例或单测）。
         let captureParameters = parameters.asCaptureParameters()
-        let raw = try await CaptureService.captureRawFrame(captureParameters, lockTimeout: timeout)
+        let raw = try await CaptureService.captureRawFrame(
+            captureParameters,
+            lockTimeout: timeout,
+            authorizedByDaemon: authorizedByDaemon
+        )
         return try await runVisionOCR(on: raw.frame.image, languages: parameters.languages)
     }
 

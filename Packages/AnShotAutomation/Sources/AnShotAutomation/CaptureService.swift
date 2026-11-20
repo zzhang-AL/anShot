@@ -243,14 +243,24 @@ public enum CaptureService {
     public static func capture(
         _ parameters: CaptureParameters,
         reservedOutputPaths: Set<String> = [],
-        lockTimeout: TimeInterval = 30
+        lockTimeout: TimeInterval = 30,
+        authorizedByDaemon: Bool = false
     ) async throws -> CaptureOutcome {
+        if !authorizedByDaemon {
+            try AutomationSecurityGate.authorize(providedToken: AutomationSecurityGate.currentEnvironmentToken())
+        }
         let target = try parameters.resolveTarget()
+
+        // 防线 4：单窗口截图拦截受保护的密码管理器与系统隐私应用。
+        if case .window(let windowID) = target.scope {
+            try AutomationSecurityGate.validateWindowIDAllowed(windowID)
+        }
 
         // 权限预检。放在构造 scope 之前：无权限时后续每一步都会失败，
         // 早失败可以省掉一次 `SCShareableContent` 查询。
         try requirePermission()
 
+        let privacyExclusion = AutomationSecuritySettings.shared.activePrivacyExclusion
         let captured: CaptureOutcome
         do {
             captured = try await DesktopCaptureCoordinator.capture(
@@ -259,7 +269,10 @@ public enum CaptureService {
                 allowSwitch: parameters.allowDesktopSwitch,
                 lockTimeout: lockTimeout
             ) {
-                let frame = try await CapturerFactory.makeDefault().captureFrame(scope: target.scope)
+                let frame = try await CapturerFactory.makeDefault().captureFrame(
+                    scope: target.scope,
+                    privacyExclusion: privacyExclusion
+                )
                 // ScreenCaptureKit 图像可能引用系统复用的表面；恢复桌面前先编码快照，
                 // 避免切回时读取到过渡画面。
                 return try prepareOutcome(frame: frame, parameters: parameters, target: target)
@@ -280,11 +293,19 @@ public enum CaptureService {
     /// 抓取单帧图像但不立即缩放到小图，供 OCR 等需要原始清晰度的场景直接复用。
     static func captureRawFrame(
         _ parameters: CaptureParameters,
-        lockTimeout: TimeInterval = 30
+        lockTimeout: TimeInterval = 30,
+        authorizedByDaemon: Bool = false
     ) async throws -> (frame: CapturedFrame, target: ResolvedCaptureTarget) {
+        if !authorizedByDaemon {
+            try AutomationSecurityGate.authorize(providedToken: AutomationSecurityGate.currentEnvironmentToken())
+        }
         let target = try parameters.resolveTarget()
+        if case .window(let windowID) = target.scope {
+            try AutomationSecurityGate.validateWindowIDAllowed(windowID)
+        }
         try requirePermission()
 
+        let privacyExclusion = AutomationSecuritySettings.shared.activePrivacyExclusion
         do {
             return try await DesktopCaptureCoordinator.capture(
                 spaceID: parameters.spaceID,
@@ -292,7 +313,10 @@ public enum CaptureService {
                 allowSwitch: parameters.allowDesktopSwitch,
                 lockTimeout: lockTimeout
             ) {
-                let frame = try await CapturerFactory.makeDefault().captureFrame(scope: target.scope)
+                let frame = try await CapturerFactory.makeDefault().captureFrame(
+                    scope: target.scope,
+                    privacyExclusion: privacyExclusion
+                )
                 // 跨桌面时先在原位拷贝出独立位图，避免切回桌面后系统底层缓冲区失效。
                 if parameters.spaceID != nil,
                    let copied = copyCGImage(frame.image) {
@@ -668,7 +692,7 @@ public enum CaptureService {
     ) throws -> ExclusiveWriteResult {
         let descriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
             guard let path else { return -1 }
-            return open(path, O_WRONLY | O_CREAT | O_EXCL, 0o644)
+            return open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o644)
         }
 
         if descriptor < 0 {

@@ -391,6 +391,10 @@ private final class SettingsViewController: NSViewController {
     private var toastToggleRow: SettingsToggleRow!
     private var recordingFrameToggleRow: SettingsToggleRow!
     private var overlayShortcutHintToggleRow: SettingsToggleRow!
+    private var automationEnabledToggleRow: SettingsToggleRow?
+    private var automationRequireTokenToggleRow: SettingsToggleRow?
+    private var automationProtectSensitiveToggleRow: SettingsToggleRow?
+    private var automationTokenStatusLabel: NSTextField?
     private var screenPermPill: SettingsStatusPill!
     private var micPermPill: SettingsStatusPill!
     private var axPermPill: SettingsStatusPill!
@@ -696,6 +700,7 @@ private final class SettingsViewController: NSViewController {
             cards = [
                 makeAppearanceAndLanguageCard(),
                 makePermissionsCard(),
+                makeAutomationSecurityCard(),
             ]
         case .capture:
             cards = [
@@ -1170,6 +1175,102 @@ private final class SettingsViewController: NSViewController {
         )
     }
 
+    /// 卡片 3：「MCP 与自动化安全」——总开关、访问令牌防借壳鉴权与密码管理器隐私屏蔽。
+    private func makeAutomationSecurityCard() -> SettingsCardView {
+        let security = AutomationSecuritySettings.shared
+
+        let enabledRow = SettingsToggleRow(
+            title: "允许 MCP 与自动化后台服务",
+            subtitle: "通过本机私有 Socket（同签名强校验）提供后台无感截图；关闭后立即停用监听并拒绝所有自动化调用"
+        )
+        enabledRow.isOn = security.isAutomationEnabled
+        enabledRow.toggle.target = self
+        enabledRow.toggle.action = #selector(automationEnabledChanged(_:))
+        automationEnabledToggleRow = enabledRow
+
+        let tokenRow = SettingsToggleRow(
+            title: "要求访问令牌（ANSHOT_MCP_TOKEN）",
+            subtitle: "推荐开启：强制要求 MCP/CLI 在环境变量中提供有效密钥，彻底拦截本机未知脚本借壳调用"
+        )
+        tokenRow.isOn = security.requireAccessToken
+        tokenRow.toggle.target = self
+        tokenRow.toggle.action = #selector(automationRequireTokenChanged(_:))
+        automationRequireTokenToggleRow = tokenRow
+
+        let privacyRow = SettingsToggleRow(
+            title: "自动屏蔽密码管理器等敏感隐私窗口",
+            subtitle: "后台全屏截图自动剔除 1Password、Bitwarden、KeePassXC、密码、钥匙串与系统设置，单窗与控件树直接拦截"
+        )
+        privacyRow.isOn = security.protectSensitiveWindows
+        privacyRow.toggle.target = self
+        privacyRow.toggle.action = #selector(automationProtectSensitiveChanged(_:))
+        automationProtectSensitiveToggleRow = privacyRow
+
+        let tokenStatus = NSTextField(labelWithString: "")
+        tokenStatus.font = .monospacedSystemFont(ofSize: 11.5, weight: .medium)
+        tokenStatus.textColor = .secondaryLabelColor
+        automationTokenStatusLabel = tokenStatus
+
+        let copyTokenBtn = SettingsPushButton(
+            title: "复制令牌",
+            emphasis: .primary,
+            target: self,
+            action: #selector(copyAutomationTokenClicked)
+        )
+        let copySnippetBtn = SettingsPushButton(
+            title: "复制 MCP 配置",
+            target: self,
+            action: #selector(copyAutomationMCPSnippetClicked)
+        )
+        let regenBtn = SettingsPushButton(
+            title: "重置令牌",
+            emphasis: .destructive,
+            target: self,
+            action: #selector(regenerateAutomationTokenClicked)
+        )
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let btnRow = NSStackView(views: [copyTokenBtn, copySnippetBtn, spacer, regenBtn])
+        btnRow.orientation = .horizontal
+        btnRow.alignment = .centerY
+        btnRow.spacing = 8
+
+        let hint = NSTextField(wrappingLabelWithString: "本地私有 Socket 默认强制通过内核代码签名校验，仅允许同签名 anShot 二进制接入；配合访问令牌与隐私屏蔽可构筑完整纵深防线。")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .tertiaryLabelColor
+
+        let actionBlock = NSStackView(views: [tokenStatus, btnRow, hint])
+        actionBlock.orientation = .vertical
+        actionBlock.alignment = .leading
+        actionBlock.spacing = 8
+        tokenStatus.widthAnchor.constraint(equalTo: actionBlock.widthAnchor).isActive = true
+        btnRow.widthAnchor.constraint(equalTo: actionBlock.widthAnchor).isActive = true
+        hint.widthAnchor.constraint(equalTo: actionBlock.widthAnchor).isActive = true
+
+        refreshAutomationTokenStatusLabel()
+        return SettingsCardView(
+            symbolName: "shield.lefthalf.filled",
+            title: "MCP 与自动化安全",
+            accentColor: SettingsPage.general.badgeColor,
+            rows: [enabledRow, tokenRow, privacyRow, actionBlock]
+        )
+    }
+
+    private func refreshAutomationTokenStatusLabel() {
+        let security = AutomationSecuritySettings.shared
+        guard let token = security.currentAccessToken(), token.count >= 16 else {
+            automationTokenStatusLabel?.stringValue = security.requireAccessToken
+                ? "当前令牌：未生成（点击「复制令牌」自动生成）"
+                : "当前令牌：未启用强制令牌校验（可随时开启并复制）"
+            return
+        }
+        let prefix = token.prefix(11)
+        let suffix = token.suffix(4)
+        let stateHint = security.requireAccessToken ? "已启用强制校验" : "已生成（未强制校验）"
+        automationTokenStatusLabel?.stringValue = "当前令牌：\(prefix)••••••••\(suffix)（\(stateHint)）"
+    }
+
     private func makeOverlayShortcutReferenceCard() -> SettingsCardView {
         let items: [([String], String)] = [
             (["Space", "Tab"], "切换独立窗体模式 / 穿透选择光标下叠放窗口"),
@@ -1348,6 +1449,77 @@ private final class SettingsViewController: NSViewController {
 
     @objc private func showOverlayShortcutHintChanged(_ sender: NSSwitch) {
         settings.setShowOverlayShortcutHint(sender.state == .on)
+    }
+
+    @objc private func automationEnabledChanged(_ sender: NSSwitch) {
+        AutomationSecuritySettings.shared.setAutomationEnabled(sender.state == .on)
+    }
+
+    @objc private func automationRequireTokenChanged(_ sender: NSSwitch) {
+        AutomationSecuritySettings.shared.setRequireAccessToken(sender.state == .on)
+        refreshAutomationTokenStatusLabel()
+    }
+
+    @objc private func automationProtectSensitiveChanged(_ sender: NSSwitch) {
+        AutomationSecuritySettings.shared.setProtectSensitiveWindows(sender.state == .on)
+    }
+
+    @objc private func copyAutomationTokenClicked() {
+        do {
+            let token = try AutomationSecuritySettings.shared.ensureAccessToken()
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(token, forType: .string)
+            refreshAutomationTokenStatusLabel()
+            ToastPresenter.show("已复制 ANSHOT_MCP_TOKEN 访问令牌")
+        } catch {
+            ToastPresenter.show("生成访问令牌失败：\(error.localizedDescription)")
+        }
+    }
+
+    @objc private func copyAutomationMCPSnippetClicked() {
+        do {
+            let token = try AutomationSecuritySettings.shared.ensureAccessToken()
+            let execPath = Bundle.main.executablePath ?? "/Applications/anShot.app/Contents/MacOS/anShot"
+            let snippet = """
+            {
+              "mcpServers": {
+                "anshot": {
+                  "command": "\(execPath)",
+                  "args": ["--mcp"],
+                  "env": {
+                    "ANSHOT_MCP_TOKEN": "\(token)"
+                  }
+                }
+              }
+            }
+            """
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(snippet, forType: .string)
+            refreshAutomationTokenStatusLabel()
+            ToastPresenter.show("已复制带访问令牌的 MCP 配置片段")
+        } catch {
+            ToastPresenter.show("生成 MCP 配置失败：\(error.localizedDescription)")
+        }
+    }
+
+    @objc private func regenerateAutomationTokenClicked() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "重置自动化访问令牌？"
+        alert.informativeText = "重置后旧的 ANSHOT_MCP_TOKEN 将立即失效，需要把新令牌更新到已接入的 MCP 客户端配置中。"
+        alert.addButton(withTitle: "重置令牌")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        do {
+            let token = try AutomationSecuritySettings.shared.regenerateAccessToken()
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(token, forType: .string)
+            refreshAutomationTokenStatusLabel()
+            ToastPresenter.show("已重置并复制新的访问令牌")
+        } catch {
+            ToastPresenter.show("重置令牌失败：\(error.localizedDescription)")
+        }
     }
 
     @objc private func refreshPermissionsClicked() {

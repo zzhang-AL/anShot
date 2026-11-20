@@ -870,6 +870,23 @@ public enum CommandLineInterface {
         var report: CommandReport
         var exitCode: Int32 = 0
 
+        // 防线 2：在兜底子实例入口同样强制校验自动化总开关与访问令牌，防止恶意程序绕过 Socket 直接 `open -n`。
+        do {
+            try AutomationSecurityGate.authorize(providedToken: request.accessToken)
+        } catch let error as AutomationError {
+            report = CommandReport.failure(error.localizedDescription)
+            if let data = encode(report).map({ Data($0.utf8) }) {
+                try? IPCRequest.writePrivateFile(data, to: URL(fileURLWithPath: request.reportPath))
+            }
+            return 1
+        } catch {
+            report = CommandReport.failure("自动化鉴权失败：\(error.localizedDescription)")
+            if let data = encode(report).map({ Data($0.utf8) }) {
+                try? IPCRequest.writePrivateFile(data, to: URL(fileURLWithPath: request.reportPath))
+            }
+            return 1
+        }
+
         switch request.action {
         case .listWindows:
             report = CommandReport(ok: true, windows: WindowCatalog.all())
@@ -877,15 +894,20 @@ public enum CommandLineInterface {
         case .capture(var params):
             params.savePath = nil
             do {
-                let timeout = max(10, request.watchdogTimeoutSeconds)
-                let outcome = try await CaptureService.capture(params, lockTimeout: timeout)
                 guard let outputPath = request.outputPath else {
                     throw AutomationError.outputFailed("IPC 请求缺少中转输出路径。")
                 }
-                try IPCRequest.writePrivateFile(outcome.imageData, to: URL(fileURLWithPath: outputPath))
+                let safeOutputURL = try AutomationPathSandbox.validateTransferOutputPath(outputPath)
+                let timeout = max(10, request.watchdogTimeoutSeconds)
+                let outcome = try await CaptureService.capture(
+                    params,
+                    lockTimeout: timeout,
+                    authorizedByDaemon: true
+                )
+                try IPCRequest.writePrivateFile(outcome.imageData, to: safeOutputURL)
                 report = CommandReport(
                     ok: true,
-                    capture: CaptureOutput(outcome: outcome, overrideSavedPath: outputPath)
+                    capture: CaptureOutput(outcome: outcome, overrideSavedPath: safeOutputURL.path)
                 )
             } catch let error as AutomationError {
                 report = CommandReport.failure(error.localizedDescription)
@@ -897,7 +919,11 @@ public enum CommandLineInterface {
 
         case .ocr(let params):
             do {
-                let ocr = try await AutomationOCRService.recognize(params, execution: .currentProcess)
+                let ocr = try await AutomationOCRService.recognize(
+                    params,
+                    execution: .currentProcess,
+                    authorizedByDaemon: true
+                )
                 report = CommandReport(ok: true, ocr: ocr)
             } catch let error as AutomationError {
                 report = CommandReport.failure(error.localizedDescription)
@@ -909,7 +935,11 @@ public enum CommandLineInterface {
 
         case .inspectElements(let params):
             do {
-                let elements = try await AccessibilityInspector.inspect(params, execution: .currentProcess)
+                let elements = try await AccessibilityInspector.inspect(
+                    params,
+                    execution: .currentProcess,
+                    authorizedByDaemon: true
+                )
                 report = CommandReport(ok: true, elements: elements)
             } catch let error as AutomationError {
                 report = CommandReport.failure(error.localizedDescription)
@@ -921,19 +951,23 @@ public enum CommandLineInterface {
 
         case .record(let params):
             do {
-                let artifact = try await RecordingService.recordLocallyToTemporaryFile(params)
+                guard let outputPath = request.outputPath else {
+                    throw AutomationError.outputFailed("IPC 请求缺少录制中转输出路径。")
+                }
+                let safeOutputURL = try AutomationPathSandbox.validateTransferOutputPath(outputPath)
+                let artifact = try await RecordingService.recordLocallyToTemporaryFile(
+                    params,
+                    authorizedByDaemon: true
+                )
                 defer {
                     try? FileManager.default.removeItem(
                         at: artifact.temporaryURL.deletingLastPathComponent()
                     )
                 }
-                guard let outputPath = request.outputPath else {
-                    throw AutomationError.outputFailed("IPC 请求缺少录制中转输出路径。")
-                }
                 let data = try Data(contentsOf: artifact.temporaryURL, options: [.mappedIfSafe])
-                try IPCRequest.writePrivateFile(data, to: URL(fileURLWithPath: outputPath))
+                try IPCRequest.writePrivateFile(data, to: safeOutputURL)
                 let rec = RecordingOutcomeOutput(
-                    savedPath: outputPath,
+                    savedPath: safeOutputURL.path,
                     format: artifact.format,
                     durationSeconds: artifact.durationSeconds,
                     pixelWidth: artifact.pixelWidth,

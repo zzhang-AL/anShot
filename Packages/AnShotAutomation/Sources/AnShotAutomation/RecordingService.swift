@@ -211,9 +211,17 @@ public enum RecordingService {
 
     /// 使用 `SCStreamRecorder` 在私有临时目录中完成录制。
     static func recordLocallyToTemporaryFile(
-        _ parameters: RecordingParameters
+        _ parameters: RecordingParameters,
+        authorizedByDaemon: Bool = false
     ) async throws -> LocalRecordingArtifact {
+        if !authorizedByDaemon {
+            try AutomationSecurityGate.authorize(providedToken: AutomationSecurityGate.currentEnvironmentToken())
+        }
         let target = try parameters.validate()
+        // 防线 4：禁止对受保护的密码管理器与系统隐私应用发起后台单窗录屏。
+        if case .window(let windowID) = target.scope {
+            try AutomationSecurityGate.validateWindowIDAllowed(windowID)
+        }
         guard CGPreflightScreenCaptureAccess() else {
             throw AutomationError.permissionDenied
         }

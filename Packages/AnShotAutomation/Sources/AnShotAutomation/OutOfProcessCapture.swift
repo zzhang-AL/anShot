@@ -315,7 +315,8 @@ enum OutOfProcessCapture {
                     outputPath: transferURL?.path,
                     reportPath: reportURL.path,
                     pidFilePath: pidURL.path,
-                    watchdogTimeoutSeconds: timeout
+                    watchdogTimeoutSeconds: timeout,
+                    accessToken: AutomationSecurityGate.currentEnvironmentToken()
                 )
                 try request.write(to: requestURL)
 

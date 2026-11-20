@@ -36,6 +36,25 @@ struct IPCRequest: Codable, Sendable, Equatable {
     /// 子实例硬超时上限（秒），用于挂载进程内 Watchdog 自毁兜底。
     let watchdogTimeoutSeconds: TimeInterval
 
+    /// 可选访问令牌（透传调用方环境变量 `ANSHOT_MCP_TOKEN`，供子实例鉴权）。
+    let accessToken: String?
+
+    init(
+        action: Action,
+        outputPath: String?,
+        reportPath: String,
+        pidFilePath: String,
+        watchdogTimeoutSeconds: TimeInterval,
+        accessToken: String? = nil
+    ) {
+        self.action = action
+        self.outputPath = outputPath
+        self.reportPath = reportPath
+        self.pidFilePath = pidFilePath
+        self.watchdogTimeoutSeconds = watchdogTimeoutSeconds
+        self.accessToken = accessToken
+    }
+
     /// 以 `0o600` 权限写入请求 JSON。
     func write(to url: URL) throws {
         let encoder = JSONEncoder()
@@ -80,7 +99,7 @@ struct IPCRequest: Codable, Sendable, Equatable {
         let tempURL = directory.appendingPathComponent(".tmp-\(UUID().uuidString)")
         let descriptor = tempURL.withUnsafeFileSystemRepresentation { path -> Int32 in
             guard let path else { return -1 }
-            return open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
+            return open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)
         }
         guard descriptor >= 0 else {
             throw AutomationError.outputFailed("无法创建私有文件 \(url.path)：\(String(cString: strerror(errno)))")

@@ -7,6 +7,7 @@
 
 import AppKit
 import AnShotAutomation
+import AnShotCapture
 import AnShotUI
 import Darwin
 
@@ -53,9 +54,16 @@ let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 
 // 正式 GUI 单实例挂载常驻私有 Unix Domain Socket 自动化代理：
-// MCP / CLI 优先直连常驻进程静默执行截图/窗口枚举/OCR/控件探测，零冷启动、零进程闪现。
+// 遵循设置页「允许 MCP 与自动化后台服务」总开关实时启停，并强制执行内核级同签名校验与令牌鉴权。
 if !isDiagnostic {
-    AutomationDaemonServer.shared.start()
+    AutomationDaemonServer.shared.syncWithSecuritySettings()
+    NotificationCenter.default.addObserver(
+        forName: AutomationSecuritySettings.didChangeNotification,
+        object: nil,
+        queue: nil
+    ) { _ in
+        AutomationDaemonServer.shared.syncWithSecuritySettings()
+    }
     NotificationCenter.default.addObserver(
         forName: NSApplication.willTerminateNotification,
         object: app,
