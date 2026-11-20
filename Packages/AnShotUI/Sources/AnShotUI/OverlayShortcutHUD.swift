@@ -13,6 +13,7 @@
 
 import AppKit
 import CoreGraphics
+import CoreText
 import Foundation
 
 @MainActor
@@ -61,13 +62,51 @@ enum OverlayShortcutHUD {
     private static let segmentGap: CGFloat = 10
     private static let avoidPadding: CGFloat = 10
 
-    // 静态缓存字体，避免在高频重绘中重复创建 NSFont 触发 macOS 27 CoreText 字典深拷贝异常。
-    private static let pillKeyFont = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .semibold)
-    private static let pillLabelFont = NSFont.systemFont(ofSize: 11.5, weight: .medium)
-    private static let sheetTitleFont = NSFont.systemFont(ofSize: 13, weight: .semibold)
-    private static let sheetCloseFont = NSFont.systemFont(ofSize: 11, weight: .regular)
-    private static let sheetSectionFont = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
-    private static let sheetDescFont = NSFont.systemFont(ofSize: 11.5, weight: .regular)
+    // 静态缓存纯 CoreText 字体与颜色，彻底绕开 AppKit `NSString.size(withAttributes:)` / `draw(at:)`
+    // 在高频 `mouseMoved` 与重绘中触发 macOS 27 CoreText 字典深拷贝异常的风险。
+    private static let pillKeyFont: CTFont = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .semibold) as CTFont
+    private static let pillLabelFont: CTFont = NSFont.systemFont(ofSize: 11.5, weight: .medium) as CTFont
+    private static let sheetTitleFont: CTFont = NSFont.systemFont(ofSize: 13, weight: .semibold) as CTFont
+    private static let sheetCloseFont: CTFont = NSFont.systemFont(ofSize: 11, weight: .regular) as CTFont
+    private static let sheetSectionFont: CTFont = NSFont.systemFont(ofSize: 10.5, weight: .semibold) as CTFont
+    private static let sheetDescFont: CTFont = NSFont.systemFont(ofSize: 11.5, weight: .regular) as CTFont
+
+    private static let white96 = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.96)
+    private static let white95 = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.95)
+    private static let white85 = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.85)
+    private static let white84 = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.84)
+    private static let white76 = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.76)
+    private static let white54 = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.54)
+    private static let white50 = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.50)
+
+    private struct MeasuredLine {
+        let line: CTLine
+        let width: CGFloat
+        let height: CGFloat
+        let ascent: CGFloat
+    }
+
+    private static func makeLine(_ text: String, font: CTFont, color: CGColor) -> MeasuredLine {
+        let attrStr = CFAttributedStringCreateMutable(kCFAllocatorDefault, 0)!
+        CFAttributedStringReplaceString(attrStr, CFRange(location: 0, length: 0), text as CFString)
+        let range = CFRange(location: 0, length: CFAttributedStringGetLength(attrStr))
+        CFAttributedStringSetAttribute(attrStr, range, kCTFontAttributeName, font)
+        CFAttributedStringSetAttribute(attrStr, range, kCTForegroundColorAttributeName, color)
+        let line = CTLineCreateWithAttributedString(attrStr)
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        var leading: CGFloat = 0
+        let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
+        return MeasuredLine(line: line, width: width, height: ascent + descent, ascent: ascent)
+    }
+
+    private static func drawLine(_ measured: MeasuredLine, atTopLeft origin: CGPoint, in context: CGContext) {
+        context.saveGState()
+        context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+        context.textPosition = CGPoint(x: origin.x, y: origin.y + measured.ascent)
+        CTLineDraw(measured.line, context)
+        context.restoreGState()
+    }
 
     // MARK: - 文案
 
@@ -184,16 +223,14 @@ enum OverlayShortcutHUD {
         }
 
         let segments = pillSegments(isSelectionConfirmed: state.isSelectionConfirmed, isEnglish: state.isEnglish)
-        let keyFont = pillKeyFont
-        let labelFont = pillLabelFont
 
         var contentWidth: CGFloat = 0
         for (index, segment) in segments.enumerated() {
             if index > 0 {
                 contentWidth += segmentGap
             }
-            let keyWidth = ceil((segment.key as NSString).size(withAttributes: [.font: keyFont]).width) + keycapPadX * 2
-            let labelWidth = ceil((segment.label as NSString).size(withAttributes: [.font: labelFont]).width)
+            let keyWidth = ceil(makeLine(segment.key, font: pillKeyFont, color: white95).width) + keycapPadX * 2
+            let labelWidth = ceil(makeLine(segment.label, font: pillLabelFont, color: white76).width)
             contentWidth += keyWidth + keyToLabelGap + labelWidth
         }
 
@@ -294,19 +331,7 @@ enum OverlayShortcutHUD {
         context.strokePath()
 
         let segments = pillSegments(isSelectionConfirmed: state.isSelectionConfirmed, isEnglish: state.isEnglish)
-        let keyFont = pillKeyFont
-        let labelFont = pillLabelFont
-        let keyAttrs: [NSAttributedString.Key: Any] = [
-            .font: keyFont,
-            .foregroundColor: NSColor.white.withAlphaComponent(0.95),
-        ]
-        let labelAttrs: [NSAttributedString.Key: Any] = [
-            .font: labelFont,
-            .foregroundColor: NSColor.white.withAlphaComponent(0.76),
-        ]
 
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
         var x = rect.minX + pillPaddingX
         for (index, segment) in segments.enumerated() {
             if index > 0 {
@@ -317,9 +342,8 @@ enum OverlayShortcutHUD {
                 x += segmentGap
             }
 
-            let keyText = segment.key as NSString
-            let keySize = keyText.size(withAttributes: keyAttrs)
-            let capWidth = ceil(keySize.width) + keycapPadX * 2
+            let keyMeasured = makeLine(segment.key, font: pillKeyFont, color: white95)
+            let capWidth = ceil(keyMeasured.width) + keycapPadX * 2
             let capRect = CGRect(
                 x: x,
                 y: rect.midY - keycapHeight / 2,
@@ -335,21 +359,21 @@ enum OverlayShortcutHUD {
             context.addPath(capPath)
             context.strokePath()
 
-            keyText.draw(
-                at: CGPoint(x: capRect.midX - keySize.width / 2, y: capRect.midY - keySize.height / 2),
-                withAttributes: keyAttrs
+            drawLine(
+                keyMeasured,
+                atTopLeft: CGPoint(x: capRect.midX - keyMeasured.width / 2, y: capRect.midY - keyMeasured.height / 2),
+                in: context
             )
             x += capWidth + keyToLabelGap
 
-            let labelText = segment.label as NSString
-            let labelSize = labelText.size(withAttributes: labelAttrs)
-            labelText.draw(
-                at: CGPoint(x: x, y: rect.midY - labelSize.height / 2),
-                withAttributes: labelAttrs
+            let labelMeasured = makeLine(segment.label, font: pillLabelFont, color: white76)
+            drawLine(
+                labelMeasured,
+                atTopLeft: CGPoint(x: x, y: rect.midY - labelMeasured.height / 2),
+                in: context
             )
-            x += ceil(labelSize.width)
+            x += ceil(labelMeasured.width)
         }
-        NSGraphicsContext.restoreGraphicsState()
         context.restoreGState()
     }
 
@@ -376,74 +400,50 @@ enum OverlayShortcutHUD {
         context.addPath(path)
         context.strokePath()
 
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
-
         let title = state.isEnglish ? "Overlay Shortcuts" : "截图与标注快捷操作"
-        let titleAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.96),
-        ]
         let closeHint = state.isEnglish ? "? / Esc to close" : "按 ? 或 Esc 关闭"
-        let closeAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: .regular),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.5),
-        ]
-        let sectionAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 10.5, weight: .semibold),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.54),
-        ]
-        let keyAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 10.5, weight: .semibold),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.95),
-        ]
-        let descAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11.5, weight: .regular),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.84),
-        ]
-
         let padX: CGFloat = 14
         var y = cardRect.minY + 13
-        (title as NSString).draw(at: CGPoint(x: cardRect.minX + padX, y: y), withAttributes: titleAttrs)
-        let closeSize = (closeHint as NSString).size(withAttributes: closeAttrs)
-        (closeHint as NSString).draw(
-            at: CGPoint(x: cardRect.maxX - padX - closeSize.width, y: y + 2),
-            withAttributes: closeAttrs
-        )
+
+        let titleMeasured = makeLine(title, font: sheetTitleFont, color: white96)
+        drawLine(titleMeasured, atTopLeft: CGPoint(x: cardRect.minX + padX, y: y), in: context)
+
+        let closeMeasured = makeLine(closeHint, font: sheetCloseFont, color: white50)
+        drawLine(closeMeasured, atTopLeft: CGPoint(x: cardRect.maxX - padX - closeMeasured.width, y: y + 2), in: context)
         y += 26
 
         let sections = cheatSheetSections(isEnglish: state.isEnglish)
         for (secIdx, section) in sections.enumerated() {
             if secIdx > 0 { y += 10 }
-            (section.title as NSString).draw(at: CGPoint(x: cardRect.minX + padX, y: y), withAttributes: sectionAttrs)
+            let sectionMeasured = makeLine(section.title, font: sheetSectionFont, color: white54)
+            drawLine(sectionMeasured, atTopLeft: CGPoint(x: cardRect.minX + padX, y: y), in: context)
             y += 18
 
             for item in section.items {
-                let keyStr = item.key as NSString
-                let keySize = keyStr.size(withAttributes: keyAttrs)
-                let capW = ceil(keySize.width) + 10
+                let keyMeasured = makeLine(item.key, font: pillKeyFont, color: white95)
+                let capW = ceil(keyMeasured.width) + 10
                 let capRect = CGRect(x: cardRect.minX + padX, y: y + 1, width: capW, height: 18)
                 let capPath = CGPath(roundedRect: capRect, cornerWidth: 4.5, cornerHeight: 4.5, transform: nil)
                 context.setFillColor(NSColor.white.withAlphaComponent(0.13).cgColor)
                 context.addPath(capPath)
                 context.fillPath()
-                keyStr.draw(
-                    at: CGPoint(x: capRect.midX - keySize.width / 2, y: capRect.midY - keySize.height / 2),
-                    withAttributes: keyAttrs
+                drawLine(
+                    keyMeasured,
+                    atTopLeft: CGPoint(x: capRect.midX - keyMeasured.width / 2, y: capRect.midY - keyMeasured.height / 2),
+                    in: context
                 )
 
                 let descX = capRect.maxX + 8
-                let descStr = item.label as NSString
-                let descSize = descStr.size(withAttributes: descAttrs)
-                descStr.draw(
-                    in: CGRect(
-                        x: descX,
-                        y: capRect.midY - descSize.height / 2,
-                        width: max(40, cardRect.maxX - padX - descX),
-                        height: ceil(descSize.height) + 1
-                    ),
-                    withAttributes: descAttrs
+                let descMeasured = makeLine(item.label, font: sheetDescFont, color: white84)
+                let maxDescWidth = max(40, cardRect.maxX - padX - descX)
+                context.saveGState()
+                context.clip(to: CGRect(x: descX, y: capRect.minY - 2, width: maxDescWidth, height: 22))
+                drawLine(
+                    descMeasured,
+                    atTopLeft: CGPoint(x: descX, y: capRect.midY - descMeasured.height / 2),
+                    in: context
                 )
+                context.restoreGState()
                 y += 22
             }
         }
@@ -466,17 +466,13 @@ enum OverlayShortcutHUD {
         } else {
             toggleLabel = state.isHintEnabled ? "不再显示左下角快捷提示" : "重新显示左下角快捷提示"
         }
-        let toggleAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11.5, weight: .medium),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.85),
-        ]
-        let toggleSize = (toggleLabel as NSString).size(withAttributes: toggleAttrs)
-        (toggleLabel as NSString).draw(
-            at: CGPoint(x: toggleRect.midX - toggleSize.width / 2, y: toggleRect.midY - toggleSize.height / 2),
-            withAttributes: toggleAttrs
+        let toggleMeasured = makeLine(toggleLabel, font: pillLabelFont, color: white85)
+        drawLine(
+            toggleMeasured,
+            atTopLeft: CGPoint(x: toggleRect.midX - toggleMeasured.width / 2, y: toggleRect.midY - toggleMeasured.height / 2),
+            in: context
         )
 
-        NSGraphicsContext.restoreGraphicsState()
         context.restoreGState()
     }
 }

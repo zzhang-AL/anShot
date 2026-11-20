@@ -303,8 +303,9 @@ public final class DetectionSession {
             return
         }
 
-        // 若当前尚未持有层级栈，先灌入基础层级栈避免去抖窗口内滚轮失效。
-        if hierarchyTargets.isEmpty {
+        // 若当前尚未持有层级栈，或已跨窗口切换（避免 45ms 去抖期间滚轮跳回上一窗口旧栈），
+        // 立即同步灌入当前基础层级栈（窗口/状态栏 → 当前整屏）。
+        if hierarchyTargets.isEmpty || hierarchyTargets.first?.windowID != window.windowID {
             hierarchyTargets = baseHierarchy
             hierarchyIndex = 0
         }

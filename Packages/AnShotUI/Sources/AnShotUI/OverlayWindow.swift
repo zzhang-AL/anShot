@@ -1424,6 +1424,10 @@ final class OverlayView: NSView {
         context.restoreGState()
     }
 
+    /// 顶部胶囊提示静态缓存 CoreText 字体与颜色（杜绝高频重绘下 AppKit 文本属性字典异常）。
+    private static let windowPickerHUDFont: CTFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium) as CTFont
+    private static let windowPickerHUDTextColor: CGColor = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.96)
+
     /// 独立窗体捕获模式顶部信息胶囊（展示序号/总数、应用名、尺寸、无阴影状态及快捷键提示）。
     private func drawWindowPickerHUD(in context: CGContext) {
         let text: String
@@ -1451,20 +1455,39 @@ final class OverlayView: NSView {
             return
         }
 
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.96),
-        ]
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.lineBreakMode = .byTruncatingMiddle
-        var drawAttrs = attrs
-        drawAttrs[.paragraphStyle] = paragraph
-        let attributed = NSAttributedString(string: text, attributes: drawAttrs)
-        let textSize = attributed.size()
+        let attrStr = CFAttributedStringCreateMutable(kCFAllocatorDefault, 0)!
+        CFAttributedStringReplaceString(attrStr, CFRange(location: 0, length: 0), text as CFString)
+        let fullRange = CFRange(location: 0, length: CFAttributedStringGetLength(attrStr))
+        CFAttributedStringSetAttribute(attrStr, fullRange, kCTFontAttributeName, Self.windowPickerHUDFont)
+        CFAttributedStringSetAttribute(attrStr, fullRange, kCTForegroundColorAttributeName, Self.windowPickerHUDTextColor)
+        let rawLine = CTLineCreateWithAttributedString(attrStr)
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        var leading: CGFloat = 0
+        let rawWidth = CGFloat(CTLineGetTypographicBounds(rawLine, &ascent, &descent, &leading))
+        let textHeight = ascent + descent
+
         let padX: CGFloat = 14
         let height: CGFloat = 28
         let maxPillWidth = max(220, bounds.width - 40)
-        let width = min(maxPillWidth, ceil(textSize.width) + padX * 2 + 2)
+        let maxTextWidth = max(1, maxPillWidth - padX * 2)
+        let line: CTLine
+        let drawWidth: CGFloat
+        if rawWidth > maxTextWidth {
+            let ellipsisAttr = CFAttributedStringCreateMutable(kCFAllocatorDefault, 0)!
+            CFAttributedStringReplaceString(ellipsisAttr, CFRange(location: 0, length: 0), "…" as CFString)
+            let eRange = CFRange(location: 0, length: CFAttributedStringGetLength(ellipsisAttr))
+            CFAttributedStringSetAttribute(ellipsisAttr, eRange, kCTFontAttributeName, Self.windowPickerHUDFont)
+            CFAttributedStringSetAttribute(ellipsisAttr, eRange, kCTForegroundColorAttributeName, Self.windowPickerHUDTextColor)
+            let token = CTLineCreateWithAttributedString(ellipsisAttr)
+            line = CTLineCreateTruncatedLine(rawLine, Double(maxTextWidth), .middle, token) ?? rawLine
+            drawWidth = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
+        } else {
+            line = rawLine
+            drawWidth = rawWidth
+        }
+
+        let width = min(maxPillWidth, ceil(drawWidth) + padX * 2 + 2)
         let topSafe = max(16, effectiveSafeAreaInsets.top + 12)
         let pillRect = CGRect(
             x: ((bounds.width - width) / 2).rounded(),
@@ -1483,17 +1506,12 @@ final class OverlayView: NSView {
         context.addPath(path)
         context.strokePath()
 
-        NSGraphicsContext.saveGraphicsState()
-        let nsContext = NSGraphicsContext(cgContext: context, flipped: true)
-        NSGraphicsContext.current = nsContext
-        let textRect = CGRect(
+        context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+        context.textPosition = CGPoint(
             x: pillRect.minX + padX,
-            y: pillRect.midY - textSize.height / 2,
-            width: max(1, pillRect.width - padX * 2),
-            height: ceil(textSize.height) + 1
+            y: pillRect.midY - textHeight / 2 + ascent
         )
-        attributed.draw(in: textRect)
-        NSGraphicsContext.restoreGraphicsState()
+        CTLineDraw(line, context)
         context.restoreGState()
     }
 
@@ -3230,6 +3248,19 @@ final class OverlayView: NSView {
         menu.addItem(.separator())
         menu.addItem(duplicate)
         menu.addItem(delete)
+        // 若当前承载窗口为 `.screenSaver`（1000），弹菜单期间临时降至 `.popUpMenu - 1`（100，
+        // 仍远高于菜单栏 24 与 Dock 20），确保右键菜单稳稳浮在覆盖层上方不被遮挡，关闭后立刻还原。
+        let hostWindow = self.window
+        let previousLevel = hostWindow?.level
+        let popUpFloor = NSWindow.Level(rawValue: NSWindow.Level.popUpMenu.rawValue - 1)
+        if let hostWindow, hostWindow.level.rawValue >= NSWindow.Level.popUpMenu.rawValue {
+            hostWindow.level = popUpFloor
+        }
+        defer {
+            if let hostWindow, let previousLevel {
+                hostWindow.level = previousLevel
+            }
+        }
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 

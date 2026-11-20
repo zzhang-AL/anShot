@@ -27,6 +27,7 @@
 
 import AppKit
 import AnShotCore
+import CoreText
 
 /// 自绘的标注工具栏。
 ///
@@ -623,6 +624,19 @@ final class AnnotationToolbarView: NSView {
         )
         saveAs.target = self
         menu.addItem(saveAs)
+        // 若承载窗口为 `.screenSaver`（1000），弹菜单期间临时降至 `.popUpMenu - 1`（100），
+        // 确保保存格式菜单浮在覆盖层上方不被遮挡，关闭后立刻恢复原层级。
+        let hostWindow = self.window
+        let previousLevel = hostWindow?.level
+        let popUpFloor = NSWindow.Level(rawValue: NSWindow.Level.popUpMenu.rawValue - 1)
+        if let hostWindow, hostWindow.level.rawValue >= NSWindow.Level.popUpMenu.rawValue {
+            hostWindow.level = popUpFloor
+        }
+        defer {
+            if let hostWindow, let previousLevel {
+                hostWindow.level = previousLevel
+            }
+        }
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
@@ -1298,23 +1312,39 @@ private final class ToolbarTooltipHUD {
 }
 
 private final class ToolbarTooltipContentView: NSView {
+    private static let titleFont: CTFont = NSFont.systemFont(ofSize: 11.5, weight: .medium) as CTFont
+    private static let keyFont: CTFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold) as CTFont
+
     private var titleText: String = ""
     private var shortcutText: String?
     private var isDark: Bool = true
 
     override var isFlipped: Bool { true }
 
+    private static func makeLine(_ text: String, font: CTFont, color: CGColor) -> (line: CTLine, width: CGFloat, height: CGFloat, ascent: CGFloat) {
+        let attrStr = CFAttributedStringCreateMutable(kCFAllocatorDefault, 0)!
+        CFAttributedStringReplaceString(attrStr, CFRange(location: 0, length: 0), text as CFString)
+        let range = CFRange(location: 0, length: CFAttributedStringGetLength(attrStr))
+        CFAttributedStringSetAttribute(attrStr, range, kCTFontAttributeName, font)
+        CFAttributedStringSetAttribute(attrStr, range, kCTForegroundColorAttributeName, color)
+        let line = CTLineCreateWithAttributedString(attrStr)
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        var leading: CGFloat = 0
+        let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
+        return (line, width, ascent + descent, ascent)
+    }
+
     func configure(title: String, shortcut: String?, isDark: Bool) -> CGSize {
         self.titleText = title
         self.shortcutText = shortcut
         self.isDark = isDark
 
-        let titleFont = NSFont.systemFont(ofSize: 11.5, weight: .medium)
-        let titleW = ceil((title as NSString).size(withAttributes: [.font: titleFont]).width) + 1
+        let dummyColor = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
+        let titleW = ceil(Self.makeLine(title, font: Self.titleFont, color: dummyColor).width) + 1
         var totalW = 10 + titleW + 10
         if let shortcut, !shortcut.isEmpty {
-            let keyFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold)
-            let keyW = ceil((shortcut as NSString).size(withAttributes: [.font: keyFont]).width)
+            let keyW = ceil(Self.makeLine(shortcut, font: Self.keyFont, color: dummyColor).width)
             totalW += 6 + keyW + 10
         }
         return CGSize(width: totalW, height: 26)
@@ -1326,63 +1356,57 @@ private final class ToolbarTooltipContentView: NSView {
         let path = CGPath(roundedRect: rect, cornerWidth: 7, cornerHeight: 7, transform: nil)
 
         let bg = isDark
-            ? NSColor(srgbRed: 0.12, green: 0.13, blue: 0.16, alpha: 0.96)
-            : NSColor(srgbRed: 0.99, green: 0.99, blue: 1.0, alpha: 0.97)
+            ? CGColor(srgbRed: 0.12, green: 0.13, blue: 0.16, alpha: 0.96)
+            : CGColor(srgbRed: 0.99, green: 0.99, blue: 1.0, alpha: 0.97)
         let border = isDark
-            ? NSColor.white.withAlphaComponent(0.16)
-            : NSColor.black.withAlphaComponent(0.12)
+            ? CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.16)
+            : CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.12)
         let textColor = isDark
-            ? NSColor.white.withAlphaComponent(0.95)
-            : NSColor(srgbRed: 0.12, green: 0.14, blue: 0.18, alpha: 0.94)
+            ? CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.95)
+            : CGColor(srgbRed: 0.12, green: 0.14, blue: 0.18, alpha: 0.94)
 
         ctx.saveGState()
         ctx.addPath(path)
-        ctx.setFillColor(bg.cgColor)
+        ctx.setFillColor(bg)
         ctx.fillPath()
         ctx.addPath(path)
-        ctx.setStrokeColor(border.cgColor)
+        ctx.setStrokeColor(border)
         ctx.setLineWidth(0.8)
         ctx.strokePath()
-        ctx.restoreGState()
 
-        let titleFont = NSFont.systemFont(ofSize: 11.5, weight: .medium)
-        let titleAttrs: [NSAttributedString.Key: Any] = [.font: titleFont, .foregroundColor: textColor]
-        let titleSize = (titleText as NSString).size(withAttributes: titleAttrs)
-        (titleText as NSString).draw(
-            at: NSPoint(x: 10, y: (bounds.height - titleSize.height) / 2),
-            withAttributes: titleAttrs
+        let titleMeasured = Self.makeLine(titleText, font: Self.titleFont, color: textColor)
+        ctx.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+        ctx.textPosition = CGPoint(
+            x: 10,
+            y: (bounds.height - titleMeasured.height) / 2 + titleMeasured.ascent
         )
+        CTLineDraw(titleMeasured.line, ctx)
 
         if let shortcut = shortcutText, !shortcut.isEmpty {
-            let keyFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold)
             let keyColor = isDark
-                ? NSColor.white.withAlphaComponent(0.78)
-                : NSColor(srgbRed: 0.25, green: 0.28, blue: 0.34, alpha: 0.88)
-            let keyAttrs: [NSAttributedString.Key: Any] = [.font: keyFont, .foregroundColor: keyColor]
-            let keySize = (shortcut as NSString).size(withAttributes: keyAttrs)
+                ? CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.78)
+                : CGColor(srgbRed: 0.25, green: 0.28, blue: 0.34, alpha: 0.88)
+            let keyMeasured = Self.makeLine(shortcut, font: Self.keyFont, color: keyColor)
             let pillRect = CGRect(
-                x: 10 + ceil(titleSize.width) + 6,
+                x: 10 + ceil(titleMeasured.width) + 6,
                 y: (bounds.height - 17) / 2,
-                width: ceil(keySize.width) + 10,
+                width: ceil(keyMeasured.width) + 10,
                 height: 17
             )
             let pillPath = CGPath(roundedRect: pillRect, cornerWidth: 4.5, cornerHeight: 4.5, transform: nil)
             let pillBg = isDark
-                ? NSColor.white.withAlphaComponent(0.12)
-                : NSColor.black.withAlphaComponent(0.065)
-            ctx.saveGState()
+                ? CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.12)
+                : CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.065)
             ctx.addPath(pillPath)
-            ctx.setFillColor(pillBg.cgColor)
+            ctx.setFillColor(pillBg)
             ctx.fillPath()
-            ctx.restoreGState()
 
-            (shortcut as NSString).draw(
-                at: NSPoint(
-                    x: pillRect.minX + 5,
-                    y: pillRect.midY - keySize.height / 2
-                ),
-                withAttributes: keyAttrs
+            ctx.textPosition = CGPoint(
+                x: pillRect.minX + 5,
+                y: pillRect.midY - keyMeasured.height / 2 + keyMeasured.ascent
             )
+            CTLineDraw(keyMeasured.line, ctx)
         }
+        ctx.restoreGState()
     }
 }
