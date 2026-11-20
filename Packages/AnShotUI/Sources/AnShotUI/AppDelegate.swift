@@ -305,7 +305,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             installGlobalHotKey()
         }
-        scheduleOCRPreheat()
+        // OCR 模型改为首次识别时按需懒加载：避免常驻闲置进程提前加载 Apple Vision
+        // 神经网络权重占用 ~40MB 常驻物理内存与 ~168MB 启动峰值。
         scheduleHistoryMaintenance()
 
         // 自动检查更新：诊断/验收进程不联网，避免测试环境产生副作用。
@@ -338,47 +339,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         #endif
     }
 
-    // MARK: - 后台预热
-
-    /// 在后台把识别能力先加载好。
-    ///
-    /// 为什么需要：进程内**第一次**识别要十几秒（实测见 `TextRecognizer.prewarm`），
-    /// 那笔成本总得有人付。不预热的话付账的是用户——他点下「识别文字」，
-    /// 然后盯着一个毫无反应的界面等下去。
-    ///
-    /// 三个刻意的选择：
-    /// - **延迟几秒再开始**：预热是十几秒的重活，跟启动时的菜单栏图标、
-    ///   热键注册抢资源会让「刚点开这个应用」变钝。
-    /// - **`.utility` 优先级**：用户真在用的时候（手动截图、标注）不能被它抢走算力。
-    /// - **失败不上抛**：预热纯属预热，它坏了不能影响任何真实功能。
-    private func scheduleOCRPreheat() {
-        // 预热只对 Apple Vision 有意义。
-        //
-        // 云端 provider（本机实际配置的是 baiduPPOCR）根本不加载本地识别模型，
-        // 跑一遍 Vision 预热等于白白付出约 48MB 的神经网络峰值内存与十几秒算力。
-        // 诊断进程同样跳过：它不验证预热带来的延迟改善，却会跟真实会话抢资源。
-        guard !isDiagnosticRun else {
-            logger.notice("OCR 预热跳过：诊断运行")
-            return
-        }
-        guard OCRProviderSettings().selectedKind == .appleVision else {
-            logger.notice("OCR 预热跳过：当前 provider 不是 Apple Vision")
-            return
-        }
-
-        // 不持有这个 Task：预热没有需要取消的下游资源，进程退出时它自然消失。
-        Task { @MainActor in
-            try? await Task.sleep(for: .seconds(3))
-            guard !Task.isCancelled else { return }
-
-            let startedAt = Date()
-            await Task.detached(priority: .utility) {
-                await TextRecognizer.prewarm()
-            }.value
-
-            logger.notice("OCR 预热完成：\(Int(Date().timeIntervalSince(startedAt) * 1000), privacy: .public)ms")
-        }
-    }
+    // MARK: - 后台维护
 
     /// 启动后在后台巡检并按需清理历史缓存与缩略图孤儿文件（跳过诊断进程）。
     private func scheduleHistoryMaintenance() {

@@ -85,7 +85,11 @@ final class OverlayView: NSView {
     /// 期间 AppKit 会先绘制一次空视图；若此处不标记脏区，
     /// 绑定底图后视图不再重绘，屏幕上会一直停留那次空绘制（表现为全黑）。
     var backdrop: CGImage? {
-        didSet { needsDisplay = true }
+        didSet {
+            composedCache = nil
+            lastLoupeSample = nil
+            needsDisplay = true
+        }
     }
 
     /// 标注编辑器的权威状态（由 `OverlayController` 注入，视图只读）。
@@ -1231,56 +1235,106 @@ final class OverlayView: NSView {
     /// 这样显示与导出走的是同一个 `render`（`model.md` §7.2），
     /// 屏幕上看到的标注必然与导出图一致。
     private func drawAnnotations(in context: CGContext) {
-        let displayed = displayedAnnotations
-        guard let backdrop, let selection = effectiveSelection,
-              !displayed.isEmpty, bounds.width > 0 else {
+        guard let editorState, let backdrop, let selection = effectiveSelection,
+              bounds.width > 0, bounds.height > 0 else {
+            return
+        }
+        let editingID = editorState.textDraft?.annotationID
+        let committed = editorState.annotations.filter { $0.id != editingID }
+        let draft = editorState.draft
+        guard !committed.isEmpty || draft != nil else {
             return
         }
 
-        // 视图坐标是逻辑点，模型坐标是底图像素（= 逻辑点 × scaleFactor）。
-        let scale = CGFloat(backdrop.width) / bounds.width
-        guard scale > 0 else {
+        // 性能与一致性的平衡：
+        // - 当存在正在拖拽的纯矢量草稿（矩形/椭圆/箭头/直线/曲线箭头/画笔/荧光笔/测距/编号/文字）时，
+        //   已提交标注 100% 复用 `composedCache`（若无已提交标注则零分配），当前草稿直接通过
+        //   `AnnotationRenderer.drawDirectVectorAnnotation` 绘制在屏幕上下文中，
+        //   彻底消除全屏 Retina 选区拖拽时每帧新分配 20MB+ 位图的带宽抖动；
+        // - 像素级草稿（马赛克/聚光灯/放大镜）或无草稿的静态态，继续走 `AnnotationRenderer.render`
+        //   并与导出共享同一份位图缓存。
+        let directVectorDraft: Annotation? = {
+            guard let draft, AnnotationRenderer.supportsDirectVectorOverlay(draft) else {
+                return nil
+            }
+            return draft
+        }()
+        let bitmapAnnotations: [Annotation] = {
+            if directVectorDraft != nil {
+                return committed
+            }
+            if let draft {
+                return committed + [draft]
+            }
+            return committed
+        }()
+
+        let sx = backdropScaleX
+        let sy = backdropScaleY
+        guard sx > 0, sy > 0 else {
             return
         }
-        let image: CGImage
-        if let cache = composedCache,
-           cache.selection == selection,
-           cache.annotations == displayed {
-            // 光标本类装饰性重绘不会改变输入，直接复用上次合成结果。
-            image = cache.image
-        } else {
-            // 先断开旧缓存再分配新画布：两者都是整张选区大小的位图，
-            // 同时在场只会白白抬高峰值内存（释放发生在 render 分配之前）。
-            composedCache = nil
-            guard let pixelSelection = pixelSelection(from: selection),
-                  let composed = AnnotationRenderer.render(
-                      backdrop: backdrop,
-                      selection: pixelSelection,
-                      annotations: displayed
-                  ) else {
-                return
+
+        if !bitmapAnnotations.isEmpty {
+            let image: CGImage
+            if let cache = composedCache,
+               cache.selection == selection,
+               cache.annotations == bitmapAnnotations {
+                // 光标或纯矢量草稿拖拽期间，已提交标注的位图缓存直接命中复用。
+                image = cache.image
+            } else {
+                // 先断开旧缓存再分配新画布：两者都是整张选区大小的位图，
+                // 同时在场只会白白抬高峰值内存（释放发生在 render 分配之前）。
+                composedCache = nil
+                guard let pixelSelection = pixelSelection(from: selection),
+                      let composed = AnnotationRenderer.render(
+                          backdrop: backdrop,
+                          selection: pixelSelection,
+                          annotations: bitmapAnnotations
+                      ) else {
+                    return
+                }
+
+                composedCache = (selection, bitmapAnnotations, composed)
+                image = composed
             }
 
-            composedCache = (selection, displayed, composed)
-            image = composed
+            // 视图是左上原点，CGImage 绘制以左下原点为准，因此翻回来再画。
+            // 目标矩形就是选区本身（不缩到 bounds，因为只画选区那一块）。
+            context.saveGState()
+            context.translateBy(x: 0, y: bounds.height)
+            context.scaleBy(x: 1, y: -1)
+            context.interpolationQuality = backdropInterpolationQuality
+            context.draw(
+                image,
+                in: CGRect(
+                    x: selection.minX,
+                    y: bounds.height - selection.maxY,
+                    width: selection.width,
+                    height: selection.height
+                )
+            )
+            context.restoreGState()
         }
 
-        // 视图是左上原点，CGImage 绘制以左下原点为准，因此翻回来再画。
-        // 目标矩形就是选区本身（不缩到 bounds，因为只画选区那一块）。
-        context.saveGState()
-        context.translateBy(x: 0, y: bounds.height)
-        context.scaleBy(x: 1, y: -1)
-        context.interpolationQuality = backdropInterpolationQuality
-        context.draw(
-            image,
-            in: CGRect(
-                x: selection.minX,
-                y: bounds.height - selection.maxY,
-                width: selection.width,
-                height: selection.height
-            )
-        )
-        context.restoreGState()
+        if let directVectorDraft,
+           let pixelSelection = pixelSelection(from: selection) {
+            let canvasWidth = Int(pixelSelection.size.width.rounded())
+            let canvasHeight = Int(pixelSelection.size.height.rounded())
+            if canvasWidth > 0, canvasHeight > 0 {
+                context.saveGState()
+                context.clip(to: selection)
+                context.scaleBy(x: 1 / sx, y: 1 / sy)
+                AnnotationRenderer.drawDirectVectorAnnotation(
+                    directVectorDraft,
+                    in: context,
+                    canvasOrigin: pixelSelection.origin,
+                    canvasWidth: canvasWidth,
+                    canvasHeight: canvasHeight
+                )
+                context.restoreGState()
+            }
+        }
     }
 
     /// 选中标注的虚线高亮框。
@@ -1690,12 +1744,26 @@ final class OverlayView: NSView {
             addSubview(loupeView, positioned: .above, relativeTo: nil)
         }
 
-        let sample = OverlayLoupeSampler.sample(
-            from: backdrop,
-            at: viewPoint,
-            scaleFactor: backdropScale
-        )
-        lastLoupeSample = sample
+        // 同一物理像素内亚像素微移直接复用上次采样结果，跳过 cropping + CGContext + makeImage 分配。
+        let sample: LoupeSample?
+        if let cached = lastLoupeSample,
+           let coord = OverlayLoupeSampler.pixelCoordinate(
+               for: viewPoint,
+               scaleFactor: backdropScale,
+               backdropWidth: backdrop.width,
+               backdropHeight: backdrop.height
+           ),
+           cached.pixelX == coord.x,
+           cached.pixelY == coord.y {
+            sample = cached
+        } else {
+            sample = OverlayLoupeSampler.sample(
+                from: backdrop,
+                at: viewPoint,
+                scaleFactor: backdropScale
+            )
+            lastLoupeSample = sample
+        }
         loupeView.update(
             sample: sample,
             cursorPoint: viewPoint,

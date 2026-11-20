@@ -565,4 +565,54 @@ struct RenderCompositionTests {
         expectColor(pixels.rgb(x: 204, y: 40), (0, 255, 0), tolerance: 6, "路径上下端之外不应被涂抹")
     }
 
+    @Test("纯矢量标注草稿直绘分类准确，且像素级输出与 render 一致")
+    func directVectorOverlayClassificationAndEquivalence() throws {
+        let stroke = StrokeStyle(color: red, width: 4)
+        let rectAnn = Annotation(kind: .rectangle(rect: rect(20, 20, 80, 60), stroke: stroke, fill: nil, cornerRadius: 0))
+        let mosaicAnn = Annotation(kind: .mosaic(rect: rect(20, 20, 80, 60), mode: .pixelate, intensity: 8, cornerRadius: 0))
+        let spotlightAnn = Annotation(kind: .spotlight(rect: rect(20, 20, 80, 60), cornerRadius: 4, dimOpacity: 0.5))
+        let magnifierAnn = Annotation(kind: .magnifier(center: PixelPoint(x: 50, y: 50), radius: 30, zoom: 2, border: stroke))
+
+        #expect(AnnotationRenderer.supportsDirectVectorOverlay(rectAnn))
+        #expect(!AnnotationRenderer.supportsDirectVectorOverlay(mosaicAnn))
+        #expect(!AnnotationRenderer.supportsDirectVectorOverlay(spotlightAnn))
+        #expect(!AnnotationRenderer.supportsDirectVectorOverlay(magnifierAnn))
+
+        // 验证 drawDirectVectorAnnotation 在翻转后的左上原点像素上下文中与 render 结果一致
+        let backdrop = solidImage(width: 120, height: 100, color: white)
+        let rendered = try #require(AnnotationRenderer.render(
+            backdrop: backdrop,
+            selection: rect(0, 0, 120, 100),
+            annotations: [rectAnn]
+        ))
+        let renderedPixels = PixelBuffer(rendered)
+
+        let ctx = try #require(CGContext(
+            data: nil,
+            width: 120,
+            height: 100,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: ImageColorSpace.sRGB,
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        ))
+        ctx.setFillColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: 120, height: 100))
+        ctx.translateBy(x: 0, y: 100)
+        ctx.scaleBy(x: 1, y: -1)
+        AnnotationRenderer.drawDirectVectorAnnotation(
+            rectAnn,
+            in: ctx,
+            canvasOrigin: PixelPoint(x: 0, y: 0),
+            canvasWidth: 120,
+            canvasHeight: 100
+        )
+        let directImage = try #require(ctx.makeImage())
+        let directPixels = PixelBuffer(directImage)
+
+        // 矩形边上 (60, 20) 应为红色，内部 (60, 50) 应为白色，与 render 完全一致
+        expectColor(directPixels.rgb(x: 60, y: 20), renderedPixels.rgb(x: 60, y: 20), tolerance: 2, "直绘矩形边框像素应与 render 一致")
+        expectColor(directPixels.rgb(x: 60, y: 50), renderedPixels.rgb(x: 60, y: 50), tolerance: 2, "直绘矩形内部像素应与 render 一致")
+    }
+
 }

@@ -43,6 +43,28 @@ enum OverlayLoupeSampler {
     /// 放大镜浮层默认逻辑尺寸：提供 152pt 内容宽，彻底容纳 4K 四位坐标与 RGB/快捷键提示不碰撞。
     static let defaultPanelSize = CGSize(width: 172, height: 204)
 
+    /// 静态缓存 sRGB 色彩空间，避免 120Hz 鼠标移动时每帧重复查找创建。
+    private static let sRGBColorSpace: CGColorSpace =
+        CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+
+    /// 将视图逻辑点换算为钳制在底图范围内的整数像素坐标。
+    static func pixelCoordinate(
+        for viewPoint: CGPoint,
+        scaleFactor: CGFloat,
+        backdropWidth: Int,
+        backdropHeight: Int
+    ) -> (x: Int, y: Int)? {
+        guard backdropWidth > 0, backdropHeight > 0, scaleFactor > 0 else {
+            return nil
+        }
+        let rawX = Int((viewPoint.x * scaleFactor).rounded(.down))
+        let rawY = Int((viewPoint.y * scaleFactor).rounded(.down))
+        return (
+            min(max(rawX, 0), backdropWidth - 1),
+            min(max(rawY, 0), backdropHeight - 1)
+        )
+    }
+
     /// 从底图采集指定视图逻辑点处的像素邻域与色值。
     static func sample(
         from backdrop: CGImage,
@@ -50,17 +72,21 @@ enum OverlayLoupeSampler {
         scaleFactor: CGFloat,
         gridRadius: Int = defaultGridRadius
     ) -> LoupeSample? {
-        guard backdrop.width > 0, backdrop.height > 0, scaleFactor > 0, gridRadius >= 1 else {
+        guard gridRadius >= 1,
+              let coord = pixelCoordinate(
+                  for: viewPoint,
+                  scaleFactor: scaleFactor,
+                  backdropWidth: backdrop.width,
+                  backdropHeight: backdrop.height
+              ) else {
             return nil
         }
 
-        let rawX = Int((viewPoint.x * scaleFactor).rounded(.down))
-        let rawY = Int((viewPoint.y * scaleFactor).rounded(.down))
-        let pixelX = min(max(rawX, 0), backdrop.width - 1)
-        let pixelY = min(max(rawY, 0), backdrop.height - 1)
+        let pixelX = coord.x
+        let pixelY = coord.y
 
         let gridSize = gridRadius * 2 + 1
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let colorSpace = sRGBColorSpace
         var buffer = [UInt8](repeating: 0, count: gridSize * gridSize * 4)
         let bytesPerRow = gridSize * 4
 
@@ -226,16 +252,34 @@ final class OverlayLoupeView: NSView {
             self.sample = nil
             return
         }
+        let contentChanged: Bool = {
+            guard let prev = self.sample else { return true }
+            return prev.pixelX != sample.pixelX
+                || prev.pixelY != sample.pixelY
+                || prev.hexString != sample.hexString
+                || prev.rgbText != sample.rgbText
+                || prev.gridSize != sample.gridSize
+                || prev.gridImage !== sample.gridImage
+                || self.showsCopyHint != showsCopyHint
+        }()
+        let wasHidden = isHidden
         self.sample = sample
         self.showsCopyHint = showsCopyHint
-        frame = OverlayLoupeSampler.panelFrame(
+        let targetFrame = OverlayLoupeSampler.panelFrame(
             forCursor: cursorPoint,
             panelSize: Self.panelSize,
             in: viewBounds,
             safeTopInset: safeTopInset
         )
-        isHidden = false
-        needsDisplay = true
+        if frame != targetFrame {
+            frame = targetFrame
+        }
+        if wasHidden {
+            isHidden = false
+        }
+        if contentChanged || wasHidden {
+            needsDisplay = true
+        }
     }
 
     override func draw(_ dirtyRect: NSRect) {

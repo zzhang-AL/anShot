@@ -56,6 +56,43 @@ public enum AnnotationRenderer {
         return canvas.context.makeImage()
     }
 
+    /// 判断一条标注是否支持在屏幕上下文中直接矢量绘制（不依赖位图 `context.data` 像素读取或全局遮罩协调）。
+    ///
+    /// 覆盖层实时拖拽新建草稿时，纯矢量标注直接叠加在已缓存的静态底图上，
+    /// 彻底避免每帧重新分配并拷贝整张选区原生分辨率位图（全屏 Retina 下每帧可省 20MB+ 内存带宽）。
+    public static func supportsDirectVectorOverlay(_ annotation: Annotation) -> Bool {
+        switch annotation.kind {
+        case .mosaic, .mosaicStroke, .spotlight, .magnifier:
+            return false
+        case .rectangle, .ellipse, .line, .arrow, .text, .numbering, .highlight, .measure, .freehand, .curvedArrow:
+            return true
+        }
+    }
+
+    /// 在已处于**左上原点底图像素坐标系**的上下文中，直接绘制单条纯矢量标注。
+    ///
+    /// 与 `render` 内部走同一套 `apply` 实现，确保实时拖拽预览与最终导出像素级一致。
+    public static func drawDirectVectorAnnotation(
+        _ annotation: Annotation,
+        in context: CGContext,
+        canvasOrigin: PixelPoint,
+        canvasWidth: Int,
+        canvasHeight: Int
+    ) {
+        guard supportsDirectVectorOverlay(annotation), canvasWidth > 0, canvasHeight > 0 else {
+            return
+        }
+        context.saveGState()
+        defer { context.restoreGState() }
+        apply(
+            annotation,
+            in: context,
+            canvasOrigin: canvasOrigin,
+            canvasWidth: canvasWidth,
+            canvasHeight: canvasHeight
+        )
+    }
+
     /// 在已建立画布坐标系的上下文中，按顺序应用全部标注。
     ///
     /// **仅供 `render` 内部使用，不得对外暴露。**
