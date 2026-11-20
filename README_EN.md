@@ -33,10 +33,10 @@
 
 ## 💡 Why anShot
 
-**anShot** is a lightweight macOS menu bar utility built natively with **Swift 6** and Apple's native frameworks (AppKit, ScreenCaptureKit, Apple Vision, and Apple Translation). It runs quietly without a Dock icon, uses minimal memory, and launches in milliseconds.
+**anShot** is a lightweight macOS menu bar utility built natively with **Swift 6** and Apple's native frameworks (AppKit, ScreenCaptureKit, Apple Vision, and Apple Translation). It runs quietly without a Dock icon, uses only **~27 MB** resident memory, and launches in milliseconds.
 
 - **All-in-One Capture Workflow**: Area and standalone window capture, 14 re-editable annotation tools, bidirectional & auto-scrolling capture, dual-track MP4/GIF recording, OCR and text/selection translation, pinned screenshots, and unified history.
-- **Built for AI Agents**: Ships with a spec-compliant **Model Context Protocol (MCP)** stdio server, a CLI wrapper, and a ready-to-use Agent Skill. Its **cross-process permission reuse** lets terminals and AI hosts (Cursor, Claude Code, Windsurf, Claude Desktop, etc.) reuse `anShot.app`'s existing Screen Recording permission without granting separate access to every host.
+- **Built for AI Agents**: Ships with a spec-compliant **Model Context Protocol (MCP)** stdio server, a CLI wrapper, and a ready-to-use Agent Skill. Its resident **private Unix Socket background proxy** reuses `anShot.app`'s existing Screen Recording permission silently—zero focus stealing, zero Dock bounce, no separate host permissions—protected by a **4-layer security defense** against local abuse.
 - **Offline & Private by Default**: OCR, system-level translation, and scrolling-capture image registration run **100% locally** by default so pixels and text never leave your Mac. Optional cloud providers (OpenAI-compatible, Claude, Baidu PP-OCRv6) are available on demand with clear privacy indicators.
 - **Fidelity-First Engineering**: Preserves native Retina DPI and transparent rounded window corners across export formats, supports pure-Swift lossless WebP and MIT-licensed `oxipng` background PNG optimization, and offers Light/Dark/System themes plus instant hot-swapping between English and Simplified Chinese.
 
@@ -45,10 +45,10 @@
 ## ✨ Key Features
 
 ### 📸 1. Precision Capture & Standalone Window Mode
-- **Zero-Jitter Silent Freeze**: Freezes the screen at native brightness on invocation with an immediate pixel loupe and color picker HUD (`C` to copy HEX, `⇧C` to copy RGB).
-- **Two-Stage Async Smart Snapping**: Highlights windows and UI elements as you hover, with anti-false-snap protection against maximized windows.
+- **Zero-Jitter Silent Freeze**: Freezes the screen at native brightness on invocation with an immediate pixel loupe and color picker HUD (`C` to copy HEX, `⇧C` to copy RGB), plus a bottom-left static hint bar and expandable shortcut cheat sheet.
+- **Semantic Smart Snapping & Wheel Layer Cycling**: Highlights windows, semantic UI elements, and the menu bar (full bar or individual status items) as you hover, with anti-false-snap protection against maximized windows. **Scroll the mouse wheel** before dragging to cycle smoothly across *Element → Window → Full Screen*, or press `⌘A` to select the full display instantly.
 - **WYSIWYG Standalone Window Capture**: Press `Space` inside the overlay (or use `⌃S`) to switch to standalone window mode. Cycle through overlapping windows beneath the cursor with `Tab` / `⇧Tab`, preserve native transparent rounded corners, and toggle soft drop shadows on the fly (`⌥ + Click`).
-- **Background & Cross-Space Windows**: Capture occluded or background windows without bringing them to the front. Use **Choose Window…** from the menu bar to pick any window directly, or **Open Image…** to annotate existing image files read-only.
+- **Effortless Repositioning & Cross-Space Windows**: Drag the dimension pill directly to pan the selection; capture occluded or background windows without bringing them to the front, pick any window via **Choose Window…**, or use **Open Image…** to annotate local images read-only.
 
 ### ✏️ 2. "Draw-First, Edit-In-Place" Annotation System
 - **14 Vector & Redaction Tools**: Rectangle, Ellipse, Line, Arrow, Curved Arrow (quadratic Bézier), Freehand Pen, Text, Area/Brush Redaction (Pixel Mosaic, 3-Pass Gaussian Blur, Solid Fill), Spotlight (rounded dimmed focus), Auto-Increment Numbering, Multiply Highlighter, Measurement Ruler, and Magnifier.
@@ -91,8 +91,17 @@
 
 anShot lets AI coding assistants actually **see** your macOS UI instead of guessing layout details.
 
-### 🌟 Cross-Process Permission Reuse
-On macOS, terminals and AI hosts calling screen capture APIs directly are blocked by TCC unless each host is separately authorized. **anShot delegates capture and window enumeration to its own authorized app instance**, so callers (Terminal, Cursor, Claude Code, Windsurf, shell scripts) **never need Screen Recording permission of their own**.
+### 🌟 Silent Background Unix Socket Proxy & Permission Reuse
+On macOS, terminals and AI hosts calling screen capture APIs directly are blocked by TCC unless each host is separately authorized. **The resident `anShot.app` exposes a private `0600` Unix Domain Socket proxy** so MCP and CLI requests complete window enumeration (~30 ms) and full-screen capture (~250 ms) directly in the background:
+- **Zero Interruption**: No secondary app launch, no focus stealing, no Dock bounce—your active workflow is never disturbed;
+- **Single Authorization**: Terminal, Cursor, Claude Code, Windsurf, Magpie, and scripts reuse `anShot.app`'s permission without separate TCC grants (automatically falling back to an isolated background child instance if `anShot.app` is not running).
+
+### 🔒 4-Layer Security Defense for Automation
+Because the resident app holds Screen Recording and Accessibility permissions, four independent security layers protect against local misuse:
+1. **Kernel-Level Code-Signature Verification**: Every incoming Socket connection is verified via macOS `LOCAL_PEERTOKEN` (`audit_token_t`) and the `Security` framework against `anShot.app`'s own code signature, immediately rejecting external Python, Node, `curl`, or differently signed processes.
+2. **Master Kill Switch + Constant-Time Access Token (`ANSHOT_MCP_TOKEN`)**: Toggle automation on or off anytime in **Settings → General → MCP & Automation Security** (disabling immediately stops and unlinks the socket). Enable **Require Access Token** to enforce a 256-bit random token checked in constant time, with one-click token copy, ready-to-paste MCP JSON export, and token rotation.
+3. **IPC Transfer Path Sandbox**: Cross-process transfer output paths are strictly confined to a user-owned `0700` `anshot-ipc-*` temporary directory, blocking `..` traversal, symlinks, and overwriting existing files (`O_NOFOLLOW`).
+4. **Sensitive Window Privacy Shield (Enabled by Default)**: Blocks automated single-window capture, AX inspection, and recording of password managers and privacy apps (1Password, Bitwarden, KeePassXC, Apple Passwords, Keychain Access, System Settings, etc.), while full-screen/region automation captures exclude those windows at the WindowServer layer via `SCContentFilter` (never affecting manual GUI captures).
 
 ### 1. Command-Line Interface (CLI)
 Symlink `tools/anshot` into your `PATH` (it automatically prefers your local build output and falls back to `/Applications/anShot.app`):
@@ -129,14 +138,17 @@ anshot record --app "Safari" --duration 4 --format gif --out /tmp/demo.gif
 
 ### 2. MCP Server Setup (Cursor / Claude Desktop / Claude Code / Windsurf)
 
-**Installed App (Recommended)**:
+**Installed App (Recommended; include the `env` block if **Require Access Token** is enabled in Settings, or use **Copy MCP Config** in Settings)**:
 
 ```json
 {
   "mcpServers": {
     "anshot": {
       "command": "/Applications/anShot.app/Contents/MacOS/anShot",
-      "args": ["--mcp"]
+      "args": ["--mcp"],
+      "env": {
+        "ANSHOT_MCP_TOKEN": "optional: paste token from anShot Settings"
+      }
     }
   }
 }
@@ -162,7 +174,7 @@ anshot record --app "Safari" --duration 4 --format gif --out /tmp/demo.gif
 | `list_displays` | Lists all displays with ID, logical size, physical pixel size, scale factor, and global origin |
 | `list_desktops` | Lists macOS Spaces / full-screen desktops per display (`id`, `displayID`, `isCurrent`) |
 | `list_windows` | Lists windows across spaces sorted by on-screen priority and area (`id`, `appName`, `title`, `frame`, `spaceIDs`) |
-| `capture_screenshot` | Captures a window, app, region, or display. Supports `format` (`png`/`jpeg`), `quality`, and `coordinate_grid` rulers. Defaults to `max_size=1568` (`0` for native resolution) and auto-falls back to JPEG (`quality=82`) when an unconstrained PNG exceeds `3.5 MiB` to save vision tokens |
+| `capture_screenshot` | Captures a window, app, region, or display. Supports `format` (`png`/`jpeg`), `quality`, `coordinate_grid` rulers, and `include_image: false` silent disk-only mode (with `save_path` to avoid base64 token overhead). Defaults to `max_size=1568` (`0` for native resolution) and auto-falls back to JPEG (`quality=82`) when an unconstrained PNG exceeds `3.5 MiB` |
 | `ocr_screenshot` | Runs offline OCR on a screen target or local image file, returning full text and line-level pixel bounding boxes |
 | `inspect_window_elements` | Traverses the Accessibility (AX) element tree of a target window or app (role, title, logical frame) |
 | `record_screen` | Records a bounded clip (`1...15` seconds) of a screen/region/window to GIF or MP4 for verifying animations and UI transitions |
@@ -226,6 +238,7 @@ The repository includes a ready-to-use Agent Skill in `skills/anshot-screenshot/
 | Shortcut | Action |
 |---|---|
 | `Space` | Toggle between Area and Standalone Window mode (before selecting); `Space + Drag` pans the selection |
+| `Mouse Wheel` / `⌘ A` | Scroll wheel before dragging to cycle *Element → Window → Full Screen*; press `⌘ A` to select the full display |
 | `Tab` / `⇧ Tab` | Cycle through stacked windows beneath the cursor in window mode |
 | `⌥ + Click` | Temporarily invert window drop-shadow setting during standalone window capture |
 | `C` / `⇧ C` | Copy `HEX` / `RGB` color under the loupe crosshair |

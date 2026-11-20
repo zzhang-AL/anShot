@@ -33,10 +33,10 @@
 
 ## 💡 为什么选择 anShot
 
-**anShot** 是一款使用 **Swift 6** 与系统原生框架（AppKit、ScreenCaptureKit、Apple Vision、Apple Translation）深度构建的 macOS 菜单栏工具，无 Dock 图标、常驻轻盈、毫秒响应。
+**anShot** 是一款使用 **Swift 6** 与系统原生框架（AppKit、ScreenCaptureKit、Apple Vision、Apple Translation）深度构建的 macOS 菜单栏工具，无 Dock 图标、常驻内存仅约 **27 MB**、毫秒响应。
 
 - **全能日常工具链**：区域与独立窗体截图、14 种可再编辑标注、双向与自动翻页长截图、双音轨 MP4/GIF 录屏、OCR 与划词/框选翻译、置顶贴图与历史归档，一站闭环。
-- **为 AI Agent 原生设计**：内置官方规范的 **Model Context Protocol (MCP)** stdio 服务端、命令行工具与配套 Agent Skill。独创**跨进程授权复用**机制，终端和 Cursor / Claude Code / Windsurf 等 AI 宿主调用截图时自动复用 `anShot.app` 已有的屏幕录制权限，无需给宿主重复授权。
+- **为 AI Agent 原生设计**：内置官方规范的 **Model Context Protocol (MCP)** stdio 服务端、命令行工具与配套 Agent Skill。常驻进程内置**私有 Unix Socket 后台无感代理**，自动复用 `anShot.app` 已有的屏幕录制权限——零焦点抢占、不打断日常使用、无需给 AI 宿主重复授权，并配备**四层纵深安全防线**防止恶意脚本借壳盗用权限。
 - **默认本地离线，隐私可控**：OCR、系统级翻译与长截图图像配准默认 **100% 本地离线执行**，像素与文本不出本机；同时支持按需接入 OpenAI 兼容、Claude、百度 PP-OCRv6 等云端引擎，外发时持续明示隐私边界。
 - **工程化画质与体验**：全格式保留 Retina 原生 DPI 与独立窗体透明圆角，支持纯 Swift 无损 WebP 及 MIT 许可 `oxipng` 两阶段后台无损精压；支持浅色/深色/跟随系统三态外观与简体中文 / English 零重启热切换。
 
@@ -45,10 +45,10 @@
 ## ✨ 核心功能
 
 ### 📸 1. 精准捕获与独立窗体取景
-- **零抖动静默冻结**：呼出即保持屏幕原亮度静默冻结，首帧显示放大镜与坐标取色 HUD（`C` 复制 HEX，`⇧C` 复制 RGB）。
-- **两阶段异步智能吸附**：鼠标悬停实时高亮候选窗口与 UI 控件，支持最大化窗口防误吸，避免误选整屏。
+- **零抖动静默冻结**：呼出即保持屏幕原亮度静默冻结，首帧显示放大镜与坐标取色 HUD（`C` 复制 HEX，`⇧C` 复制 RGB），左下角提供静态提示与可展开快捷键速查卡。
+- **语义级智能吸附与滚轮切层**：鼠标悬停实时高亮窗口、UI 控件与顶部状态栏（整条及单个图标），内置最大化窗口防误吸；待选态**滚动鼠标滚轮**即可在「控件 → 窗口 → 全屏」候选栈间逐级切换，按 `⌘A` 可一键全屏。
 - **所见即所得独立窗体捕获**：覆盖层内按 `Space`（或直接用 `⌃S`）切换独立窗体模式，支持 `Tab` / `⇧Tab` 穿透叠放窗口；默认合成原生柔和阴影（`⌥ + 单击` 临时切换无阴影），完整保留窗口透明圆角。
-- **跨桌面与后台窗口**：可直接截取被完全遮挡或位于后台的窗口，亦可通过菜单栏「选择窗口…」精确取图，或通过「打开图片…」以只读方式载入磁盘图片继续标注。
+- **选区便捷微调与跨桌面取图**：尺寸胶囊支持四向拖拽平移选区；可直接截取被完全遮挡或位于后台的窗口，亦可通过菜单栏「选择窗口…」精确取图，或通过「打开图片…」以只读方式载入磁盘图片继续标注。
 
 ### ✏️ 2. 「绘制优先 + 无缝直编」标注系统
 - **14 种专业标注工具**：矩形、椭圆、直线、箭头、弯曲箭头（二次贝塞尔）、自由画笔、文字、框选/涂抹打码（像素马赛克 / 3-Pass 高斯模糊 / 纯色遮盖）、聚光灯（圆角压暗聚焦）、自增编号、正片叠底荧光笔、测量标尺、放大镜。
@@ -91,8 +91,17 @@
 
 anShot 让 AI 编程助手真正「看见」你的 macOS 界面，而不再盲猜布局。
 
-### 🌟 独创「跨进程授权复用」
-在 macOS 上，终端或 AI 宿主进程直接调取系统截屏 API 会被 TCC 拦截并要求反复授权。**anShot 默认通过自身已授权的 App 实例跨进程执行捕获与窗口枚举**，调用方（Terminal、Cursor、Claude Code、Windsurf、自动化脚本等）**无需单独申请屏幕录制权限**。
+### 🌟 后台无感私有 Socket 代理 & 跨进程授权复用
+在 macOS 上，终端或 AI 宿主进程直接调取系统截屏 API 会被 TCC 拦截并要求反复授权。**常驻运行中的 `anShot.app` 内置私有 `0600` Unix Domain Socket 后台代理**，MCP 与 CLI 调用时自动直连常驻进程完成窗口枚举（~30 ms）与整屏捕获（~250 ms）：
+- **完全无感**：不拉起新 App 实例、不抢占前台焦点、无 Dock 弹跳，后台执行时绝不打断你当前的正常打字或操作；
+- **免重复授权**：Terminal、Cursor、Claude Code、Windsurf、Magpie 等宿主均无需单独申请屏幕录制权限（若 `anShot.app` 未在后台运行，将自动无缝降级为临时后台子实例兜底）。
+
+### 🔒 四层安全防线（防恶意脚本借壳滥用）
+由于常驻 `anShot.app` 持有屏幕录制与辅助功能权限，内置四层纵深防护保障本地安全：
+1. **内核级同签名强校验**：Socket 接入层通过 macOS 内核 `LOCAL_PEERTOKEN`（`audit_token_t`）与 `Security` 框架强制校验对端进程必须为同一签名签发的 `anShot.app` 二进制，直接拒绝外部 Python / Node / curl 等未签名或异签名进程直连。
+2. **自动化总开关 + 访问令牌（`ANSHOT_MCP_TOKEN`）**：在「**设置 → 通用 → MCP 与自动化安全**」可一键启停整个后台自动化服务（关闭即刻停用并清理 Socket）；开启 **「要求访问令牌」** 后强制使用 256-bit 随机令牌做常量时间校验，支持一键复制令牌、一键复制带令牌的 MCP JSON 配置与重置轮换。
+3. **IPC 中转路径沙箱**：严格校验跨进程中转输出路径必须位于当前用户 `0700` 私有临时目录内，禁止路径穿越、软链目录与覆盖已存在文件（底层落盘强制 `O_NOFOLLOW`）。
+4. **敏感隐私窗口自动保护（默认开启）**：自动拦截针对 1Password、Bitwarden、KeePassXC、密码、钥匙串访问、系统设置等隐私应用的单窗截图、AX 控件探测与录屏；全屏/区域自动化截屏在底层通过 `SCContentFilter` 硬件级自动剔除敏感窗口（不影响人工手动截图）。
 
 ### 1. 命令行接口 (CLI)
 将仓库中的 `tools/anshot` 软链到全局 `PATH` 即可使用（脚本会自动优先定位本地最新构建产物，其次使用 `/Applications/anShot.app`）：
@@ -129,14 +138,17 @@ anshot record --app "Safari" --duration 4 --format gif --out /tmp/demo.gif
 
 ### 2. 接入 MCP（Cursor / Claude Desktop / Claude Code / Windsurf）
 
-**正式安装版配置**（推荐）：
+**正式安装版配置**（推荐；若已在设置页开启「要求访问令牌」，加上 `env` 块即可，也可在设置页点击「复制 MCP 配置」一键生成）：
 
 ```json
 {
   "mcpServers": {
     "anshot": {
       "command": "/Applications/anShot.app/Contents/MacOS/anShot",
-      "args": ["--mcp"]
+      "args": ["--mcp"],
+      "env": {
+        "ANSHOT_MCP_TOKEN": "可选：开启令牌保护后粘贴此处"
+      }
     }
   }
 }
@@ -162,7 +174,7 @@ anshot record --app "Safari" --duration 4 --format gif --out /tmp/demo.gif
 | `list_displays` | 获取所有显示器的 ID、逻辑尺寸、物理像素尺寸、缩放系数与全局位置 |
 | `list_desktops` | 获取各显示器的桌面与全屏空间 ID、序号与当前活动状态 |
 | `list_windows` | 按「在屏优先、面积降序」列出各桌面窗口的 ID、应用名、标题、矩形与所属空间 |
-| `capture_screenshot` | 截取窗口/应用/区域/整屏；支持 `format`（`png`/`jpeg`）、`quality`、`coordinate_grid` 坐标标尺网格；默认 `max_size=1568`（`0` 为原图），未显式锁定 PNG 且超过 `3.5 MiB` 时自动降级高质量 JPEG 控制视觉 Token 体积 |
+| `capture_screenshot` | 截取窗口/应用/区域/整屏；支持 `format`（`png`/`jpeg`）、`quality`、`coordinate_grid` 坐标标尺网格与 `include_image: false` 静默落盘（配 `save_path` 不回传图像省 Token）；默认 `max_size=1568`（`0` 为原图），未显式锁定 PNG 且超过 `3.5 MiB` 时自动降级高质量 JPEG |
 | `ocr_screenshot` | 离线识别屏幕/窗口/区域或本地图片文字，返回全文与逐行精确像素包围盒 |
 | `inspect_window_elements` | 探测目标窗口或应用的 AX 控件树（角色、标题与逻辑点坐标框） |
 | `record_screen` | 有界时长（`1...15` 秒）录制屏幕/区域/窗口为 GIF 或 MP4，用于验收动画与交互时序 |
@@ -226,6 +238,7 @@ anshot record --app "Safari" --duration 4 --format gif --out /tmp/demo.gif
 | 快捷键 | 动作 |
 |---|---|
 | `Space` | 在「区域框选」与「独立窗体捕获」之间切换（未框选态）；`Space + 拖拽` 平移选区 |
+| `鼠标滚轮` / `⌘ A` | 待选态滚动滚轮在「控件 → 窗口 → 全屏」候选栈间逐级切换；`⌘ A` 一键全屏 |
 | `Tab` / `⇧ Tab` | 独立窗体模式下穿透光标下叠放窗口 |
 | `⌥ + 单击` | 独立窗体捕获时临时切换「有/无柔和阴影」 |
 | `C` / `⇧ C` | 复制放大镜十字准星处像素的 `HEX` / `RGB` 色值 |
