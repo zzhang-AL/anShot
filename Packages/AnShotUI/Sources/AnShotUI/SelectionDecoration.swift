@@ -265,6 +265,13 @@ enum SelectionHandleLayout {
             handles = SelectionHandle.allCases
         }
 
+        let isCompact = decoration.usesCompactHandles(for: decoratedRect.size)
+        let shortSide = min(decoratedRect.width, decoratedRect.height)
+        // 紧凑小选区（短边 < 44pt）动态收缩角热区基线，避免四角 12pt 热区吃光中心平移空间。
+        let cornerBaseRadius: CGFloat = isCompact
+            ? min(decoration.cornerHitRadius, max(6, shortSide * 0.28))
+            : decoration.cornerHitRadius
+
         return handles.map { handle in
             // 命中半径必须覆盖**可见**的括号范围：贴屏幕角时臂长会跟着圆角变长
             // （可达 20pt+），命中半径若仍是 20pt，多出来那段就成了
@@ -275,7 +282,7 @@ enum SelectionHandleLayout {
                     for: decoratedRect.size,
                     cornerRadius: radius(of: handle, in: radii)
                 )
-                hitRadius = max(decoration.cornerHitRadius, arm)
+                hitRadius = max(cornerBaseRadius, arm)
             } else {
                 hitRadius = decoration.midpointHitRadius
             }

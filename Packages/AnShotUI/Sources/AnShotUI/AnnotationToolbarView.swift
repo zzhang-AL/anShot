@@ -1069,7 +1069,15 @@ final class AnnotationToolbarView: NSView {
             case .mosaic: return "马赛克与放大镜 (M)"
             }
         case let .tool(tool):
-            return "\(tool.displayName) (\(String(tool.keyCharacter).uppercased()))"
+            let key = String(tool.keyCharacter).uppercased()
+            switch tool {
+            case .pointer:
+                return "\(tool.displayName) (\(key)) · 或按住 Space / 拖尺寸标签移选区"
+            case .text:
+                return "\(tool.displayName) (\(key)) · Enter 完成 / ⇧Enter 换行"
+            default:
+                return "\(tool.displayName) (\(key))"
+            }
         case .moreTools:
             return "更多工具：直线 / 曲线箭头 / 测量 / 放大镜"
         case let .color(color):

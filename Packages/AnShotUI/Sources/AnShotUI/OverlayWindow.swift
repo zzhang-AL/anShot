@@ -263,6 +263,25 @@ final class OverlayView: NSView {
     /// 确认态下是否正按住空格键用于平移整个选区。
     private var isSpaceKeyPressed = false
 
+    /// 完整快捷键速查卡是否展开（按 `?` 或点击左下角微提示切换）。
+    private(set) var isShortcutCheatSheetVisible = false {
+        didSet {
+            if isShortcutCheatSheetVisible != oldValue {
+                needsDisplay = true
+            }
+        }
+    }
+
+    /// 复位空格平移状态（窗口失焦、切换焦点或重置选区时调用，防止漏收 keyUp 导致卡死）。
+    func clearSpaceKeyState() {
+        guard isSpaceKeyPressed else { return }
+        isSpaceKeyPressed = false
+        if let window {
+            let mousePoint = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+            updateCursor(at: mousePoint)
+        }
+    }
+
     /// 绘图工具下按下瞬间命中的已有标注与起点（用于松手位移 < 3pt 时原地选中该标注）。
     private var pendingDrawingHitAnnotationID: UUID?
     private var pendingDrawingDownPoint: CGPoint?
@@ -485,6 +504,8 @@ final class OverlayView: NSView {
     ///   过期渲染，不是用户清空了选区；若照常回调，控制器会把刚刚提交的
     ///   选区当成一次新的「清空」再提交回去，造成递归与误清空。
     func resetSelection(notifying: Bool = true) {
+        clearSpaceKeyState()
+        isShortcutCheatSheetVisible = false
         selectionRect = nil
         customToolbarOrigin = nil
         lastSelectionForToolbarOrigin = nil
@@ -1054,6 +1075,57 @@ final class OverlayView: NSView {
         drawSelection(in: context)
         drawDraftOutline(in: context)
         drawWindowPickerHUD(in: context)
+        OverlayShortcutHUD.draw(shortcutHUDState(), in: context)
+    }
+
+    /// 构造左下角快捷微提示与 `?` 速查卡的当前输入快照（绘制与命中同源）。
+    func shortcutHUDState() -> OverlayShortcutHUD.State {
+        var avoidRects: [CGRect] = []
+        if let selection = effectiveSelection {
+            avoidRects.append(selection)
+        }
+        if !toolbar.isHidden, toolbar.frame.width > 0, toolbar.frame.height > 0 {
+            avoidRects.append(toolbar.frame)
+        }
+        if let labelRect = sizeLabelDragRect() {
+            avoidRects.append(labelRect)
+        }
+        let isSuppressed = isWindowPickerMode
+            || isRecordSetupActive
+            || recordingPick.isActive
+            || isInteracting
+            || editorState?.hasDraft == true
+            || editorState?.isEditingText == true
+            || numberingEditorField != nil
+            || enclosingScrollView != nil
+        return OverlayShortcutHUD.State(
+            viewBounds: bounds,
+            safeInsets: effectiveSafeAreaInsets,
+            isSelectionConfirmed: isSelectionConfirmed,
+            isHintEnabled: appSettings?.showOverlayShortcutHint ?? true,
+            isCheatSheetVisible: isShortcutCheatSheetVisible,
+            isSuppressedByMode: isSuppressed,
+            avoidRects: avoidRects,
+            isEnglish: AnShotLocalization.isEnglish
+        )
+    }
+
+    /// 当前已确认选区外侧「像素尺寸胶囊」的几何矩形（仅非创建态返回，作为全局平移选区把手）。
+    func sizeLabelDragRect() -> CGRect? {
+        guard isSelectionConfirmed, !isCreating, let selection = effectiveSelection else { return nil }
+        return SelectionChromeRenderer.sizeLabelRect(
+            for: SelectionChromeRenderer.Chrome(
+                selection: selection,
+                viewBounds: bounds,
+                displayID: displayID,
+                scaleFactor: pixelsPerPoint,
+                decoration: decoration,
+                isConfirmed: true,
+                isCreating: false,
+                activeHandle: activeHandle,
+                hoveredHandle: hoveredHandle
+            )
+        )
     }
 
     /// 正在拖拽的标注草稿的辅助轮廓。
@@ -1827,6 +1899,18 @@ final class OverlayView: NSView {
     /// 判定顺序必须与 `mouseDown` 完全一致（手柄 → 选区内部 → 空白），
     /// 否则会出现「光标说是移动、结果却改了尺寸」的错位。
     private func updateCursor(at point: CGPoint) {
+        // 悬停在左下角快捷微提示或速查卡开关上时显示手型光标。
+        if let hudHit = OverlayShortcutHUD.hitTest(point, state: shortcutHUDState()) {
+            hoveredHandle = nil
+            switch hudHit {
+            case .toggleCheatSheet, .toggleHintVisibility:
+                NSCursor.pointingHand.set()
+            case .cheatSheetBody:
+                NSCursor.arrow.set()
+            }
+            return
+        }
+
         guard let selection = effectiveSelection else {
             hoveredHandle = nil
             NSCursor.crosshair.set()
@@ -1881,6 +1965,13 @@ final class OverlayView: NSView {
         hoveredHandle = hit
         if let hit {
             SelectionCursor.cursor(for: hit).set()
+            return
+        }
+
+        // 尺寸胶囊平移把手（严格排在选区 8 个边角缩放手柄之后，绝不抢占角/边缩放）：
+        // 任意工具下悬停在选区外侧尺寸胶囊上显示抓手，可直接按住平移整个截图框。
+        if let labelRect = sizeLabelDragRect(), labelRect.contains(point) {
+            NSCursor.openHand.set()
             return
         }
 
@@ -2462,6 +2553,38 @@ final class OverlayView: NSView {
             dismissColorPanel()
         }
 
+        // 左下角快捷微提示与 `?` 速查卡命中：优先处理，不穿透到画布。
+        if let hudHit = OverlayShortcutHUD.hitTest(point, state: shortcutHUDState()) {
+            switch hudHit {
+            case .toggleCheatSheet:
+                isShortcutCheatSheetVisible.toggle()
+            case .toggleHintVisibility:
+                let current = appSettings?.showOverlayShortcutHint ?? true
+                appSettings?.setShowOverlayShortcutHint(!current)
+                if current {
+                    // 选择不再显示左下角提示后顺手收起速查卡并告知随时可按 ? 再次打开。
+                    isShortcutCheatSheetVisible = false
+                    ToastPresenter.show(
+                        AnShotLocalization.isEnglish
+                            ? "Hint hidden (press ? anytime for shortcuts)"
+                            : "已隐藏底部提示（随时按 ? 查看快捷键）",
+                        on: window?.screen
+                    )
+                } else {
+                    needsDisplay = true
+                }
+            case .cheatSheetBody:
+                break
+            }
+            updateCursor(at: point)
+            return
+        }
+
+        // 速查卡展开时点击画布其余任意处先自动收起。
+        if isShortcutCheatSheetVisible {
+            isShortcutCheatSheetVisible = false
+        }
+
         // 点击编号数字输入框外部时自动提交数字编辑。
         if let numField = numberingEditorField, !numField.frame.contains(point) {
             commitNumberingEditing()
@@ -2547,6 +2670,16 @@ final class OverlayView: NSView {
                     resizingInitialRect = selection
                     interaction = .resizing(handle: hit)
                     SelectionCursor.cursor(for: hit).set()
+                    return
+                }
+
+                // 选区外侧「尺寸胶囊」平移把手（严格在选区边角缩放手柄之后，绝不抢占改选区大小）：
+                // 任意标注工具下按住尺寸胶囊即可直接平移整个截图框，无需切回指针或按住 Space。
+                if let labelRect = sizeLabelDragRect(), labelRect.contains(point) {
+                    interaction = .moving(
+                        grabOffset: CGPoint(x: point.x - selection.minX, y: point.y - selection.minY)
+                    )
+                    NSCursor.closedHand.set()
                     return
                 }
 
@@ -3120,6 +3253,19 @@ final class OverlayView: NSView {
             return
         }
 
+        // 速查卡展开时按 Esc 优先收起速查卡，不误退出截图。
+        if isShortcutCheatSheetVisible, event.keyCode == 53 {
+            isShortcutCheatSheetVisible = false
+            return
+        }
+
+        // `?`（含中文输入法下 `？`）切换完整快捷键速查卡。
+        if !flags.contains(.command), !flags.contains(.control), !flags.contains(.option),
+           let chars = event.characters, chars == "?" || chars == "？" {
+            isShortcutCheatSheetVisible.toggle()
+            return
+        }
+
         // Delete / Backspace 删除选中的标注（任意工具下只要有选中即生效）。
         if let editorState, editorState.hasSelectedAnnotation,
            event.keyCode == 51 || event.keyCode == 117 {
@@ -3160,6 +3306,11 @@ final class OverlayView: NSView {
             return
         }
         performCommand(command)
+    }
+
+    override func resignFirstResponder() -> Bool {
+        clearSpaceKeyState()
+        return super.resignFirstResponder()
     }
 
     override func keyUp(with event: NSEvent) {
@@ -3547,11 +3698,16 @@ final class OverlayWindow: NSPanel, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        overlayView.clearSpaceKeyState()
         if let observer = scrollBoundsObserver {
             NotificationCenter.default.removeObserver(observer)
             scrollBoundsObserver = nil
         }
         onWindowWillClose?()
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        overlayView.clearSpaceKeyState()
     }
 
     func windowDidResize(_ notification: Notification) {

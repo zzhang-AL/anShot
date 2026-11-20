@@ -412,4 +412,72 @@ struct SelectionGestureExportTests {
         #expect(panelKinds.contains(.deleteSelected), "跨类型选中检查面板应包含删除按钮")
         #expect(panelKinds.contains(.textBoldToggle), "矩形工具下选中文字时应展示文字属性控件而非矩形线宽")
     }
+
+    @Test("绘图工具下可拖动尺寸胶囊平移选区，且左下角静态微提示支持避让即隐与按 ? 速查卡")
+    func sizeLabelDragAndOverlayShortcutHUD() throws {
+        let initial = makeRect(400, 200, 400, 300) // 逻辑点 (200,100,200,150)
+        let fixture = Fixture(scale: 2, initialSelection: initial)
+        let suiteName = "com.anshot.tests.hud.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(store: defaults)
+        fixture.view.appSettings = settings
+
+        let logicalSelection = CGRect(x: 200, y: 100, width: 200, height: 150)
+        fixture.view.setSelection(logicalSelection)
+        fixture.editor.confirmSelection()
+        fixture.editor.select(.rectangle)
+
+        // 1. 绘图工具下，抓着选区外侧「尺寸胶囊」直接拖动应平移整个选区，且不新建矩形标注
+        let labelRect = try #require(fixture.view.sizeLabelDragRect(), "已确认非创建态应存在尺寸胶囊")
+        let labelCenter = CGPoint(x: labelRect.midX, y: labelRect.midY)
+        fixture.send(.leftMouseDown, at: labelCenter)
+        fixture.send(.leftMouseDragged, at: CGPoint(x: labelCenter.x + 40, y: labelCenter.y + 30))
+        fixture.send(.leftMouseUp, at: CGPoint(x: labelCenter.x + 40, y: labelCenter.y + 30))
+
+        #expect(fixture.editor.annotations.isEmpty, "拖动尺寸胶囊只应平移选区，不得新建矩形标注")
+        #expect(fixture.view.effectiveSelection?.minX == 240, "拖动尺寸胶囊右移 40pt 后选区 X 应更新为 240")
+        #expect(fixture.view.effectiveSelection?.minY == 130, "拖动尺寸胶囊下移 30pt 后选区 Y 应更新为 130")
+
+        // 2. 左下角微提示：选区远离左下角时可见，选区覆盖左下角时自动静默隐藏
+        let visibleHUD = fixture.view.shortcutHUDState()
+        let pill = try #require(OverlayShortcutHUD.pillRect(for: visibleHUD), "选区远离左下角时应展示微提示胶囊")
+        #expect(OverlayShortcutHUD.hitTest(CGPoint(x: pill.midX, y: pill.midY), state: visibleHUD) == .toggleCheatSheet)
+
+        // 按 `?` 展开速查卡；按 Esc 优先收起速查卡而不是取消整个截图会话
+        var cancelled = false
+        fixture.view.onCancel = { cancelled = true }
+        let questionEvent = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: .shift, timestamp: 0,
+            windowNumber: fixture.window.windowNumber, context: nil,
+            characters: "?", charactersIgnoringModifiers: "/",
+            isARepeat: false, keyCode: 44
+        ))
+        fixture.view.keyDown(with: questionEvent)
+        #expect(fixture.view.isShortcutCheatSheetVisible, "按 ? 应展开完整快捷键速查卡")
+
+        let escEvent = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: fixture.window.windowNumber, context: nil,
+            characters: "\u{1B}", charactersIgnoringModifiers: "\u{1B}",
+            isARepeat: false, keyCode: 53
+        ))
+        fixture.view.keyDown(with: escEvent)
+        #expect(!fixture.view.isShortcutCheatSheetVisible, "展开态按 Esc 应先收起速查卡")
+        #expect(!cancelled, "收起速查卡时不得直接退出截图覆盖层")
+
+        // 3. 点击微胶囊展开速查卡后，点击底部开关可关闭左下角提示并持久化到 AppSettings
+        fixture.send(.leftMouseDown, at: CGPoint(x: pill.midX, y: pill.midY))
+        #expect(fixture.view.isShortcutCheatSheetVisible, "点击左下角微提示应展开速查卡")
+        let sheet = try #require(OverlayShortcutHUD.cheatSheetGeometry(for: fixture.view.shortcutHUDState()))
+        fixture.send(.leftMouseDown, at: CGPoint(x: sheet.toggleRect.midX, y: sheet.toggleRect.midY))
+        #expect(!settings.showOverlayShortcutHint, "点击底部开关应关闭左下角快捷提示并持久化")
+        #expect(!fixture.view.isShortcutCheatSheetVisible, "关闭提示后应顺手收起速查卡")
+        #expect(OverlayShortcutHUD.pillRect(for: fixture.view.shortcutHUDState()) == nil, "关闭后默认不再绘制左下角微提示")
+
+        // 4. 重新开启后，若选区覆盖左下角区域，微提示自动静默隐藏（避让即隐）
+        settings.setShowOverlayShortcutHint(true)
+        fixture.view.setSelection(CGRect(x: 10, y: 500, width: 200, height: 90))
+        #expect(OverlayShortcutHUD.pillRect(for: fixture.view.shortcutHUDState()) == nil, "选区靠近左下角时微提示应静默隐藏")
+    }
 }

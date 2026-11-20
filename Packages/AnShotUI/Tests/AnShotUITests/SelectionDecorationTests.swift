@@ -433,4 +433,26 @@ struct SelectionEdgeBandAndLoupeTests {
         #expect(panelFrame.maxX < 780)
         #expect(panelFrame.maxY < 580)
     }
+
+    @Test("紧凑小选区（短边 < 44pt）动态收缩角热区，中心留出可拖动平移区")
+    func compactSelectionShrinksCornerHitRadiusForCenterDragging() {
+        let smallSelection = makeRect(100, 100, 30, 30)
+        let decorated = SelectionHandleLayout.decoratedRect(for: smallSelection)
+        let items = SelectionHandleLayout.items(
+            decoratedRect: decorated,
+            radii: .uniform(0),
+            decoration: decoration
+        )
+        #expect(items.count == 4, "紧凑选区应只保留四个角手柄")
+        for item in items {
+            #expect(item.hitRadius < decoration.cornerHitRadius, "小选区角命中半径应动态收窄以留出中间平移区")
+        }
+        let centerHit = SelectionHandleLayout.hit(
+            at: CGPoint(x: decorated.midX, y: decorated.midY),
+            decoratedRect: decorated,
+            radii: .uniform(0),
+            decoration: decoration
+        )
+        #expect(centerHit == nil, "30×30 小选区中心不应被四角热区吞掉，必须可直接平移")
+    }
 }

@@ -390,6 +390,7 @@ private final class SettingsViewController: NSViewController {
     private var languagePopUp: NSPopUpButton!
     private var toastToggleRow: SettingsToggleRow!
     private var recordingFrameToggleRow: SettingsToggleRow!
+    private var overlayShortcutHintToggleRow: SettingsToggleRow!
     private var screenPermPill: SettingsStatusPill!
     private var micPermPill: SettingsStatusPill!
     private var axPermPill: SettingsStatusPill!
@@ -1345,6 +1346,10 @@ private final class SettingsViewController: NSViewController {
         settings.setRecordingShowRegionFrame(sender.state == .on)
     }
 
+    @objc private func showOverlayShortcutHintChanged(_ sender: NSSwitch) {
+        settings.setShowOverlayShortcutHint(sender.state == .on)
+    }
+
     @objc private func refreshPermissionsClicked() {
         refreshPermissionStatusLabels()
     }
@@ -1604,11 +1609,20 @@ private final class SettingsViewController: NSViewController {
         recFrameRow.toggle.action = #selector(recordingShowRegionFrameChanged(_:))
         recordingFrameToggleRow = recFrameRow
 
+        let shortcutHintRow = SettingsToggleRow(
+            title: "截图覆盖层左下角显示快捷提示",
+            subtitle: "展示极简操作提示（被选区遮挡时自动隐藏）；关闭后仍可随时按 ? 查看完整速查"
+        )
+        shortcutHintRow.isOn = settings.showOverlayShortcutHint
+        shortcutHintRow.toggle.target = self
+        shortcutHintRow.toggle.action = #selector(showOverlayShortcutHintChanged(_:))
+        overlayShortcutHintToggleRow = shortcutHintRow
+
         return SettingsCardView(
             symbolName: "viewfinder",
             title: "截图行为与录屏",
             accentColor: SettingsPage.capture.badgeColor,
-            rows: [shadowRow, cancelGuardRow, recFrameRow]
+            rows: [shadowRow, cancelGuardRow, recFrameRow, shortcutHintRow]
         )
     }
 
@@ -2951,6 +2965,7 @@ private final class SettingsViewController: NSViewController {
         }
         toastToggleRow?.isOn = settings.showCompletionToast
         recordingFrameToggleRow?.isOn = settings.recordingShowRegionFrame
+        overlayShortcutHintToggleRow?.isOn = settings.showOverlayShortcutHint
         refreshPermissionStatusLabels()
         refreshSaveControls()
         refreshExportFormatControls()

@@ -626,6 +626,7 @@ public final class AppSettings {
             .flatMap(AppLanguage.init(rawValue:)) ?? .system
         self.showCompletionToast = store.object(forKey: Key.showCompletionToast) as? Bool ?? true
         self.recordingShowRegionFrame = store.object(forKey: Key.recordingShowRegionFrame) as? Bool ?? true
+        self.showOverlayShortcutHint = store.object(forKey: Key.showOverlayShortcutHint) as? Bool ?? true
     }
 
     /// 检测 `UserDefaults` 是否存在任意历史版本设置键（用于无损区分老用户升级与全新安装）。
@@ -1042,6 +1043,15 @@ public final class AppSettings {
         store.set(enabled, forKey: Key.recordingShowRegionFrame)
     }
 
+    /// 截图覆盖层左下角是否显示极简快捷操作提示胶囊（默认开启；随时可按 `?` 查看完整速查）。
+    public private(set) var showOverlayShortcutHint: Bool
+
+    public func setShowOverlayShortcutHint(_ enabled: Bool) {
+        guard enabled != showOverlayShortcutHint else { return }
+        showOverlayShortcutHint = enabled
+        store.set(enabled, forKey: Key.showOverlayShortcutHint)
+    }
+
     // MARK: 键名
 
     private enum Key {
@@ -1068,6 +1078,7 @@ public final class AppSettings {
         static let appLanguage = "settings.appLanguage"
         static let showCompletionToast = "settings.showCompletionToast"
         static let recordingShowRegionFrame = "settings.recordingShowRegionFrame"
+        static let showOverlayShortcutHint = "settings.showOverlayShortcutHint"
     }
 
     private enum Mode {

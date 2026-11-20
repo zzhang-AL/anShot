@@ -217,7 +217,50 @@ enum SelectionChromeRenderer {
         CaptureFrameStyle.fillPathWithContrast(path, color: color, in: context)
     }
 
-    /// 绘制像素尺寸提示。
+    /// 计算像素尺寸胶囊矩形（绘制与鼠标拖动命中共用同一份几何，绝不漂移）。
+    static func sizeLabelRect(for chrome: Chrome) -> CGRect {
+        let pixelSize = CoordinateConversion.pixelRect(
+            fromLogical: chrome.selection,
+            scaleFactor: chrome.scaleFactor
+        ).size
+        let text = "\(Int(pixelSize.width.rounded())) × \(Int(pixelSize.height.rounded()))"
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.white
+        ]
+        let textSize = (text as NSString).size(withAttributes: attributes)
+
+        let showsDragGrip = chrome.isConfirmed && !chrome.isCreating
+        let gripReserve: CGFloat = showsDragGrip ? 11 : 0
+        let horizontalPadding: CGFloat = 10
+        let labelSize = CGSize(
+            // 下限取两倍高度，保证极窄的内容（如 "9 × 9"）也得到胶囊而非圆
+            width: max(textSize.width + gripReserve + horizontalPadding * 2, chrome.decoration.labelHeight * 2),
+            height: chrome.decoration.labelHeight
+        )
+
+        // 垂直：优先选区下方；下方放不下则上方；上下都放不下时
+        // （选区几乎占满屏幕高度）贴屏幕下沿内侧。
+        let gap: CGFloat = 8
+        var y = chrome.selection.maxY + gap
+        if y + labelSize.height > chrome.viewBounds.maxY - 4 {
+            y = chrome.selection.minY - labelSize.height - gap
+        }
+        if y < 4 {
+            y = chrome.viewBounds.maxY - labelSize.height - 4
+        }
+
+        // 水平：跟随选区居中，贴屏幕左右边缘时收进来。
+        let margin: CGFloat = 4
+        let x = min(
+            max(margin, chrome.selection.midX - labelSize.width / 2),
+            max(margin, chrome.viewBounds.maxX - labelSize.width - margin)
+        )
+
+        return CGRect(origin: CGPoint(x: x, y: y), size: labelSize)
+    }
+
+    /// 绘制像素尺寸提示（已确认态左侧附带极简 6 点握把，作为任意工具下平移选区的直观把手）。
     ///
     /// 显示的是**像素**而非逻辑点：用户关心的最终产物尺寸是像素，
     /// 而选区在 2x 屏上的逻辑点数值是像素的一半。
@@ -235,33 +278,8 @@ enum SelectionChromeRenderer {
         let attributed = NSAttributedString(string: text, attributes: attributes)
         let textSize = attributed.size()
 
-        let horizontalPadding: CGFloat = 10
-        let labelSize = CGSize(
-            // 下限取两倍高度，保证极窄的内容（如 "9 × 9"）也得到胶囊而非圆
-            width: max(textSize.width + horizontalPadding * 2, chrome.decoration.labelHeight * 2),
-            height: chrome.decoration.labelHeight
-        )
-
-        // 垂直：优先选区下方；下方放不下则上方；上下都放不下时
-        // （选区几乎占满屏幕高度）贴屏幕下沿内侧。
-        // 只处理第一种情况是不够的——顶部贴边的小选区会得到负的 y。
-        let gap: CGFloat = 8
-        var y = chrome.selection.maxY + gap
-        if y + labelSize.height > chrome.viewBounds.maxY - 4 {
-            y = chrome.selection.minY - labelSize.height - gap
-        }
-        if y < 4 {
-            y = chrome.viewBounds.maxY - labelSize.height - 4
-        }
-
-        // 水平：跟随选区居中，贴屏幕左右边缘时收进来。
-        let margin: CGFloat = 4
-        let x = min(
-            max(margin, chrome.selection.midX - labelSize.width / 2),
-            max(margin, chrome.viewBounds.maxX - labelSize.width - margin)
-        )
-
-        let labelRect = CGRect(origin: CGPoint(x: x, y: y), size: labelSize)
+        let showsDragGrip = chrome.isConfirmed && !chrome.isCreating
+        let labelRect = sizeLabelRect(for: chrome)
         // 用 CGPath 而非 NSBezierPath(cgPath:)：后者是 macOS 14.0+，
         // 会超出本项目的 13.0 基线。
         let path = CGPath(
@@ -290,9 +308,38 @@ enum SelectionChromeRenderer {
         context.strokePath()
         context.restoreGState()
 
-        attributed.draw(at: CGPoint(
-            x: labelRect.midX - textSize.width / 2,
-            y: labelRect.midY - textSize.height / 2
-        ))
+        if showsDragGrip {
+            // 绘制柔和 2×3 六点握把，暗示可直接抓着尺寸胶囊平移整个选区。
+            let gripWidth: CGFloat = 5
+            let gripGap: CGFloat = 6
+            let contentWidth = gripWidth + gripGap + textSize.width
+            let startX = labelRect.midX - contentWidth / 2
+            let dotRadius: CGFloat = 0.85
+            context.saveGState()
+            context.setFillColor(NSColor.white.withAlphaComponent(0.55).cgColor)
+            for col in 0 ..< 2 {
+                for row in 0 ..< 3 {
+                    let cx = startX + CGFloat(col) * 3.2 + dotRadius
+                    let cy = labelRect.midY + CGFloat(row - 1) * 3.1
+                    context.fillEllipse(in: CGRect(
+                        x: cx - dotRadius,
+                        y: cy - dotRadius,
+                        width: dotRadius * 2,
+                        height: dotRadius * 2
+                    ))
+                }
+            }
+            context.restoreGState()
+
+            attributed.draw(at: CGPoint(
+                x: startX + gripWidth + gripGap,
+                y: labelRect.midY - textSize.height / 2
+            ))
+        } else {
+            attributed.draw(at: CGPoint(
+                x: labelRect.midX - textSize.width / 2,
+                y: labelRect.midY - textSize.height / 2
+            ))
+        }
     }
 }
