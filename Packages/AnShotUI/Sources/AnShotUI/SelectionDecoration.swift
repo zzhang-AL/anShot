@@ -192,7 +192,8 @@ enum SelectionHandleLayout {
         // **覆盖层视图是左上原点**：绘图坐标系的 minY 侧就是屏幕上方、maxY 侧是屏幕下方，
         // 因此 `.minXMinY ↔ 屏幕左上角`、`.minXMaxY ↔ 屏幕左下角`（其余同理）。
         // 「屏幕角 → 绘图角」的映射只在这一处，写错就会把上下贴合搞反。
-        let strokeInset = selection.minX - rect.minX
+        // 内缩量为正值（`decoratedRect` 在 `selection` 内侧，故为 `rect.minX - selection.minX`）。
+        let strokeInset = rect.minX - selection.minX
         let minXGap = selection.minX - viewBounds.minX
         let maxXGap = viewBounds.maxX - selection.maxX
         let minYGap = selection.minY - viewBounds.minY      // 上边

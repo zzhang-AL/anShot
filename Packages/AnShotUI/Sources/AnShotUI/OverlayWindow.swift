@@ -3784,9 +3784,11 @@ final class OverlayWindow: NSPanel, NSWindowDelegate {
         // 不透明背景 + 黑色：窗口显示瞬间若视图尚未绘制，看到的是黑屏而非桌面透出。
         isOpaque = true
         backgroundColor = .black
-        // 层级需高于菜单栏（.mainMenu）与全屏窗口（.fullScreen）。
-        level = .screenSaver
+        // 注意顺序：`isFloatingPanel = true` 内部会把 `level` 重置为 `.floating`（3），
+        // 必须在它**之后**再设置 `level = .screenSaver`（1000），才能真正压过顶部菜单栏（.mainMenu = 24）
+        // 与全屏应用窗口，确保顶部框选虚线可见且顶部状态栏区域可接收鼠标吸附事件。
         isFloatingPanel = true
+        level = .screenSaver
         becomesKeyOnlyIfNeeded = false
         hasShadow = false
         // 本应用激活策略为 .accessory，失焦是常态，不可因此隐藏覆盖层。

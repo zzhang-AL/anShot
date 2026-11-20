@@ -530,4 +530,18 @@ struct SelectionGestureExportTests {
         let enSegments = OverlayShortcutHUD.pillSegments(isSelectionConfirmed: false, isEnglish: true)
         #expect(enSegments.contains(where: { $0.key == "⌘A" }))
     }
+
+    @Test("全屏 OverlayWindow 层级必须保持为 .screenSaver（1000），不被 isFloatingPanel 重置回 .floating（3）")
+    func fullScreenOverlayWindowMaintainsScreenSaverLevel() throws {
+        guard let screen = NSScreen.screens.first else {
+            return
+        }
+        let window = OverlayWindow(screen: screen, displayID: CGMainDisplayID())
+        #expect(
+            window.level == .screenSaver,
+            "全屏覆盖层必须在 isFloatingPanel 之后设置 .screenSaver，才能压过菜单栏（layer=24）并完整显示顶部虚线"
+        )
+        #expect(window.level.rawValue > Int(CGWindowLevelForKey(.mainMenuWindow)))
+        window.close()
+    }
 }

@@ -28,6 +28,8 @@ public struct DetectedWindow: Equatable, Sendable {
     public let title: String?
     public let processID: pid_t
     public let applicationName: String?
+    /// 是否为系统顶部状态栏/菜单栏窗口（普通截图允许吸附整条状态栏及内部图标，独立窗体与窗口录制自动跳过）。
+    public let isSystemBar: Bool
 
     public init(
         windowID: CGWindowID,
@@ -35,7 +37,8 @@ public struct DetectedWindow: Equatable, Sendable {
         layer: Int,
         title: String?,
         processID: pid_t,
-        applicationName: String?
+        applicationName: String?,
+        isSystemBar: Bool = false
     ) {
         self.windowID = windowID
         self.frame = frame
@@ -43,6 +46,7 @@ public struct DetectedWindow: Equatable, Sendable {
         self.title = title
         self.processID = processID
         self.applicationName = applicationName
+        self.isSystemBar = isSystemBar
     }
 }
 
@@ -114,6 +118,29 @@ public protocol ScreenElementDetecting: AnyObject, Sendable {
     ///   - processID: 目标应用的进程号；通常来自鼠标下窗口的 `owningApplication`
     /// - Returns: 控件信息；无权限、该应用不接受 AX 或该点无控件时为 `nil`
     func control(atGlobalPoint point: CGPoint, inApplication processID: pid_t) -> ControlHit?
+
+    /// 在顶部系统状态栏/菜单栏区域内探测单个菜单项或状态栏图标。
+    ///
+    /// - Parameters:
+    ///   - point: 全局左上原点屏幕坐标
+    ///   - barFrame: 当前显示器顶部状态栏的全局矩形
+    ///   - candidatePIDs: 状态栏项宿主进程列表（通常为前台应用 + ControlCenter + SystemUIServer）
+    /// - Returns: 命中的状态栏项矩形；未命中时返回 `nil`（调用方回落为整条状态栏）
+    func statusBarItem(
+        atGlobalPoint point: CGPoint,
+        inBar barFrame: CGRect,
+        candidatePIDs: [pid_t]
+    ) -> ControlHit?
+}
+
+public extension ScreenElementDetecting {
+    func statusBarItem(
+        atGlobalPoint point: CGPoint,
+        inBar barFrame: CGRect,
+        candidatePIDs: [pid_t]
+    ) -> ControlHit? {
+        nil
+    }
 }
 
 /// 基于 ScreenCaptureKit 与辅助功能 API 的实现。
@@ -156,7 +183,10 @@ public final class SystemElementDetector: ScreenElementDetecting {
         kAXSheetRole as String,
         "AXPopover",
         kAXMenuRole as String,
-        kAXMenuItemRole as String
+        kAXMenuItemRole as String,
+        kAXMenuBarItemRole as String,
+        "AXMenuExtra",
+        kAXMenuBarRole as String
     ]
 
     /// 透明布局包装角色（常包在文字/图标外层，若其父级为高语义控件则继续穿透归并）。
@@ -208,27 +238,125 @@ public final class SystemElementDetector: ScreenElementDetecting {
             throw DetectionError.displayUnavailable(displayID)
         }
 
-        let detected = content.windows
-            .filter { isSelectable($0, onDisplay: displayID) }
+        let displayBounds = DisplayGeometry.bounds(for: displayID)
+        let mainMenuLayer = Int(CGWindowLevelForKey(.mainMenuWindow))
+
+        var detected = content.windows
+            .filter { isSelectable($0, displayBounds: displayBounds) }
             .map { window in
-                DetectedWindow(
+                let isBar = window.windowLayer == mainMenuLayer
+                    && Self.isMenuBarRect(window.frame, in: displayBounds)
+                return DetectedWindow(
                     windowID: window.windowID,
                     frame: window.frame,
                     layer: window.windowLayer,
                     title: window.title,
                     processID: window.owningApplication?.processID ?? 0,
-                    applicationName: window.owningApplication?.applicationName
+                    applicationName: window.owningApplication?.applicationName,
+                    isSystemBar: isBar
                 )
             }
 
-        // SCShareableContent.windows 不保证按屏幕 Z-Order 排序，
-        // 必须结合 CGWindowListCopyWindowInfo 的权威前到后顺序表重排。
+        // SCShareableContent.windows 不保证按屏幕 Z-Order 排序，且会排除 Window Server 的顶部 Menubar 窗口；
+        // 统一结合 CGWindowListCopyWindowInfo 的权威前到后顺序表重排，并补齐当前显示器顶部可见的系统状态栏。
         let windowInfoList = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
             kCGNullWindowID
         ) as? [[String: Any]]
+        let existingIDs = Set(detected.map(\.windowID))
+        for bar in Self.systemMenuBarWindows(
+            from: windowInfoList,
+            displayBounds: displayBounds,
+            ownProcessID: ownProcessID
+        ) where !existingIDs.contains(bar.windowID) {
+            detected.append(bar)
+        }
+
         let orderMap = Self.zOrderMap(from: windowInfoList)
         return Self.sortWindowsByZOrder(detected, orderMap: orderMap)
+    }
+
+    /// 判定给定全局矩形是否符合当前显示器顶部系统状态栏/菜单栏的几何特征。
+    static func isMenuBarRect(_ rect: CGRect, in displayBounds: CGRect) -> Bool {
+        guard displayBounds.width > 0, displayBounds.height > 0 else { return false }
+        let clipped = rect.intersection(displayBounds)
+        guard !clipped.isNull else { return false }
+        return clipped.width >= displayBounds.width * 0.5
+            && clipped.height >= 16
+            && clipped.height <= 64
+            && clipped.minY <= displayBounds.minY + 4
+    }
+
+    /// 从 `CGWindowListCopyWindowInfo` 中提取当前显示器顶部在屏可见的系统状态栏（Menu Bar）窗口。
+    static func systemMenuBarWindows(
+        from windowInfoList: [[String: Any]]?,
+        displayBounds: CGRect,
+        ownProcessID: pid_t
+    ) -> [DetectedWindow] {
+        guard let windowInfoList, displayBounds.width > 0, displayBounds.height > 0 else {
+            return []
+        }
+        let mainMenuLayer = Int(CGWindowLevelForKey(.mainMenuWindow))
+        for info in windowInfoList {
+            let layer = (info[kCGWindowLayer as String] as? Int) ?? 0
+            guard layer == mainMenuLayer else { continue }
+            let alpha = (info[kCGWindowAlpha as String] as? Double) ?? 1.0
+            guard alpha > 0.01 else { continue }
+            let pid = pid_t((info[kCGWindowOwnerPID as String] as? Int) ?? 0)
+            guard pid != ownProcessID else { continue }
+            guard let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+                  let rect = CGRect(dictionaryRepresentation: boundsDict),
+                  isMenuBarRect(rect, in: displayBounds),
+                  let number = info[kCGWindowNumber as String] as? NSNumber else {
+                continue
+            }
+            let rawName = (info[kCGWindowName as String] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = (rawName?.isEmpty == false) ? rawName : "状态栏"
+            return [DetectedWindow(
+                windowID: CGWindowID(number.uint32Value),
+                frame: rect,
+                layer: layer,
+                title: title,
+                processID: pid,
+                applicationName: "状态栏",
+                isSystemBar: true
+            )]
+        }
+        return []
+    }
+
+    /// 从 `CGWindowListCopyWindowInfo` 查找命中光标的独立状态栏项窗口（`kCGStatusWindowLevel` = 25）。
+    static func statusBarWindowHit(
+        atGlobalPoint point: CGPoint,
+        inBar barFrame: CGRect,
+        from windowInfoList: [[String: Any]]?,
+        ownProcessID: pid_t
+    ) -> ControlHit? {
+        guard let windowInfoList else { return nil }
+        let statusLayer = Int(CGWindowLevelForKey(.statusWindow))
+        var bestRect: CGRect?
+        var bestArea = CGFloat.greatestFiniteMagnitude
+        for info in windowInfoList {
+            let layer = (info[kCGWindowLayer as String] as? Int) ?? 0
+            guard layer == statusLayer else { continue }
+            let alpha = (info[kCGWindowAlpha as String] as? Double) ?? 1.0
+            guard alpha > 0.01 else { continue }
+            let pid = pid_t((info[kCGWindowOwnerPID as String] as? Int) ?? 0)
+            guard pid != ownProcessID else { continue }
+            guard let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+                  let rect = CGRect(dictionaryRepresentation: boundsDict),
+                  rect.insetBy(dx: -2, dy: -2).contains(point),
+                  isValidStatusBarItemFrame(rect, inBar: barFrame) else {
+                continue
+            }
+            let area = rect.width * rect.height
+            if area < bestArea {
+                bestArea = area
+                bestRect = rect
+            }
+        }
+        guard let bestRect else { return nil }
+        return ControlHit(frame: bestRect, role: "AXMenuExtra")
     }
 
     /// 判断窗口层号是否属于可拾取的可见用户窗口层级。
@@ -272,12 +400,13 @@ public final class SystemElementDetector: ScreenElementDetecting {
 
     /// 某个窗口是否应当作为识别候选。
     ///
-    /// 三条过滤缺一不可：
+    /// 四条过滤缺一不可：
     /// - 合理可见层级：排除负值桌面背板与全屏级以上系统遮罩，支持置顶浮动窗口。
     /// - `owningApplication != nil`：拿不到归属应用的条目没有意义，
     ///   也无法参与应用级聚合。
     /// - 排除本进程：见 `ownProcessID` 的说明。
-    private func isSelectable(_ window: SCWindow, onDisplay displayID: CGDirectDisplayID) -> Bool {
+    /// - 排除 `com.apple.dock` 的全屏透明容器窗（`layer = 20` 铺满整屏），防止其挡住所有普通应用窗口。
+    private func isSelectable(_ window: SCWindow, displayBounds: CGRect) -> Bool {
         guard Self.isSelectableLayer(window.windowLayer) else {
             return false
         }
@@ -287,14 +416,92 @@ public final class SystemElementDetector: ScreenElementDetecting {
         guard application.processID != ownProcessID else {
             return false
         }
+        if application.bundleIdentifier == "com.apple.dock",
+           DetectionSession.isMaximizedLike(window.frame, in: displayBounds) {
+            return false
+        }
         guard window.frame.width >= 1, window.frame.height >= 1 else {
             return false
         }
         // 窗口至少要和目标显示器有重合，否则不参与本屏识别。
-        return window.frame.intersects(DisplayGeometry.bounds(for: displayID))
+        return window.frame.intersects(displayBounds)
     }
 
     // MARK: - 控件识别
+
+    public func statusBarItem(
+        atGlobalPoint point: CGPoint,
+        inBar barFrame: CGRect,
+        candidatePIDs: [pid_t]
+    ) -> ControlHit? {
+        // 阶段 1：优先匹配独立状态栏图标窗口（kCGStatusWindowLevel = 25），零 AX IPC 延迟。
+        let windowInfoList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]]
+        if let windowHit = Self.statusBarWindowHit(
+            atGlobalPoint: point,
+            inBar: barFrame,
+            from: windowInfoList,
+            ownProcessID: ownProcessID
+        ) {
+            return windowHit
+        }
+
+        // 阶段 2：在具备辅助功能权限时，对前台应用 + ControlCenter + SystemUIServer 执行轻量 AX 探测。
+        guard hasAccessibilityPermission else {
+            return nil
+        }
+        let statusTimeout: Float = 0.025
+        for pid in candidatePIDs where pid > 0 && pid != ownProcessID {
+            let application = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(application, statusTimeout)
+
+            var element: AXUIElement?
+            let error = AXUIElementCopyElementAtPosition(
+                application,
+                Float(point.x),
+                Float(point.y),
+                &element
+            )
+            guard error == .success, let element else { continue }
+            if let hit = resolveStatusBarControlHit(startingAt: element, queryPoint: point, inBar: barFrame) {
+                return hit
+            }
+        }
+        return nil
+    }
+
+    /// 校验并归并状态栏内的单个 AX 菜单项/图标（最多向上归并 3 层，绝不扩成整条 AXMenuBar）。
+    private func resolveStatusBarControlHit(
+        startingAt element: AXUIElement,
+        queryPoint: CGPoint,
+        inBar barFrame: CGRect
+    ) -> ControlHit? {
+        var current: AXUIElement? = element
+        var best: (frame: CGRect, role: String?)?
+        for _ in 0..<3 {
+            guard let node = current, let snapshot = readSnapshot(of: node) else { break }
+            if snapshot.role == (kAXMenuBarRole as String)
+                || snapshot.role == (kAXApplicationRole as String)
+                || snapshot.role == (kAXWindowRole as String) {
+                break
+            }
+            if let frame = snapshot.frame,
+               frame.insetBy(dx: -4, dy: -4).contains(queryPoint),
+               Self.isValidStatusBarItemFrame(frame, inBar: barFrame) {
+                best = (frame, snapshot.role)
+                if snapshot.role == (kAXMenuBarItemRole as String)
+                    || snapshot.role == "AXMenuExtra"
+                    || snapshot.role == (kAXButtonRole as String) {
+                    break
+                }
+            }
+            current = snapshot.parent
+        }
+        guard let best else { return nil }
+        return ControlHit(frame: best.frame, role: best.role)
+    }
 
     public func control(atGlobalPoint point: CGPoint, inApplication processID: pid_t) -> ControlHit? {
         // 无权限时直接返回 nil，让调用方降级到窗口层。
@@ -417,17 +624,33 @@ public final class SystemElementDetector: ScreenElementDetecting {
         return ControlHit(frame: chosen.frame, role: chosen.role, ancestors: ancestors)
     }
 
-    /// 判断节点尺寸是否满足控件最小有效阈值（过滤微小图标碎片、分隔线与细长滚动条）。
+    /// 判断节点尺寸是否满足普通控件最小有效阈值（过滤微小图标碎片、分隔线与极细竖向滚动条，
+    /// 同时放行 20pt+ 高度的应用底部/顶部状态栏与工具栏条）。
     static func isValidControlFrame(_ frame: CGRect) -> Bool {
         let width = frame.width
         let height = frame.height
         guard width >= 18, height >= 18 else { return false }
         let area = width * height
         guard area >= 480 else { return false }
+        // 过滤极细长分隔线 / 滚动条槽（如 900×18 或 18×800）；同时放行 20pt+ 高度的应用底部/顶部状态栏。
         let shortSide = min(width, height)
         let longSide = max(width, height)
-        // 过滤极细长分隔线 / 滚动条槽（如 1400×18 或 18×800）。
-        if shortSide < 24, longSide / shortSide > 16 {
+        if shortSide < 20, longSide / shortSide > 16 {
+            return false
+        }
+        return true
+    }
+
+    /// 判断节点尺寸是否满足顶部系统状态栏内单个菜单项/图标的有效阈值（兼容 22×32 图标与菜单标题，排除整条菜单栏）。
+    static func isValidStatusBarItemFrame(_ frame: CGRect, inBar barFrame: CGRect) -> Bool {
+        let clipped = frame.intersection(barFrame)
+        guard !clipped.isNull else { return false }
+        let width = clipped.width
+        let height = clipped.height
+        guard width >= 12, height >= 14, width * height >= 180 else {
+            return false
+        }
+        guard width <= max(420, barFrame.width * 0.55) else {
             return false
         }
         return true

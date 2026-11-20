@@ -311,9 +311,126 @@ struct DetectionSessionAsyncTests {
         let displayToWindow = session.stepControlHierarchy(expand: false)
         #expect(displayToWindow?.layer == .window && displayToWindow?.windowID == 777)
 
-        // 4. 细长分隔线与极小碎片应被 isValidControlFrame 淘汰
+        // 5. 细长分隔线/滚动条槽与极小碎片应被 isValidControlFrame 淘汰，20pt+ 应用状态栏正常放行
         #expect(!SystemElementDetector.isValidControlFrame(CGRect(x: 0, y: 0, width: 14, height: 14)))
         #expect(!SystemElementDetector.isValidControlFrame(CGRect(x: 0, y: 0, width: 900, height: 18)))
+        #expect(!SystemElementDetector.isValidControlFrame(CGRect(x: 1450, y: 40, width: 18, height: 800)))
+        #expect(SystemElementDetector.isValidControlFrame(CGRect(x: 0, y: 934, width: 1470, height: 22)))
         #expect(SystemElementDetector.isValidControlFrame(CGRect(x: 0, y: 0, width: 80, height: 28)))
+    }
+
+    @MainActor
+    @Test("顶部状态栏支持整条与单个图标识别及滚轮切层，独立窗体模式自动排除状态栏")
+    func supportsSystemStatusBarDetectionAndHierarchy() async {
+        let displayBounds = CGRect(x: 0, y: 0, width: 1470, height: 956)
+        let mainMenuLayer = Int(CGWindowLevelForKey(.mainMenuWindow))
+        let statusLayer = Int(CGWindowLevelForKey(.statusWindow))
+
+        // 1. 静态提取顶部 Menubar 与状态栏图标窗口
+        let infoList: [[String: Any]] = [
+            [
+                kCGWindowNumber as String: NSNumber(value: 9001),
+                kCGWindowLayer as String: mainMenuLayer,
+                kCGWindowAlpha as String: 1.0,
+                kCGWindowOwnerPID as String: 607,
+                kCGWindowName as String: "Menubar",
+                kCGWindowBounds as String: ["X": 0.0, "Y": 0.0, "Width": 1470.0, "Height": 33.0] as NSDictionary
+            ],
+            [
+                kCGWindowNumber as String: NSNumber(value: 9002),
+                kCGWindowLayer as String: statusLayer,
+                kCGWindowAlpha as String: 1.0,
+                kCGWindowOwnerPID as String: 888,
+                kCGWindowName as String: "Item-0",
+                kCGWindowBounds as String: ["X": 1320.0, "Y": 0.0, "Width": 28.0, "Height": 33.0] as NSDictionary
+            ]
+        ]
+
+        let extractedBars = SystemElementDetector.systemMenuBarWindows(
+            from: infoList,
+            displayBounds: displayBounds,
+            ownProcessID: 9999
+        )
+        #expect(extractedBars.count == 1)
+        #expect(extractedBars.first?.isSystemBar == true)
+        #expect(extractedBars.first?.frame == CGRect(x: 0, y: 0, width: 1470, height: 33))
+
+        let statusHit = SystemElementDetector.statusBarWindowHit(
+            atGlobalPoint: CGPoint(x: 1330, y: 16),
+            inBar: CGRect(x: 0, y: 0, width: 1470, height: 33),
+            from: infoList,
+            ownProcessID: 9999
+        )
+        #expect(statusHit?.frame == CGRect(x: 1320, y: 0, width: 28, height: 33))
+
+        // 2. DetectionSession 普通区域模式吸附状态栏与内部图标，滚轮依次：图标 → 整条状态栏 → 当前整屏
+        final class StatusBarMockDetector: ScreenElementDetecting, @unchecked Sendable {
+            let list: [DetectedWindow]
+            let itemHit: ControlHit?
+            init(list: [DetectedWindow], itemHit: ControlHit?) {
+                self.list = list
+                self.itemHit = itemHit
+            }
+            var hasAccessibilityPermission: Bool { false }
+            func windows(onDisplay displayID: CGDirectDisplayID) async throws -> [DetectedWindow] { list }
+            func control(atGlobalPoint point: CGPoint, inApplication processID: pid_t) -> ControlHit? { nil }
+            func statusBarItem(atGlobalPoint point: CGPoint, inBar barFrame: CGRect, candidatePIDs: [pid_t]) -> ControlHit? {
+                itemHit
+            }
+        }
+
+        let barWindow = DetectedWindow(
+            windowID: 9001,
+            frame: CGRect(x: 0, y: 0, width: 1470, height: 33),
+            layer: mainMenuLayer,
+            title: "Menubar",
+            processID: 607,
+            applicationName: "状态栏",
+            isSystemBar: true
+        )
+        let appWindow = DetectedWindow(
+            windowID: 3001,
+            frame: CGRect(x: 0, y: 33, width: 1470, height: 923),
+            layer: 0,
+            title: "Editor",
+            processID: 555,
+            applicationName: "Editor"
+        )
+        let mock = StatusBarMockDetector(
+            list: [barWindow, appWindow],
+            itemHit: ControlHit(frame: CGRect(x: 1320, y: 0, width: 28, height: 33), role: "AXMenuExtra")
+        )
+        let session = DetectionSession(detector: mock, displayID: 1, displayBounds: displayBounds)
+        session.suppressesMaximizedWindow = true
+        await session.load()
+
+        // 即时命中整条状态栏
+        let immediateBar = session.immediateTarget(atGlobalPoint: CGPoint(x: 1330, y: 16), preference: .automatic)
+        #expect(immediateBar?.layer == .window)
+        #expect(immediateBar?.rect == CGRect(x: 0, y: 0, width: 1470, height: 33))
+
+        // 后台即使无辅助功能权限也可通过独立状态项窗口收窄到单个图标，并建立 3 层滚轮栈
+        var itemTarget: DetectionTarget?
+        var fired = false
+        session.scheduleControlTarget(
+            atGlobalPoint: CGPoint(x: 1330, y: 16),
+            preference: .automatic,
+            debounce: .milliseconds(5)
+        ) { target in
+            itemTarget = target
+            fired = true
+        }
+        for _ in 0..<100 where !fired {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(itemTarget?.layer == .control)
+        #expect(itemTarget?.rect == CGRect(x: 1320, y: 0, width: 28, height: 33))
+        #expect(session.controlHierarchyCount == 3)
+        #expect(session.stepControlHierarchy(expand: true)?.rect == CGRect(x: 0, y: 0, width: 1470, height: 33))
+        #expect(session.stepControlHierarchy(expand: true)?.layer == .display)
+
+        // 独立窗体模式自动排除系统状态栏，不污染单窗捕获候选栈
+        #expect(session.windowCandidates(atGlobalPoint: CGPoint(x: 1330, y: 16)).isEmpty)
+        #expect(session.windowCandidates(atGlobalPoint: CGPoint(x: 500, y: 200)).map(\.windowID) == [3001])
     }
 }

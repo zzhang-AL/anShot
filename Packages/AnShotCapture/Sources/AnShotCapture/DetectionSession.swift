@@ -46,9 +46,11 @@ public final class DetectionSession {
     /// 后台控件去抖查询代际号与当前任务。
     private var controlLookupGeneration: UInt64 = 0
     private var controlLookupTask: Task<Void, Never>?
-    /// 最近一次在光标位置收集到的层级候选栈（由内到外：控件 → 语义父容器 → 窗口），供悬停滚轮逐层切换。
+    /// 最近一次在光标位置收集到的层级候选栈（由内到外：控件 → 语义父容器 → 窗口 → 当前整屏），供悬停滚轮逐层切换。
     private var hierarchyTargets: [DetectionTarget] = []
     private var hierarchyIndex: Int = 0
+    /// 顶部系统状态栏内图标/菜单项的候选宿主进程 PID 缓存（前台应用 + ControlCenter + SystemUIServer）。
+    private var statusBarOwnerPIDs: [pid_t] = []
 
     public init(
         detector: ScreenElementDetecting,
@@ -82,12 +84,29 @@ public final class DetectionSession {
     /// 不该让「按热键截图」这条主路径因为窗口枚举失败而中断。
     public func load() async {
         cachedAccessibilityPermission = detector.hasAccessibilityPermission
+        statusBarOwnerPIDs = Self.collectStatusBarOwnerPIDs()
         do {
             windows = try await detector.windows(onDisplay: displayID)
         } catch {
             windows = []
         }
         isLoaded = true
+    }
+
+    /// 采集当前会话中可能承载顶部状态栏菜单项与系统图标的宿主进程 PID（在主线程一次性缓存，供后台线程安全读取）。
+    private static func collectStatusBarOwnerPIDs() -> [pid_t] {
+        var pids: [pid_t] = []
+        func appendUnique(_ pid: pid_t?) {
+            guard let pid, pid > 0, !pids.contains(pid) else { return }
+            pids.append(pid)
+        }
+        appendUnique(NSWorkspace.shared.frontmostApplication?.processIdentifier)
+        for bundleID in ["com.apple.controlcenter", "com.apple.systemuiserver"] {
+            for app in NSRunningApplication.runningApplications(withBundleIdentifier: bundleID) {
+                appendUnique(app.processIdentifier)
+            }
+        }
+        return pids
     }
 
     /// 在普通区域截图模式下是否抑制最大化窗口（宽 ≥ 92%、高 ≥ 82% 且面积 ≥ 78%）的窗口级吸附。
@@ -110,11 +129,11 @@ public final class DetectionSession {
         return widthRatio >= 0.92 && heightRatio >= 0.82 && areaRatio >= 0.78
     }
 
-    /// 返回光标下方按权威 Z-order（前到后）排列的全部可见窗口候选，供窗体模式 `Tab` 穿透切换。
+    /// 返回光标下方按权威 Z-order（前到后）排列的全部可见应用窗口候选，供窗体模式 `Tab` 穿透切换（排除系统状态栏）。
     public func windowCandidates(atGlobalPoint point: CGPoint) -> [DetectionTarget] {
         guard isLoaded else { return [] }
         var targets: [DetectionTarget] = []
-        for window in windows where window.frame.contains(point) {
+        for window in windows where !window.isSystemBar && window.frame.contains(point) {
             guard let local = DetectionGeometry.clampedLocalBounds(
                 ofGlobalRects: [window.frame],
                 displayBounds: displayBounds
@@ -176,10 +195,20 @@ public final class DetectionSession {
         }
     }
 
+    /// 返回光标下方最顶层参与本次模式识别的窗口（普通区域模式包含系统状态栏；录制/窗体模式跳过系统状态栏）。
+    private func topWindow(atGlobalPoint point: CGPoint) -> DetectedWindow? {
+        windows.first { window in
+            if window.isSystemBar, !suppressesMaximizedWindow {
+                return false
+            }
+            return window.frame.contains(point)
+        }
+    }
+
     /// 返回光标下方最顶层可见窗口的 `windowID`（不发起 AX 跨进程查询，用于判断光标是否仍在同一窗口内）。
     public func topWindowID(atGlobalPoint point: CGPoint) -> CGWindowID? {
         guard isLoaded else { return nil }
-        return windows.first(where: { $0.frame.contains(point) })?.windowID
+        return topWindow(atGlobalPoint: point)?.windowID
     }
 
     /// 阶段一零阻塞即时命中：仅使用内存中的窗口快照，不发起跨进程 AX 查询。
@@ -216,8 +245,8 @@ public final class DetectionSession {
         guard preference == .automatic else {
             return immediateTarget(atGlobalPoint: point, preference: preference)
         }
-        guard cachedAccessibilityPermission,
-              let window = windows.first(where: { $0.frame.contains(point) }) else {
+        guard let window = topWindow(atGlobalPoint: point),
+              window.isSystemBar || cachedAccessibilityPermission else {
             if let target = windowTarget(atGlobalPoint: point) {
                 return target
             }
@@ -226,8 +255,14 @@ public final class DetectionSession {
 
         let detector = self.detector
         let pid = window.processID
+        let isSystemBar = window.isSystemBar
+        let barFrame = window.frame
+        let statusPIDs = self.statusBarOwnerPIDs
         let hit = await Task.detached(priority: .userInitiated) {
-            detector.control(atGlobalPoint: point, inApplication: pid)
+            if isSystemBar {
+                return detector.statusBarItem(atGlobalPoint: point, inBar: barFrame, candidatePIDs: statusPIDs)
+            }
+            return detector.control(atGlobalPoint: point, inApplication: pid)
         }.value
 
         if let hit, let control = makeControlTarget(from: hit, in: window, atGlobalPoint: point) {
@@ -242,7 +277,7 @@ public final class DetectionSession {
     /// 阶段二后台去抖查询控件：主线程可先用 `immediateTarget` 瞬时响应，再由本方法异步收窄到控件框。
     ///
     /// 每次调用会自动取消前一次尚未完成或仍在去抖窗口内的查询，确保只有最新坐标的控件结果回填；
-    /// 同时维护悬停滚轮层级栈（由内到外最终衔接当前整屏），即便未命中细控件也支持「窗口 ↔ 当前整屏」切换。
+    /// 同时维护悬停滚轮层级栈（由内到外最终衔接当前整屏），即便未命中细控件也支持「窗口/状态栏 ↔ 当前整屏」切换。
     public func scheduleControlTarget(
         atGlobalPoint point: CGPoint,
         preference: DetectionLayerPreference,
@@ -256,12 +291,13 @@ public final class DetectionSession {
             return
         }
 
-        // 先构造不含 AX 控件的基础层级栈（如 窗口 → 当前整屏，或仅当前整屏），
+        // 先构造不含 AX 控件的基础层级栈（如 窗口/状态栏 → 当前整屏，或仅当前整屏），
         // 保证无辅助功能权限、窗口级模式或尚未命中细控件时，悬停滚轮同样可切到整屏。
         let baseHierarchy = makeBaseHierarchy(atGlobalPoint: point, preference: preference)
 
-        guard preference == .automatic, cachedAccessibilityPermission,
-              let window = windows.first(where: { $0.frame.contains(point) }) else {
+        guard preference == .automatic,
+              let window = topWindow(atGlobalPoint: point),
+              window.isSystemBar || cachedAccessibilityPermission else {
             hierarchyTargets = baseHierarchy
             hierarchyIndex = 0
             return
@@ -277,6 +313,9 @@ public final class DetectionSession {
         let generation = controlLookupGeneration
         let detector = self.detector
         let pid = window.processID
+        let isSystemBar = window.isSystemBar
+        let barFrame = window.frame
+        let statusPIDs = self.statusBarOwnerPIDs
 
         controlLookupTask = Task { [weak self] in
             do {
@@ -289,7 +328,10 @@ public final class DetectionSession {
             guard !Task.isCancelled else { return }
 
             let hit = await Task.detached(priority: .userInitiated) {
-                detector.control(atGlobalPoint: point, inApplication: pid)
+                if isSystemBar {
+                    return detector.statusBarItem(atGlobalPoint: point, inBar: barFrame, candidatePIDs: statusPIDs)
+                }
+                return detector.control(atGlobalPoint: point, inApplication: pid)
             }.value
 
             guard !Task.isCancelled, let self else { return }
@@ -384,6 +426,9 @@ public final class DetectionSession {
     /// `CGWindowListCopyWindowInfo` 的语义一致。命中测试取第一个包含该点的窗口。
     private func windowTarget(atGlobalPoint point: CGPoint) -> DetectionTarget? {
         for window in windows where window.frame.contains(point) {
+            if window.isSystemBar, !suppressesMaximizedWindow {
+                continue
+            }
             // 普通区域截图模式下，若最顶层命中窗口本身已近似最大化/全屏，
             // 直接停止并返回 nil：既不误吸全屏，也绝不穿透去吸附其背后的半屏窗口。
             if suppressesMaximizedWindow, Self.isMaximizedLike(window.frame, in: displayBounds) {
@@ -412,13 +457,13 @@ public final class DetectionSession {
         return nil
     }
 
-    /// 鼠标下窗口所属应用在本显示器内的全部窗口。
+    /// 鼠标下窗口所属应用在本显示器内的全部窗口（跳过系统状态栏）。
     private func applicationTarget(atGlobalPoint point: CGPoint) -> DetectionTarget? {
-        guard let hit = windows.first(where: { $0.frame.contains(point) }) else {
+        guard let hit = windows.first(where: { !$0.isSystemBar && $0.frame.contains(point) }) else {
             return nil
         }
 
-        let siblings = windows.filter { $0.processID == hit.processID }
+        let siblings = windows.filter { !$0.isSystemBar && $0.processID == hit.processID }
         guard let box = DetectionGeometry.clampedLocalBounds(
             ofGlobalRects: siblings.map(\.frame),
             displayBounds: displayBounds
@@ -441,21 +486,28 @@ public final class DetectionSession {
         )
     }
 
-    /// 界面控件。
+    /// 界面控件（含顶部系统状态栏内的单个图标/菜单项）。
     ///
     /// 顺序是「先找窗口、再在该应用内找控件」，不能反过来：
     /// 覆盖层浮在最顶层，用 system-wide 元素做 AX 命中测试时命中的
     /// 永远是覆盖层自己，控件层会恒等于整屏。详见
     /// `ScreenElementDetecting.control(atGlobalPoint:inApplication:)`。
     private func controlTarget(atGlobalPoint point: CGPoint) -> DetectionTarget? {
-        guard cachedAccessibilityPermission,
-              let window = windows.first(where: { $0.frame.contains(point) }),
-              let hit = detector.control(
-                  atGlobalPoint: point,
-                  inApplication: window.processID
-              ) else {
+        guard let window = topWindow(atGlobalPoint: point) else {
             return nil
         }
+        let hit: ControlHit?
+        if window.isSystemBar {
+            hit = detector.statusBarItem(
+                atGlobalPoint: point,
+                inBar: window.frame,
+                candidatePIDs: statusBarOwnerPIDs
+            )
+        } else {
+            guard cachedAccessibilityPermission else { return nil }
+            hit = detector.control(atGlobalPoint: point, inApplication: window.processID)
+        }
+        guard let hit else { return nil }
         return makeControlTarget(from: hit, in: window, atGlobalPoint: point)
     }
 
@@ -557,9 +609,12 @@ public final class DetectionSession {
         }
 
         let clippedToWindow = frame.intersection(window.frame)
+        let isValidSize = window.isSystemBar
+            ? SystemElementDetector.isValidStatusBarItemFrame(clippedToWindow, inBar: window.frame)
+            : SystemElementDetector.isValidControlFrame(clippedToWindow)
         guard !clippedToWindow.isNull,
               clippedToWindow.insetBy(dx: -4, dy: -4).contains(point),
-              SystemElementDetector.isValidControlFrame(clippedToWindow) else {
+              isValidSize else {
             return nil
         }
 
