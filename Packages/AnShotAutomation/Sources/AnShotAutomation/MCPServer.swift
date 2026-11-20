@@ -209,8 +209,9 @@ public enum AnShotMCP {
             - quality：JPEG 压缩质量（1...100，默认 82，仅 JPEG 时生效）。
             - coordinate_grid：可选布尔值，为 true 时在图像边缘绘制逻辑点坐标标尺网格，辅助精准定位点击坐标。
             - save_path：把截图另存到该路径（已存在时自动追加序号，不覆盖）。
+            - include_image：可选布尔值，默认 true。设为 false（须配合 save_path）时仅后台静默落盘并返回元数据，不回传 base64 图像载荷。
 
-            截图由 anShot.app 自己完成，复用它已有的屏幕录制授权。
+            常驻 anShot.app 运行时将通过本机私有 Socket 后台无感直连执行（零进程冷启动、不抢焦点、不切桌面）。
             """,
             inputSchema: .object([
                 "type": .string("object"),
@@ -266,6 +267,10 @@ public enum AnShotMCP {
                     "save_path": .object([
                         "type": .string("string"),
                         "description": .string("另存路径（可选）。已存在时自动追加序号，不会覆盖。")
+                    ]),
+                    "include_image": .object([
+                        "type": .string("boolean"),
+                        "description": .string("是否在响应中回传 base64 图像，默认 true。设为 false 时必须指定 save_path，仅后台静默落盘并返回元数据。")
                     ])
                 ]),
                 "additionalProperties": .bool(false)
@@ -532,8 +537,11 @@ public enum AnShotMCP {
         logger: Logger
     ) async -> CallTool.Result {
         let parameters: CaptureParameters
+        let includeImage: Bool
         do {
-            parameters = try parse(arguments: arguments)
+            let parsed = try parseCaptureRequest(arguments: arguments)
+            parameters = parsed.parameters
+            includeImage = parsed.includeImage
         } catch let error as AutomationError {
             return errorResult(error.localizedDescription)
         } catch {
@@ -548,10 +556,12 @@ public enum AnShotMCP {
                 execution: .reuseApplicationAuthorization
             )
 
-            try MCPPayloadLimits.validate(
-                byteCount: outcome.imageData.count,
-                format: outcome.imageFormat
-            )
+            if includeImage {
+                try MCPPayloadLimits.validate(
+                    byteCount: outcome.imageData.count,
+                    format: outcome.imageFormat
+                )
+            }
 
             if let savePath = parameters.savePath, !savePath.isEmpty {
                 outcome = outcome.withSavedURL(
@@ -559,21 +569,27 @@ public enum AnShotMCP {
                 )
             }
 
-            let base64 = outcome.imageData.base64EncodedString()
-            return CallTool.Result(
-                content: [
+            var content: [Tool.Content] = []
+            if includeImage {
+                let base64 = outcome.imageData.base64EncodedString()
+                content.append(
                     .image(
                         data: base64,
                         mimeType: outcome.mimeType,
                         annotations: nil,
                         _meta: nil
-                    ),
-                    .text(
-                        text: metadataText(for: outcome),
-                        annotations: nil,
-                        _meta: nil
                     )
-                ],
+                )
+            }
+            content.append(
+                .text(
+                    text: metadataText(for: outcome),
+                    annotations: nil,
+                    _meta: nil
+                )
+            )
+            return CallTool.Result(
+                content: content,
                 isError: false
             )
         } catch let error as AutomationError {
@@ -671,15 +687,23 @@ public enum AnShotMCP {
 
     // MARK: - 参数解析（internal 便于单元测试直接覆盖）
 
-    /// 把 `capture_screenshot` MCP 参数解析为共享请求模型。
+    /// 把 `capture_screenshot` MCP 参数解析为共享请求模型（保持单测兼容入口）。
     static func parse(
         arguments: [String: Value]?
     ) throws -> CaptureParameters {
+        try parseCaptureRequest(arguments: arguments).parameters
+    }
+
+    /// 把 `capture_screenshot` MCP 参数解析为共享请求模型与 `include_image` 标志。
+    static func parseCaptureRequest(
+        arguments: [String: Value]?
+    ) throws -> (parameters: CaptureParameters, includeImage: Bool) {
         let arguments = arguments ?? [:]
 
         let allowedKeys: Set<String> = [
             "window_id", "app", "display_id", "space_id", "allow_switch",
-            "region", "max_size", "format", "quality", "coordinate_grid", "save_path"
+            "region", "max_size", "format", "quality", "coordinate_grid", "save_path",
+            "include_image"
         ]
         try rejectUnknownArguments(in: arguments, allowedKeys: allowedKeys)
 
@@ -687,6 +711,7 @@ public enum AnShotMCP {
             maxLongEdge: MCPPayloadLimits.defaultMaxLongEdge,
             autoFallbackToJPEG: true
         )
+        var includeImage = true
 
         if let raw = arguments["window_id"] {
             parameters.windowID = try parseWindowID(raw)
@@ -732,6 +757,16 @@ public enum AnShotMCP {
         if let raw = arguments["save_path"] {
             parameters.savePath = try parseString(raw, name: "save_path")
         }
+        if let raw = arguments["include_image"] {
+            includeImage = try parseBool(raw, name: "include_image")
+        }
+
+        if !includeImage {
+            let trimmedPath = parameters.savePath?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !trimmedPath.isEmpty else {
+                throw AutomationError.invalidArgument("include_image 为 false 时必须提供 save_path，否则截图既不落盘也不返回。")
+            }
+        }
 
         // 入口即做数值边界与格式互斥校验（如 quality 1...100、png+quality 冲突）。
         if let quality = parameters.jpegQuality {
@@ -753,7 +788,7 @@ public enum AnShotMCP {
             }
         }
 
-        return parameters
+        return (parameters, includeImage)
     }
 
     /// 解析 `ocr_screenshot` 参数。

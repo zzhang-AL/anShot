@@ -42,7 +42,8 @@ do {
 // `open -n app --args -diagnose...` 一起禁掉，诊断入口就没了。
 // 统一调用 `AppDelegate.isDiagnosticLaunch` 作为单一事实来源（#if DEBUG 下放行诊断入口，
 // Release 构建恒返回 false，确保任何参数都不会绕过单实例锁）。
-if !AppDelegate.isDiagnosticLaunch(arguments: CommandLine.arguments) {
+let isDiagnostic = AppDelegate.isDiagnosticLaunch(arguments: CommandLine.arguments)
+if !isDiagnostic {
     enforceSingleInstance()
 }
 
@@ -50,6 +51,22 @@ let app = NSApplication.shared
 
 // .accessory：菜单栏 agent，无 Dock 图标、无主菜单（与 Info.plist 的 LSUIElement 一致）
 app.setActivationPolicy(.accessory)
+
+// 正式 GUI 单实例挂载常驻私有 Unix Domain Socket 自动化代理：
+// MCP / CLI 优先直连常驻进程静默执行截图/窗口枚举/OCR/控件探测，零冷启动、零进程闪现。
+if !isDiagnostic {
+    AutomationDaemonServer.shared.start()
+    NotificationCenter.default.addObserver(
+        forName: NSApplication.willTerminateNotification,
+        object: app,
+        queue: nil
+    ) { _ in
+        AutomationDaemonServer.shared.stop()
+    }
+    atexit {
+        AutomationDaemonServer.shared.stop()
+    }
+}
 
 // ⚠️ NSApplication.delegate 是 weak 引用。
 // 必须在此持有强引用，否则 AppDelegate 会在 run() 之前被释放，

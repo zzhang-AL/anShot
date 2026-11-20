@@ -42,8 +42,8 @@ struct EncodedImagePayload: Sendable {
 /// 截图结果。
 public struct CaptureOutcome: Sendable {
 
-    /// 图像（可能已按 `maxLongEdge` 缩小，并可能已绘制坐标网格）。
-    public let image: CGImage
+    /// 图像（本进程直接捕获时持有；跨进程/Socket 透传路径免去无意义的 PNG/JPEG 二次解码，为 `nil`）。
+    public let image: CGImage?
 
     /// 最终编码后的图像字节（PNG 或 JPEG）。
     public let imageData: Data
@@ -95,9 +95,7 @@ public struct CaptureOutcome: Sendable {
     public let savedURL: URL?
 
     /// 输出像素尺寸（缩放**之后**）。
-    public var pixelSize: CGSize {
-        CGSize(width: image.width, height: image.height)
-    }
+    public let pixelSize: CGSize
 
     /// 原图像素尺寸（缩放**之前**）。
     public let sourcePixelSize: CGSize
@@ -120,6 +118,43 @@ public struct CaptureOutcome: Sendable {
         sourcePixelSize: CGSize
     ) {
         self.image = image
+        self.pixelSize = CGSize(width: image.width, height: image.height)
+        self.imageData = imageData
+        self.imageFormat = imageFormat
+        self.jpegQuality = jpegQuality
+        self.didAutoFallbackToJPEG = didAutoFallbackToJPEG
+        self.originalPNGByteCount = originalPNGByteCount
+        self.coordinateGridEnabled = coordinateGridEnabled
+        self.coordinateGridOrigin = coordinateGridOrigin
+        self.displayID = displayID
+        self.scaleFactor = scaleFactor
+        self.region = region
+        self.spaceID = spaceID
+        self.window = window
+        self.savedURL = savedURL
+        self.sourcePixelSize = sourcePixelSize
+    }
+
+    /// 免解码构造器：供常驻 Socket 与跨进程传输路径直接透传编码字节与尺寸元数据，省去整图二次解码。
+    public init(
+        pixelSize: CGSize,
+        imageData: Data,
+        imageFormat: CaptureImageFormat = .png,
+        jpegQuality: Int? = nil,
+        didAutoFallbackToJPEG: Bool = false,
+        originalPNGByteCount: Int? = nil,
+        coordinateGridEnabled: Bool = false,
+        coordinateGridOrigin: CGPoint? = nil,
+        displayID: CGDirectDisplayID,
+        scaleFactor: CGFloat,
+        region: CGRect?,
+        spaceID: UInt64?,
+        window: WindowCaptureInfo?,
+        savedURL: URL?,
+        sourcePixelSize: CGSize
+    ) {
+        self.image = nil
+        self.pixelSize = pixelSize
         self.imageData = imageData
         self.imageFormat = imageFormat
         self.jpegQuality = jpegQuality
@@ -141,8 +176,27 @@ public struct CaptureOutcome: Sendable {
     /// 跨进程路径需要它：截图由子实例完成（所以当时没有落盘），落盘由父进程
     /// 补上，而本类型的字段都是 `let`。
     func withSavedURL(_ url: URL?) -> CaptureOutcome {
-        CaptureOutcome(
-            image: image,
+        if let image {
+            return CaptureOutcome(
+                image: image,
+                imageData: imageData,
+                imageFormat: imageFormat,
+                jpegQuality: jpegQuality,
+                didAutoFallbackToJPEG: didAutoFallbackToJPEG,
+                originalPNGByteCount: originalPNGByteCount,
+                coordinateGridEnabled: coordinateGridEnabled,
+                coordinateGridOrigin: coordinateGridOrigin,
+                displayID: displayID,
+                scaleFactor: scaleFactor,
+                region: region,
+                spaceID: spaceID,
+                window: window,
+                savedURL: url,
+                sourcePixelSize: sourcePixelSize
+            )
+        }
+        return CaptureOutcome(
+            pixelSize: pixelSize,
             imageData: imageData,
             imageFormat: imageFormat,
             jpegQuality: jpegQuality,

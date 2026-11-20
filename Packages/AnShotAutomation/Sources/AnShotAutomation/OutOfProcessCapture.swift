@@ -80,15 +80,16 @@ enum OutOfProcessCapture {
             throw AutomationError.remoteFailure("anShot 实例报告成功，但未返回截图数据。")
         }
 
-        guard let image = decodeImage(imageData) else {
-            throw AutomationError.remoteFailure("anShot 实例生成的截图无法解码为图像。")
+        let pixelSize = CGSize(width: capture.pixelWidth, height: capture.pixelHeight)
+        guard pixelSize.width > 0, pixelSize.height > 0 else {
+            throw AutomationError.remoteFailure("anShot 实例返回的截图尺寸非法（\(capture.pixelWidth)×\(capture.pixelHeight)）。")
         }
 
         let format = capture.imageFormat.flatMap(CaptureImageFormat.init(rawValue:)) ?? .png
         let gridOrigin = capture.coordinateGridOrigin.map { CGPoint(x: $0.x, y: $0.y) }
 
         return CaptureOutcome(
-            image: image,
+            pixelSize: pixelSize,
             imageData: imageData,
             imageFormat: format,
             jpegQuality: capture.jpegQuality,
@@ -180,13 +181,56 @@ enum OutOfProcessCapture {
         sanitized.savePath = nil
 
         let outputFileName = "transfer.\(parameters.format.fileExtension)"
-        let (report, _, workspace) = try await runIPCWithWorkspace(
-            appURL: appURL,
-            timeout: timeout,
-            outputFileName: outputFileName,
-            makeAction: { .record(sanitized) }
-        )
+
+        // 优先走常驻 anShot.app 私有 Unix Domain Socket 直连录屏（零冷启动、零进程闪现）；
+        // 若常驻 App 未启动，自动无感降级到 `open -n -g -W` 兜底路径。
+        let workspace = try createPrivateWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
+        let transferURL = workspace.appendingPathComponent(outputFileName)
+
+        let report: CommandReport
+        do {
+            let (daemonReport, _) = try await AutomationDaemonClient.send(
+                action: .record(sanitized),
+                outputPath: transferURL.path,
+                timeout: timeout
+            )
+            guard daemonReport.ok else {
+                throw AutomationError.remoteFailure(daemonReport.error ?? "anShot 常驻实例未说明录屏失败原因。")
+            }
+            report = daemonReport
+        } catch DaemonClientTransportError.unavailable {
+            let (fallbackReport, _, fallbackWorkspace) = try await runIPCWithWorkspace(
+                appURL: appURL,
+                timeout: timeout,
+                outputFileName: outputFileName,
+                makeAction: { .record(sanitized) }
+            )
+            defer { try? FileManager.default.removeItem(at: fallbackWorkspace) }
+            guard let recording = fallbackReport.recording else {
+                throw AutomationError.remoteFailure("anShot 实例报告成功，但未返回录制元数据。")
+            }
+            let sourceURL = URL(fileURLWithPath: recording.savedPath)
+            let savedURL = try RecordingService.saveRecordingExclusively(
+                from: sourceURL,
+                to: savePath,
+                reservedPaths: reservedOutputPaths
+            )
+            return RecordingOutcomeOutput(
+                savedPath: savedURL.path,
+                format: recording.format,
+                durationSeconds: recording.durationSeconds,
+                pixelWidth: recording.pixelWidth,
+                pixelHeight: recording.pixelHeight,
+                frameRate: recording.frameRate,
+                fileSizeBytes: recording.fileSizeBytes
+            )
+        } catch let error as DaemonClientTransportError {
+            if case .protocolFailure(let message) = error {
+                throw AutomationError.remoteFailure(message)
+            }
+            throw error
+        }
 
         guard let recording = report.recording else {
             throw AutomationError.remoteFailure("anShot 实例报告成功，但未返回录制元数据。")
@@ -218,11 +262,34 @@ enum OutOfProcessCapture {
         outputFileName: String?,
         makeAction: () -> IPCRequest.Action
     ) async throws -> (report: CommandReport, outputData: Data?) {
+        let action = makeAction()
+
+        // 优先走常驻 GUI 进程（anShot.app）内置私有 Unix Domain Socket：
+        // 零进程冷启动、零临时磁盘 I/O、零 20ms 文件轮询，真正后台无感执行。
+        do {
+            let (report, binaryData) = try await AutomationDaemonClient.send(
+                action: action,
+                outputPath: nil,
+                timeout: timeout
+            )
+            guard report.ok else {
+                throw AutomationError.remoteFailure(report.error ?? "anShot 常驻实例未说明失败原因。")
+            }
+            return (report, binaryData)
+        } catch DaemonClientTransportError.unavailable {
+            // 常驻 anShot.app 未运行时无缝回落至原有 `open -n -g -W` 兜底路径。
+        } catch let error as DaemonClientTransportError {
+            if case .protocolFailure(let message) = error {
+                throw AutomationError.remoteFailure(message)
+            }
+            throw error
+        }
+
         let (report, outputData, workspace) = try await runIPCWithWorkspace(
             appURL: appURL,
             timeout: timeout,
             outputFileName: outputFileName,
-            makeAction: makeAction
+            makeAction: { action }
         )
         defer { try? FileManager.default.removeItem(at: workspace) }
         return (report, outputData)
@@ -447,19 +514,10 @@ enum OutOfProcessCapture {
         }
         _ = kill(pid, SIGTERM)
     }
-
-    // MARK: - 解码
-
-    private static func decodeImage(_ data: Data) -> CGImage? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
-            return nil
-        }
-        return CGImageSourceCreateImageAtIndex(source, 0, nil)
-    }
 }
 
-/// 支持取消的异步并发控制信号量（用于限制跨进程子实例最大并发数）。
-private actor AsyncSemaphore {
+/// 支持取消的异步并发控制信号量（用于限制跨进程与常驻 Socket 最大并发数）。
+actor AsyncSemaphore {
     private var available: Int
     private var waiters: [(id: UUID, continuation: CheckedContinuation<Void, Error>)] = []
 

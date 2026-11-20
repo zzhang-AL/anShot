@@ -1210,8 +1210,8 @@ struct CaptureOutput: Codable {
     init(outcome: CaptureOutcome, overrideSavedPath: String? = nil) {
         self.displayId = outcome.displayID
         self.spaceId = outcome.spaceID
-        self.pixelWidth = outcome.image.width
-        self.pixelHeight = outcome.image.height
+        self.pixelWidth = Int(outcome.pixelSize.width)
+        self.pixelHeight = Int(outcome.pixelSize.height)
         self.sourcePixelWidth = Int(outcome.sourcePixelSize.width)
         self.sourcePixelHeight = Int(outcome.sourcePixelSize.height)
         self.scaleFactor = Double(outcome.scaleFactor)
