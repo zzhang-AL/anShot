@@ -83,11 +83,16 @@ enum SelectionChromeRenderer {
         return (line, width, ascent + descent, ascent)
     }
 
-    /// 绘制选区边框（未确认候选态附加极轻主题色微光填充，配合全屏原亮度静止零闪烁呈现吸附目标）。
+    /// 绘制选区边框（未确认候选态对局部控件/窗口附加极轻主题色微光填充，
+    /// 整屏兜底候选仅绘制清晰边界不铺整屏蓝雾，配合全屏原亮度静止实现零闪烁呈现）。
     private static func drawBorder(for chrome: Chrome, in context: CGContext) {
         let decorated = SelectionHandleLayout.decoratedRect(for: chrome.selection)
         let cornerRadii = radii(for: chrome)
-        if !chrome.isConfirmed, !chrome.isCreating {
+        let isFullScreenCandidate = !chrome.isConfirmed && !chrome.isCreating
+            && chrome.viewBounds.width > 0 && chrome.viewBounds.height > 0
+            && chrome.selection.width >= chrome.viewBounds.width - 4
+            && chrome.selection.height >= chrome.viewBounds.height - 4
+        if !chrome.isConfirmed, !chrome.isCreating, !isFullScreenCandidate {
             let fillPath = CaptureFrameStyle.roundedPath(in: decorated, radii: cornerRadii)
             context.saveGState()
             context.setFillColor(NSColor.controlAccentColor.withAlphaComponent(0.08).cgColor)

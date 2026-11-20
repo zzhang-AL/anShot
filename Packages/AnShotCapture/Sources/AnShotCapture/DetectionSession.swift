@@ -90,10 +90,10 @@ public final class DetectionSession {
         isLoaded = true
     }
 
-    /// 在普通区域截图模式下是否抑制最大化窗口（宽 ≥ 92%、高 ≥ 82% 且面积 ≥ 78%）的自动吸附。
+    /// 在普通区域截图模式下是否抑制最大化窗口（宽 ≥ 92%、高 ≥ 82% 且面积 ≥ 78%）的窗口级吸附。
     ///
-    /// 开启后，当光标下最顶层窗口近似全屏/最大化时，既不误吸附整屏、也不穿透吸附底层半屏窗口；
-    /// 同时不再退回整屏 `displayTarget()`，保持 100% 原始亮度的干净画面供用户直接拖拽框选。
+    /// 开启后，当光标下最顶层窗口近似全屏/最大化时，既不误吸附该窗口、也不穿透吸附底层半屏窗口；
+    /// 若光标下也没有细粒度控件命中，则自然回落至整屏 `displayTarget()` 兜底（点击即选全屏，拖拽仍直接自由框选）。
     /// 独立窗体模式与录制取目标模式关闭此开关，确保所有窗口均可被点选。
     public var suppressesMaximizedWindow: Bool = false
 
@@ -154,25 +154,25 @@ public final class DetectionSession {
             return nil
 
         case .automatic:
-            // 由内到外：控件 → 窗口 → 显示器（抑制最大化模式下不回退整屏显示器）。
+            // 由内到外：控件 → 窗口 → 当前整屏兜底。
             if let control = controlTarget(atGlobalPoint: point) {
                 return control
             }
             if let window = windowTarget(atGlobalPoint: point) {
                 return window
             }
-            return suppressesMaximizedWindow ? nil : displayTarget()
+            return displayTarget()
 
         case .window:
             if let window = windowTarget(atGlobalPoint: point) {
                 return window
             }
-            return suppressesMaximizedWindow ? nil : displayTarget()
+            return displayTarget()
 
         case .application:
             return applicationTarget(atGlobalPoint: point)
                 ?? windowTarget(atGlobalPoint: point)
-                ?? (suppressesMaximizedWindow ? nil : displayTarget())
+                ?? displayTarget()
         }
     }
 
@@ -197,11 +197,11 @@ public final class DetectionSession {
             if let window = windowTarget(atGlobalPoint: point) {
                 return window
             }
-            return suppressesMaximizedWindow ? nil : displayTarget()
+            return displayTarget()
         case .application:
             return applicationTarget(atGlobalPoint: point)
                 ?? windowTarget(atGlobalPoint: point)
-                ?? (suppressesMaximizedWindow ? nil : displayTarget())
+                ?? displayTarget()
         }
     }
 
@@ -221,7 +221,7 @@ public final class DetectionSession {
             if let target = windowTarget(atGlobalPoint: point) {
                 return target
             }
-            return suppressesMaximizedWindow ? nil : displayTarget()
+            return displayTarget()
         }
 
         let detector = self.detector
@@ -236,12 +236,13 @@ public final class DetectionSession {
         if let target = windowTarget(atGlobalPoint: point) {
             return target
         }
-        return suppressesMaximizedWindow ? nil : displayTarget()
+        return displayTarget()
     }
 
     /// 阶段二后台去抖查询控件：主线程可先用 `immediateTarget` 瞬时响应，再由本方法异步收窄到控件框。
     ///
-    /// 每次调用会自动取消前一次尚未完成或仍在去抖窗口内的查询，确保只有最新坐标的控件结果回填。
+    /// 每次调用会自动取消前一次尚未完成或仍在去抖窗口内的查询，确保只有最新坐标的控件结果回填；
+    /// 同时维护悬停滚轮层级栈（由内到外最终衔接当前整屏），即便未命中细控件也支持「窗口 ↔ 当前整屏」切换。
     public func scheduleControlTarget(
         atGlobalPoint point: CGPoint,
         preference: DetectionLayerPreference,
@@ -249,11 +250,27 @@ public final class DetectionSession {
         onUpdate: @escaping @MainActor (DetectionTarget?) -> Void
     ) {
         cancelPendingControlLookup()
-        guard preference == .automatic, isLoaded, cachedAccessibilityPermission,
-              let window = windows.first(where: { $0.frame.contains(point) }) else {
+        guard preference != .disabled, isLoaded else {
             hierarchyTargets = []
             hierarchyIndex = 0
             return
+        }
+
+        // 先构造不含 AX 控件的基础层级栈（如 窗口 → 当前整屏，或仅当前整屏），
+        // 保证无辅助功能权限、窗口级模式或尚未命中细控件时，悬停滚轮同样可切到整屏。
+        let baseHierarchy = makeBaseHierarchy(atGlobalPoint: point, preference: preference)
+
+        guard preference == .automatic, cachedAccessibilityPermission,
+              let window = windows.first(where: { $0.frame.contains(point) }) else {
+            hierarchyTargets = baseHierarchy
+            hierarchyIndex = 0
+            return
+        }
+
+        // 若当前尚未持有层级栈，先灌入基础层级栈避免去抖窗口内滚轮失效。
+        if hierarchyTargets.isEmpty {
+            hierarchyTargets = baseHierarchy
+            hierarchyIndex = 0
         }
 
         controlLookupGeneration &+= 1
@@ -278,9 +295,15 @@ public final class DetectionSession {
             guard !Task.isCancelled, let self else { return }
             guard self.controlLookupGeneration == generation, self.isLoaded else { return }
             let chain = hit.map { self.makeControlHierarchy(from: $0, in: window, atGlobalPoint: point) } ?? []
-            self.hierarchyTargets = chain
-            self.hierarchyIndex = 0
-            onUpdate(chain.first)
+            if !chain.isEmpty {
+                self.hierarchyTargets = chain
+                self.hierarchyIndex = 0
+                onUpdate(chain.first)
+            } else {
+                self.hierarchyTargets = self.makeBaseHierarchy(atGlobalPoint: point, preference: preference)
+                self.hierarchyIndex = 0
+                onUpdate(nil)
+            }
         }
     }
 
@@ -436,7 +459,20 @@ public final class DetectionSession {
         return makeControlTarget(from: hit, in: window, atGlobalPoint: point)
     }
 
-    /// 构造从最内层语义控件到外层容器（含可选窗口层）的完整层级链。
+    /// 构造不含 AX 细控件的基础层级栈（如「窗口 → 当前整屏」或「应用 → 当前整屏」或单层「当前整屏」）。
+    private func makeBaseHierarchy(
+        atGlobalPoint point: CGPoint,
+        preference: DetectionLayerPreference
+    ) -> [DetectionTarget] {
+        guard let immediate = immediateTarget(atGlobalPoint: point, preference: preference) else {
+            return []
+        }
+        var result = [immediate]
+        appendDisplayFallback(to: &result)
+        return result
+    }
+
+    /// 构造从最内层语义控件到外层容器、窗口，最终衔接当前整屏的完整层级链。
     private func makeControlHierarchy(
         from hit: ControlHit,
         in window: DetectedWindow,
@@ -458,7 +494,7 @@ public final class DetectionSession {
                 result.append(target)
             }
         }
-        // 非最大化窗口时，允许滚轮最后扩一层到完整窗口本身。
+        // 非最大化窗口时，允许滚轮向上先扩到完整窗口本身，再衔接当前整屏。
         if !result.isEmpty,
            !(suppressesMaximizedWindow && Self.isMaximizedLike(window.frame, in: displayBounds)),
            let localWindow = DetectionGeometry.clampedLocalBounds(ofGlobalRects: [window.frame], displayBounds: displayBounds) {
@@ -473,7 +509,27 @@ public final class DetectionSession {
                 applicationName: window.applicationName
             ))
         }
+        if !result.isEmpty {
+            appendDisplayFallback(to: &result)
+        }
         return result
+    }
+
+    /// 在层级链最顶层衔接「当前整屏」，若末尾目标已与整屏重合（误差 ≤ 4pt）则不重复追加。
+    private func appendDisplayFallback(to chain: inout [DetectionTarget]) {
+        guard let display = displayTarget() else { return }
+        if let last = chain.last {
+            if last.layer == .display {
+                return
+            }
+            if abs(last.rect.minX - display.rect.minX) <= 2,
+               abs(last.rect.minY - display.rect.minY) <= 2,
+               abs(last.rect.width - display.rect.width) <= 4,
+               abs(last.rect.height - display.rect.height) <= 4 {
+                return
+            }
+        }
+        chain.append(display)
     }
 
     /// 将 AX 控件命中结果收敛为有效的控件级 `DetectionTarget`。

@@ -177,7 +177,7 @@ struct DetectionSessionAsyncTests {
     }
 
     @MainActor
-    @Test("普通区域模式抑制最大化窗口吸附且不穿透底层半屏窗口，窗体候选栈按 Z-order 完整返回")
+    @Test("普通区域模式抑制最大化窗口不穿透底层半屏窗口并回落整屏兜底，窗体候选栈按 Z-order 完整返回")
     func suppressesMaximizedWindowAndReturnsOrderedWindowCandidates() async {
         let displayBounds = CGRect(x: 0, y: 0, width: 1440, height: 900)
         // 顶层最大化窗口：占满 96% 宽、94% 高、90% 面积
@@ -206,9 +206,15 @@ struct DetectionSessionAsyncTests {
         #expect(DetectionSession.isMaximizedLike(maximized.frame, in: displayBounds))
         #expect(!DetectionSession.isMaximizedLike(behind.frame, in: displayBounds))
 
-        // 光标在重叠点：抑制最大化窗口后应返回 nil，既不吸附 Safari 也不穿透吸附 Notes。
+        // 光标在重叠点：抑制最大化窗口且绝不穿透吸附底层 Notes，无细控件时回落整屏 `.display` 兜底。
         let hit = session.immediateTarget(atGlobalPoint: CGPoint(x: 300, y: 300), preference: .automatic)
-        #expect(hit == nil)
+        #expect(hit?.layer == .display)
+        #expect(hit?.rect == CGRect(x: 0, y: 0, width: 1440, height: 900))
+        // 光标在桌面空白处（无任何窗口覆盖）：同样使用当前整屏兜底。
+        let blankHit = session.immediateTarget(atGlobalPoint: CGPoint(x: 5, y: 5), preference: .automatic)
+        #expect(blankHit?.layer == .display)
+        // 按住 Option 关闭识别（.disabled）时保持返回 nil。
+        #expect(session.immediateTarget(atGlobalPoint: CGPoint(x: 300, y: 300), preference: .disabled) == nil)
 
         // 独立窗体模式下 `windowCandidates` 按 Z-order 完整返回所有叠放窗口。
         let candidates = session.windowCandidates(atGlobalPoint: CGPoint(x: 300, y: 300))
@@ -256,27 +262,54 @@ struct DetectionSessionAsyncTests {
             ]
         )
         var callbackTarget: DetectionTarget?
+        var callbackFired = false
         session.scheduleControlTarget(
             atGlobalPoint: CGPoint(x: 300, y: 70),
             preference: .automatic,
             debounce: .milliseconds(5)
         ) { target in
             callbackTarget = target
+            callbackFired = true
         }
-        try? await Task.sleep(for: .milliseconds(40))
+        for _ in 0..<100 where !callbackFired {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
 
         #expect(callbackTarget?.layer == .control)
         #expect(callbackTarget?.windowID == 777, "控件目标必须携带所属 windowID 保证粘性保稳生效")
         #expect((callbackTarget?.rect.maxX ?? 0) <= window.frame.maxX + 0.1, "越界控件必须裁剪在所属窗口边界内")
 
-        // 3. 滚轮层级链切换：按钮/工具栏 → 祖先容器 → 窗口，再缩回
-        #expect(session.controlHierarchyCount == 3)
+        // 3. 滚轮层级链切换：按钮/工具栏 → 祖先容器 → 窗口 → 当前整屏，再逐层缩回
+        #expect(session.controlHierarchyCount == 4)
         let expanded1 = session.stepControlHierarchy(expand: true)
         #expect(expanded1?.layer == .control && expanded1?.rect.height == 180)
         let expanded2 = session.stepControlHierarchy(expand: true)
         #expect(expanded2?.layer == .window && expanded2?.windowID == 777)
-        let shrunk = session.stepControlHierarchy(expand: false)
-        #expect(shrunk?.layer == .control && shrunk?.rect.height == 180)
+        let expanded3 = session.stepControlHierarchy(expand: true)
+        #expect(expanded3?.layer == .display && expanded3?.rect == CGRect(x: 0, y: 0, width: 1440, height: 900))
+        let shrunk1 = session.stepControlHierarchy(expand: false)
+        #expect(shrunk1?.layer == .window && shrunk1?.windowID == 777)
+        let shrunk2 = session.stepControlHierarchy(expand: false)
+        #expect(shrunk2?.layer == .control && shrunk2?.rect.height == 180)
+
+        // 4. 光标在普通窗口内但未命中细控件时，悬停滚轮仍支持「窗口 ↔ 当前整屏」两层切换
+        detector.nextHit = nil
+        var fallbackFired = false
+        session.scheduleControlTarget(
+            atGlobalPoint: CGPoint(x: 300, y: 70),
+            preference: .automatic,
+            debounce: .milliseconds(5)
+        ) { _ in
+            fallbackFired = true
+        }
+        for _ in 0..<100 where !fallbackFired {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(session.controlHierarchyCount == 2)
+        let windowToDisplay = session.stepControlHierarchy(expand: true)
+        #expect(windowToDisplay?.layer == .display)
+        let displayToWindow = session.stepControlHierarchy(expand: false)
+        #expect(displayToWindow?.layer == .window && displayToWindow?.windowID == 777)
 
         // 4. 细长分隔线与极小碎片应被 isValidControlFrame 淘汰
         #expect(!SystemElementDetector.isValidControlFrame(CGRect(x: 0, y: 0, width: 14, height: 14)))

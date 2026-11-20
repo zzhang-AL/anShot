@@ -365,9 +365,9 @@ struct Phase5PolishAndMigrationTests {
         session.suppressesMaximizedWindow = true
         await session.load()
 
-        // 光标在最大化窗口区域内：顶层窗口为 101，且 immediateTarget 抑制整屏误吸返回 nil
+        // 光标在最大化窗口区域内：顶层窗口为 101，抑制窗口吸附不穿透底层窗口，无细控件时回落整屏 `.display` 兜底
         #expect(session.topWindowID(atGlobalPoint: CGPoint(x: 200, y: 200)) == 101)
-        #expect(session.immediateTarget(atGlobalPoint: CGPoint(x: 200, y: 200), preference: .automatic) == nil)
+        #expect(session.immediateTarget(atGlobalPoint: CGPoint(x: 200, y: 200), preference: .automatic)?.layer == .display)
         // 移入上层悬浮窗：顶层窗口切换为 202，immediateTarget 立即命中浮窗
         #expect(session.topWindowID(atGlobalPoint: CGPoint(x: 960, y: 200)) == 202)
         #expect(session.immediateTarget(atGlobalPoint: CGPoint(x: 960, y: 200), preference: .automatic)?.windowID == 202)

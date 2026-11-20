@@ -35,6 +35,8 @@ enum OverlayKeyCommand: Equatable {
     case redo
     /// ⌘P：把当前截图钉在屏幕上。
     case pin
+    /// ⌘A：全选当前屏幕并确认选区。
+    case selectFullScreen
     /// ⌘D：复制当前选中的标注。
     case duplicate
     /// 方向键微调位置（1px；按住 Shift 为 10px）。
@@ -56,6 +58,7 @@ enum OverlayKeyCommand: Equatable {
 
         if flags.contains(.command), !flags.contains(.control), !flags.contains(.option) {
             switch characters {
+            case "a" where !flags.contains(.shift): return .selectFullScreen
             case "s": return .save
             case "c": return .copy
             case "p": return .pin

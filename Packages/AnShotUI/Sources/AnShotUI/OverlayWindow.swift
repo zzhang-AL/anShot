@@ -111,6 +111,9 @@ final class OverlayView: NSView {
     /// 当前是否正在编辑文字（供 `OverlayWindow.performKeyEquivalent` 分流快捷键）。
     var isEditingText: Bool { editorState?.isEditingText == true }
 
+    /// 当前是否正在内联编辑编号数字（供 `OverlayWindow.performKeyEquivalent` 放行输入框 `⌘A` 等快捷键）。
+    var isEditingNumbering: Bool { numberingEditorField != nil }
+
     /// 是否正在选取录制目标（供 `OverlayWindow.performKeyEquivalent` 判别）。
     var isRecordingPickActive: Bool { recordingPick.isActive }
 
@@ -1789,7 +1792,7 @@ final class OverlayView: NSView {
                 preference: preference
             ) {
                 applyDetectionTarget(immediate)
-            } else if session.suppressesMaximizedWindow {
+            } else {
                 clearPreviewCandidate()
             }
         }
@@ -1807,13 +1810,13 @@ final class OverlayView: NSView {
             if let controlTarget {
                 self.applyDetectionTarget(controlTarget)
             } else if shouldHoldCurrentControl {
-                // 后台确认光标下已无细控件命中时，再平滑回退到窗口候选或静默空态。
+                // 后台确认光标下已无细控件命中时，平滑回退到窗口候选或当前整屏兜底（按住 ⌥ 时清空）。
                 if let fallback = session.immediateTarget(
                     atGlobalPoint: globalPoint,
                     preference: preference
                 ) {
                     self.applyDetectionTarget(fallback)
-                } else if session.suppressesMaximizedWindow {
+                } else {
                     self.clearPreviewCandidate()
                 }
             }
@@ -3132,7 +3135,7 @@ final class OverlayView: NSView {
     }
 
     /// 滚轮交互：
-    /// - 未确认选区且悬停命中控件时：沿当前 AX 父级链逐层放大/缩小吸附范围（如 按钮 ↔ 卡片 ↔ 面板 ↔ 窗口）；
+    /// - 未确认选区悬停时：沿层级链逐层放大/缩小吸附范围（如 按钮 ↔ 卡片 ↔ 面板 ↔ 窗口 ↔ 当前整屏）；
     /// - 已确认选区时：有选中标注调整其线宽/字号/模糊强度/压暗度/半径，无选中调整当前工具默认参数；
     /// - 独立图片/长截图滚动编辑窗内：普通滚轮交由 `NSScrollView` 浏览长图，按住 `⌥ + 滚轮` 调参。
     override func scrollWheel(with event: NSEvent) {
@@ -3473,6 +3476,8 @@ final class OverlayView: NSView {
             performExport(.copy)
         case .pin:
             performExport(.pin)
+        case .selectFullScreen:
+            performSelectFullScreen()
         case .duplicate:
             if editorState?.duplicateSelected() != true {
                 NSSound.beep()
@@ -3512,6 +3517,51 @@ final class OverlayView: NSView {
                 updateCursor(at: mousePoint)
                 updateLoupe(at: mousePoint)
             }
+        }
+    }
+
+    /// `⌘A`：一键全选当前屏幕并锁定确认（无论当前处于静默首帧、吸附候选或已有局部选区）。
+    private func performSelectFullScreen() {
+        guard !isWindowPickerMode,
+              !isRecordSetupActive,
+              !recordingPick.isActive,
+              bounds.width >= decoration.minimumSelectionSize,
+              bounds.height >= decoration.minimumSelectionSize else {
+            NSSound.beep()
+            return
+        }
+        commitNumberingEditing()
+        detectionSession?.cancelPendingControlLookup()
+        detectionSession?.clearControlHierarchy()
+        if editorState?.hasDraft == true {
+            editorState?.discardDraft()
+        }
+        interaction = .idle
+        pendingCandidate = nil
+        preCreatingSelectionRect = nil
+        resizingInitialRect = nil
+        isDraggingSizeLabel = false
+        currentDetectionTarget = nil
+        detectionTitle = nil
+        detectionLayerName = nil
+        lastDetectionDescription = nil
+
+        selectionRect = bounds
+        onSelectionChanged?(bounds)
+        if let onSelectionCommitted {
+            onSelectionCommitted(bounds)
+        } else {
+            let pixel = CoordinateConversion.pixelRect(fromLogical: bounds, scaleFactor: pixelsPerPoint)
+            editorState?.commitSelection(pixel)
+        }
+        editorState?.confirmSelection()
+        refreshToolbar()
+        if let window {
+            let mousePoint = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+            updateCursor(at: mousePoint)
+            updateLoupe(at: mousePoint)
+        } else {
+            loupeView.isHidden = true
         }
     }
 
@@ -3787,9 +3837,10 @@ final class OverlayWindow: NSPanel, NSWindowDelegate {
         orderFrontRegardless()
     }
 
-    /// 非文字编辑态下优先响应覆盖层画布级快捷键，避免被常驻 Edit 主菜单吞掉 ⌘C / ⌘Z。
+    /// 非文字编辑态下优先响应覆盖层画布级快捷键，避免被常驻 Edit 主菜单吞掉 ⌘A / ⌘C / ⌘Z。
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if !overlayView.isEditingText,
+           !overlayView.isEditingNumbering,
            !overlayView.isRecordSetupActive,
            !overlayView.isRecordingPickActive,
            event.modifierFlags.contains(.command),

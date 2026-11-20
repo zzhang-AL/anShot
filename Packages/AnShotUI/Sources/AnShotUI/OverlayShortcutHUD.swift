@@ -88,12 +88,14 @@ enum OverlayShortcutHUD {
         } else {
             if isEnglish {
                 return [
+                    PillSegment(key: "⌘A", label: "Full"),
                     PillSegment(key: "Space", label: "Window"),
                     PillSegment(key: "C", label: "Color"),
                     PillSegment(key: "?", label: "Keys"),
                 ]
             }
             return [
+                PillSegment(key: "⌘A", label: "全屏"),
                 PillSegment(key: "Space", label: "独立窗体"),
                 PillSegment(key: "C", label: "取色"),
                 PillSegment(key: "?", label: "快捷键"),
@@ -107,6 +109,8 @@ enum OverlayShortcutHUD {
                 CheatSheetSection(
                     title: "Selection & Capture",
                     items: [
+                        ("⌘A", "Select current screen"),
+                        ("Scroll Hover", "Cycle control / window / screen"),
                         ("Space", "Window mode / Hold to pan selection"),
                         ("Drag Size Pill", "Pan selection from any tool"),
                         ("Arrows / ⌥+Arrows", "Nudge 1px / Resize selection"),
@@ -138,8 +142,9 @@ enum OverlayShortcutHUD {
             CheatSheetSection(
                 title: "选区与取景",
                 items: [
+                    ("⌘A", "一键全选当前屏幕"),
+                    ("悬停滚轮", "逐层切换控件 / 窗口 / 全屏"),
                     ("Space", "切换窗体模式 / 按住平移选区"),
-                    ("悬停滚轮", "逐层扩大或缩小吸附控件范围"),
                     ("拖尺寸胶囊", "任意标注工具下直接平移选区"),
                     ("方向键 / ⌥+方向键", "1px 移动 / 调整选区宽高"),
                     ("C / ⇧C", "复制光标处 HEX / RGB 色值"),

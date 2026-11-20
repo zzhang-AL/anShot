@@ -481,4 +481,53 @@ struct SelectionGestureExportTests {
         fixture.view.setSelection(CGRect(x: 10, y: 500, width: 200, height: 90))
         #expect(OverlayShortcutHUD.pillRect(for: fixture.view.shortcutHUDState()) == nil, "选区靠近左下角时微提示应静默隐藏")
     }
+
+    @Test("覆盖层 ⌘A 一键全选当前屏幕并确认选区，微提示包含 ⌘A 全屏引导")
+    func commandASelectsFullScreenAndConfirmsSelection() throws {
+        // 1. 解析器校验：⌘A 命中 selectFullScreen，⇧⌘A 不误触发
+        let cmdA = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0,
+            windowNumber: 0, context: nil, characters: "a", charactersIgnoringModifiers: "a",
+            isARepeat: false, keyCode: 0
+        ))
+        #expect(OverlayKeyCommand.parse(cmdA) == .selectFullScreen)
+
+        let shiftCmdA = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.command, .shift], timestamp: 0,
+            windowNumber: 0, context: nil, characters: "A", charactersIgnoringModifiers: "a",
+            isARepeat: false, keyCode: 0
+        ))
+        #expect(OverlayKeyCommand.parse(shiftCmdA) == nil)
+
+        // 2. 在真实 OverlayWindow 上按 ⌘A：非文字编辑态直接由窗口消费，不落入主菜单 Select All，
+        //    并将任意候选/局部选区立即锁定为当前整屏并确认
+        let overlayWindow = OverlayWindow(
+            imageFrame: NSRect(x: 0, y: 0, width: 800, height: 600),
+            displayID: 0
+        )
+        let editor = AnnotationEditorState(selection: makeRect(100, 100, 200, 120))
+        overlayWindow.overlayView.editorState = editor
+        overlayWindow.overlayView.backdrop = makeBackdrop(width: 1600, height: 1200)
+        overlayWindow.overlayView.setSelection(CGRect(x: 50, y: 50, width: 100, height: 60))
+        #expect(!editor.isSelectionConfirmed)
+
+        var committedRect: CGRect?
+        overlayWindow.overlayView.onSelectionCommitted = { rect in
+            committedRect = rect
+            let pixel = CoordinateConversion.pixelRect(fromLogical: rect, scaleFactor: overlayWindow.overlayView.pixelsPerPoint)
+            editor.commitSelection(pixel)
+        }
+
+        let handled = overlayWindow.performKeyEquivalent(with: cmdA)
+        #expect(handled, "非文字编辑态下 OverlayWindow 应直接消费 ⌘A，不被主菜单吞掉")
+        #expect(overlayWindow.overlayView.effectiveSelection == overlayWindow.overlayView.bounds, "按 ⌘A 后选区应覆盖整块当前屏幕")
+        #expect(committedRect == overlayWindow.overlayView.bounds, "按 ⌘A 应立即提交整屏选区")
+        #expect(editor.isSelectionConfirmed, "按 ⌘A 后选区应直接进入确认态以便导出或标注")
+
+        // 3. 框选前左下角微提示应直接包含 ⌘A 全屏入口
+        let zhSegments = OverlayShortcutHUD.pillSegments(isSelectionConfirmed: false, isEnglish: false)
+        #expect(zhSegments.contains(where: { $0.key == "⌘A" }))
+        let enSegments = OverlayShortcutHUD.pillSegments(isSelectionConfirmed: false, isEnglish: true)
+        #expect(enSegments.contains(where: { $0.key == "⌘A" }))
+    }
 }
